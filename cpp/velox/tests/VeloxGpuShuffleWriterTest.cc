@@ -35,6 +35,7 @@
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
 #include <chrono>
+#include <cstdint>
 #include <iomanip>
 #include <numeric>
 
@@ -120,6 +121,7 @@ RowVectorPtr mergeBufferColumnarBatches(std::vector<std::shared_ptr<GpuBufferCol
       getDefaultMemoryManager()->defaultArrowMemoryPool(),
       getDefaultMemoryManager()->getLeafMemoryPool().get(),
       1200, // output one batch
+      INT64_MAX,
       std::make_unique<ColumnarBatchArray>(bufferBatches));
   auto cb = resizer.next();
   auto batch = std::dynamic_pointer_cast<VeloxColumnarBatch>(cb);

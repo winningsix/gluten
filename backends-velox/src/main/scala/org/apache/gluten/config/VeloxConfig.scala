@@ -82,6 +82,8 @@ class VeloxConfig(conf: SQLConf) extends GlutenConfig(conf) {
 
   def cudfBatchSize: Int = getConf(CUDF_BATCH_SIZE)
 
+  def cudfBatchSizeInBytes: Long = getConf(CUDF_BATCH_SIZE_IN_BYTES)
+
   def cudfConcurrentGpuTasks: Option[Int] = getConf(CUDF_CONCURRENT_GPU_TASKS)
 
   def cudfGpuMemorySize: Option[Long] = getConf(CUDF_GPU_MEMORY_SIZE)
@@ -680,6 +682,15 @@ object VeloxConfig extends ConfigRegistry {
       .doc("Cudf input batch size after shuffle reader")
       .intConf
       .createWithDefault(Integer.MAX_VALUE)
+
+  val CUDF_BATCH_SIZE_IN_BYTES =
+    buildConf("spark.gluten.sql.columnar.backend.velox.cudf.batchSizeInBytes")
+      .doc(
+        "Maximum byte size of a composed batch in GpuBufferBatchResizer. " +
+          "Works together with cudf.batchSize (row limit): a flush is " +
+          "triggered when either threshold is reached first.")
+      .longConf
+      .createWithDefault(Long.MaxValue)
 
   val CUDF_GPU_TARGET_BATCH_ROWS =
     buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.gpuTargetBatchRows")

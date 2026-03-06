@@ -17,6 +17,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+
 #include "cudf/GpuLock.h"
 #include "memory/GpuBufferColumnarBatch.h"
 #include "utils/GpuBufferBatchResizer.h"
@@ -415,7 +417,7 @@ TEST_F(GpuBufferScatterBench, endToEndWithNulls) {
         batches.begin(), batches.begin() + 100);
     auto it = std::make_unique<ReplayIterator>(wb);
     gluten::GpuBufferBatchResizer resizer(
-        arrow::default_memory_pool(), pool_.get(), 100000, std::move(it));
+        arrow::default_memory_pool(), pool_.get(), 100000, INT64_MAX, std::move(it));
     while (auto cb = resizer.next()) {}
   }
 
@@ -433,7 +435,7 @@ TEST_F(GpuBufferScatterBench, endToEndWithNulls) {
   {
     auto it = std::make_unique<ReplayIterator>(batches);
     gluten::GpuBufferBatchResizer resizer(
-        arrow::default_memory_pool(), pool_.get(), kTargetRows, std::move(it));
+        arrow::default_memory_pool(), pool_.get(), kTargetRows, INT64_MAX, std::move(it));
     auto result = resizer.next();
     ASSERT_NE(result, nullptr);
     EXPECT_EQ(result->numRows(), kTargetRows);
@@ -479,7 +481,7 @@ TEST_F(GpuBufferScatterBench, varyingBatchCount) {
     {
       auto it = std::make_unique<ReplayIterator>(batches);
       gluten::GpuBufferBatchResizer resizer(
-          arrow::default_memory_pool(), pool_.get(), kTotalRows, std::move(it));
+          arrow::default_memory_pool(), pool_.get(), kTotalRows, INT64_MAX, std::move(it));
       auto result = resizer.next();
       ASSERT_NE(result, nullptr);
     }

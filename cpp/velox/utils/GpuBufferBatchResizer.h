@@ -43,6 +43,7 @@ class GpuBufferBatchResizer : public ColumnarBatchIterator {
       arrow::MemoryPool* arrowPool,
       facebook::velox::memory::MemoryPool* pool,
       int32_t minOutputBatchSize,
+      int64_t minOutputBatchSizeInBytes,
       std::unique_ptr<ColumnarBatchIterator> in);
 
   std::shared_ptr<ColumnarBatch> next() override;
@@ -53,6 +54,7 @@ class GpuBufferBatchResizer : public ColumnarBatchIterator {
   arrow::MemoryPool* arrowPool_;
   facebook::velox::memory::MemoryPool* pool_;
   const int32_t minOutputBatchSize_;
+  const int64_t minOutputBatchSizeInBytes_;
   std::unique_ptr<ColumnarBatchIterator> in_;
 };
 

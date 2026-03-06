@@ -114,7 +114,8 @@ object CudfNodeValidationRule {
     }
     if (!SQLConf.get.adaptiveExecutionEnabled) {
       val batchSize = VeloxConfig.get.cudfBatchSize
-      GpuResizeBufferColumnarBatchExec(exec, batchSize)
+      val batchSizeInBytes = VeloxConfig.get.cudfBatchSizeInBytes
+      GpuResizeBufferColumnarBatchExec(exec, batchSize, batchSizeInBytes)
     } else {
       exec
     }

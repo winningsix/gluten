@@ -453,14 +453,15 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_utils_GpuBufferBatchResizerJniWra
     JNIEnv* env,
     jobject wrapper,
     jint minOutputBatchSize,
+    jlong minOutputBatchSizeInBytes,
     jobject jIter) {
   JNI_METHOD_START
   auto ctx = getRuntime(env, wrapper);
   auto arrowPool = dynamic_cast<VeloxMemoryManager*>(ctx->memoryManager())->defaultArrowMemoryPool();
   auto pool = dynamic_cast<VeloxMemoryManager*>(ctx->memoryManager())->getLeafMemoryPool();
   auto iter = makeJniColumnarBatchIterator(env, jIter, ctx);
-  auto appender = std::make_shared<ResultIterator>(
-      std::make_unique<GpuBufferBatchResizer>(arrowPool, pool.get(), minOutputBatchSize, std::move(iter)));
+  auto appender = std::make_shared<ResultIterator>(std::make_unique<GpuBufferBatchResizer>(
+      arrowPool, pool.get(), minOutputBatchSize, minOutputBatchSizeInBytes, std::move(iter)));
   return ctx->saveObject(appender);
   JNI_METHOD_END(kInvalidObjectHandle)
 }

@@ -257,18 +257,22 @@ GpuBufferBatchResizer::GpuBufferBatchResizer(
     arrow::MemoryPool* arrowPool,
     facebook::velox::memory::MemoryPool* pool,
     int32_t minOutputBatchSize,
+    int64_t minOutputBatchSizeInBytes,
     std::unique_ptr<ColumnarBatchIterator> in)
     : arrowPool_(arrowPool),
       pool_(pool),
       minOutputBatchSize_(minOutputBatchSize),
+      minOutputBatchSizeInBytes_(minOutputBatchSizeInBytes),
       in_(std::move(in)) {
   VELOX_CHECK_GT(minOutputBatchSize_, 0, "minOutputBatchSize should be larger than 0");
+  VELOX_CHECK_GT(minOutputBatchSizeInBytes_, 0, "minOutputBatchSizeInBytes should be larger than 0");
 }
 
 std::shared_ptr<ColumnarBatch> GpuBufferBatchResizer::next() {
   std::vector<std::shared_ptr<GpuBufferColumnarBatch>> cachedBatches;
   int32_t cachedRows = 0;
-  while (cachedRows < minOutputBatchSize_) {
+  int64_t cachedBytes = 0;
+  while (cachedRows < minOutputBatchSize_ && cachedBytes < minOutputBatchSizeInBytes_) {
     auto nextCb = in_->next();
     if (!nextCb) {
       break;
@@ -281,6 +285,7 @@ std::shared_ptr<ColumnarBatch> GpuBufferBatchResizer::next() {
     }
 
     cachedRows += nextBatch->numRows();
+    cachedBytes += nextBatch->numBytes();
     cachedBatches.push_back(std::move(nextBatch));
   }
   if (cachedRows == 0) {

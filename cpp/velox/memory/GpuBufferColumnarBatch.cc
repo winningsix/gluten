@@ -79,7 +79,9 @@ std::vector<char> GpuBufferColumnarBatch::toUnsafeRow(int32_t rowId) const {
 int64_t GpuBufferColumnarBatch::numBytes() {
   int64_t numBytes = 0;
   for (const auto& buffer : buffers_) {
-    numBytes += buffer->size();
+    if (buffer) {
+      numBytes += buffer->size();
+    }
   }
   return numBytes;
 }
