@@ -28,6 +28,7 @@
 #include <arrow/memory_pool.h>
 
 #include <cstring>
+#include <mutex>
 #include <unordered_set>
 #include <cuda_runtime.h>
 #include <cudf/column/column.hpp>
@@ -50,8 +51,17 @@ namespace {
 /// buffers allocated here can be DMA'd directly by cudaMemcpyAsync without
 /// CUDA's internal pageable→pinned staging.  Falls back to the default pool on
 /// allocation failure (e.g. pinned pool exhausted).
+///
+/// This is a global singleton (not thread_local) because Arrow buffers can be
+/// freed by a different thread than the one that allocated them.  The
+/// fallbackPtrs_ set is protected by a mutex to allow safe cross-thread Free.
 class PinnedArrowMemoryPool : public arrow::MemoryPool {
  public:
+  static PinnedArrowMemoryPool& instance() {
+    static PinnedArrowMemoryPool pool;
+    return pool;
+  }
+
   arrow::Status Allocate(int64_t size, int64_t alignment, uint8_t** out) override {
     try {
       *out = static_cast<uint8_t*>(pinnedMr().allocate_sync(size));
@@ -59,17 +69,21 @@ class PinnedArrowMemoryPool : public arrow::MemoryPool {
       return arrow::Status::OK();
     } catch (...) {
       ARROW_RETURN_NOT_OK(arrow::default_memory_pool()->Allocate(size, alignment, out));
+      std::lock_guard<std::mutex> lock(mu_);
       fallbackPtrs_.insert(*out);
       return arrow::Status::OK();
     }
   }
 
   arrow::Status Reallocate(int64_t oldSize, int64_t newSize, int64_t alignment, uint8_t** ptr) override {
-    if (fallbackPtrs_.count(*ptr)) {
-      fallbackPtrs_.erase(*ptr);
-      ARROW_RETURN_NOT_OK(arrow::default_memory_pool()->Reallocate(oldSize, newSize, alignment, ptr));
-      fallbackPtrs_.insert(*ptr);
-      return arrow::Status::OK();
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (fallbackPtrs_.count(*ptr)) {
+        fallbackPtrs_.erase(*ptr);
+        ARROW_RETURN_NOT_OK(arrow::default_memory_pool()->Reallocate(oldSize, newSize, alignment, ptr));
+        fallbackPtrs_.insert(*ptr);
+        return arrow::Status::OK();
+      }
     }
     uint8_t* newBuf = nullptr;
     try {
@@ -81,6 +95,7 @@ class PinnedArrowMemoryPool : public arrow::MemoryPool {
         pinnedMr().deallocate_sync(*ptr, oldSize);
       }
       *ptr = newBuf;
+      std::lock_guard<std::mutex> lock(mu_);
       fallbackPtrs_.insert(*ptr);
       return arrow::Status::OK();
     }
@@ -94,9 +109,12 @@ class PinnedArrowMemoryPool : public arrow::MemoryPool {
   }
 
   void Free(uint8_t* buffer, int64_t size, int64_t alignment) override {
-    if (fallbackPtrs_.erase(buffer)) {
-      arrow::default_memory_pool()->Free(buffer, size, alignment);
-      return;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (fallbackPtrs_.erase(buffer)) {
+        arrow::default_memory_pool()->Free(buffer, size, alignment);
+        return;
+      }
     }
     pinnedMr().deallocate_sync(buffer, size);
     bytesAllocated_.fetch_sub(size, std::memory_order_relaxed);
@@ -112,10 +130,13 @@ class PinnedArrowMemoryPool : public arrow::MemoryPool {
   std::string backend_name() const override { return "cudf_pinned"; }
 
  private:
+  PinnedArrowMemoryPool() = default;
+
   static rmm::host_device_async_resource_ref pinnedMr() {
     return cudf::get_pinned_memory_resource();
   }
   std::atomic<int64_t> bytesAllocated_{0};
+  std::mutex mu_;
   std::unordered_set<uint8_t*> fallbackPtrs_;
 };
 
@@ -249,8 +270,7 @@ std::shared_ptr<VeloxColumnarBatch> gpuBuffersToCudfVector(
 }
 
 arrow::MemoryPool* getPinnedArrowMemoryPool() {
-  static thread_local PinnedArrowMemoryPool pool;
-  return &pool;
+  return &PinnedArrowMemoryPool::instance();
 }
 
 GpuBufferBatchResizer::GpuBufferBatchResizer(
