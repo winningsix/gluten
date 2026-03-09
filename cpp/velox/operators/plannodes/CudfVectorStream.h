@@ -152,6 +152,7 @@ class CudfVectorStream : public CudfVectorStreamBase {
             stashedCudf_ = cudfVector;
             break;
           }
+          GpuLockGuard gpuLock;
           return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
               vp->pool(), outputType_, vp->size(), cudfVector->release(), cudfVector->stream());
         }
@@ -185,6 +186,7 @@ class CudfVectorStream : public CudfVectorStreamBase {
     if (pendingRows_.empty() && pendingGpuBatches_.empty() && stashedCudf_ != nullptr) {
       auto cudf = std::move(stashedCudf_);
       stashedCudf_ = nullptr;
+      GpuLockGuard gpuLock;
       return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
           cudf->pool(), outputType_, cudf->size(), cudf->release(), cudf->stream());
     }
@@ -222,20 +224,23 @@ class CudfVectorStream : public CudfVectorStreamBase {
     }
 
     // Batched HtoD: N async from_arrow, ONE sync, GPU concatenate.
-    auto stream = facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
-    auto tbl = facebook::velox::cudf_velox::with_arrow::toCudfTableBatched(
-        pendingRows_, pool_, stream);
-    VELOX_CHECK_NOT_NULL(tbl);
-    const auto size = tbl->num_rows();
+    {
+      GpuLockGuard gpuLock;
+      auto stream = facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+      auto tbl = facebook::velox::cudf_velox::with_arrow::toCudfTableBatched(
+          pendingRows_, pool_, stream);
+      VELOX_CHECK_NOT_NULL(tbl);
+      const auto size = tbl->num_rows();
 
-    numCoalescedBatches_ += (pendingRows_.size() > 1) ? 1 : 0;
+      numCoalescedBatches_ += (pendingRows_.size() > 1) ? 1 : 0;
 
-    pendingRows_.clear();
-    pendingBytes_ = 0;
-    pendingRowCount_ = 0;
+      pendingRows_.clear();
+      pendingBytes_ = 0;
+      pendingRowCount_ = 0;
 
-    return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
-        pool_, outputType_, size, std::move(tbl), stream);
+      return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
+          pool_, outputType_, size, std::move(tbl), stream);
+    }
   }
 
   int64_t numCoalescedBatches() const {
