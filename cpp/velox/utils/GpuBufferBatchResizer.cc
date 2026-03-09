@@ -182,7 +182,7 @@ struct DispatchColumn {
     auto nulls = buffers[bufferIdx++];
     auto values = buffers[bufferIdx++];
 
-    rmm::device_buffer dataBuf(values->size(), stream);
+    rmm::device_buffer dataBuf(values->size(), stream, mr);
     CUDF_CUDA_TRY(
         cudaMemcpyAsync(dataBuf.data(), values->data(), values->size(), cudaMemcpyHostToDevice, stream.value()));
 
@@ -226,13 +226,23 @@ struct DispatchColumn {
         ? 0
         : cpuNullCount(nulls->data(), numRows);
 
+    VELOX_CHECK_EQ(
+        offsets->size(),
+        static_cast<int64_t>((numRows + 1) * sizeof(int32_t)),
+        "String offsets buffer size mismatch: expected {} got {}",
+        (numRows + 1) * sizeof(int32_t),
+        offsets->size());
+
     auto offsetColumn = getOffsetsColumn(offsets);
 
     rmm::device_buffer chars(valueBuffer->size(), stream, mr);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(
-        chars.data(), valueBuffer->data_as<uint8_t>(), chars.size(), cudaMemcpyDefault, stream.value()));
+    if (valueBuffer->size() > 0) {
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          chars.data(), valueBuffer->data_as<uint8_t>(), chars.size(),
+          cudaMemcpyHostToDevice, stream.value()));
+    }
     return cudf::make_strings_column(
-        numRows, std::move(offsetColumn), std::move(chars), nullCount, std::move(*mask.release()));
+        numRows, std::move(offsetColumn), std::move(chars), nullCount, std::move(*mask));
   }
 };
 
@@ -265,6 +275,7 @@ std::shared_ptr<VeloxColumnarBatch> gpuBuffersToCudfVector(
   }
   auto cudfTable = std::make_unique<cudf::table>(std::move(cudfColumns));
   stream.synchronize();
+  CUDF_CUDA_TRY(cudaGetLastError());
   return std::make_shared<VeloxColumnarBatch>(
       std::make_shared<cudf_velox::CudfVector>(pool, type, numRows, std::move(cudfTable), stream), type->size());
 }

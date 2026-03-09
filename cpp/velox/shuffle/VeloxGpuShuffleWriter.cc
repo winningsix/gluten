@@ -276,8 +276,11 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
     VELOX_CHECK_EQ(partOffsets.size(), numPartitions_ + 1);
     offsets = std::move(partOffsets);
 
-    // Free the original input batch GPU memory now that cudf::partition()
-    // produced an independent copy. This roughly halves peak GPU usage.
+    // Synchronize before freeing the original input: cudf::partition() is
+    // async on `stream` and reads from `dataTable` (which references
+    // cudfVec's data). Without this sync, the input's GPU memory may be
+    // freed while the partition kernel is still reading from it.
+    stream.synchronize();
     pidColOwned.reset();
     cudfVec.reset();
 
