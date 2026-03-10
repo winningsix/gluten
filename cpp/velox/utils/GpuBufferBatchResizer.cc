@@ -299,6 +299,15 @@ GpuBufferBatchResizer::GpuBufferBatchResizer(
   VELOX_CHECK_GT(minOutputBatchSizeInBytes_, 0, "minOutputBatchSizeInBytes should be larger than 0");
 }
 
+GpuBufferBatchResizer::~GpuBufferBatchResizer() {
+  if (batches_ > 0) {
+    LOG(INFO) << "GpuBufferBatchResizer summary: batches=" << batches_
+              << " rows=" << totalRows_
+              << " composeMs=" << (composeNs_ / 1'000'000)
+              << " h2dUploadMs=" << (h2dUploadNs_ / 1'000'000);
+  }
+}
+
 std::shared_ptr<ColumnarBatch> GpuBufferBatchResizer::next() {
   std::vector<std::shared_ptr<GpuBufferColumnarBatch>> cachedBatches;
   int32_t cachedRows = 0;
@@ -323,13 +332,18 @@ std::shared_ptr<ColumnarBatch> GpuBufferBatchResizer::next() {
     return nullptr;
   }
 
-  // compose on CPU without GPU lock — allows multi-task parallelism.
-  // Allocate composed buffers in pinned memory so cudaMemcpyAsync can DMA
-  // directly without CUDA's internal pageable→pinned staging.
-  auto batch = GpuBufferColumnarBatch::compose(
-      getPinnedArrowMemoryPool(), cachedBatches, cachedRows);
+  ++batches_;
+  totalRows_ += cachedRows;
+
+  std::shared_ptr<GpuBufferColumnarBatch> batch;
+  {
+    ScopedTimer composeTimer(&composeNs_);
+    batch = GpuBufferColumnarBatch::compose(
+        getPinnedArrowMemoryPool(), cachedBatches, cachedRows);
+  }
 
   GpuLockGuard gpuLock;
+  ScopedTimer h2dTimer(&h2dUploadNs_);
   return gpuBuffersToCudfVector(
       batch->getRowType(), batch->numRows(), batch->buffers(), pool_);
 }

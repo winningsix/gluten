@@ -18,6 +18,7 @@
 #include "VeloxGpuShuffleWriter.h"
 #include "cudf/GpuLock.h"
 #include "memory/VeloxColumnarBatch.h"
+#include "utils/Timer.h"
 
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
@@ -142,6 +143,7 @@ arrow::Status VeloxGpuHashShuffleWriter::write(std::shared_ptr<ColumnarBatch> cb
         }
 
         writtenBytes_ = 0;
+        ++gpuWriteBatches_;
         // Release all outer shared_ptr references so gpuPartitionAndEvict
         // can free the GPU memory after cudf::partition() creates its copy.
         auto localCudfVec = std::move(cudfVec);
@@ -169,6 +171,7 @@ arrow::Status VeloxGpuHashShuffleWriter::write(std::shared_ptr<ColumnarBatch> cb
     }
   }
 
+  ++cpuFallbackBatches_;
   return VeloxHashShuffleWriter::write(cb, memLimit);
 }
 
@@ -241,10 +244,10 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
     auto tableView = cudfVec->getTableView();
     auto stream = cudfVec->stream();
 
-    LOG(WARNING) << "gpuPartitionAndEvict: input rows=" << tableView.num_rows()
-                 << " cols=" << tableView.num_columns()
-                 << " numPartitions=" << numPartitions_
-                 << " partitioning=" << static_cast<int>(partitioning_);
+    VLOG(1) << "gpuPartitionAndEvict: input rows=" << tableView.num_rows()
+             << " cols=" << tableView.num_columns()
+             << " numPartitions=" << numPartitions_
+             << " partitioning=" << static_cast<int>(partitioning_);
 
     auto firstCol = tableView.column(0);
 
@@ -255,55 +258,54 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
     }
     cudf::table_view dataTable(dataCols);
 
-    std::unique_ptr<cudf::column> pidColOwned;
-    cudf::column_view pidColView;
-    if (partitioning_ == Partitioning::kHash) {
-      auto numPartScalar = cudf::numeric_scalar<int32_t>(
-          static_cast<int32_t>(numPartitions_), true, stream);
-      pidColOwned = cudf::binary_operation(
-          firstCol,
-          numPartScalar,
-          cudf::binary_operator::PYMOD,
-          cudf::data_type{cudf::type_id::INT32},
-          stream);
-      pidColView = pidColOwned->view();
-    } else {
-      pidColView = firstCol;
+    {
+      ScopedTimer partTimer(&gpuPartitionNs_);
+      std::unique_ptr<cudf::column> pidColOwned;
+      cudf::column_view pidColView;
+      if (partitioning_ == Partitioning::kHash) {
+        auto numPartScalar = cudf::numeric_scalar<int32_t>(
+            static_cast<int32_t>(numPartitions_), true, stream);
+        pidColOwned = cudf::binary_operation(
+            firstCol,
+            numPartScalar,
+            cudf::binary_operator::PYMOD,
+            cudf::data_type{cudf::type_id::INT32},
+            stream);
+        pidColView = pidColOwned->view();
+      } else {
+        pidColView = firstCol;
+      }
+
+      auto [partitionedTable, partOffsets] = cudf::partition(
+          dataTable, pidColView, static_cast<cudf::size_type>(numPartitions_), stream);
+      VELOX_CHECK_EQ(partOffsets.size(), numPartitions_ + 1);
+      offsets = std::move(partOffsets);
+
+      stream.synchronize();
+      pidColOwned.reset();
+      cudfVec.reset();
+
+      uint64_t totalEvicted = 0;
+      for (uint32_t i = 0; i < numPartitions_; ++i) {
+        totalEvicted += (offsets[i + 1] - offsets[i]);
+      }
+      VLOG(1) << "gpuPartitionAndEvict: partitioned rows=" << partitionedTable->num_rows()
+               << " dataCols=" << partitionedTable->num_columns()
+               << " totalInOffsets=" << totalEvicted
+               << " offsets[0]=" << offsets[0]
+               << " offsets[last]=" << offsets[numPartitions_];
+
+      // D2H: convert the partitioned table to a Velox RowVector on host.
+      partTimer.switchTo(&d2hNs_);
+      veloxRv = cudf_velox::with_arrow::toVeloxColumn(
+          partitionedTable->view(), veloxPool_.get(), std::string(""), stream);
     }
-
-    auto [partitionedTable, partOffsets] = cudf::partition(
-        dataTable, pidColView, static_cast<cudf::size_type>(numPartitions_), stream);
-    VELOX_CHECK_EQ(partOffsets.size(), numPartitions_ + 1);
-    offsets = std::move(partOffsets);
-
-    // Synchronize before freeing the original input: cudf::partition() is
-    // async on `stream` and reads from `dataTable` (which references
-    // cudfVec's data). Without this sync, the input's GPU memory may be
-    // freed while the partition kernel is still reading from it.
-    stream.synchronize();
-    pidColOwned.reset();
-    cudfVec.reset();
-
-    uint64_t totalEvicted = 0;
-    for (uint32_t i = 0; i < numPartitions_; ++i) {
-      totalEvicted += (offsets[i + 1] - offsets[i]);
-    }
-    LOG(WARNING) << "gpuPartitionAndEvict: partitioned rows=" << partitionedTable->num_rows()
-                 << " dataCols=" << partitionedTable->num_columns()
-                 << " totalInOffsets=" << totalEvicted
-                 << " offsets[0]=" << offsets[0]
-                 << " offsets[last]=" << offsets[numPartitions_];
-
-    // D2H: convert the partitioned table to a Velox RowVector on host.
-    veloxRv = cudf_velox::with_arrow::toVeloxColumn(
-        partitionedTable->view(), veloxPool_.get(), std::string(""), stream);
-
     // partitionedTable (GPU) is released when this scope exits.
   }
   // GpuLockGuard released here — all GPU work is done.
 
-  LOG(WARNING) << "gpuPartitionAndEvict: veloxRv rows=" << veloxRv->size()
-               << " children=" << veloxRv->childrenSize();
+  VLOG(1) << "gpuPartitionAndEvict: veloxRv rows=" << veloxRv->size()
+           << " children=" << veloxRv->childrenSize();
 
   // CPU-side: extract buffers per partition directly from the full RowVector
   // using offsets (avoids sliced-vector offset pitfalls and enables zero-copy).
@@ -316,12 +318,18 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
     }
 
     std::vector<std::shared_ptr<arrow::Buffer>> buffers;
-    RETURN_NOT_OK(extractBuffersFromRowVector(*veloxRv, start, numRows, buffers));
-    RETURN_NOT_OK(evictBuffers(pid, numRows, std::move(buffers), false));
+    {
+      ScopedTimer extractTimer(&extractBufferNs_);
+      RETURN_NOT_OK(extractBuffersFromRowVector(*veloxRv, start, numRows, buffers));
+    }
+    {
+      ScopedTimer evictTimer(&evictNs_);
+      RETURN_NOT_OK(evictBuffers(pid, numRows, std::move(buffers), false));
+    }
     totalRowsEvicted += numRows;
   }
 
-  LOG(WARNING) << "gpuPartitionAndEvict: totalRowsEvicted=" << totalRowsEvicted;
+  VLOG(1) << "gpuPartitionAndEvict: totalRowsEvicted=" << totalRowsEvicted;
   return arrow::Status::OK();
 }
 

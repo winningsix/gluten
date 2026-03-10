@@ -46,6 +46,8 @@ class GpuBufferBatchResizer : public ColumnarBatchIterator {
       int64_t minOutputBatchSizeInBytes,
       std::unique_ptr<ColumnarBatchIterator> in);
 
+  ~GpuBufferBatchResizer() override;
+
   std::shared_ptr<ColumnarBatch> next() override;
 
   int64_t spillFixedSize(int64_t size) override;
@@ -56,6 +58,11 @@ class GpuBufferBatchResizer : public ColumnarBatchIterator {
   const int32_t minOutputBatchSize_;
   const int64_t minOutputBatchSizeInBytes_;
   std::unique_ptr<ColumnarBatchIterator> in_;
+
+  int64_t batches_{0};
+  int64_t totalRows_{0};
+  int64_t composeNs_{0};
+  int64_t h2dUploadNs_{0};
 };
 
 } // namespace gluten

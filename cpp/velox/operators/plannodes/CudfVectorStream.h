@@ -22,6 +22,7 @@
 #include "memory/GpuBufferColumnarBatch.h"
 #include "memory/VeloxColumnarBatch.h"
 #include "utils/GpuBufferBatchResizer.h"
+#include "utils/Timer.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/Task.h"
@@ -195,16 +196,25 @@ class CudfVectorStream : public CudfVectorStreamBase {
     // Direct GPU path: compose Arrow buffers in pinned memory, then convert
     // to cudf columns without the Velox RowVector intermediate.
     if (!pendingGpuBatches_.empty()) {
-      auto composed = GpuBufferColumnarBatch::compose(
-          getPinnedArrowMemoryPool(), pendingGpuBatches_, pendingRowCount_);
+      std::shared_ptr<GpuBufferColumnarBatch> composed;
+      {
+        ScopedTimer composeTimer(&composeNs_);
+        composed = GpuBufferColumnarBatch::compose(
+            getPinnedArrowMemoryPool(), pendingGpuBatches_, pendingRowCount_);
+      }
 
       GpuLockGuard gpuLock;
-      auto vcb = gpuBuffersToCudfVector(
-          composed->getRowType(), composed->numRows(),
-          composed->buffers(), pool_);
+      std::shared_ptr<VeloxColumnarBatch> vcb;
+      {
+        ScopedTimer h2dTimer(&h2dUploadNs_);
+        vcb = gpuBuffersToCudfVector(
+            composed->getRowType(), composed->numRows(),
+            composed->buffers(), pool_);
+      }
       VELOX_CHECK_NOT_NULL(vcb);
 
       numCoalescedBatches_ += (pendingGpuBatches_.size() > 1) ? 1 : 0;
+      ++gpuBatchUploads_;
       pendingGpuBatches_.clear();
       pendingBytes_ = 0;
       pendingRowCount_ = 0;
@@ -247,6 +257,15 @@ class CudfVectorStream : public CudfVectorStreamBase {
     return numCoalescedBatches_;
   }
 
+  void logTimingSummary() const {
+    if (gpuBatchUploads_ > 0) {
+      LOG(INFO) << "CudfVectorStream summary: gpuBatchUploads=" << gpuBatchUploads_
+                << " composeMs=" << (composeNs_ / 1'000'000)
+                << " h2dUploadMs=" << (h2dUploadNs_ / 1'000'000)
+                << " coalesced=" << numCoalescedBatches_;
+    }
+  }
+
  private:
   int64_t targetBatchBytes_;
   int64_t targetBatchRows_;
@@ -256,6 +275,10 @@ class CudfVectorStream : public CudfVectorStreamBase {
   int64_t pendingRowCount_ = 0;
   int64_t numCoalescedBatches_ = 0;
   std::shared_ptr<facebook::velox::cudf_velox::CudfVector> stashedCudf_;
+
+  int64_t gpuBatchUploads_ = 0;
+  int64_t composeNs_ = 0;
+  int64_t h2dUploadNs_ = 0;
 };
 
 // To avoid plan translator uses false node, this one cannot inherit ValueStreamNode.
@@ -341,6 +364,7 @@ class CudfValueStream : public facebook::velox::exec::SourceOperator, public fac
 
  private:
   void reportCoalescedBatches() {
+    rvStream_->logTimingSummary();
     auto count = rvStream_->numCoalescedBatches();
     if (count > 0) {
       auto lockedStats = stats_.wlock();

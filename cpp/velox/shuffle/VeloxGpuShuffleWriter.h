@@ -43,6 +43,18 @@ class VeloxGpuHashShuffleWriter : public VeloxHashShuffleWriter {
 
   arrow::Status write(std::shared_ptr<ColumnarBatch> cb, int64_t memLimit) override;
 
+  arrow::Status stop() override {
+    if (gpuWriteBatches_ > 0) {
+      LOG(INFO) << "GpuShuffleWriter summary: batches=" << gpuWriteBatches_
+                << " gpuPartitionMs=" << (gpuPartitionNs_ / 1'000'000)
+                << " d2hMs=" << (d2hNs_ / 1'000'000)
+                << " extractMs=" << (extractBufferNs_ / 1'000'000)
+                << " evictMs=" << (evictNs_ / 1'000'000)
+                << " cpuFallbackBatches=" << cpuFallbackBatches_;
+    }
+    return VeloxHashShuffleWriter::stop();
+  }
+
  private:
   void splitBoolValueType(const uint8_t* srcAddr, const std::vector<uint8_t*>& dstAddrs) override;
 
@@ -80,5 +92,12 @@ class VeloxGpuHashShuffleWriter : public VeloxHashShuffleWriter {
   bool gpuPartitionEnabled_{false};
   bool gpuSchemaInitialized_{false};
   bool gpuPartitionDiagLogged_{false};
+
+  int64_t gpuWriteBatches_{0};
+  int64_t cpuFallbackBatches_{0};
+  int64_t gpuPartitionNs_{0};
+  int64_t d2hNs_{0};
+  int64_t extractBufferNs_{0};
+  int64_t evictNs_{0};
 };
 } // namespace gluten
