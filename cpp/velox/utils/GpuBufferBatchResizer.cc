@@ -19,6 +19,7 @@
 #include "cudf/GpuLock.h"
 #include "memory/GpuBufferColumnarBatch.h"
 #include "utils/Timer.h"
+#include "velox/experimental/cudf/exec/PinnedHostMemory.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -29,7 +30,7 @@
 
 #include <cstring>
 #include <mutex>
-#include <unordered_set>
+#include <unordered_map>
 #include <cuda_runtime.h>
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -47,76 +48,56 @@ namespace gluten {
 
 namespace {
 
-/// arrow::MemoryPool that allocates from cudf's pinned-memory pool.  Composed
-/// buffers allocated here can be DMA'd directly by cudaMemcpyAsync without
-/// CUDA's internal pageable→pinned staging.  Falls back to the default pool on
-/// allocation failure (e.g. pinned pool exhausted).
+/// arrow::MemoryPool backed by PreferredPinnedPool (pinned pool → pageable
+/// malloc).  Composed buffers allocated here can be DMA'd directly by
+/// cudaMemcpyAsync when pinned; CUDA transparently handles pageable buffers
+/// via internal staging.
 ///
-/// This is a global singleton (not thread_local) because Arrow buffers can be
-/// freed by a different thread than the one that allocated them.  The
-/// fallbackPtrs_ set is protected by a mutex to allow safe cross-thread Free.
+/// Global singleton — Arrow buffers may be freed on a different thread.
+/// The pinnedFlags_ map is mutex-protected for cross-thread safety.
 class PinnedArrowMemoryPool : public arrow::MemoryPool {
  public:
+  using Pool = facebook::velox::cudf_velox::PreferredPinnedPool;
+
   static PinnedArrowMemoryPool& instance() {
     static PinnedArrowMemoryPool pool;
     return pool;
   }
 
-  arrow::Status Allocate(int64_t size, int64_t alignment, uint8_t** out) override {
-    try {
-      *out = static_cast<uint8_t*>(pinnedMr().allocate_sync(size));
-      bytesAllocated_.fetch_add(size, std::memory_order_relaxed);
-      return arrow::Status::OK();
-    } catch (...) {
-      ARROW_RETURN_NOT_OK(arrow::default_memory_pool()->Allocate(size, alignment, out));
-      std::lock_guard<std::mutex> lock(mu_);
-      fallbackPtrs_.insert(*out);
-      return arrow::Status::OK();
-    }
-  }
-
-  arrow::Status Reallocate(int64_t oldSize, int64_t newSize, int64_t alignment, uint8_t** ptr) override {
+  arrow::Status Allocate(int64_t size, int64_t /*alignment*/, uint8_t** out) override {
+    auto [ptr, pinned] = Pool::instance().allocate(static_cast<size_t>(size));
+    *out = static_cast<uint8_t*>(ptr);
     {
       std::lock_guard<std::mutex> lock(mu_);
-      if (fallbackPtrs_.count(*ptr)) {
-        fallbackPtrs_.erase(*ptr);
-        ARROW_RETURN_NOT_OK(arrow::default_memory_pool()->Reallocate(oldSize, newSize, alignment, ptr));
-        fallbackPtrs_.insert(*ptr);
-        return arrow::Status::OK();
-      }
+      pinnedFlags_[*out] = pinned;
     }
-    uint8_t* newBuf = nullptr;
-    try {
-      newBuf = static_cast<uint8_t*>(pinnedMr().allocate_sync(newSize));
-    } catch (...) {
-      ARROW_RETURN_NOT_OK(arrow::default_memory_pool()->Allocate(newSize, alignment, &newBuf));
-      if (oldSize > 0 && *ptr) {
-        std::memcpy(newBuf, *ptr, std::min(oldSize, newSize));
-        pinnedMr().deallocate_sync(*ptr, oldSize);
-      }
-      *ptr = newBuf;
-      std::lock_guard<std::mutex> lock(mu_);
-      fallbackPtrs_.insert(*ptr);
-      return arrow::Status::OK();
-    }
-    if (oldSize > 0 && *ptr) {
-      std::memcpy(newBuf, *ptr, std::min(oldSize, newSize));
-      pinnedMr().deallocate_sync(*ptr, oldSize);
-    }
-    *ptr = newBuf;
-    bytesAllocated_.fetch_add(newSize - oldSize, std::memory_order_relaxed);
+    bytesAllocated_.fetch_add(size, std::memory_order_relaxed);
     return arrow::Status::OK();
   }
 
-  void Free(uint8_t* buffer, int64_t size, int64_t alignment) override {
+  arrow::Status Reallocate(int64_t oldSize, int64_t newSize, int64_t alignment, uint8_t** ptr) override {
+    uint8_t* newBuf = nullptr;
+    ARROW_RETURN_NOT_OK(Allocate(newSize, alignment, &newBuf));
+    if (oldSize > 0 && *ptr) {
+      std::memcpy(newBuf, *ptr, std::min(oldSize, newSize));
+      Free(*ptr, oldSize, alignment);
+    }
+    *ptr = newBuf;
+    return arrow::Status::OK();
+  }
+
+  void Free(uint8_t* buffer, int64_t size, int64_t /*alignment*/) override {
+    if (!buffer) return;
+    bool pinned = false;
     {
       std::lock_guard<std::mutex> lock(mu_);
-      if (fallbackPtrs_.erase(buffer)) {
-        arrow::default_memory_pool()->Free(buffer, size, alignment);
-        return;
+      auto it = pinnedFlags_.find(buffer);
+      if (it != pinnedFlags_.end()) {
+        pinned = it->second;
+        pinnedFlags_.erase(it);
       }
     }
-    pinnedMr().deallocate_sync(buffer, size);
+    Pool::instance().deallocate(buffer, static_cast<size_t>(size), pinned);
     bytesAllocated_.fetch_sub(size, std::memory_order_relaxed);
   }
 
@@ -127,17 +108,13 @@ class PinnedArrowMemoryPool : public arrow::MemoryPool {
   int64_t max_memory() const override { return -1; }
   int64_t total_bytes_allocated() const override { return -1; }
   int64_t num_allocations() const override { return -1; }
-  std::string backend_name() const override { return "cudf_pinned"; }
+  std::string backend_name() const override { return "preferred_pinned"; }
 
  private:
   PinnedArrowMemoryPool() = default;
-
-  static rmm::host_device_async_resource_ref pinnedMr() {
-    return cudf::get_pinned_memory_resource();
-  }
   std::atomic<int64_t> bytesAllocated_{0};
   std::mutex mu_;
-  std::unordered_set<uint8_t*> fallbackPtrs_;
+  std::unordered_map<uint8_t*, bool> pinnedFlags_;
 };
 
 /// Count null values from a CPU-resident Arrow validity bitmask (bit SET =

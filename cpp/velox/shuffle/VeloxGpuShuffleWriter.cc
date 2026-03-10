@@ -238,6 +238,7 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
   // GPU-intensive section: partition on device and D2H transfer.
   // Acquire the GPU concurrency semaphore so that concurrent shuffle tasks
   // do not collectively exhaust GPU memory.
+  try {
   {
     GpuLockGuard gpuLock;
 
@@ -303,6 +304,16 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
     // partitionedTable (GPU) is released when this scope exits.
   }
   // GpuLockGuard released here — all GPU work is done.
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "gpuPartitionAndEvict failed: " << e.what()
+               << ". This is often caused by pinned memory pool exhaustion "
+               << "under high GPU concurrency. Consider increasing "
+               << "spark.gluten.sql.columnar.backend.velox.cudf.pinnedPoolSize "
+               << "or reducing spark.gluten.sql.columnar.backend.velox.cudf.concurrentGpuTasks.";
+    return arrow::Status::ExecutionError(
+        "GPU shuffle partition failed (likely pinned pool exhaustion): ",
+        e.what());
+  }
 
   VLOG(1) << "gpuPartitionAndEvict: veloxRv rows=" << veloxRv->size()
            << " children=" << veloxRv->childrenSize();
