@@ -669,20 +669,21 @@ BlockPayload::deserializeAsync(
         auto output,
         arrow::AllocateResizableBuffer(uncompLen, pool));
 
-    readTimer.switchTo(nullptr);
-
     // Submit decompress to pool. Captures shared_ptr to
-    // compressed (zero-copy handoff) and raw pointer to
-    // output (owned by the future consumer).
-    auto compShared =
-        std::shared_ptr<arrow::Buffer>(std::move(compressed));
-    auto outRaw = output->mutable_data();
+    // compressed (zero-copy handoff) and shared_ptr to
+    // output (returned directly from the future).
+    auto compShared = std::shared_ptr<arrow::Buffer>(
+        std::move(compressed));
+    auto outShared = std::shared_ptr<arrow::Buffer>(
+        std::move(output));
+    auto outRaw = outShared->mutable_data();
     auto codecPtr = codec;
     bool lz4 = isLz4(codec);
 
-    auto fut = decompPool.submit(
-        [compShared, outRaw, compLen, uncompLen,
-         codecPtr, lz4]()
+    PendingDecomp pd;
+    pd.future = decompPool.submit(
+        [compShared, outShared, outRaw, compLen,
+         uncompLen, codecPtr, lz4]()
             -> arrow::Result<
                 std::shared_ptr<arrow::Buffer>> {
           if (lz4) {
@@ -694,24 +695,6 @@ BlockPayload::deserializeAsync(
                 compLen, compShared->data(),
                 uncompLen, outRaw));
           }
-          return nullptr;  // signal: use pre-allocated output
-        });
-
-    PendingDecomp pd;
-    pd.future = std::move(fut);
-    // Store output buffer to retrieve later.
-    // We use a trick: pack output into a deferred future
-    // that waits on the decomp future first.
-    auto outShared =
-        std::shared_ptr<arrow::Buffer>(std::move(output));
-    auto decompFut = std::move(pd.future);
-    pd.future = std::async(
-        std::launch::deferred,
-        [decompFut = std::move(decompFut),
-         outShared]() mutable
-            -> arrow::Result<
-                std::shared_ptr<arrow::Buffer>> {
-          ARROW_ASSIGN_OR_RAISE(auto _, decompFut.get());
           return outShared;
         });
     pending.push_back(std::move(pd));
