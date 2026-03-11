@@ -271,6 +271,7 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
     }
     cudf::table_view dataTable(dataCols);
 
+    ScopedTimer gpuTimer(&gpuPartitionNs_);
     std::unique_ptr<cudf::column> pidColOwned;
     cudf::column_view pidColView;
     if (partitioning_ == Partitioning::kHash) {
@@ -300,6 +301,7 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
     pidColOwned.reset();
     cudfVec.reset();
 
+    gpuTimer.switchTo(&d2hNs_);
     totalRows = partitionedTable->num_rows();
     numCols = partitionedTable->num_columns();
     auto tv = partitionedTable->view();
@@ -413,6 +415,8 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
     std::vector<std::shared_ptr<arrow::Buffer>> buffers;
     buffers.reserve(numCols * 2);
 
+    { // extract buffers
+    ScopedTimer extractTimer(&extractBufferNs_);
     for (int c = 0; c < numCols; ++c) {
       auto& ch = colHosts[c];
       auto arrowTypeId = arrowColumnTypes_[c]->id();
@@ -484,9 +488,13 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
         }
       }
     }
+    } // end extract buffers
 
-    RETURN_NOT_OK(evictBuffers(
-        pid, numRows, std::move(buffers), false));
+    {
+      ScopedTimer evictTimer(&evictNs_);
+      RETURN_NOT_OK(evictBuffers(
+          pid, numRows, std::move(buffers), false));
+    }
     totalRowsEvicted += numRows;
   }
 

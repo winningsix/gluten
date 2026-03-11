@@ -93,5 +93,9 @@ class VeloxGpuHashShuffleWriter : public VeloxHashShuffleWriter {
   bool gpuSchemaInitialized_{false};
   int64_t gpuWriteBatches_{0};
   int64_t cpuFallbackBatches_{0};
+  int64_t gpuPartitionNs_{0};
+  int64_t d2hNs_{0};
+  int64_t extractBufferNs_{0};
+  int64_t evictNs_{0};
 };
 } // namespace gluten
