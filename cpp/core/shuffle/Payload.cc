@@ -24,6 +24,7 @@
 
 #include "shuffle/Dictionary.h"
 #include "shuffle/Options.h"
+#include "shuffle/ShuffleCompressionPool.h"
 #include "shuffle/Utils.h"
 #include "utils/Exception.h"
 #include "utils/Timer.h"
@@ -558,6 +559,178 @@ BlockPayload::deserialize(
               inputStream, pool, deserializeTime));
     }
   }
+  return buffers;
+}
+
+arrow::Result<std::vector<std::shared_ptr<arrow::Buffer>>>
+BlockPayload::deserializeAsync(
+    arrow::io::InputStream* inputStream,
+    const std::shared_ptr<arrow::util::Codec>& codec,
+    arrow::MemoryPool* pool,
+    uint32_t& numRows,
+    int64_t& deserializeTime,
+    int64_t& decompressTime) {
+  auto timer =
+      std::make_unique<ScopedTimer>(&deserializeTime);
+  ARROW_ASSIGN_OR_RAISE(
+      auto type, readPayloadType(inputStream));
+
+  RETURN_NOT_OK(
+      inputStream->Read(sizeof(uint32_t), &numRows));
+  uint32_t numBuffers;
+  RETURN_NOT_OK(
+      inputStream->Read(sizeof(uint32_t), &numBuffers));
+
+  if (type != Type::kCompressed) {
+    // Uncompressed: no benefit from async, use sync path.
+    timer.reset();
+    std::vector<std::shared_ptr<arrow::Buffer>> buffers;
+    buffers.reserve(numBuffers);
+    for (uint32_t i = 0; i < numBuffers; ++i) {
+      buffers.emplace_back();
+      ARROW_ASSIGN_OR_RAISE(
+          buffers.back(),
+          readUncompressedBuffer(
+              inputStream, pool, deserializeTime));
+    }
+    return buffers;
+  }
+
+  // Phase 1: Read all compressed data on the calling
+  // thread. For each buffer, submit decompress to the
+  // pool immediately so it overlaps with reading the
+  // next buffer.
+  timer.reset();
+  auto& decompPool = ShuffleCompressionPool::instance();
+
+  struct PendingDecomp {
+    std::future<
+        arrow::Result<std::shared_ptr<arrow::Buffer>>>
+        future;
+    // nullptr for null/zero-length sentinels.
+  };
+  std::vector<PendingDecomp> pending;
+  pending.reserve(numBuffers);
+
+  for (uint32_t i = 0; i < numBuffers; i++) {
+    ScopedTimer readTimer(&deserializeTime);
+    int64_t compLen;
+    RETURN_NOT_OK(
+        inputStream->Read(sizeof(int64_t), &compLen));
+    if (compLen == kNullBuffer) {
+      pending.push_back({});
+      continue;
+    }
+    if (compLen == kZeroLengthBuffer) {
+      PendingDecomp pd;
+      pd.future = std::async(
+          std::launch::deferred,
+          []() -> arrow::Result<
+              std::shared_ptr<arrow::Buffer>> {
+            return zeroLengthNullBuffer();
+          });
+      pending.push_back(std::move(pd));
+      continue;
+    }
+    int64_t uncompLen;
+    RETURN_NOT_OK(
+        inputStream->Read(sizeof(int64_t), &uncompLen));
+
+    if (compLen == kUncompressedBuffer) {
+      ARROW_ASSIGN_OR_RAISE(
+          auto buf,
+          arrow::AllocateResizableBuffer(
+              uncompLen, pool));
+      RETURN_NOT_OK(inputStream->Read(
+          uncompLen, buf->mutable_data()));
+      PendingDecomp pd;
+      auto bufPtr =
+          std::shared_ptr<arrow::Buffer>(std::move(buf));
+      pd.future = std::async(
+          std::launch::deferred,
+          [bufPtr]() -> arrow::Result<
+              std::shared_ptr<arrow::Buffer>> {
+            return bufPtr;
+          });
+      pending.push_back(std::move(pd));
+      continue;
+    }
+
+    // Read compressed data (I/O on main thread).
+    ARROW_ASSIGN_OR_RAISE(
+        auto compressed,
+        arrow::AllocateResizableBuffer(compLen, pool));
+    RETURN_NOT_OK(inputStream->Read(
+        compLen, compressed->mutable_data()));
+
+    // Alloc output on main thread (keeps pool accounting
+    // on the calling thread's allocator).
+    ARROW_ASSIGN_OR_RAISE(
+        auto output,
+        arrow::AllocateResizableBuffer(uncompLen, pool));
+
+    readTimer.switchTo(nullptr);
+
+    // Submit decompress to pool. Captures shared_ptr to
+    // compressed (zero-copy handoff) and raw pointer to
+    // output (owned by the future consumer).
+    auto compShared =
+        std::shared_ptr<arrow::Buffer>(std::move(compressed));
+    auto outRaw = output->mutable_data();
+    auto codecPtr = codec;
+    bool lz4 = isLz4(codec);
+
+    auto fut = decompPool.submit(
+        [compShared, outRaw, compLen, uncompLen,
+         codecPtr, lz4]()
+            -> arrow::Result<
+                std::shared_ptr<arrow::Buffer>> {
+          if (lz4) {
+            RETURN_NOT_OK(rawLz4Decompress(
+                compShared->data(), compLen,
+                outRaw, uncompLen));
+          } else {
+            RETURN_NOT_OK(codecPtr->Decompress(
+                compLen, compShared->data(),
+                uncompLen, outRaw));
+          }
+          return nullptr;  // signal: use pre-allocated output
+        });
+
+    PendingDecomp pd;
+    pd.future = std::move(fut);
+    // Store output buffer to retrieve later.
+    // We use a trick: pack output into a deferred future
+    // that waits on the decomp future first.
+    auto outShared =
+        std::shared_ptr<arrow::Buffer>(std::move(output));
+    auto decompFut = std::move(pd.future);
+    pd.future = std::async(
+        std::launch::deferred,
+        [decompFut = std::move(decompFut),
+         outShared]() mutable
+            -> arrow::Result<
+                std::shared_ptr<arrow::Buffer>> {
+          ARROW_ASSIGN_OR_RAISE(auto _, decompFut.get());
+          return outShared;
+        });
+    pending.push_back(std::move(pd));
+  }
+
+  // Phase 2: Collect results.
+  std::vector<std::shared_ptr<arrow::Buffer>> buffers;
+  buffers.reserve(numBuffers);
+  for (uint32_t i = 0; i < numBuffers; i++) {
+    auto& pd = pending[i];
+    if (!pd.future.valid()) {
+      buffers.push_back(nullptr);
+      continue;
+    }
+    ScopedTimer decompTimer(&decompressTime);
+    ARROW_ASSIGN_OR_RAISE(auto buf, pd.future.get());
+    buffers.push_back(std::move(buf));
+  }
+
   return buffers;
 }
 

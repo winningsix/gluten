@@ -115,8 +115,11 @@ std::shared_ptr<ColumnarBatch> VeloxGpuHashShuffleReaderDeserializer::next() {
   uint32_t numRows = 0;
   GLUTEN_ASSIGN_OR_THROW(
       auto arrowBuffers,
-      BlockPayload::deserialize(
-          in_.get(), codec_, memoryManager_->defaultArrowMemoryPool(), numRows, deserializeTime_, decompressTime_));
+      BlockPayload::deserializeAsync(
+          in_.get(), codec_,
+          memoryManager_->defaultArrowMemoryPool(),
+          numRows, deserializeTime_,
+          decompressTime_));
 
   return std::make_shared<GpuBufferColumnarBatch>(rowType_, std::move(arrowBuffers), static_cast<int32_t>(numRows));
 }

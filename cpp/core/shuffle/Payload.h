@@ -90,6 +90,20 @@ class BlockPayload final : public Payload {
       int64_t& deserializeTime,
       int64_t& decompressTime);
 
+  // Async version: reads all compressed data on calling
+  // thread, then submits decompression to the global
+  // ShuffleCompressionPool. Decompression of buffer N
+  // overlaps with I/O read of buffer N+1.
+  static arrow::Result<
+      std::vector<std::shared_ptr<arrow::Buffer>>>
+  deserializeAsync(
+      arrow::io::InputStream* inputStream,
+      const std::shared_ptr<arrow::util::Codec>& codec,
+      arrow::MemoryPool* pool,
+      uint32_t& numRows,
+      int64_t& deserializeTime,
+      int64_t& decompressTime);
+
   // Two-phase deserialization with column projection:
   // Phase 1: readHeader() reads type, numRows, numBuffers (small IO).
   // Phase 2: readSelectedBuffers() reads only projected buffers, skipping the rest.
