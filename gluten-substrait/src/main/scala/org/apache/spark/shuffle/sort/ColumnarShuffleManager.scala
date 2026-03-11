@@ -47,22 +47,19 @@ class ColumnarShuffleManager(conf: SparkConf)
     new ConcurrentHashMap[Int, OpenHashSet[Long]]()
 
   @volatile private var cleanupListenerRegistered = false
+  private val cleanupListener = new CatalogCleanupListener()
 
   private def ensureCleanupListener(): Unit = {
     if (!cleanupListenerRegistered) {
       synchronized {
         if (!cleanupListenerRegistered) {
-          try {
-            val sc = SparkContext.getActive
-            sc.foreach {
-              ctx =>
-                ctx.addSparkListener(new CatalogCleanupListener())
-                logInfo("Registered CatalogCleanupListener")
-            }
-          } catch {
-            case _: Exception =>
+          SparkContext.getActive match {
+            case Some(sc) =>
+              sc.addSparkListener(cleanupListener)
+              logInfo("Registered CatalogCleanupListener")
+              cleanupListenerRegistered = true
+            case None =>
           }
-          cleanupListenerRegistered = true
         }
       }
     }
@@ -98,12 +95,12 @@ class ColumnarShuffleManager(conf: SparkConf)
     }
   }
 
-  /** Get a writer for a given partition. Called on executors by map tasks. */
   override def getWriter[K, V](
       handle: ShuffleHandle,
       mapId: Long,
       context: TaskContext,
       metrics: ShuffleWriteMetricsReporter): ShuffleWriter[K, V] = {
+    ensureCleanupListener()
     val mapTaskIds =
       taskIdMapsForShuffle.computeIfAbsent(handle.shuffleId, _ => new OpenHashSet[Long](16))
     mapTaskIds.synchronized {
