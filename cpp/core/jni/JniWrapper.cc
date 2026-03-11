@@ -24,6 +24,7 @@
 #include "config/GlutenConfig.h"
 #include "jni/JniCommon.h"
 #include "jni/JniError.h"
+#include "shuffle/ShufflePayloadCatalog.h"
 
 #include <arrow/c/bridge.h>
 #include <google/protobuf/stubs/common.h>
@@ -934,32 +935,47 @@ Java_org_apache_gluten_vectorized_LocalPartitionWriterJniWrapper_createPartition
     jstring dataFileJstr,
     jstring localDirsJstr,
     jboolean enableDictionary,
-    jint compressionThreads) {
+    jint compressionThreads,
+    jboolean skipMerge,
+    jint shuffleId,
+    jlong mapId) {
   JNI_METHOD_START
 
   const auto ctx = getRuntime(env, wrapper);
 
-  auto dataFile = jStringToCString(env, dataFileJstr);
-  auto localDirs = splitPaths(jStringToCString(env, localDirsJstr));
+  auto dataFile =
+      jStringToCString(env, dataFileJstr);
+  auto localDirs =
+      splitPaths(jStringToCString(env, localDirsJstr));
 
-  auto partitionWriterOptions = std::make_shared<LocalPartitionWriterOptions>(
-      shuffleFileBufferSize,
-      compressionBufferSize,
-      compressionThreshold,
-      mergeBufferSize,
-      mergeThreshold,
-      numSubDirs,
-      enableDictionary,
-      compressionThreads);
+  auto opts =
+      std::make_shared<LocalPartitionWriterOptions>(
+          shuffleFileBufferSize,
+          compressionBufferSize,
+          compressionThreshold,
+          mergeBufferSize,
+          mergeThreshold,
+          numSubDirs,
+          enableDictionary,
+          compressionThreads,
+          static_cast<bool>(skipMerge));
 
-  auto partitionWriter = std::make_shared<LocalPartitionWriter>(
-      numPartitions,
-      createCompressionCodec(
-          getCompressionType(env, codecJstr), getCodecBackend(env, codecBackendJstr), compressionLevel),
-      ctx->memoryManager(),
-      partitionWriterOptions,
-      dataFile,
-      std::move(localDirs));
+  auto partitionWriter =
+      std::make_shared<LocalPartitionWriter>(
+          numPartitions,
+          createCompressionCodec(
+              getCompressionType(env, codecJstr),
+              getCodecBackend(env, codecBackendJstr),
+              compressionLevel),
+          ctx->memoryManager(),
+          opts,
+          dataFile,
+          std::move(localDirs));
+
+  if (skipMerge) {
+    partitionWriter->setShuffleIdAndMapId(
+        shuffleId, mapId);
+  }
 
   return ctx->saveObject(partitionWriter);
   JNI_METHOD_END(kInvalidObjectHandle)
@@ -1254,6 +1270,67 @@ JNIEXPORT void JNICALL Java_org_apache_gluten_vectorized_ShuffleReaderJniWrapper
   JNI_METHOD_START
   auto reader = ObjectStore::retrieve<ShuffleReader>(shuffleReaderHandle);
   ObjectStore::release(shuffleReaderHandle);
+  JNI_METHOD_END()
+}
+
+// -- ShufflePayloadCatalog JNI methods --
+
+JNIEXPORT jobjectArray JNICALL
+Java_org_apache_gluten_vectorized_ShufflePayloadCatalogJniWrapper_resolveBlockDirect( // NOLINT
+    JNIEnv* env,
+    jclass,
+    jint shuffleId,
+    jlong mapId,
+    jint partitionId) {
+  JNI_METHOD_START
+  auto& catalog = ShufflePayloadCatalog::instance();
+  auto result = catalog.resolveBlockDirect(
+      shuffleId, mapId, partitionId);
+  if (!result.found) {
+    return nullptr;
+  }
+  if (result.segments.empty()) {
+    // Found but empty partition.
+    return env->NewObjectArray(
+        0, env->FindClass("java/nio/ByteBuffer"),
+        nullptr);
+  }
+
+  auto bbClass =
+      env->FindClass("java/nio/ByteBuffer");
+  auto arr = env->NewObjectArray(
+      result.segments.size(), bbClass, nullptr);
+  for (size_t i = 0; i < result.segments.size(); ++i) {
+    auto [ptr, sz] = result.segments[i];
+    auto bb = env->NewDirectByteBuffer(
+        const_cast<uint8_t*>(ptr), sz);
+    env->SetObjectArrayElement(arr, i, bb);
+    env->DeleteLocalRef(bb);
+  }
+  return arr;
+  JNI_METHOD_END(nullptr)
+}
+
+JNIEXPORT void JNICALL
+Java_org_apache_gluten_vectorized_ShufflePayloadCatalogJniWrapper_unregisterShuffle( // NOLINT
+    JNIEnv* env,
+    jclass,
+    jint shuffleId) {
+  JNI_METHOD_START
+  ShufflePayloadCatalog::instance().unregisterShuffle(
+      shuffleId);
+  JNI_METHOD_END()
+}
+
+JNIEXPORT void JNICALL
+Java_org_apache_gluten_vectorized_ShufflePayloadCatalogJniWrapper_unregisterMapOutput( // NOLINT
+    JNIEnv* env,
+    jclass,
+    jint shuffleId,
+    jlong mapId) {
+  JNI_METHOD_START
+  ShufflePayloadCatalog::instance().unregisterMapOutput(
+      shuffleId, mapId);
   JNI_METHOD_END()
 }
 

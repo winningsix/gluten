@@ -147,22 +147,28 @@ class ColumnarShuffleWriter[K, V](
           if (compressionThreads > 1) {
             logInfo(s"Parallel shuffle compression: $compressionThreads threads")
           }
-          val partitionWriterHandle = partitionWriterJniWrapper.createPartitionWriter(
-            numPartitions,
-            compressionCodec.orNull,
-            GlutenConfig.get.columnarShuffleCodecBackend.orNull,
-            compressionLevel,
-            compressionBufferSize,
-            GlutenConfig.get.columnarShuffleCompressionThreshold,
-            nativeBufferSize,
-            GlutenConfig.get.columnarShuffleMergeThreshold,
-            blockManager.subDirsPerLocalDir,
-            conf.get(SHUFFLE_FILE_BUFFER_SIZE).toInt,
-            tempDataFile.getAbsolutePath,
-            localDirs,
-            GlutenConfig.get.columnarShuffleEnableDictionary,
-            compressionThreads
-          )
+          val skipMerge =
+            GlutenConfig.get.columnarShuffleSkipMerge
+          val partitionWriterHandle =
+            partitionWriterJniWrapper.createPartitionWriter(
+              numPartitions,
+              compressionCodec.orNull,
+              GlutenConfig.get.columnarShuffleCodecBackend.orNull,
+              compressionLevel,
+              compressionBufferSize,
+              GlutenConfig.get.columnarShuffleCompressionThreshold,
+              nativeBufferSize,
+              GlutenConfig.get.columnarShuffleMergeThreshold,
+              blockManager.subDirsPerLocalDir,
+              conf.get(SHUFFLE_FILE_BUFFER_SIZE).toInt,
+              tempDataFile.getAbsolutePath,
+              localDirs,
+              GlutenConfig.get.columnarShuffleEnableDictionary,
+              compressionThreads,
+              skipMerge,
+              dep.shuffleId,
+              mapId
+            )
 
           nativeShuffleWriter = if (isSort) {
             shuffleWriterJniWrapper.createSortShuffleWriter(
@@ -269,23 +275,40 @@ class ColumnarShuffleWriter[K, V](
     taskContext.taskMetrics().incDiskBytesSpilled(splitResult.getTotalBytesSpilled)
 
     partitionLengths = splitResult.getPartitionLengths
-    try {
+
+    val skipMergeUsed =
+      GlutenConfig.get.columnarShuffleSkipMerge &&
+        splitResult.getTotalBytesSpilled == 0
+    if (skipMergeUsed) {
+      // Data is in native catalog. Write a minimal index
+      // so MapStatus reporting works, but skip committing
+      // the data file.
       shuffleBlockResolver.writeMetadataFileAndCommit(
         dep.shuffleId,
         mapId,
         partitionLengths,
         Array[Long](),
-        tempDataFile)
-    } finally {
-      if (tempDataFile.exists() && !tempDataFile.delete()) {
-        logError(s"Error while deleting temp file ${tempDataFile.getAbsolutePath}")
+        null)
+    } else {
+      try {
+        shuffleBlockResolver.writeMetadataFileAndCommit(
+          dep.shuffleId,
+          mapId,
+          partitionLengths,
+          Array[Long](),
+          tempDataFile)
+      } finally {
+        if (
+          tempDataFile.exists() &&
+          !tempDataFile.delete()
+        ) {
+          logError(
+            "Error while deleting temp file " +
+              tempDataFile.getAbsolutePath)
+        }
       }
     }
 
-    // The partitionLength is much more than vanilla spark partitionLengths,
-    // almost 3 times than vanilla spark partitionLengths
-    // This value is sensitive in rules such as AQE rule OptimizeSkewedJoin DynamicJoinSelection
-    // May affect the final plan
     mapStatus = MapStatus(blockManager.shuffleServerId, partitionLengths, mapId)
   }
 

@@ -242,6 +242,9 @@ class GlutenConfig(conf: SQLConf) extends GlutenCoreConfig(conf) {
   def columnarShuffleCompressionThreads: Int =
     getConf(SHUFFLE_COMPRESSION_THREADS)
 
+  def columnarShuffleSkipMerge: Boolean =
+    getConf(SHUFFLE_SKIP_MERGE)
+
   def maxBatchSize: Int = getConf(COLUMNAR_MAX_BATCH_SIZE)
 
   def shuffleWriterBufferSize: Int = getConf(SHUFFLE_WRITER_BUFFER_SIZE)
@@ -1086,6 +1089,16 @@ object GlutenConfig extends ConfigRegistry {
       .intConf
       .checkValue(_ >= 1, "Compression threads must be at least 1")
       .createWithDefault(1)
+
+  val SHUFFLE_SKIP_MERGE =
+    buildConf("spark.gluten.sql.columnar.shuffle.skipMerge")
+      .doc(
+        "Skip merging partial files at shuffle write. " +
+          "Keeps data in memory and serves directly " +
+          "from a native catalog. Falls back to merge " +
+          "when spills occur. Requires ESS disabled.")
+      .booleanConf
+      .createWithDefault(false)
 
   val COLUMNAR_MAX_BATCH_SIZE =
     buildConf("spark.gluten.sql.columnar.maxBatchSize").intConf

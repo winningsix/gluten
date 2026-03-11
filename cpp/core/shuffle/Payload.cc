@@ -20,9 +20,9 @@
 #include <arrow/io/memory.h>
 #include <arrow/util/bitmap.h>
 #include <arrow/util/compression.h>
-#include <iostream>
-#include <numeric>
+#include <lz4.h>
 
+#include "shuffle/Dictionary.h"
 #include "shuffle/Options.h"
 #include "shuffle/Utils.h"
 #include "utils/Exception.h"
@@ -37,6 +37,51 @@ static const Payload::Type kUncompressedType = gluten::BlockPayload::kUncompress
 static constexpr int64_t kZeroLengthBuffer = 0;
 static constexpr int64_t kNullBuffer = -1;
 static constexpr int64_t kUncompressedBuffer = -2;
+
+bool isLz4(arrow::util::Codec* codec) {
+  return codec != nullptr &&
+      codec->compression_type() ==
+          arrow::Compression::LZ4_FRAME;
+}
+
+bool isLz4(
+    const std::shared_ptr<arrow::util::Codec>& codec) {
+  return isLz4(codec.get());
+}
+
+int64_t rawLz4MaxCompressedLen(int64_t inputSize) {
+  return LZ4_compressBound(static_cast<int>(inputSize));
+}
+
+arrow::Result<int64_t> rawLz4Compress(
+    const uint8_t* src, int64_t srcSize,
+    uint8_t* dst, int64_t dstCapacity) {
+  auto result = LZ4_compress_default(
+      reinterpret_cast<const char*>(src),
+      reinterpret_cast<char*>(dst),
+      static_cast<int>(srcSize),
+      static_cast<int>(dstCapacity));
+  if (result <= 0) {
+    return arrow::Status::IOError(
+        "Raw LZ4 compression failed");
+  }
+  return static_cast<int64_t>(result);
+}
+
+arrow::Status rawLz4Decompress(
+    const uint8_t* src, int64_t /*srcSize*/,
+    uint8_t* dst, int64_t originalSize) {
+  auto result = LZ4_decompress_fast(
+      reinterpret_cast<const char*>(src),
+      reinterpret_cast<char*>(dst),
+      static_cast<int>(originalSize));
+  if (result < 0) {
+    return arrow::Status::IOError(
+        "Raw LZ4 decompression failed, code=",
+        std::to_string(result));
+  }
+  return arrow::Status::OK();
+}
 
 template <typename T>
 void write(uint8_t** dst, T data) {
@@ -58,141 +103,156 @@ arrow::Result<uint8_t> readPayloadType(arrow::io::InputStream* is) {
   return type;
 }
 
-arrow::Result<int64_t> compressBuffer(
-    const std::shared_ptr<arrow::Buffer>& buffer,
-    uint8_t* output,
-    int64_t outputLength,
-    arrow::util::Codec* codec) {
-  auto outputPtr = &output;
-  if (!buffer) {
-    write<int64_t>(outputPtr, kNullBuffer);
-    return sizeof(int64_t);
-  }
-  if (buffer->size() == 0) {
-    write<int64_t>(outputPtr, kZeroLengthBuffer);
-    return sizeof(int64_t);
-  }
-  static const int64_t kCompressedBufferHeaderLength = 2 * sizeof(int64_t);
-  auto* compressedLengthPtr = advance<int64_t>(outputPtr);
-  write(outputPtr, static_cast<int64_t>(buffer->size()));
-  ARROW_ASSIGN_OR_RAISE(
-      auto compressedLength, codec->Compress(buffer->size(), buffer->data(), outputLength, *outputPtr));
-  if (compressedLength >= buffer->size()) {
-    // Write uncompressed buffer.
-    memcpy(*outputPtr, buffer->data(), buffer->size());
-    *compressedLengthPtr = kUncompressedBuffer;
-    return kCompressedBufferHeaderLength + buffer->size();
-  }
-  *compressedLengthPtr = static_cast<int64_t>(compressedLength);
-  return kCompressedBufferHeaderLength + compressedLength;
-}
-
-arrow::Status compressAndFlush(
-    const std::shared_ptr<arrow::Buffer>& buffer,
-    arrow::io::OutputStream* outputStream,
-    arrow::util::Codec* codec,
-    arrow::MemoryPool* pool,
-    int64_t& compressTime,
-    int64_t& writeTime) {
-  if (!buffer) {
-    ScopedTimer timer(&writeTime);
-    RETURN_NOT_OK(outputStream->Write(&kNullBuffer, sizeof(int64_t)));
-    return arrow::Status::OK();
-  }
-  if (buffer->size() == 0) {
-    ScopedTimer timer(&writeTime);
-    RETURN_NOT_OK(outputStream->Write(&kZeroLengthBuffer, sizeof(int64_t)));
-    return arrow::Status::OK();
-  }
-  ScopedTimer timer(&compressTime);
-  auto maxCompressedLength = codec->MaxCompressedLen(buffer->size(), buffer->data());
-  ARROW_ASSIGN_OR_RAISE(
-      auto compressed, arrow::AllocateResizableBuffer(sizeof(int64_t) * 2 + maxCompressedLength, pool));
-  auto output = compressed->mutable_data();
-  ARROW_ASSIGN_OR_RAISE(auto compressedSize, compressBuffer(buffer, output, maxCompressedLength, codec));
-
-  timer.switchTo(&writeTime);
-  RETURN_NOT_OK(outputStream->Write(compressed->data(), compressedSize));
-  return arrow::Status::OK();
-}
-
 arrow::Result<std::shared_ptr<arrow::Buffer>>
-readUncompressedBuffer(arrow::io::InputStream* inputStream, arrow::MemoryPool* pool, int64_t& deserializedTime) {
+readUncompressedBuffer(
+    arrow::io::InputStream* inputStream,
+    arrow::MemoryPool* pool,
+    int64_t& deserializedTime) {
   ScopedTimer timer(&deserializedTime);
   int64_t bufferLength;
-  RETURN_NOT_OK(inputStream->Read(sizeof(int64_t), &bufferLength));
+  RETURN_NOT_OK(
+      inputStream->Read(sizeof(int64_t), &bufferLength));
   if (bufferLength == kNullBuffer) {
     return nullptr;
   }
-  ARROW_ASSIGN_OR_RAISE(auto buffer, arrow::AllocateResizableBuffer(bufferLength, pool));
-  RETURN_NOT_OK(inputStream->Read(bufferLength, buffer->mutable_data()));
+  ARROW_ASSIGN_OR_RAISE(
+      auto buffer,
+      arrow::AllocateResizableBuffer(bufferLength, pool));
+  RETURN_NOT_OK(inputStream->Read(
+      bufferLength, buffer->mutable_data()));
   return buffer;
 }
 
-arrow::Result<std::shared_ptr<arrow::Buffer>> readCompressedBuffer(
+int64_t bufMaxCompressedLen(
+    int64_t rawSize,
+    const uint8_t* data,
+    arrow::util::Codec* codec) {
+  if (isLz4(codec)) {
+    return rawLz4MaxCompressedLen(rawSize);
+  }
+  return codec->MaxCompressedLen(rawSize, data);
+}
+
+static const int64_t kCompBufHeader = 2 * sizeof(int64_t);
+
+// Per-buffer wire format:
+//   [compressedLen : int64]  -1=null, 0=empty,
+//                            -2=stored uncompressed
+//   [uncompressedLen : int64]  (only if data)
+//   [data]                     (only if data)
+// Returns bytes written.
+arrow::Result<int64_t> compressBuffer(
+    const std::shared_ptr<arrow::Buffer>& buffer,
+    uint8_t* output,
+    int64_t outputCapacity,
+    arrow::util::Codec* codec) {
+  auto* out = &output;
+  if (!buffer) {
+    write<int64_t>(out, kNullBuffer);
+    return sizeof(int64_t);
+  }
+  if (buffer->size() == 0) {
+    write<int64_t>(out, kZeroLengthBuffer);
+    return sizeof(int64_t);
+  }
+  auto* compLenSlot = advance<int64_t>(out);
+  write<int64_t>(out, buffer->size());
+
+  int64_t dataCapacity =
+      outputCapacity - kCompBufHeader;
+  int64_t compLen;
+  if (isLz4(codec)) {
+    ARROW_ASSIGN_OR_RAISE(
+        compLen,
+        rawLz4Compress(
+            buffer->data(), buffer->size(),
+            *out, dataCapacity));
+  } else {
+    ARROW_ASSIGN_OR_RAISE(
+        compLen,
+        codec->Compress(
+            buffer->size(), buffer->data(),
+            dataCapacity, *out));
+  }
+  if (compLen >= buffer->size()) {
+    memcpy(*out, buffer->data(), buffer->size());
+    *compLenSlot = kUncompressedBuffer;
+    return kCompBufHeader + buffer->size();
+  }
+  *compLenSlot = compLen;
+  return kCompBufHeader + compLen;
+}
+
+arrow::Result<std::shared_ptr<arrow::Buffer>>
+readCompressedBuffer(
     arrow::io::InputStream* inputStream,
     const std::shared_ptr<arrow::util::Codec>& codec,
     arrow::MemoryPool* pool,
     int64_t& deserializeTime,
     int64_t& decompressTime) {
   ScopedTimer timer(&deserializeTime);
-  int64_t compressedLength;
-  RETURN_NOT_OK(inputStream->Read(sizeof(int64_t), &compressedLength));
-  if (compressedLength == kNullBuffer) {
+  int64_t compLen;
+  RETURN_NOT_OK(
+      inputStream->Read(sizeof(int64_t), &compLen));
+  if (compLen == kNullBuffer) {
     return nullptr;
   }
-  if (compressedLength == kZeroLengthBuffer) {
+  if (compLen == kZeroLengthBuffer) {
     return zeroLengthNullBuffer();
   }
+  int64_t uncompLen;
+  RETURN_NOT_OK(
+      inputStream->Read(sizeof(int64_t), &uncompLen));
 
-  int64_t uncompressedLength;
-  RETURN_NOT_OK(inputStream->Read(sizeof(int64_t), &uncompressedLength));
-  if (compressedLength == kUncompressedBuffer) {
-    ARROW_ASSIGN_OR_RAISE(auto uncompressed, arrow::AllocateResizableBuffer(uncompressedLength, pool));
-    RETURN_NOT_OK(inputStream->Read(uncompressedLength, uncompressed->mutable_data()));
-    return uncompressed;
+  if (compLen == kUncompressedBuffer) {
+    ARROW_ASSIGN_OR_RAISE(
+        auto buf,
+        arrow::AllocateResizableBuffer(uncompLen, pool));
+    RETURN_NOT_OK(
+        inputStream->Read(uncompLen, buf->mutable_data()));
+    return buf;
   }
-  ARROW_ASSIGN_OR_RAISE(auto compressed, arrow::AllocateResizableBuffer(compressedLength, pool));
-  RETURN_NOT_OK(inputStream->Read(compressedLength, compressed->mutable_data()));
+
+  ARROW_ASSIGN_OR_RAISE(
+      auto compressed,
+      arrow::AllocateResizableBuffer(compLen, pool));
+  RETURN_NOT_OK(inputStream->Read(
+      compLen, compressed->mutable_data()));
 
   timer.switchTo(&decompressTime);
-  ARROW_ASSIGN_OR_RAISE(auto output, arrow::AllocateResizableBuffer(uncompressedLength, pool));
-  RETURN_NOT_OK(codec->Decompress(compressedLength, compressed->data(), uncompressedLength, output->mutable_data()));
+  ARROW_ASSIGN_OR_RAISE(
+      auto output,
+      arrow::AllocateResizableBuffer(uncompLen, pool));
+  if (isLz4(codec)) {
+    RETURN_NOT_OK(rawLz4Decompress(
+        compressed->data(), compLen,
+        output->mutable_data(), uncompLen));
+  } else {
+    RETURN_NOT_OK(codec->Decompress(
+        compLen, compressed->data(),
+        uncompLen, output->mutable_data()));
+  }
   return output;
 }
 
-// Skip an uncompressed buffer: read size header, advance past data.
-arrow::Status skipUncompressedBuffer(arrow::io::InputStream* inputStream, int64_t& skipTime) {
+arrow::Status skipCompressedBuffer(
+    arrow::io::InputStream* inputStream,
+    int64_t& skipTime) {
   ScopedTimer timer(&skipTime);
-  int64_t bufferLength;
-  RETURN_NOT_OK(inputStream->Read(sizeof(int64_t), &bufferLength));
-  if (bufferLength == kNullBuffer || bufferLength == kZeroLengthBuffer) {
+  int64_t compLen;
+  RETURN_NOT_OK(
+      inputStream->Read(sizeof(int64_t), &compLen));
+  if (compLen == kNullBuffer ||
+      compLen == kZeroLengthBuffer) {
     return arrow::Status::OK();
   }
-  if (auto* mmapStream = dynamic_cast<MmapFileStream*>(inputStream)) {
-    RETURN_NOT_OK(mmapStream->Advance(bufferLength));
-  } else {
-    ARROW_ASSIGN_OR_RAISE(auto unused, inputStream->Read(bufferLength));
-  }
-  return arrow::Status::OK();
-}
-
-// Skip a compressed buffer: read size headers, advance past compressed data.
-arrow::Status skipCompressedBuffer(arrow::io::InputStream* inputStream, int64_t& skipTime) {
-  ScopedTimer timer(&skipTime);
-  int64_t compressedLength;
-  RETURN_NOT_OK(inputStream->Read(sizeof(int64_t), &compressedLength));
-  if (compressedLength == kNullBuffer || compressedLength == kZeroLengthBuffer) {
-    return arrow::Status::OK();
-  }
-  int64_t uncompressedLength;
-  RETURN_NOT_OK(inputStream->Read(sizeof(int64_t), &uncompressedLength));
-  int64_t bytesToSkip = (compressedLength == kUncompressedBuffer) ? uncompressedLength : compressedLength;
-  if (auto* mmapStream = dynamic_cast<MmapFileStream*>(inputStream)) {
-    RETURN_NOT_OK(mmapStream->Advance(bytesToSkip));
-  } else {
-    ARROW_ASSIGN_OR_RAISE(auto unused, inputStream->Read(bytesToSkip));
-  }
+  int64_t uncompLen;
+  RETURN_NOT_OK(
+      inputStream->Read(sizeof(int64_t), &uncompLen));
+  int64_t skip = (compLen == kUncompressedBuffer)
+      ? uncompLen : compLen;
+  ARROW_ASSIGN_OR_RAISE(
+      auto unused, inputStream->Read(skip));
   return arrow::Status::OK();
 }
 
@@ -215,183 +275,181 @@ std::string Payload::toString() const {
   return kToBeCompressedString;
 }
 
-arrow::Result<std::unique_ptr<BlockPayload>> BlockPayload::fromBuffers(
+arrow::Result<std::unique_ptr<BlockPayload>>
+BlockPayload::fromBuffers(
     Payload::Type payloadType,
     uint32_t numRows,
     std::vector<std::shared_ptr<arrow::Buffer>> buffers,
     const std::vector<bool>* isValidityBuffer,
     arrow::MemoryPool* pool,
-    arrow::util::Codec* codec,
-    int32_t compressionThreads,
-    CompressionThreadPool* threadPool) {
+    arrow::util::Codec* codec) {
   const uint32_t numBuffers = buffers.size();
 
   if (payloadType == Payload::Type::kCompressed) {
     Timer compressionTime;
     compressionTime.start();
 
-    const bool useParallel = compressionThreads > 1 && numBuffers > 1 && threadPool != nullptr;
+    auto maxLen = maxCompressedLength(buffers, codec);
+    ARROW_ASSIGN_OR_RAISE(
+        auto output,
+        arrow::AllocateResizableBuffer(maxLen, pool));
+    auto* out = output->mutable_data();
 
-    if (!useParallel) {
-      auto maxLength = maxCompressedLength(buffers, codec);
-      std::shared_ptr<arrow::Buffer> compressedBuffer;
-
-      ARROW_ASSIGN_OR_RAISE(compressedBuffer, arrow::AllocateResizableBuffer(maxLength, pool));
-      auto* output = compressedBuffer->mutable_data();
-
-      int64_t actualLength = 0;
-      for (auto& buffer : buffers) {
-        auto availableLength = maxLength - actualLength;
-        ARROW_ASSIGN_OR_RAISE(auto compressedSize, compressBuffer(std::move(buffer), output, availableLength, codec));
-        output += compressedSize;
-        actualLength += compressedSize;
-      }
-
-      ARROW_RETURN_IF(actualLength < 0, arrow::Status::Invalid("Writing compressed buffer out of bound."));
-      RETURN_NOT_OK(std::dynamic_pointer_cast<arrow::ResizableBuffer>(compressedBuffer)->Resize(actualLength));
-
-      compressionTime.stop();
-      auto payload = std::unique_ptr<BlockPayload>(
-          new BlockPayload(Type::kCompressed, numRows, numBuffers, {compressedBuffer}, isValidityBuffer));
-      payload->setCompressionTime(compressionTime.realTimeUsed());
-      return payload;
+    int64_t actualLen = 0;
+    for (auto& buf : buffers) {
+      auto avail = maxLen - actualLen;
+      ARROW_ASSIGN_OR_RAISE(
+          auto written,
+          compressBuffer(buf, out, avail, codec));
+      out += written;
+      actualLen += written;
     }
-
-    // Parallel compression: workers do ONLY raw codec->Compress() with
-    // pre-computed raw pointers. No Arrow types, no memory pool operations,
-    // no Codec::Create inside workers -- workers never touch any
-    // non-thread-safe shared state, eliminating mutex corruption risk.
-    //
-    // Uses a single contiguous output buffer to avoid per-buffer allocation
-    // overhead and final concatenation memcpy. After parallel compression,
-    // the main thread compacts the buffer in-place (always moving backward).
-
-    static const int64_t kHeaderLen = 2 * sizeof(int64_t);
-
-    struct CompressWork {
-      const uint8_t* inputData;
-      int64_t inputSize;
-      uint8_t* compressTarget;   // raw pointer where worker writes compressed data
-      int64_t compressCapacity;
-      int64_t rawCompressedLen;  // filled by worker (raw codec output, no header)
-      bool failed;
-      int64_t trivialMarker;    // kNullBuffer or kZeroLengthBuffer for trivial buffers
-      int64_t regionOffset;     // offset of this buffer's region in the output buffer
-    };
-
-    std::vector<CompressWork> work(numBuffers);
-    std::vector<uint32_t> nonTrivialIndices;
-    nonTrivialIndices.reserve(numBuffers);
-
-    // Compute layout: assign each buffer a region in a single contiguous buffer.
-    int64_t totalMaxLen = 0;
-    for (uint32_t i = 0; i < numBuffers; i++) {
-      auto& w = work[i];
-      w.failed = false;
-      w.rawCompressedLen = 0;
-      w.regionOffset = totalMaxLen;
-      if (!buffers[i]) {
-        w.inputSize = 0;
-        w.trivialMarker = kNullBuffer;
-        totalMaxLen += sizeof(int64_t);
-      } else if (buffers[i]->size() == 0) {
-        w.inputSize = 0;
-        w.trivialMarker = kZeroLengthBuffer;
-        totalMaxLen += sizeof(int64_t);
-      } else {
-        w.inputData = buffers[i]->data();
-        w.inputSize = buffers[i]->size();
-        w.compressCapacity = codec->MaxCompressedLen(w.inputSize, w.inputData);
-        totalMaxLen += kHeaderLen + w.compressCapacity;
-        nonTrivialIndices.push_back(i);
-      }
-    }
-
-    // Single allocation for the entire output.
-    ARROW_ASSIGN_OR_RAISE(auto compressedBuffer, arrow::AllocateResizableBuffer(totalMaxLen, pool));
-    auto* base = compressedBuffer->mutable_data();
-
-    // Set up raw pointers for workers (compressed data goes after the header slot).
-    for (const auto idx : nonTrivialIndices) {
-      work[idx].compressTarget = base + work[idx].regionOffset + kHeaderLen;
-    }
-
-    // Pre-create one codec per worker on the main thread.
-    const int32_t numWorkers =
-        std::min(static_cast<int32_t>(nonTrivialIndices.size()), compressionThreads);
-    std::vector<std::unique_ptr<arrow::util::Codec>> workerCodecs(numWorkers);
-    for (int32_t t = 0; t < numWorkers; t++) {
-      ARROW_ASSIGN_OR_RAISE(workerCodecs[t],
-          arrow::util::Codec::Create(codec->compression_type(), codec->compression_level()));
-    }
-
-    // Submit numWorkers tasks to the persistent pool. Each task processes
-    // its share of buffers using a pre-created codec. The pool's submitMutex
-    // serializes concurrent callers (main thread vs memory reclamation),
-    // and atomic spin-wait avoids stack-local mutex lifetime issues.
-    std::vector<std::function<void()>> tasks;
-    tasks.reserve(numWorkers);
-    for (int32_t t = 0; t < numWorkers; t++) {
-      auto* localCodec = workerCodecs[t].get();
-      tasks.emplace_back(
-          [t, numWorkers, &nonTrivialIndices, &work, localCodec]() {
-            for (size_t j = t; j < nonTrivialIndices.size();
-                 j += static_cast<size_t>(numWorkers)) {
-              auto& w = work[nonTrivialIndices[j]];
-              auto result = localCodec->Compress(
-                  w.inputSize, w.inputData, w.compressCapacity, w.compressTarget);
-              if (!result.ok()) {
-                w.failed = true;
-                return;
-              }
-              w.rawCompressedLen = *result;
-            }
-          });
-    }
-    threadPool->submitAndWait(tasks);
-
-    // Compact in-place: write final data contiguously from the start.
-    // Since compressed size <= max size, the write position is always <=
-    // the source position, so memmove is safe (always moves backward).
-    auto* dst = base;
-    for (uint32_t i = 0; i < numBuffers; i++) {
-      auto& w = work[i];
-      if (w.inputSize == 0) {
-        write<int64_t>(&dst, w.trivialMarker);
-        continue;
-      }
-      ARROW_RETURN_IF(w.failed, arrow::Status::Invalid("Parallel compression failed for buffer ", i));
-
-      auto* compSrc = base + w.regionOffset + kHeaderLen;
-      if (w.rawCompressedLen >= w.inputSize) {
-        write<int64_t>(&dst, kUncompressedBuffer);
-        write<int64_t>(&dst, static_cast<int64_t>(w.inputSize));
-        memcpy(dst, w.inputData, w.inputSize);
-        dst += w.inputSize;
-      } else {
-        write<int64_t>(&dst, static_cast<int64_t>(w.rawCompressedLen));
-        write<int64_t>(&dst, static_cast<int64_t>(w.inputSize));
-        if (dst != compSrc) {
-          memmove(dst, compSrc, w.rawCompressedLen);
-        }
-        dst += w.rawCompressedLen;
-      }
-      buffers[i].reset();
-    }
-
-    int64_t actualLen = dst - base;
-    RETURN_NOT_OK(compressedBuffer->Resize(actualLen));
+    RETURN_NOT_OK(output->Resize(actualLen));
 
     compressionTime.stop();
-    std::vector<std::shared_ptr<arrow::Buffer>> compressedBuffers;
-    compressedBuffers.push_back(std::move(compressedBuffer));
     auto payload = std::unique_ptr<BlockPayload>(
-        new BlockPayload(Type::kCompressed, numRows, numBuffers, std::move(compressedBuffers), isValidityBuffer));
-    payload->setCompressionTime(compressionTime.realTimeUsed());
+        new BlockPayload(
+            Type::kCompressed, numRows, numBuffers,
+            {std::move(output)}, isValidityBuffer));
+    payload->setCompressionTime(
+        compressionTime.realTimeUsed());
     return payload;
   }
   return std::unique_ptr<BlockPayload>(
-      new BlockPayload(payloadType, numRows, numBuffers, std::move(buffers), isValidityBuffer));
+      new BlockPayload(
+          payloadType, numRows, numBuffers,
+          std::move(buffers), isValidityBuffer));
+}
+
+arrow::Result<std::unique_ptr<BlockPayload>>
+BlockPayload::compressBuffersForPool(
+    uint32_t numRows,
+    std::vector<std::shared_ptr<arrow::Buffer>> buffers,
+    const std::vector<bool>* isValidityBuffer,
+    arrow::util::Codec* codec) {
+  return fromBuffers(
+      Payload::kCompressed, numRows,
+      std::move(buffers), isValidityBuffer,
+      arrow::default_memory_pool(), codec);
+}
+
+arrow::Result<BlockPayload::PreparedCompression>
+BlockPayload::prepareCompression(
+    uint32_t numRows,
+    std::vector<std::shared_ptr<arrow::Buffer>> buffers,
+    const std::vector<bool>* isValidityBuffer,
+    arrow::MemoryPool* pool,
+    arrow::util::Codec* codec) {
+  PreparedCompression pc;
+  pc.numRows = numRows;
+  pc.numBuffers = buffers.size();
+  pc.isValidityBuffer = isValidityBuffer;
+  pc.buffers = std::move(buffers);
+
+  auto maxLen =
+      maxCompressedLength(pc.buffers, codec);
+  ARROW_ASSIGN_OR_RAISE(
+      pc.output,
+      arrow::AllocateResizableBuffer(maxLen, pool));
+  return pc;
+}
+
+arrow::Result<std::unique_ptr<BlockPayload>>
+BlockPayload::finishCompression(
+    PreparedCompression&& pc,
+    arrow::util::Codec* codec) {
+  Timer compressionTime;
+  compressionTime.start();
+
+  auto* out = pc.output->mutable_data();
+  int64_t totalLen = 0;
+  int64_t capacity = pc.output->size();
+
+  for (auto& buf : pc.buffers) {
+    ARROW_ASSIGN_OR_RAISE(
+        auto written,
+        compressBuffer(
+            buf, out, capacity - totalLen, codec));
+    out += written;
+    totalLen += written;
+    buf.reset();
+  }
+  pc.buffers.clear();
+
+  RETURN_NOT_OK(pc.output->Resize(totalLen));
+
+  compressionTime.stop();
+  auto payload = std::unique_ptr<BlockPayload>(
+      new BlockPayload(
+          Type::kCompressed, pc.numRows,
+          pc.numBuffers,
+          {std::move(pc.output)},
+          pc.isValidityBuffer));
+  payload->setCompressionTime(
+      compressionTime.realTimeUsed());
+  return payload;
+}
+
+// Wire format header size:
+// 1 (BlockType) + 1 (PayloadType) + 4 (numRows) + 4 (numBuffers)
+static constexpr int64_t kWireHeaderSize = 10;
+
+arrow::Result<BlockPayload::PreparedCompression>
+BlockPayload::prepareWireFormat(
+    uint32_t numRows,
+    std::vector<std::shared_ptr<arrow::Buffer>> buffers,
+    const std::vector<bool>* isValidityBuffer,
+    arrow::MemoryPool* pool,
+    arrow::util::Codec* codec) {
+  PreparedCompression pc;
+  pc.numRows = numRows;
+  pc.numBuffers = buffers.size();
+  pc.isValidityBuffer = isValidityBuffer;
+  pc.buffers = std::move(buffers);
+
+  auto maxLen =
+      maxCompressedLength(pc.buffers, codec);
+  // Extra space for the wire header at the front.
+  ARROW_ASSIGN_OR_RAISE(
+      pc.output,
+      arrow::AllocateResizableBuffer(
+          kWireHeaderSize + maxLen, pool));
+  return pc;
+}
+
+arrow::Result<std::shared_ptr<arrow::Buffer>>
+BlockPayload::finishWireFormat(
+    PreparedCompression&& pc,
+    arrow::util::Codec* codec) {
+  // Compress data starting after the header.
+  auto* out = pc.output->mutable_data() + kWireHeaderSize;
+  int64_t totalLen = 0;
+  int64_t capacity = pc.output->size() - kWireHeaderSize;
+
+  for (auto& buf : pc.buffers) {
+    ARROW_ASSIGN_OR_RAISE(
+        auto written,
+        compressBuffer(
+            buf, out, capacity - totalLen, codec));
+    out += written;
+    totalLen += written;
+    buf.reset();
+  }
+  pc.buffers.clear();
+
+  // Fill the header at the beginning.
+  auto* hdr = pc.output->mutable_data();
+  hdr[0] = static_cast<uint8_t>(
+      BlockType::kPlainPayload);
+  hdr[1] = static_cast<uint8_t>(
+      Payload::kCompressed);
+  memcpy(hdr + 2, &pc.numRows, sizeof(uint32_t));
+  memcpy(hdr + 6, &pc.numBuffers, sizeof(uint32_t));
+
+  RETURN_NOT_OK(
+      pc.output->Resize(kWireHeaderSize + totalLen));
+  return std::shared_ptr<arrow::Buffer>(
+      std::move(pc.output));
 }
 
 arrow::Status BlockPayload::serialize(arrow::io::OutputStream* outputStream) {
@@ -458,31 +516,46 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> BlockPayload::readBufferAt(uint32_
   return std::move(buffers_[pos]);
 }
 
-arrow::Result<std::vector<std::shared_ptr<arrow::Buffer>>> BlockPayload::deserialize(
+arrow::Result<std::vector<std::shared_ptr<arrow::Buffer>>>
+BlockPayload::deserialize(
     arrow::io::InputStream* inputStream,
     const std::shared_ptr<arrow::util::Codec>& codec,
     arrow::MemoryPool* pool,
     uint32_t& numRows,
     int64_t& deserializeTime,
     int64_t& decompressTime) {
-  auto timer = std::make_unique<ScopedTimer>(&deserializeTime);
-  ARROW_ASSIGN_OR_RAISE(auto type, readPayloadType(inputStream));
+  auto timer =
+      std::make_unique<ScopedTimer>(&deserializeTime);
+  ARROW_ASSIGN_OR_RAISE(
+      auto type, readPayloadType(inputStream));
 
-  RETURN_NOT_OK(inputStream->Read(sizeof(uint32_t), &numRows));
+  RETURN_NOT_OK(
+      inputStream->Read(sizeof(uint32_t), &numRows));
   uint32_t numBuffers;
-  RETURN_NOT_OK(inputStream->Read(sizeof(uint32_t), &numBuffers));
-  timer.reset();
+  RETURN_NOT_OK(
+      inputStream->Read(sizeof(uint32_t), &numBuffers));
 
-  bool isCompressionEnabled = type == Type::kCompressed;
   std::vector<std::shared_ptr<arrow::Buffer>> buffers;
   buffers.reserve(numBuffers);
-  for (auto i = 0; i < numBuffers; ++i) {
-    buffers.emplace_back();
-    if (isCompressionEnabled) {
+
+  if (type == Type::kCompressed) {
+    timer.reset();
+    for (uint32_t i = 0; i < numBuffers; i++) {
       ARROW_ASSIGN_OR_RAISE(
-          buffers.back(), readCompressedBuffer(inputStream, codec, pool, deserializeTime, decompressTime));
-    } else {
-      ARROW_ASSIGN_OR_RAISE(buffers.back(), readUncompressedBuffer(inputStream, pool, deserializeTime));
+          auto buf,
+          readCompressedBuffer(
+              inputStream, codec, pool,
+              deserializeTime, decompressTime));
+      buffers.push_back(std::move(buf));
+    }
+  } else {
+    timer.reset();
+    for (uint32_t i = 0; i < numBuffers; ++i) {
+      buffers.emplace_back();
+      ARROW_ASSIGN_OR_RAISE(
+          buffers.back(),
+          readUncompressedBuffer(
+              inputStream, pool, deserializeTime));
     }
   }
   return buffers;
@@ -499,7 +572,8 @@ arrow::Result<BlockPayload::BlockHeader> BlockPayload::readHeader(
   return header;
 }
 
-arrow::Result<std::vector<std::shared_ptr<arrow::Buffer>>> BlockPayload::readSelectedBuffers(
+arrow::Result<std::vector<std::shared_ptr<arrow::Buffer>>>
+BlockPayload::readSelectedBuffers(
     arrow::io::InputStream* inputStream,
     const BlockHeader& header,
     const std::shared_ptr<arrow::util::Codec>& codec,
@@ -507,28 +581,56 @@ arrow::Result<std::vector<std::shared_ptr<arrow::Buffer>>> BlockPayload::readSel
     const std::vector<bool>& bufferProjection,
     int64_t& deserializeTime,
     int64_t& decompressTime) {
-  bool isCompressionEnabled = header.type == Type::kCompressed;
-
   std::vector<std::shared_ptr<arrow::Buffer>> buffers;
   buffers.reserve(header.numBuffers);
 
-  for (uint32_t i = 0; i < header.numBuffers; ++i) {
-    bool shouldRead = i < bufferProjection.size() ? bufferProjection[i] : true;
-
-    if (shouldRead) {
-      buffers.emplace_back();
-      if (isCompressionEnabled) {
+  if (header.type == Type::kCompressed) {
+    for (uint32_t i = 0; i < header.numBuffers; i++) {
+      bool shouldRead =
+          i < bufferProjection.size()
+              ? bufferProjection[i] : true;
+      if (shouldRead) {
         ARROW_ASSIGN_OR_RAISE(
-            buffers.back(), readCompressedBuffer(inputStream, codec, pool, deserializeTime, decompressTime));
+            auto buf,
+            readCompressedBuffer(
+                inputStream, codec, pool,
+                deserializeTime, decompressTime));
+        buffers.push_back(std::move(buf));
       } else {
-        ARROW_ASSIGN_OR_RAISE(buffers.back(), readUncompressedBuffer(inputStream, pool, deserializeTime));
+        buffers.push_back(nullptr);
+        RETURN_NOT_OK(skipCompressedBuffer(
+            inputStream, deserializeTime));
       }
-    } else {
-      buffers.emplace_back(nullptr);
-      if (isCompressionEnabled) {
-        RETURN_NOT_OK(skipCompressedBuffer(inputStream, deserializeTime));
+    }
+  } else {
+    for (uint32_t i = 0; i < header.numBuffers; ++i) {
+      bool shouldRead =
+          i < bufferProjection.size()
+              ? bufferProjection[i] : true;
+      if (shouldRead) {
+        buffers.emplace_back();
+        ARROW_ASSIGN_OR_RAISE(
+            buffers.back(),
+            readUncompressedBuffer(
+                inputStream, pool, deserializeTime));
       } else {
-        RETURN_NOT_OK(skipUncompressedBuffer(inputStream, deserializeTime));
+        buffers.emplace_back(nullptr);
+        ScopedTimer timer(&deserializeTime);
+        int64_t bufferLength;
+        RETURN_NOT_OK(inputStream->Read(
+            sizeof(int64_t), &bufferLength));
+        if (bufferLength > 0) {
+          if (auto* mmapStream =
+                  dynamic_cast<MmapFileStream*>(
+                      inputStream)) {
+            RETURN_NOT_OK(
+                mmapStream->Advance(bufferLength));
+          } else {
+            ARROW_ASSIGN_OR_RAISE(
+                auto unused,
+                inputStream->Read(bufferLength));
+          }
+        }
       }
     }
   }
@@ -544,18 +646,20 @@ int64_t BlockPayload::rawSize() {
 }
 
 int64_t BlockPayload::maxCompressedLength(
-    const std::vector<std::shared_ptr<arrow::Buffer>>& buffers,
+    const std::vector<std::shared_ptr<arrow::Buffer>>&
+        buffers,
     arrow::util::Codec* codec) {
-  // Compressed buffer layout: | buffer1 compressedLength | buffer1 uncompressedLength | buffer1 | ...
-  const auto metadataLength = sizeof(int64_t) * 2 * buffers.size();
-  int64_t totalCompressedLength =
-      std::accumulate(buffers.begin(), buffers.end(), 0LL, [&](auto sum, const auto& buffer) {
-        if (!buffer) {
-          return sum;
-        }
-        return sum + codec->MaxCompressedLen(buffer->size(), buffer->data());
-      });
-  return metadataLength + totalCompressedLength;
+  int64_t total = 0;
+  for (const auto& buf : buffers) {
+    if (!buf || buf->size() == 0) {
+      total += sizeof(int64_t);
+    } else {
+      total += kCompBufHeader +
+          bufMaxCompressedLen(
+              buf->size(), buf->data(), codec);
+    }
+  }
+  return total;
 }
 
 arrow::Result<std::unique_ptr<InMemoryPayload>> InMemoryPayload::merge(
@@ -638,11 +742,9 @@ arrow::Result<std::unique_ptr<BlockPayload>>
 InMemoryPayload::toBlockPayload(
     Payload::Type payloadType,
     arrow::MemoryPool* pool,
-    arrow::util::Codec* codec,
-    int32_t compressionThreads,
-    CompressionThreadPool* threadPool) {
+    arrow::util::Codec* codec) {
   return BlockPayload::fromBuffers(
-      payloadType, numRows_, std::move(buffers_), isValidityBuffer_, pool, codec, compressionThreads, threadPool);
+      payloadType, numRows_, std::move(buffers_), isValidityBuffer_, pool, codec);
 }
 
 arrow::Status InMemoryPayload::serialize(arrow::io::OutputStream* outputStream) {
@@ -717,50 +819,113 @@ UncompressedDiskBlockPayload::UncompressedDiskBlockPayload(
       pool_(pool),
       codec_(codec) {}
 
-arrow::Status UncompressedDiskBlockPayload::serialize(arrow::io::OutputStream* outputStream) {
+arrow::Status UncompressedDiskBlockPayload::serialize(
+    arrow::io::OutputStream* outputStream) {
   ARROW_RETURN_IF(
-      inputStream_ == nullptr, arrow::Status::Invalid("inputStream_ is uninitialized before calling serialize()."));
+      inputStream_ == nullptr,
+      arrow::Status::Invalid(
+          "inputStream_ is uninitialized before"
+          " calling serialize()."));
 
   if (type_ == Payload::kUncompressed) {
-    ARROW_ASSIGN_OR_RAISE(auto block, inputStream_->Read(rawSize_));
+    ARROW_ASSIGN_OR_RAISE(
+        auto block, inputStream_->Read(rawSize_));
     RETURN_NOT_OK(outputStream->Write(block));
     return arrow::Status::OK();
   }
 
   GLUTEN_DCHECK(
       type_ == Payload::kToBeCompressed,
-      "Invalid payload type: " + std::to_string(type_) +
-          ", should be either Payload::kUncompressed or Payload::kToBeCompressed");
+      "Invalid payload type: " +
+          std::to_string(type_) +
+          ", should be either kUncompressed"
+          " or kToBeCompressed");
 
-  GLUTEN_CHECK(codec_ != nullptr, "Codec is null when serializing Payload::kToBeCompressed.");
+  GLUTEN_CHECK(
+      codec_ != nullptr,
+      "Codec is null when serializing"
+      " Payload::kToBeCompressed.");
 
   uint8_t blockType;
-  ARROW_ASSIGN_OR_RAISE(auto bytes, inputStream_->Read(sizeof(blockType), &blockType));
-  ARROW_RETURN_IF(bytes == 0, arrow::Status::Invalid("Cannot serialize payload. Reached EOS."));
-
-  RETURN_NOT_OK(outputStream->Write(&blockType, sizeof(blockType)));
-
-  RETURN_NOT_OK(outputStream->Write(&kCompressedType, sizeof(kCompressedType)));
-  RETURN_NOT_OK(outputStream->Write(&numRows_, sizeof(uint32_t)));
+  ARROW_ASSIGN_OR_RAISE(
+      auto bytes,
+      inputStream_->Read(sizeof(blockType), &blockType));
+  ARROW_RETURN_IF(
+      bytes == 0,
+      arrow::Status::Invalid(
+          "Cannot serialize payload. Reached EOS."));
 
   uint32_t numBuffers = 0;
-  ARROW_ASSIGN_OR_RAISE(bytes, inputStream_->Read(sizeof(uint32_t), &numBuffers));
-  ARROW_RETURN_IF(bytes == 0 || numBuffers == 0, arrow::Status::Invalid("Cannot serialize payload with 0 buffers."));
-
-  RETURN_NOT_OK(outputStream->Write(&numBuffers, sizeof(uint32_t)));
+  ARROW_ASSIGN_OR_RAISE(
+      bytes,
+      inputStream_->Read(
+          sizeof(uint32_t), &numBuffers));
+  ARROW_RETURN_IF(
+      bytes == 0 || numBuffers == 0,
+      arrow::Status::Invalid(
+          "Cannot serialize with 0 buffers."));
 
   ARROW_ASSIGN_OR_RAISE(auto start, inputStream_->Tell());
-
   auto pos = start;
-  auto rawBufferSize = rawSize_ - sizeof(blockType) - sizeof(numBuffers);
+  auto rawBufBytes =
+      rawSize_ - sizeof(blockType) - sizeof(numBuffers);
 
-  while (pos - start < rawBufferSize) {
-    ARROW_ASSIGN_OR_RAISE(auto uncompressed, readUncompressedBuffer());
-    ARROW_ASSIGN_OR_RAISE(pos, inputStream_->Tell());
-    RETURN_NOT_OK(compressAndFlush(std::move(uncompressed), outputStream, codec_, pool_, compressTime_, writeTime_));
+  std::vector<std::shared_ptr<arrow::Buffer>> rawBufs;
+  rawBufs.reserve(numBuffers);
+
+  {
+    ScopedTimer wt(&writeTime_);
+    while (pos - start < rawBufBytes) {
+      ARROW_ASSIGN_OR_RAISE(
+          auto buf, readUncompressedBuffer());
+      ARROW_ASSIGN_OR_RAISE(
+          pos, inputStream_->Tell());
+      rawBufs.push_back(std::move(buf));
+    }
   }
 
-  GLUTEN_CHECK(pos - start == rawBufferSize, "Not all data is read from input stream.");
+  GLUTEN_CHECK(
+      pos - start == rawBufBytes,
+      "Not all data is read from input stream.");
+
+  // Write header.
+  ScopedTimer wt(&writeTime_);
+  RETURN_NOT_OK(
+      outputStream->Write(
+          &blockType, sizeof(blockType)));
+  RETURN_NOT_OK(outputStream->Write(
+      &kCompressedType, sizeof(kCompressedType)));
+  RETURN_NOT_OK(
+      outputStream->Write(
+          &numRows_, sizeof(uint32_t)));
+  auto numBufs =
+      static_cast<uint32_t>(rawBufs.size());
+  RETURN_NOT_OK(outputStream->Write(
+      &numBufs, sizeof(uint32_t)));
+
+  // Per-buffer compress and write.
+  wt.switchTo(&compressTime_);
+  for (auto& buf : rawBufs) {
+    int64_t maxLen = sizeof(int64_t);
+    if (buf && buf->size() > 0) {
+      maxLen = kCompBufHeader +
+          bufMaxCompressedLen(
+              buf->size(), buf->data(), codec_);
+    }
+    ARROW_ASSIGN_OR_RAISE(
+        auto compBuf,
+        arrow::AllocateResizableBuffer(
+            maxLen, pool_));
+    ARROW_ASSIGN_OR_RAISE(
+        auto written,
+        compressBuffer(
+            buf, compBuf->mutable_data(),
+            maxLen, codec_));
+    wt.switchTo(&writeTime_);
+    RETURN_NOT_OK(outputStream->Write(
+        compBuf->data(), written));
+    wt.switchTo(&compressTime_);
+  }
 
   return arrow::Status::OK();
 }

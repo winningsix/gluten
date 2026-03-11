@@ -18,7 +18,7 @@ package org.apache.spark.shuffle.sort
 
 import org.apache.gluten.shuffle.SupportsColumnarShuffle
 
-import org.apache.spark.{ShuffleDependency, SparkConf, SparkEnv, TaskContext}
+import org.apache.spark.{ShuffleDependency, SparkConf, SparkContext, SparkEnv, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.serializer.SerializerManager
 import org.apache.spark.shuffle._
@@ -38,16 +38,41 @@ class ColumnarShuffleManager(conf: SparkConf)
 
   import ColumnarShuffleManager._
 
-  private lazy val shuffleExecutorComponents = loadShuffleExecutorComponents(conf)
-  override val shuffleBlockResolver = new IndexShuffleBlockResolver(conf)
+  private lazy val shuffleExecutorComponents =
+    loadShuffleExecutorComponents(conf)
+  override val shuffleBlockResolver =
+    new CatalogShuffleBlockResolver(conf)
 
-  /** A mapping from shuffle ids to the number of mappers producing output for those shuffles. */
-  private[this] val taskIdMapsForShuffle = new ConcurrentHashMap[Int, OpenHashSet[Long]]()
+  private[this] val taskIdMapsForShuffle =
+    new ConcurrentHashMap[Int, OpenHashSet[Long]]()
 
-  /** Obtains a [[ShuffleHandle]] to pass to tasks. */
+  @volatile private var cleanupListenerRegistered = false
+
+  private def ensureCleanupListener(): Unit = {
+    if (!cleanupListenerRegistered) {
+      synchronized {
+        if (!cleanupListenerRegistered) {
+          try {
+            val sc = SparkContext.getActive
+            sc.foreach {
+              ctx =>
+                ctx.addSparkListener(new CatalogCleanupListener())
+                logInfo("Registered CatalogCleanupListener")
+            }
+          } catch {
+            case _: Exception =>
+          }
+          cleanupListenerRegistered = true
+        }
+      }
+    }
+  }
+
   override def registerShuffle[K, V, C](
       shuffleId: Int,
-      dependency: ShuffleDependency[K, V, C]): ShuffleHandle = {
+      dependency: ShuffleDependency[K, V, C]
+  ): ShuffleHandle = {
+    ensureCleanupListener()
     if (dependency.isInstanceOf[ColumnarShuffleDependency[_, _, _]]) {
       logInfo(s"Registering ColumnarShuffle shuffleId: $shuffleId")
       new ColumnarShuffleHandle[K, V](
@@ -142,12 +167,14 @@ class ColumnarShuffleManager(conf: SparkConf)
       metrics)
   }
 
-  /** Remove a shuffle's metadata from the ShuffleManager. */
   override def unregisterShuffle(shuffleId: Int): Boolean = {
+    shuffleBlockResolver.unregisterCatalogShuffle(shuffleId)
     Option(taskIdMapsForShuffle.remove(shuffleId)).foreach {
       mapTaskIds =>
         mapTaskIds.iterator.foreach {
-          mapId => shuffleBlockResolver.removeDataByMap(shuffleId, mapId)
+          mapId =>
+            shuffleBlockResolver
+              .removeDataByMap(shuffleId, mapId)
         }
     }
     true

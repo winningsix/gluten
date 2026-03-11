@@ -168,19 +168,20 @@ struct GpuHashShuffleWriterOptions : HashShuffleWriterOptions {
 };
 
 struct LocalPartitionWriterOptions {
-  int64_t shuffleFileBufferSize = kDefaultShuffleFileBufferSize; // spark.shuffle.file.buffer
-  int32_t compressionBufferSize =
-      kDefaultCompressionBufferSize; // spark.io.compression.lz4.blockSize,spark.io.compression.zstd.bufferSize
+  int64_t shuffleFileBufferSize = kDefaultShuffleFileBufferSize;
+  int32_t compressionBufferSize = kDefaultCompressionBufferSize;
 
   int32_t compressionThreshold = kDefaultCompressionThreshold;
   int32_t mergeBufferSize = kDefaultShuffleWriterBufferSize;
   double mergeThreshold = kDefaultMergeBufferThreshold;
 
-  int32_t numSubDirs = kDefaultNumSubDirs; // spark.diskStore.subDirectories
+  int32_t numSubDirs = kDefaultNumSubDirs;
 
   bool enableDictionary = kDefaultEnableDictionary;
 
   int32_t compressionThreads = kDefaultCompressionThreads;
+
+  bool skipMerge = false;
 
   LocalPartitionWriterOptions() = default;
 
@@ -192,7 +193,8 @@ struct LocalPartitionWriterOptions {
       double mergeThreshold,
       int32_t numSubDirs,
       bool enableDictionary,
-      int32_t compressionThreads = kDefaultCompressionThreads)
+      int32_t compressionThreads = kDefaultCompressionThreads,
+      bool skipMerge = false)
       : shuffleFileBufferSize(shuffleFileBufferSize),
         compressionBufferSize(compressionBufferSize),
         compressionThreshold(compressionThreshold),
@@ -200,7 +202,8 @@ struct LocalPartitionWriterOptions {
         mergeThreshold(mergeThreshold),
         numSubDirs(numSubDirs),
         enableDictionary(enableDictionary),
-        compressionThreads(compressionThreads) {}
+        compressionThreads(compressionThreads),
+        skipMerge(skipMerge) {}
 };
 
 struct RssPartitionWriterOptions {

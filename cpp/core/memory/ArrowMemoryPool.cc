@@ -38,6 +38,11 @@ void ArrowMemoryPool::Free(uint8_t* buffer, int64_t size, int64_t alignment) {
   allocator_->free(buffer, size);
 }
 
+void ArrowMemoryPool::detach(int64_t size) {
+  static_cast<ListenableMemoryAllocator*>(
+      allocator_.get())->detach(size);
+}
+
 int64_t ArrowMemoryPool::bytes_allocated() const {
   return allocator_->getBytes();
 }

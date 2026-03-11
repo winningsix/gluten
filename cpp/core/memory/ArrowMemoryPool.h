@@ -49,6 +49,9 @@ class ArrowMemoryPool final : public arrow::MemoryPool {
 
   void Free(uint8_t* buffer, int64_t size, int64_t alignment) override;
 
+  // Release quota without freeing memory.
+  void detach(int64_t size);
+
   int64_t bytes_allocated() const override;
 
   int64_t max_memory() const override;

@@ -20,6 +20,7 @@ import org.apache.gluten.exception.GlutenException;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufInputStream;
+import io.netty.buffer.CompositeByteBuf;
 import io.netty.util.internal.PlatformDependent;
 
 import java.io.IOException;
@@ -82,10 +83,16 @@ public class LowCopyNettyJniByteInputStream implements JniByteInputStream {
     ByteBufInputStream bbin = (ByteBufInputStream) in;
     try {
       final ByteBuf byteBuf = (ByteBuf) FIELD_ByteBufInputStream_buffer.get(bbin);
-      if (!byteBuf.isDirect()) {
-        return false;
+      if (byteBuf.isDirect()) {
+        return true;
       }
-      return true;
+      // CompositeByteBuf wrapping direct components:
+      // isDirect() returns false but readBytes(direct)
+      // works correctly via scatter read.
+      if (byteBuf instanceof CompositeByteBuf) {
+        return true;
+      }
+      return false;
     } catch (IllegalAccessException e) {
       throw new GlutenException(e);
     }

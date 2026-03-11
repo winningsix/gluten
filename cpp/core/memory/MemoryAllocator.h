@@ -64,6 +64,11 @@ class ListenableMemoryAllocator final : public MemoryAllocator {
 
   bool free(void* p, int64_t size) override;
 
+  // Release quota: decrements the usage counter without
+  // freeing memory. The caller takes ownership of the
+  // underlying allocation.
+  void detach(int64_t size);
+
   int64_t getBytes() const override;
 
   int64_t peakBytes() const override;

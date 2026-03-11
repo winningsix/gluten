@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 
-#include "shuffle/CompressionThreadPool.h"
 #include "shuffle/Payload.h"
 
 #include <arrow/buffer.h>
@@ -30,7 +29,8 @@
 using namespace gluten;
 
 // ~70% compression ratio (similar to production shuffle data)
-static std::shared_ptr<arrow::Buffer> makeRealisticBuffer(int64_t size, uint32_t seed) {
+static std::shared_ptr<arrow::Buffer> makeRealisticBuffer(
+    int64_t size, uint32_t seed) {
   auto pool = arrow::default_memory_pool();
   auto buf = *arrow::AllocateResizableBuffer(size, pool);
   std::mt19937 gen(seed);
@@ -50,32 +50,32 @@ struct BenchConfig {
   int numBatches;
 };
 
-static void runBench(const BenchConfig& cfg, int threads) {
+static void runBench(const BenchConfig& cfg) {
   auto pool = arrow::default_memory_pool();
-  auto codec = *arrow::util::Codec::Create(arrow::Compression::LZ4_FRAME);
+  auto codec = *arrow::util::Codec::Create(
+      arrow::Compression::LZ4_FRAME);
   std::vector<bool> isValidity(cfg.numBuffers, false);
 
-  std::unique_ptr<CompressionThreadPool> threadPool;
-  if (threads > 1) {
-    threadPool = std::make_unique<CompressionThreadPool>(threads);
-  }
-
-  // Pre-create template buffers (outside timing)
   std::vector<std::shared_ptr<arrow::Buffer>> templates;
   for (int j = 0; j < cfg.numBuffers; j++) {
-    templates.push_back(makeRealisticBuffer(cfg.bufferSize, j));
+    templates.push_back(
+        makeRealisticBuffer(cfg.bufferSize, j));
   }
 
   // Warm up
   for (int i = 0; i < 3; i++) {
     std::vector<std::shared_ptr<arrow::Buffer>> buffers;
     for (int j = 0; j < cfg.numBuffers; j++) {
-      auto copy = *arrow::AllocateResizableBuffer(cfg.bufferSize, pool);
-      memcpy(copy->mutable_data(), templates[j]->data(), cfg.bufferSize);
+      auto copy = *arrow::AllocateResizableBuffer(
+          cfg.bufferSize, pool);
+      memcpy(
+          copy->mutable_data(), templates[j]->data(),
+          cfg.bufferSize);
       buffers.push_back(std::move(copy));
     }
     auto r = BlockPayload::fromBuffers(
-        Payload::kCompressed, 100, std::move(buffers), &isValidity, pool, codec.get(), threads, threadPool.get());
+        Payload::kCompressed, 100, std::move(buffers),
+        &isValidity, pool, codec.get());
     (void)r;
   }
 
@@ -83,36 +83,47 @@ static void runBench(const BenchConfig& cfg, int threads) {
   for (int b = 0; b < cfg.numBatches; b++) {
     std::vector<std::shared_ptr<arrow::Buffer>> buffers;
     for (int j = 0; j < cfg.numBuffers; j++) {
-      auto copy = *arrow::AllocateResizableBuffer(cfg.bufferSize, pool);
-      memcpy(copy->mutable_data(), templates[j]->data(), cfg.bufferSize);
+      auto copy = *arrow::AllocateResizableBuffer(
+          cfg.bufferSize, pool);
+      memcpy(
+          copy->mutable_data(), templates[j]->data(),
+          cfg.bufferSize);
       buffers.push_back(std::move(copy));
     }
     auto r = BlockPayload::fromBuffers(
-        Payload::kCompressed, 100, std::move(buffers), &isValidity, pool, codec.get(), threads, threadPool.get());
+        Payload::kCompressed, 100, std::move(buffers),
+        &isValidity, pool, codec.get());
     (void)r;
   }
   auto end = std::chrono::high_resolution_clock::now();
-  auto ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+  auto ms = std::chrono::duration_cast<
+                 std::chrono::microseconds>(end - start)
+                .count() /
+      1000.0;
 
-  std::cout << "  threads=" << threads << "  " << ms << " ms  ("
-            << (ms / cfg.numBatches) << " ms/batch)" << std::endl;
+  std::cout << "  " << ms << " ms  ("
+            << (ms / cfg.numBatches) << " ms/batch)"
+            << std::endl;
 }
 
 int main() {
   std::vector<BenchConfig> configs = {
       {"Q9-like (8 bufs x 1MB)", 8, 1024 * 1024, 50},
       {"Q3/Q7-like (16 bufs x 512KB)", 16, 512 * 1024, 50},
-      {"Production-like (8 bufs x 8MB)", 8, 8 * 1024 * 1024, 20},
-      {"Large batch (16 bufs x 8MB)", 16, 8 * 1024 * 1024, 10},
+      {"Production-like (8 bufs x 8MB)",
+       8, 8 * 1024 * 1024, 20},
+      {"Large batch (16 bufs x 8MB)",
+       16, 8 * 1024 * 1024, 10},
   };
 
   for (const auto& cfg : configs) {
-    int64_t totalMB = (int64_t)cfg.numBuffers * cfg.bufferSize / (1024 * 1024);
-    std::cout << "\n=== " << cfg.label << " (" << totalMB << " MB/batch, "
-              << cfg.numBatches << " batches) ===" << std::endl;
-    runBench(cfg, 1);
-    runBench(cfg, 4);
-    runBench(cfg, 8);
+    int64_t totalMB = (int64_t)cfg.numBuffers *
+        cfg.bufferSize / (1024 * 1024);
+    std::cout << "\n=== " << cfg.label << " ("
+              << totalMB << " MB/batch, "
+              << cfg.numBatches << " batches) ==="
+              << std::endl;
+    runBench(cfg);
   }
   return 0;
 }

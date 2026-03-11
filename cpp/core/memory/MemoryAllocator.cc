@@ -96,6 +96,10 @@ bool ListenableMemoryAllocator::free(void* p, int64_t size) {
   return succeed;
 }
 
+void ListenableMemoryAllocator::detach(int64_t size) {
+  updateUsage(-size);
+}
+
 int64_t ListenableMemoryAllocator::getBytes() const {
   return usedBytes_;
 }
