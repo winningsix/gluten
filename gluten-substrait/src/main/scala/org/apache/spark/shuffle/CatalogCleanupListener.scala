@@ -16,8 +16,6 @@
  */
 package org.apache.spark.shuffle
 
-import org.apache.gluten.vectorized.ShufflePayloadCatalogJniWrapper
-
 import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler._
 import org.apache.spark.sql.execution.SQLExecution
@@ -28,8 +26,8 @@ import java.util.concurrent.ConcurrentHashMap
 import scala.collection.mutable
 
 /**
- * Proactively cleans up ShufflePayloadCatalog entries when a SQL execution completes, instead of
- * waiting for GC-triggered ContextCleaner.
+ * SparkListener that tracks shuffle-to-execution mapping and triggers cleanup when SQL executions
+ * complete. Subclass and override onCleanup() to customize the cleanup action.
  */
 class CatalogCleanupListener extends SparkListener with Logging {
 
@@ -70,26 +68,35 @@ class CatalogCleanupListener extends SparkListener with Logging {
   }
 
   private def onSQLExecutionEnd(event: SparkListenerSQLExecutionEnd): Unit = {
-    val shuffleIds =
-      Option(executionShuffles.remove(event.executionId))
-    shuffleIds.foreach {
+    Option(executionShuffles.remove(event.executionId)).foreach {
       ids =>
         if (ids.nonEmpty) {
           logInfo(
-            s"SQL execution ${event.executionId} ended," +
-              s" cleaning ${ids.size} shuffle(s) from" +
-              s" catalog: ${ids.mkString(", ")}")
+            s"SQL execution ${event.executionId} " +
+              s"ended, cleaning ${ids.size} " +
+              s"shuffle(s): ${ids.mkString(", ")}")
           ids.foreach {
             shuffleId =>
               try {
-                ShufflePayloadCatalogJniWrapper
-                  .unregisterShuffle(shuffleId)
+                onCleanup(shuffleId)
               } catch {
                 case e: Exception =>
-                  logWarning(s"Failed to clean shuffle $shuffleId", e)
+                  logWarning(
+                    s"Failed to clean shuffle " +
+                      s"$shuffleId",
+                    e)
               }
           }
         }
     }
+  }
+
+  /** Override to customize cleanup action. */
+  protected def onCleanup(shuffleId: Int): Unit = {
+    // Default: directly call JNI (local mode).
+    // In standalone mode, the CatalogCleanupPlugin
+    // overrides this to use the polling mechanism.
+    org.apache.gluten.vectorized.ShufflePayloadCatalogJniWrapper
+      .unregisterShuffle(shuffleId)
   }
 }
