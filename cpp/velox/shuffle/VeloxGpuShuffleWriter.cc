@@ -126,37 +126,17 @@ arrow::Result<std::shared_ptr<VeloxShuffleWriter>> VeloxGpuHashShuffleWriter::cr
 arrow::Status VeloxGpuHashShuffleWriter::write(std::shared_ptr<ColumnarBatch> cb, int64_t memLimit) {
   if (!gpuPartitionEnabled_ ||
       partitioning_ == Partitioning::kSingle) {
-    if (!gpuPartitionDiagLogged_) {
-      gpuPartitionDiagLogged_ = true;
-      LOG(WARNING) << "GPU partition DISABLED: gpuPartitionEnabled_=" << gpuPartitionEnabled_
-                   << " partitioning=" << static_cast<int>(partitioning_);
-    }
     return VeloxHashShuffleWriter::write(cb, memLimit);
   }
 
-  // Detect CudfVector before any D2H conversion.
   if (cb->getType() == "velox") {
     auto veloxBatch = std::dynamic_pointer_cast<VeloxColumnarBatch>(cb);
     if (veloxBatch) {
       auto rv = veloxBatch->getRowVector();
       auto cudfVec = std::dynamic_pointer_cast<CudfVector>(rv);
-      if (!gpuPartitionDiagLogged_) {
-        gpuPartitionDiagLogged_ = true;
-        LOG(WARNING) << "GPU partition diag: batchType=" << cb->getType()
-                  << " veloxBatch=" << (veloxBatch != nullptr)
-                  << " rvType=" << (rv ? rv->type()->toString() : "null")
-                  << " rvTypeName=" << (rv ? typeid(*rv).name() : "null")
-                  << " isCudfVector=" << (cudfVec != nullptr)
-                  << " numRows=" << cb->numRows();
-      }
       if (cudfVec) {
         if (!gpuSchemaInitialized_) {
           gpuSchemaInitialized_ = true;
-          LOG(WARNING)
-              << "GPU partition: first CudfVector batch,"
-              << " rows=" << cudfVec->size()
-              << " cols="
-              << cudfVec->getTableView().num_columns();
           auto& fullRowType = cudfVec->type()->asRow();
           auto typeChildren = fullRowType.children();
           typeChildren.erase(typeChildren.begin());
@@ -194,17 +174,6 @@ arrow::Status VeloxGpuHashShuffleWriter::write(std::shared_ptr<ColumnarBatch> cb
       // have been in the pipeline. Fall through to the standard CPU path
       // which correctly handles both pre-partitioned (PID as col 0) and
       // regular (hash as col 0) data via computePid (pid % numPartitions).
-      if (!gpuPartitionDiagLogged_) {
-        LOG(WARNING) << "GPU partition: RowVector (not CudfVector) received, "
-                  << "using CPU shuffle path. rows=" << rv->size()
-                  << " cols=" << rv->childrenSize();
-      }
-    }
-  } else {
-    if (!gpuPartitionDiagLogged_) {
-      gpuPartitionDiagLogged_ = true;
-      LOG(WARNING) << "GPU partition fallback: batchType=" << cb->getType()
-                   << " (not 'velox'), falling back to CPU path";
     }
   }
 
@@ -289,11 +258,6 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
     auto tableView = cudfVec->getTableView();
     auto stream = cudfVec->stream();
 
-    LOG(WARNING)
-        << "gpuPartitionAndEvict: input rows="
-        << tableView.num_rows()
-        << " cols=" << tableView.num_columns()
-        << " numPartitions=" << numPartitions_;
 
     auto firstCol = tableView.column(0);
     std::vector<cudf::column_view> dataCols;
@@ -335,9 +299,6 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
     numCols = partitionedTable->num_columns();
     auto tv = partitionedTable->view();
 
-    LOG(WARNING)
-        << "gpuPartitionAndEvict: partitioned rows="
-        << totalRows << " dataCols=" << numCols;
 
     colHosts.resize(numCols);
 
@@ -523,8 +484,6 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
     totalRowsEvicted += numRows;
   }
 
-  LOG(WARNING) << "gpuPartitionAndEvict: "
-               << "totalRowsEvicted=" << totalRowsEvicted;
   return arrow::Status::OK();
 }
 

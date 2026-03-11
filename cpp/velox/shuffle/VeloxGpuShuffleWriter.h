@@ -79,6 +79,5 @@ class VeloxGpuHashShuffleWriter : public VeloxHashShuffleWriter {
 
   bool gpuPartitionEnabled_{false};
   bool gpuSchemaInitialized_{false};
-  bool gpuPartitionDiagLogged_{false};
 };
 } // namespace gluten
