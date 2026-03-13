@@ -21,6 +21,7 @@
 #include <arrow/io/interfaces.h>
 #include <arrow/memory_pool.h>
 #include <arrow/util/compression.h>
+#include <future>
 
 #include "shuffle/Dictionary.h"
 #include "shuffle/Options.h"
@@ -30,7 +31,13 @@ namespace gluten {
 
 class Payload {
  public:
-  enum Type : uint8_t { kCompressed = 1, kUncompressed = 2, kToBeCompressed = 3, kRaw = 4 };
+  enum Type : uint8_t {
+    kCompressed = 1,
+    kUncompressed = 2,
+    kToBeCompressed = 3,
+    kRaw = 4,
+    kMergedCompressed = 5
+  };
 
   Payload(Type type, uint32_t numRows, const std::vector<bool>* isValidityBuffer);
 
@@ -102,6 +109,57 @@ class BlockPayload final : public Payload {
       arrow::MemoryPool* pool,
       uint32_t& numRows,
       int64_t& deserializeTime,
+      int64_t& decompressTime);
+
+  // Two-phase async deserialization for prefetch.
+  // startDeserialize: read metadata + compressed data,
+  //   submit decompression to pool, return immediately.
+  // finishDeserialize: wait for decompression, assemble
+  //   buffer vector.
+  struct PendingDecompression {
+    Type type = Type::kUncompressed;
+    uint32_t numRows = 0;
+    uint32_t numBuffers = 0;
+    int64_t estimatedBytes = 0;
+
+    std::vector<int64_t> bufMeta;
+    int64_t totalUncomp = 0;
+    std::future<arrow::Result<
+        std::shared_ptr<arrow::Buffer>>>
+        mergedFuture;
+
+    struct PendingBuffer {
+      std::future<arrow::Result<
+          std::shared_ptr<arrow::Buffer>>> future;
+    };
+    std::vector<PendingBuffer> perBufferFutures;
+
+    std::vector<std::shared_ptr<arrow::Buffer>>
+        readyBuffers;
+
+    PendingDecompression() = default;
+    PendingDecompression(
+        PendingDecompression&&) = default;
+    PendingDecompression& operator=(
+        PendingDecompression&&) = default;
+    PendingDecompression(
+        const PendingDecompression&) = delete;
+    PendingDecompression& operator=(
+        const PendingDecompression&) = delete;
+  };
+
+  static arrow::Result<PendingDecompression>
+  startDeserialize(
+      arrow::io::InputStream* inputStream,
+      const std::shared_ptr<
+          arrow::util::Codec>& codec,
+      arrow::MemoryPool* pool,
+      int64_t& deserializeTime);
+
+  static arrow::Result<
+      std::vector<std::shared_ptr<arrow::Buffer>>>
+  finishDeserialize(
+      PendingDecompression&& pending,
       int64_t& decompressTime);
 
   // Two-phase deserialization with column projection:

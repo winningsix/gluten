@@ -29,6 +29,8 @@
 #include "memory/GpuBufferColumnarBatch.h"
 
 #include <algorithm>
+#include <nvtx3/nvtx3.hpp>
+#include "velox/experimental/cudf/exec/NvtxHelper.h"
 
 using namespace facebook::velox;
 
@@ -95,33 +97,74 @@ void VeloxGpuHashShuffleReaderDeserializer::loadNextStream() {
           readerBufferSize_, memoryManager_->defaultArrowMemoryPool(), std::move(in)));
 }
 
-std::shared_ptr<ColumnarBatch> VeloxGpuHashShuffleReaderDeserializer::next() {
-  if (in_ == nullptr) {
-    loadNextStream();
-
-    if (reachedEos_) {
-      return nullptr;
+void
+VeloxGpuHashShuffleReaderDeserializer::
+    fillPrefetchQueue() {
+  while (prefetchQueue_.size() < kMaxPrefetch &&
+         !reachedEos_) {
+    if (in_ == nullptr) {
+      loadNextStream();
+      if (reachedEos_) {
+        return;
+      }
     }
+    while (!resolveNextBlockType()) {
+      loadNextStream();
+      if (reachedEos_) {
+        return;
+      }
+    }
+    GLUTEN_ASSIGN_OR_THROW(
+        auto pending,
+        BlockPayload::startDeserialize(
+            in_.get(), codec_,
+            memoryManager_->
+                defaultArrowMemoryPool(),
+            deserializeTime_));
+    prefetchQueue_.push_back(
+        std::move(pending));
+  }
+}
+
+std::shared_ptr<ColumnarBatch>
+VeloxGpuHashShuffleReaderDeserializer::next() {
+  using VD =
+      facebook::velox::cudf_velox::VeloxDomain;
+
+  {
+    nvtx3::scoped_range_in<VD> prefetchRange(
+        nvtx3::event_attributes{
+            "ShuffleRead::prefetch",
+            nvtx3::rgb{100, 149, 237}});
+    fillPrefetchQueue();
   }
 
-  while (!resolveNextBlockType()) {
-    loadNextStream();
-
-    if (reachedEos_) {
-      return nullptr;
-    }
+  if (prefetchQueue_.empty()) {
+    return nullptr;
   }
 
-  uint32_t numRows = 0;
-  GLUTEN_ASSIGN_OR_THROW(
-      auto arrowBuffers,
-      BlockPayload::deserializeAsync(
-          in_.get(), codec_,
-          memoryManager_->defaultArrowMemoryPool(),
-          numRows, deserializeTime_,
-          decompressTime_));
+  auto pending =
+      std::move(prefetchQueue_.front());
+  prefetchQueue_.pop_front();
+  auto numRows = pending.numRows;
 
-  return std::make_shared<GpuBufferColumnarBatch>(rowType_, std::move(arrowBuffers), static_cast<int32_t>(numRows));
+  std::vector<std::shared_ptr<arrow::Buffer>>
+      arrowBuffers;
+  {
+    nvtx3::scoped_range_in<VD> collectRange(
+        nvtx3::event_attributes{
+            "ShuffleRead::collectDecomp",
+            nvtx3::rgb{255, 140, 0}});
+    GLUTEN_ASSIGN_OR_THROW(
+        arrowBuffers,
+        BlockPayload::finishDeserialize(
+            std::move(pending),
+            decompressTime_));
+  }
+
+  return std::make_shared<GpuBufferColumnarBatch>(
+      rowType_, std::move(arrowBuffers),
+      static_cast<int32_t>(numRows));
 }
 
 } // namespace gluten

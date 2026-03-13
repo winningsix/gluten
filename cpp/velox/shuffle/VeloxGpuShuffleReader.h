@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <deque>
+
 #include "memory/VeloxMemoryManager.h"
 #include "shuffle/Payload.h"
 #include "shuffle/ShuffleReader.h"
@@ -63,5 +65,11 @@ class VeloxGpuHashShuffleReaderDeserializer final : public ColumnarBatchIterator
 
   bool reachedEos_{false};
   bool blockTypeResolved_{false};
+
+  std::deque<BlockPayload::PendingDecompression>
+      prefetchQueue_;
+  static constexpr size_t kMaxPrefetch = 16;
+
+  void fillPrefetchQueue();
 };
 } // namespace gluten

@@ -19,11 +19,13 @@
 #include "cudf/GpuLock.h"
 #include "memory/GpuBufferColumnarBatch.h"
 #include "utils/Timer.h"
+#include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/vector/FlatVector.h"
+#include <nvtx3/nvtx3.hpp>
 
 #include <arrow/buffer.h>
 #include <arrow/memory_pool.h>
@@ -312,17 +314,31 @@ std::shared_ptr<ColumnarBatch> GpuBufferBatchResizer::next() {
   ++batches_;
   totalRows_ += cachedRows;
 
+  using VD = facebook::velox::cudf_velox::VeloxDomain;
+
   std::shared_ptr<GpuBufferColumnarBatch> batch;
   {
+    nvtx3::scoped_range_in<VD> compRange(
+        nvtx3::event_attributes{
+            "ShuffleRead::compose",
+            nvtx3::rgb{50, 205, 50}});
     ScopedTimer composeTimer(&composeNs_);
     batch = GpuBufferColumnarBatch::compose(
-        getPinnedArrowMemoryPool(), cachedBatches, cachedRows);
+        getPinnedArrowMemoryPool(),
+        cachedBatches, cachedRows);
   }
 
   GpuLockGuard gpuLock;
-  ScopedTimer h2dTimer(&h2dUploadNs_);
-  return gpuBuffersToCudfVector(
-      batch->getRowType(), batch->numRows(), batch->buffers(), pool_);
+  {
+    nvtx3::scoped_range_in<VD> h2dRange(
+        nvtx3::event_attributes{
+            "ShuffleRead::H2D",
+            nvtx3::rgb{220, 20, 60}});
+    ScopedTimer h2dTimer(&h2dUploadNs_);
+    return gpuBuffersToCudfVector(
+        batch->getRowType(), batch->numRows(),
+        batch->buffers(), pool_);
+  }
 }
 
 int64_t GpuBufferBatchResizer::spillFixedSize(int64_t size) {

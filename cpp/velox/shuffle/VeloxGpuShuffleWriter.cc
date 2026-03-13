@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/exec/PinnedHostMemory.h"
+#include "velox/experimental/cudf/exec/NvtxHelper.h"
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -271,7 +272,15 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
     }
     cudf::table_view dataTable(dataCols);
 
+    std::unique_ptr<cudf::table> partitionedTable;
+
     ScopedTimer gpuTimer(&gpuPartitionNs_);
+    {
+    nvtx3::scoped_range_in<
+        facebook::velox::cudf_velox::VeloxDomain>
+        partRange(nvtx3::event_attributes{
+            "ShuffleWrite::gpuPartition",
+            nvtx3::rgb{200, 100, 50}});
     std::unique_ptr<cudf::column> pidColOwned;
     cudf::column_view pidColView;
     if (partitioning_ == Partitioning::kHash) {
@@ -288,20 +297,27 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
       pidColView = firstCol;
     }
 
-    auto [partitionedTable, partOffsets] =
+    auto [table, partOffsets] =
         cudf::partition(
             dataTable, pidColView,
             static_cast<cudf::size_type>(numPartitions_),
             stream);
     VELOX_CHECK_EQ(
         partOffsets.size(), numPartitions_ + 1);
+    partitionedTable = std::move(table);
     offsets = std::move(partOffsets);
-    // Sync before freeing input: cudf::partition is async.
     stream.synchronize();
     pidColOwned.reset();
     cudfVec.reset();
 
     gpuTimer.switchTo(&d2hNs_);
+    } // end gpuPartition range
+    {
+    nvtx3::scoped_range_in<
+        facebook::velox::cudf_velox::VeloxDomain>
+        d2hRange(nvtx3::event_attributes{
+            "ShuffleWrite::D2H",
+            nvtx3::rgb{50, 150, 200}});
     totalRows = partitionedTable->num_rows();
     numCols = partitionedTable->num_columns();
     auto tv = partitionedTable->view();
@@ -393,6 +409,7 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
 
     RETURN_CUDA_ERROR(
         cudaStreamSynchronize(stream.value()));
+    } // end D2H range
   }
   } catch (const std::exception& e) {
     LOG(ERROR) << "gpuPartitionAndEvict failed: "
@@ -401,8 +418,12 @@ arrow::Status VeloxGpuHashShuffleWriter::gpuPartitionAndEvict(
         "GPU shuffle partition failed: ", e.what());
   }
 
-  // CPU-side: slice per-column host buffers per partition.
   uint64_t totalRowsEvicted = 0;
+  nvtx3::scoped_range_in<
+      facebook::velox::cudf_velox::VeloxDomain>
+      evictRange(nvtx3::event_attributes{
+          "ShuffleWrite::cpuEvict",
+          nvtx3::rgb{180, 120, 60}});
 
   for (uint32_t pid = 0; pid < numPartitions_; ++pid) {
     auto start = offsets[pid];

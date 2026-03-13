@@ -19,6 +19,8 @@
 #include <condition_variable>
 #include <mutex>
 #include <glog/logging.h>
+#include <nvtx3/nvtx3.hpp>
+#include "velox/experimental/cudf/exec/NvtxHelper.h"
 
 namespace gluten {
 
@@ -64,7 +66,16 @@ void lockGpu() {
   }
   auto& s = getState();
   std::unique_lock<std::mutex> lock(s.mutex);
-  s.cv.wait(lock, [&] { return s.activeCount < s.maxConcurrent; });
+  {
+    nvtx3::scoped_range_in<
+        facebook::velox::cudf_velox::VeloxDomain>
+        waitRange(nvtx3::event_attributes{
+            "GpuLock::wait",
+            nvtx3::rgb{255, 69, 0}});
+    s.cv.wait(lock, [&] {
+      return s.activeCount < s.maxConcurrent;
+    });
+  }
   ++s.activeCount;
   tLocalRefCount = 1;
 }
