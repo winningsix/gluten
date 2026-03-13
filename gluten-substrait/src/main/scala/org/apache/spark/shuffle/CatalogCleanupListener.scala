@@ -16,6 +16,9 @@
  */
 package org.apache.spark.shuffle
 
+import org.apache.gluten.vectorized.ShufflePayloadCatalogJniWrapper
+
+import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler._
 import org.apache.spark.sql.execution.SQLExecution
@@ -93,10 +96,24 @@ class CatalogCleanupListener extends SparkListener with Logging {
 
   /** Override to customize cleanup action. */
   protected def onCleanup(shuffleId: Int): Unit = {
-    // Default: directly call JNI (local mode).
-    // In standalone mode, the CatalogCleanupPlugin
-    // overrides this to use the polling mechanism.
-    org.apache.gluten.vectorized.ShufflePayloadCatalogJniWrapper
-      .unregisterShuffle(shuffleId)
+    val env = SparkEnv.get
+    if (env != null) {
+      try {
+        env.blockManager.master
+          .removeShuffle(shuffleId, false)
+      } catch {
+        case e: Exception =>
+          logWarning(
+            s"removeShuffle via BlockManagerMaster " +
+              s"failed for $shuffleId, " +
+              s"falling back to direct JNI",
+            e)
+          ShufflePayloadCatalogJniWrapper
+            .unregisterShuffle(shuffleId)
+      }
+    } else {
+      ShufflePayloadCatalogJniWrapper
+        .unregisterShuffle(shuffleId)
+    }
   }
 }

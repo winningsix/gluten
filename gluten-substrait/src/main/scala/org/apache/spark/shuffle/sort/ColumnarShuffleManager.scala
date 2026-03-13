@@ -166,13 +166,23 @@ class ColumnarShuffleManager(conf: SparkConf)
 
   override def unregisterShuffle(shuffleId: Int): Boolean = {
     shuffleBlockResolver.unregisterCatalogShuffle(shuffleId)
-    Option(taskIdMapsForShuffle.remove(shuffleId)).foreach {
+    val mapCount = Option(taskIdMapsForShuffle.remove(shuffleId))
+    mapCount.foreach {
       mapTaskIds =>
+        val cnt = mapTaskIds.size
         mapTaskIds.iterator.foreach {
           mapId =>
             shuffleBlockResolver
               .removeDataByMap(shuffleId, mapId)
         }
+        logInfo(
+          s"Unregistered shuffle $shuffleId " +
+            s"($cnt map outputs)")
+    }
+    if (mapCount.isEmpty) {
+      logInfo(
+        s"Unregistered shuffle $shuffleId " +
+          s"(no local map outputs)")
     }
     true
   }
