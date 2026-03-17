@@ -41,6 +41,16 @@ class CatalogShuffleBlockResolver(conf: SparkConf)
           ShufflePayloadCatalogJniWrapper
             .resolveBlockDirect(sid.shuffleId, sid.mapId, sid.reduceId)
         if (segments == null) {
+          val stack = Thread.currentThread.getStackTrace
+            .take(10)
+            .map(_.toString)
+            .mkString(" <- ")
+          logWarning(
+            s"Catalog miss for $sid " +
+              s"(shuffle=${sid.shuffleId}, " +
+              s"map=${sid.mapId}, " +
+              s"reduce=${sid.reduceId}), " +
+              s"dirs=$dirs, stack: $stack")
           return super.getBlockData(blockId, dirs)
         }
         if (segments.isEmpty) {

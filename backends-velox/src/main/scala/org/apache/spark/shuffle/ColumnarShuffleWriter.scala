@@ -278,7 +278,13 @@ class ColumnarShuffleWriter[K, V](
 
     val skipMergeUsed =
       GlutenConfig.get.columnarShuffleSkipMerge &&
-        splitResult.getTotalBytesSpilled == 0
+        splitResult.getTotalBytesSpilled == 0 &&
+        splitResult.getBytesWritten == 0
+    logInfo(
+      s"Shuffle write done: shuffle=${dep.shuffleId}" +
+        s" map=$mapId skipMergeUsed=$skipMergeUsed" +
+        s" spilled=${splitResult.getTotalBytesSpilled}" +
+        s" written=${splitResult.getBytesWritten}")
     if (skipMergeUsed) {
       // Data is in native catalog. Write a minimal index
       // so MapStatus reporting works, but skip committing

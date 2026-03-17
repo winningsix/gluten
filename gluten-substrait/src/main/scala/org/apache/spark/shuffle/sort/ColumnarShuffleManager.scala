@@ -20,6 +20,7 @@ import org.apache.gluten.shuffle.SupportsColumnarShuffle
 
 import org.apache.spark.{ShuffleDependency, SparkConf, SparkContext, SparkEnv, TaskContext}
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config
 import org.apache.spark.serializer.SerializerManager
 import org.apache.spark.shuffle._
 import org.apache.spark.shuffle.api.ShuffleExecutorComponents
@@ -37,6 +38,32 @@ class ColumnarShuffleManager(conf: SparkConf)
   with Logging {
 
   import ColumnarShuffleManager._
+
+  // When skipMerge is enabled, shuffle data lives in each
+  // executor's in-memory catalog rather than on disk.
+  // Spark's HOST_LOCAL optimization reads shuffle files
+  // directly from the writer executor's local disk,
+  // bypassing the writer's BlockManager (and its catalog).
+  // This causes FileNotFoundException for skipMerge
+  // shuffles that have no disk files. Disabling host-local
+  // disk reads forces all inter-executor fetches through
+  // the network path, which correctly consults the remote
+  // executor's catalog.
+  if (conf.getBoolean("spark.gluten.sql.columnar.shuffle.skipMerge", defaultValue = false)) {
+    conf.set(config.SHUFFLE_HOST_LOCAL_DISK_READING_ENABLED, false)
+    logInfo(
+      "Disabled spark.shuffle.readHostLocalDisk.enabled" +
+        s" (verified=${conf.get(config.SHUFFLE_HOST_LOCAL_DISK_READING_ENABLED)})" +
+        " because shuffle.skipMerge is active")
+    if (conf.getBoolean("spark.shuffle.service.enabled", defaultValue = false)) {
+      logWarning(
+        "skipMerge is incompatible with External " +
+          "Shuffle Service (ESS). ESS reads shuffle " +
+          "data from disk but skipMerge keeps data " +
+          "in memory. Shuffle reads from ESS will " +
+          "fail with FileNotFoundException.")
+    }
+  }
 
   private lazy val shuffleExecutorComponents =
     loadShuffleExecutorComponents(conf)

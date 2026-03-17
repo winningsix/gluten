@@ -1031,6 +1031,15 @@ LocalPartitionWriter::sortEvict(uint32_t partitionId, std::unique_ptr<InMemoryPa
 }
 
 arrow::Status LocalPartitionWriter::reclaimFixedSize(int64_t size, int64_t* actual) {
+  if (options_->skipMerge) {
+    // In skipMerge mode, wire-format buffers are allocated from
+    // arrow::default_memory_pool() (untracked). Reclaiming from
+    // the tracked payloadPool_ yields almost nothing, and the
+    // concurrent access to PayloadCache is not thread-safe.
+    *actual = 0;
+    return arrow::Status::OK();
+  }
+
   // Finish last spiller.
   RETURN_NOT_OK(finishSpill());
 
