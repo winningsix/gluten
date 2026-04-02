@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include "WholeStageResultIterator.h"
+#include <chrono>
 #include "VeloxBackend.h"
 #include "VeloxPlanConverter.h"
 #include "VeloxRuntime.h"
@@ -66,6 +67,7 @@ const std::string kNumWrittenFiles = "numWrittenFiles";
 const std::string kWriteIOTime = "writeIOWallNanos";
 const std::string kPinnedAllocBytes = "pinnedAllocBytes";
 const std::string kPageableAllocBytes = "pageableAllocBytes";
+const std::string kGpuComputeNanos = "gpuComputeNanos";
 
 // others
 const std::string kHiveDefaultPartition = "__HIVE_DEFAULT_PARTITION__";
@@ -307,7 +309,13 @@ std::shared_ptr<velox::core::QueryCtx> WholeStageResultIterator::createNewVeloxQ
 }
 
 std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
+  auto nextStart = std::chrono::steady_clock::now();
+  ++nextCallCount_;
+
   if (task_->isFinished()) {
+    auto nextEnd = std::chrono::steady_clock::now();
+    totalNextNanos_ += std::chrono::duration_cast<
+        std::chrono::nanoseconds>(nextEnd - nextStart).count();
     return nullptr;
   }
   velox::RowVectorPtr vector;
@@ -325,33 +333,48 @@ std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
 
   while (true) {
     auto future = velox::ContinueFuture::makeEmpty();
+    auto veloxStart = std::chrono::steady_clock::now();
     auto out = task_->next(&future);
+    auto veloxEnd = std::chrono::steady_clock::now();
+    totalVeloxNextNanos_ += std::chrono::duration_cast<
+        std::chrono::nanoseconds>(veloxEnd - veloxStart).count();
     if (!future.valid()) {
-      // Not need to wait. Break.
       vector = std::move(out);
       break;
     }
-    // Velox suggested to wait. This might be because another thread (e.g., background io thread) is spilling the task.
-    GLUTEN_CHECK(out == nullptr, "Expected to wait but still got non-null output from Velox task");
+    GLUTEN_CHECK(
+        out == nullptr,
+        "Expected to wait but still got non-null output");
     VLOG(2) << "Velox task " << task_->taskId()
-            << " is busy when ::next() is called. Will wait and try again. Task state: "
+            << " is busy when ::next() is called. "
+            << "Will wait and try again. Task state: "
             << taskStateString(task_->state());
     future.wait();
   }
 
+  auto recordAndReturn =
+      [&](std::shared_ptr<ColumnarBatch> result)
+      -> std::shared_ptr<ColumnarBatch> {
+    auto nextEnd = std::chrono::steady_clock::now();
+    totalNextNanos_ += std::chrono::duration_cast<
+        std::chrono::nanoseconds>(nextEnd - nextStart).count();
+    return result;
+  };
+
   if (vector == nullptr) {
-    return nullptr;
+    return recordAndReturn(nullptr);
   }
   uint64_t numRows = vector->size();
   if (numRows == 0) {
-    return nullptr;
+    return recordAndReturn(nullptr);
   }
 
 #ifdef GLUTEN_ENABLE_GPU
-  if (auto cudfVec =
-          std::dynamic_pointer_cast<velox::cudf_velox::CudfVector>(vector)) {
+  if (auto cudfVec = std::dynamic_pointer_cast<
+          velox::cudf_velox::CudfVector>(vector)) {
     auto numCols = cudfVec->getTableView().num_columns();
-    return std::make_shared<VeloxColumnarBatch>(vector, numCols);
+    return recordAndReturn(
+        std::make_shared<VeloxColumnarBatch>(vector, numCols));
   }
 #endif
 
@@ -362,7 +385,8 @@ std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
     }
   }
 
-  return std::make_shared<VeloxColumnarBatch>(vector);
+  return recordAndReturn(
+      std::make_shared<VeloxColumnarBatch>(vector));
 }
 
 int64_t WholeStageResultIterator::spillFixedSize(int64_t size) {
@@ -493,13 +517,23 @@ void WholeStageResultIterator::noMoreSplits() {
 
 void WholeStageResultIterator::collectMetrics() {
   if (metrics_) {
-    // The metrics has already been created.
     return;
   }
 
+  LOG(WARNING) << "collectMetrics() called, task state="
+               << static_cast<int>(task_->state());
+
+  LOG(WARNING) << "[TIMING] " << taskInfo_
+               << " totalNextNanos=" << totalNextNanos_
+               << " veloxNextNanos=" << totalVeloxNextNanos_
+               << " wrapperNanos="
+               << (totalNextNanos_ - totalVeloxNextNanos_)
+               << " nextCalls=" << nextCallCount_;
+
   const auto& taskStats = task_->taskStats();
   if (taskStats.executionStartTimeMs == 0) {
-    LOG(INFO) << "Skip collect task metrics since task did not call next().";
+    LOG(INFO) << "Skip collect task metrics since "
+              << "task did not call next().";
     return;
   }
 
@@ -619,6 +653,16 @@ void WholeStageResultIterator::collectMetrics() {
           runtimeMetric("sum", second->customStats, kPinnedAllocBytes);
       metrics_->get(Metrics::kPageableAllocBytes)[metricIndex] =
           runtimeMetric("sum", second->customStats, kPageableAllocBytes);
+      auto gpuVal =
+          runtimeMetric("sum", second->customStats, kGpuComputeNanos);
+      metrics_->get(Metrics::kGpuComputeTime)[metricIndex] = gpuVal;
+      if (gpuVal > 0 || second->customStats.count(kGpuComputeNanos)) {
+        LOG(WARNING) << "collectMetrics opType="
+                     << entry.first
+                     << " gpuComputeNanos=" << gpuVal
+                     << " present="
+                     << second->customStats.count(kGpuComputeNanos);
+      }
 
       metricIndex += 1;
     }

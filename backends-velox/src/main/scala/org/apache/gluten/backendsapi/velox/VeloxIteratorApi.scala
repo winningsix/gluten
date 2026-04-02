@@ -196,6 +196,8 @@ class VeloxIteratorApi extends IteratorApi with Logging {
       inputPartition.isInstanceOf[GlutenPartition],
       "Velox backend only accept GlutenPartition.")
 
+    val planBuildStart = System.nanoTime()
+
     if (enableCudf) {
       trySetCurrentTask(context)
     }
@@ -210,8 +212,8 @@ class VeloxIteratorApi extends IteratorApi with Logging {
       "spark.gluten.sql.columnar.cudf.skipOutputToVelox" ->
         skipOutputToVelox.toString
     ).asJava
-    val transKernel =
-      NativePlanEvaluator.create(BackendsApiManager.getBackendName, extraConf)
+    val transKernel = NativePlanEvaluator
+      .create(BackendsApiManager.getBackendName, extraConf)
 
     val splitInfoByteArray = inputPartition
       .asInstanceOf[GlutenPartition]
@@ -226,12 +228,22 @@ class VeloxIteratorApi extends IteratorApi with Logging {
     val resIter: ColumnarBatchOutIterator =
       transKernel.createKernelWithBatchIterator(
         inputPartition.plan,
-        if (splitInfoByteArray.nonEmpty) splitInfoByteArray else null,
-        if (columnarNativeIterators.nonEmpty) columnarNativeIterators.toArray else null,
+        if (splitInfoByteArray.nonEmpty) {
+          splitInfoByteArray
+        } else null,
+        if (columnarNativeIterators.nonEmpty) {
+          columnarNativeIterators.toArray
+        } else null,
         partitionIndex,
-        BackendsApiManager.getSparkPlanExecApiInstance.rewriteSpillPath(spillDirPath)
+        BackendsApiManager.getSparkPlanExecApiInstance
+          .rewriteSpillPath(spillDirPath)
       )
     resIter.noMoreSplits()
+
+    val tracker =
+      org.apache.gluten.metrics.TaskWallTimeTracker.get()
+    tracker.planBuildNanos +=
+      (System.nanoTime() - planBuildStart)
     val itrMetrics = IteratorMetricsJniWrapper.create()
 
     Iterators
@@ -267,6 +279,8 @@ class VeloxIteratorApi extends IteratorApi with Logging {
       enableCudf: Boolean = false,
       skipOutputToVelox: Boolean = false
   ): Iterator[ColumnarBatch] = {
+    val planBuildStart = System.nanoTime()
+
     if (enableCudf) {
       trySetCurrentTask(context)
     }
@@ -277,8 +291,8 @@ class VeloxIteratorApi extends IteratorApi with Logging {
       "spark.gluten.sql.columnar.cudf.skipOutputToVelox" ->
         skipOutputToVelox.toString
     ).asJava
-    val transKernel =
-      NativePlanEvaluator.create(BackendsApiManager.getBackendName, extraConf)
+    val transKernel = NativePlanEvaluator
+      .create(BackendsApiManager.getBackendName, extraConf)
     val columnarNativeIterator =
       inputIterators.map {
         iter => new ColumnarBatchInIterator(BackendsApiManager.getBackendName, iter.asJava)
@@ -292,11 +306,19 @@ class VeloxIteratorApi extends IteratorApi with Logging {
       transKernel.createKernelWithBatchIterator(
         rootNode.toProtobuf.toByteArray,
         null,
-        if (columnarNativeIterator.nonEmpty) columnarNativeIterator.toArray else null,
+        if (columnarNativeIterator.nonEmpty) {
+          columnarNativeIterator.toArray
+        } else null,
         partitionIndex,
-        BackendsApiManager.getSparkPlanExecApiInstance.rewriteSpillPath(spillDirPath)
+        BackendsApiManager.getSparkPlanExecApiInstance
+          .rewriteSpillPath(spillDirPath)
       )
     nativeResultIterator.noMoreSplits()
+
+    val tracker =
+      org.apache.gluten.metrics.TaskWallTimeTracker.get()
+    tracker.planBuildNanos +=
+      (System.nanoTime() - planBuildStart)
     val itrMetrics = IteratorMetricsJniWrapper.create()
 
     Iterators

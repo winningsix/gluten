@@ -17,6 +17,7 @@
 package org.apache.gluten.columnarbatch;
 
 import org.apache.gluten.memory.arrow.alloc.ArrowBufferAllocators;
+import org.apache.gluten.metrics.TaskWallTimeTracker;
 import org.apache.gluten.runtime.Runtime;
 import org.apache.gluten.runtime.Runtimes;
 import org.apache.gluten.utils.ArrowAbiUtil;
@@ -179,6 +180,17 @@ public final class ColumnarBatches {
   }
 
   public static ColumnarBatch load(BufferAllocator allocator, ColumnarBatch input) {
+    long start = System.nanoTime();
+    try {
+      return loadInternal(allocator, input);
+    } finally {
+      TaskWallTimeTracker t = TaskWallTimeTracker.get();
+      t.arrowImportNanos += System.nanoTime() - start;
+      t.arrowImportCalls++;
+    }
+  }
+
+  private static ColumnarBatch loadInternal(BufferAllocator allocator, ColumnarBatch input) {
     if (isZeroColumnBatch(input)) {
       return input;
     }

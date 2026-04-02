@@ -218,18 +218,25 @@ object TaskResources extends TaskListener with Logging {
         })
       tc.addTaskCompletionListener(new TaskCompletionListener {
         override def onTaskCompletion(context: TaskContext): Unit = {
+          val cleanupStart = System.nanoTime()
           RESOURCE_REGISTRIES.synchronized {
-            val currentTaskRegistries = RESOURCE_REGISTRIES.get(context)
+            val currentTaskRegistries =
+              RESOURCE_REGISTRIES.get(context)
             if (currentTaskRegistries == null) {
               throw new IllegalStateException(
-                "TaskResourceRegistry is not initialized, this should not happen")
+                "TaskResourceRegistry is not initialized" +
+                  ", this should not happen")
             }
-            // We should first call `releaseAll` then remove the registries, because
-            // the functions inside registries may register new resource to registries.
             currentTaskRegistries.releaseAll()
-            context.taskMetrics().incPeakExecutionMemory(registry.getSharedUsage().peak())
+            context
+              .taskMetrics()
+              .incPeakExecutionMemory(registry.getSharedUsage().peak())
             RESOURCE_REGISTRIES.remove(context)
           }
+          val tracker = org.apache.gluten.metrics.TaskWallTimeTracker.get()
+          tracker.taskCleanupNanos +=
+            (System.nanoTime() - cleanupStart)
+          tracker.logAndReset(context.stageId(), context.taskAttemptId())
         }
       })
     }

@@ -93,6 +93,7 @@ class HashAggregateMetricsUpdaterImpl(val metrics: Map[String, SQLMetric])
     }
 
     loadLazyVectorTime += aggregationMetrics.asScala.last.loadLazyVectorTime
+    metrics.get("gpuComputeTime").foreach(_ += aggMetrics.gpuComputeTime)
 
     if (TaskResources.inSparkTask()) {
       SparkMetricsUtil.incMemoryBytesSpilled(

@@ -142,6 +142,13 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
   bool allSplitsAdded_ = false;
 
   int64_t loadLazyVectorTime_ = 0;
+
+  /// Wall-time accumulators for task duration decomposition.
+  /// totalNextNanos_: wall time inside WholeStageResultIterator::next()
+  /// totalVeloxNextNanos_: wall time inside task_->next() (subset)
+  int64_t totalNextNanos_ = 0;
+  int64_t totalVeloxNextNanos_ = 0;
+  int32_t nextCallCount_ = 0;
 };
 
 } // namespace gluten
