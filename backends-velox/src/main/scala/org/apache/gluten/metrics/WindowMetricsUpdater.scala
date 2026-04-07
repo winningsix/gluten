@@ -35,6 +35,7 @@ class WindowMetricsUpdater(val metrics: Map[String, SQLMetric]) extends MetricsU
       metrics("spilledPartitions") += operatorMetrics.spilledPartitions
       metrics("spilledFiles") += operatorMetrics.spilledFiles
       metrics("loadLazyVectorTime") += operatorMetrics.loadLazyVectorTime
+      metrics.get("gpuComputeTime").foreach(_ += operatorMetrics.gpuComputeTime)
     }
   }
 }

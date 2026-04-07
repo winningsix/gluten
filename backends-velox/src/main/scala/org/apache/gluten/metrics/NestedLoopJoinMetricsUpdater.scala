@@ -62,6 +62,7 @@ class NestedLoopJoinMetricsUpdater(override val metrics: Map[String, SQLMetric])
     nestedLoopJoinProbeWallNanos += nestedLoopJoinProbeMetrics.wallNanos
     nestedLoopJoinProbePeakMemoryBytes += nestedLoopJoinProbeMetrics.peakMemoryBytes
     nestedLoopJoinProbeNumMemoryAllocations += nestedLoopJoinProbeMetrics.numMemoryAllocations
+    metrics.get("gpuComputeTime").foreach(_ += nestedLoopJoinProbeMetrics.gpuComputeTime)
 
     // nestedLoopJoinBuild
     val nestedLoopJoinBuildMetrics = joinMetrics.get(1)

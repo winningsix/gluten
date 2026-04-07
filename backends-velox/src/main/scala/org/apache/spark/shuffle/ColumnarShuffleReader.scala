@@ -70,6 +70,7 @@ class ColumnarShuffleReader[K, C](
 
   /** Read the combined key-values for this reduce task */
   override def read(): Iterator[Product2[K, C]] = {
+    val shuffleReadStart = System.nanoTime()
     val wrappedStreams = new ShuffleBlockFetcherIterator(
       context,
       blockManager.blockStoreClient,
@@ -120,7 +121,13 @@ class ColumnarShuffleReader[K, C](
       },
       context.taskMetrics().mergeShuffleReadMetrics())
 
-    // An interruptible iterator must be used here in order to support task cancellation
+    val tracker =
+      org.apache.gluten.metrics.TaskWallTimeTracker.get()
+    tracker.shuffleReadInitNanos +=
+      (System.nanoTime() - shuffleReadStart)
+
+    // An interruptible iterator must be used here
+    // in order to support task cancellation
     new InterruptibleIterator[(Any, Any)](context, metricIter)
       .asInstanceOf[Iterator[Product2[K, C]]]
   }

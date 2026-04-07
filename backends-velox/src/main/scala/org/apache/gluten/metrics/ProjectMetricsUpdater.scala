@@ -35,6 +35,7 @@ class ProjectMetricsUpdater(
       metrics("numMemoryAllocations") += operatorMetrics.numMemoryAllocations
       metrics("loadLazyVectorTime") += operatorMetrics.loadLazyVectorTime
       metrics("numCoalescedBatches") += operatorMetrics.numCoalescedBatches
+      metrics.get("gpuComputeTime").foreach(_ += operatorMetrics.gpuComputeTime)
       extraMetrics.foreach {
         case (name, metric) =>
           name match {

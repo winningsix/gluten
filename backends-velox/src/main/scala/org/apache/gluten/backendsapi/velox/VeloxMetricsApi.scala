@@ -76,7 +76,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
     Map(
       "cpuCount" -> SQLMetrics.createMetric(sparkContext, "cpu wall time count"),
       "wallNanos" -> wallNanosMetric,
-      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches")
+      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     ) ++ outputMetrics
   }
 
@@ -130,7 +131,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
         "time of loading lazy vectors"),
       "pinnedAllocBytes" -> SQLMetrics.createSizeMetric(sparkContext, "pinned alloc bytes"),
       "pageableAllocBytes" -> SQLMetrics.createSizeMetric(sparkContext, "pageable alloc bytes"),
-      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches")
+      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   override def genBatchScanTransformerMetricsUpdater(
@@ -184,7 +186,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
         "time of loading lazy vectors"),
       "pinnedAllocBytes" -> SQLMetrics.createSizeMetric(sparkContext, "pinned alloc bytes"),
       "pageableAllocBytes" -> SQLMetrics.createSizeMetric(sparkContext, "pageable alloc bytes"),
-      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches")
+      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   override def genHiveTableScanTransformerMetricsUpdater(
@@ -238,7 +241,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
         "time of loading lazy vectors"),
       "pinnedAllocBytes" -> SQLMetrics.createSizeMetric(sparkContext, "pinned alloc bytes"),
       "pageableAllocBytes" -> SQLMetrics.createSizeMetric(sparkContext, "pageable alloc bytes"),
-      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches")
+      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   override def genFileSourceScanTransformerMetricsUpdater(
@@ -258,7 +262,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
       "loadLazyVectorTime" -> SQLMetrics.createNanoTimingMetric(
         sparkContext,
         "time of loading lazy vectors"),
-      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches")
+      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   override def genFilterTransformerMetricsUpdater(
@@ -280,7 +285,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
       "loadLazyVectorTime" -> SQLMetrics.createNanoTimingMetric(
         sparkContext,
         "time of loading lazy vectors"),
-      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches")
+      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   override def genProjectTransformerMetricsUpdater(
@@ -332,7 +338,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
         "number of final output vectors"),
       "loadLazyVectorTime" -> SQLMetrics.createNanoTimingMetric(
         sparkContext,
-        "time of loading lazy vectors")
+        "time of loading lazy vectors"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   override def genHashAggregateTransformerMetricsUpdater(
@@ -352,7 +359,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
         "number of memory allocations"),
       "loadLazyVectorTime" -> SQLMetrics.createNanoTimingMetric(
         sparkContext,
-        "time of loading lazy vectors")
+        "time of loading lazy vectors"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   override def genExpandTransformerMetricsUpdater(metrics: Map[String, SQLMetric]): MetricsUpdater =
@@ -424,7 +432,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
       "spilledFiles" -> SQLMetrics.createMetric(sparkContext, "total spilled files"),
       "loadLazyVectorTime" -> SQLMetrics.createNanoTimingMetric(
         sparkContext,
-        "time of loading lazy vectors")
+        "time of loading lazy vectors"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   override def genWindowTransformerMetricsUpdater(metrics: Map[String, SQLMetric]): MetricsUpdater =
@@ -457,7 +466,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
         "number of memory allocations"),
       "loadLazyVectorTime" -> SQLMetrics.createNanoTimingMetric(
         sparkContext,
-        "time of loading lazy vectors")
+        "time of loading lazy vectors"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   override def genLimitTransformerMetricsUpdater(metrics: Map[String, SQLMetric]): MetricsUpdater =
@@ -473,7 +483,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
       "numWrittenFiles" -> SQLMetrics.createMetric(sparkContext, "number of written files"),
       "loadLazyVectorTime" -> SQLMetrics.createNanoTimingMetric(
         sparkContext,
-        "time of loading lazy vectors")
+        "time of loading lazy vectors"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   def genWriteFilesTransformerMetricsUpdater(metrics: Map[String, SQLMetric]): MetricsUpdater =
@@ -504,7 +515,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
       "spilledFiles" -> SQLMetrics.createMetric(sparkContext, "total spilled files"),
       "loadLazyVectorTime" -> SQLMetrics.createNanoTimingMetric(
         sparkContext,
-        "time of loading lazy vectors")
+        "time of loading lazy vectors"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   override def genSortTransformerMetricsUpdater(metrics: Map[String, SQLMetric]): MetricsUpdater =
@@ -668,7 +680,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
       "loadLazyVectorTime" -> SQLMetrics.createNanoTimingMetric(
         sparkContext,
         "time of loading lazy vectors"),
-      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches")
+      "numCoalescedBatches" -> SQLMetrics.createMetric(sparkContext, "number of coalesced batches"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   override def genHashJoinTransformerMetricsUpdater(
@@ -736,7 +749,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
       "numOutputBytes" -> SQLMetrics.createSizeMetric(sparkContext, "number of output bytes"),
       "loadLazyVectorTime" -> SQLMetrics.createNanoTimingMetric(
         sparkContext,
-        "time of loading lazy vectors")
+        "time of loading lazy vectors"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   override def genNestedLoopJoinTransformerMetricsUpdater(
@@ -755,7 +769,8 @@ class VeloxMetricsApi extends MetricsApi with Logging {
         "number of memory allocations"),
       "loadLazyVectorTime" -> SQLMetrics.createNanoTimingMetric(
         sparkContext,
-        "time of loading lazy vectors")
+        "time of loading lazy vectors"),
+      "gpuComputeTime" -> SQLMetrics.createNanoTimingMetric(sparkContext, "gpu compute time")
     )
 
   override def genSampleTransformerMetricsUpdater(metrics: Map[String, SQLMetric]): MetricsUpdater =

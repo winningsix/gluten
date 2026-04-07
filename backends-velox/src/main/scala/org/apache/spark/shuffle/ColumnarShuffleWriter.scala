@@ -143,6 +143,7 @@ class ColumnarShuffleWriter[K, V](
         logInfo(s"Skip ColumnarBatch of ${cb.numRows} rows, ${cb.numCols} cols")
       } else {
         if (nativeShuffleWriter == -1L) {
+          val initStart = System.nanoTime()
           val compressionThreads = GlutenConfig.get.columnarShuffleCompressionThreads
           if (compressionThreads > 1) {
             logInfo(s"Parallel shuffle compression: $compressionThreads threads")
@@ -220,6 +221,10 @@ class ColumnarShuffleWriter[K, V](
                   case _ => 0L
                 }
             })
+          org.apache.gluten.metrics.TaskWallTimeTracker
+            .get()
+            .shuffleWriterInitNanos +=
+            (System.nanoTime() - initStart)
         }
 
         val rows = cb.numRows()
@@ -231,7 +236,11 @@ class ColumnarShuffleWriter[K, V](
           rows,
           columnarBatchHandle,
           availableOffHeapPerTask())
-        dep.metrics("shuffleWallTime").add(System.nanoTime() - startTime)
+        val writeElapsed = System.nanoTime() - startTime
+        dep.metrics("shuffleWallTime").add(writeElapsed)
+        org.apache.gluten.metrics.TaskWallTimeTracker
+          .get()
+          .shuffleWriteJniNanos += writeElapsed
         dep.metrics("numInputRows").add(rows)
         dep.metrics("inputBatches").add(1)
         writeMetrics.incBytesWritten(bytesWritten)
@@ -246,11 +255,15 @@ class ColumnarShuffleWriter[K, V](
       return
     }
 
-    val startTime = System.nanoTime()
+    val stopStart = System.nanoTime()
     assert(nativeShuffleWriter != -1L)
     splitResult = shuffleWriterJniWrapper.stop(nativeShuffleWriter)
     closeShuffleWriter()
-    dep.metrics("shuffleWallTime").add(System.nanoTime() - startTime)
+    val stopElapsed = System.nanoTime() - stopStart
+    dep.metrics("shuffleWallTime").add(stopElapsed)
+    org.apache.gluten.metrics.TaskWallTimeTracker
+      .get()
+      .shuffleWriteStopNanos += stopElapsed
     if (!isSort) {
       dep
         .metrics("splitTime")
@@ -285,10 +298,8 @@ class ColumnarShuffleWriter[K, V](
         s" map=$mapId skipMergeUsed=$skipMergeUsed" +
         s" spilled=${splitResult.getTotalBytesSpilled}" +
         s" written=${splitResult.getBytesWritten}")
+    val metaStart = System.nanoTime()
     if (skipMergeUsed) {
-      // Data is in native catalog. Write a minimal index
-      // so MapStatus reporting works, but skip committing
-      // the data file.
       shuffleBlockResolver.writeMetadataFileAndCommit(
         dep.shuffleId,
         mapId,
@@ -314,6 +325,10 @@ class ColumnarShuffleWriter[K, V](
         }
       }
     }
+    val metaTracker =
+      org.apache.gluten.metrics.TaskWallTimeTracker.get()
+    metaTracker.shuffleWriteMetaNanos +=
+      (System.nanoTime() - metaStart)
 
     mapStatus = MapStatus(blockManager.shuffleServerId, partitionLengths, mapId)
   }

@@ -37,6 +37,7 @@ class SortMetricsUpdater(val metrics: Map[String, SQLMetric]) extends MetricsUpd
       metrics("spilledPartitions") += operatorMetrics.spilledPartitions
       metrics("spilledFiles") += operatorMetrics.spilledFiles
       metrics("loadLazyVectorTime") += operatorMetrics.loadLazyVectorTime
+      metrics.get("gpuComputeTime").foreach(_ += operatorMetrics.gpuComputeTime)
       if (TaskResources.inSparkTask()) {
         SparkMetricsUtil.incMemoryBytesSpilled(
           TaskResources.getLocalTaskContext().taskMetrics(),

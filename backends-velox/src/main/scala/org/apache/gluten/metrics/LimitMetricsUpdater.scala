@@ -31,6 +31,7 @@ class LimitMetricsUpdater(val metrics: Map[String, SQLMetric]) extends MetricsUp
       metrics("peakMemoryBytes") += operatorMetrics.peakMemoryBytes
       metrics("numMemoryAllocations") += operatorMetrics.numMemoryAllocations
       metrics("loadLazyVectorTime") += operatorMetrics.loadLazyVectorTime
+      metrics.get("gpuComputeTime").foreach(_ += operatorMetrics.gpuComputeTime)
     }
   }
 }

@@ -132,6 +132,7 @@ class HashJoinMetricsUpdater(override val metrics: Map[String, SQLMetric])
     hashProbeDynamicFiltersProduced += hashProbeMetrics.numDynamicFiltersProduced
     bloomFilterBlocksByteSize += hashProbeMetrics.bloomFilterBlocksByteSize
     numCoalescedBatches += hashProbeMetrics.numCoalescedBatches
+    metrics.get("gpuComputeTime").foreach(_ += hashProbeMetrics.gpuComputeTime)
     idx += 1
 
     // HashBuild

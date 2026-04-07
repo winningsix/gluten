@@ -61,6 +61,7 @@ class BatchScanMetricsUpdater(val metrics: Map[String, SQLMetric]) extends Metri
       metrics("pinnedAllocBytes") += operatorMetrics.pinnedAllocBytes
       metrics("pageableAllocBytes") += operatorMetrics.pageableAllocBytes
       metrics("numCoalescedBatches") += operatorMetrics.numCoalescedBatches
+      metrics.get("gpuComputeTime").foreach(_ += operatorMetrics.gpuComputeTime)
     }
   }
 }

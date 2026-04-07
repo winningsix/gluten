@@ -100,6 +100,9 @@ struct Metrics {
     kPinnedAllocBytes,
     kPageableAllocBytes,
 
+    // CUDA event-based GPU compute time (nanoseconds).
+    kGpuComputeTime,
+
     // The end of enum items.
     kEnd,
     kNum = kEnd - kBegin

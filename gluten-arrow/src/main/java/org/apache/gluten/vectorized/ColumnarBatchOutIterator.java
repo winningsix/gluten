@@ -18,6 +18,7 @@ package org.apache.gluten.vectorized;
 
 import org.apache.gluten.columnarbatch.ColumnarBatches;
 import org.apache.gluten.iterator.ClosableIterator;
+import org.apache.gluten.metrics.TaskWallTimeTracker;
 import org.apache.gluten.runtime.Runtime;
 import org.apache.gluten.runtime.RuntimeAware;
 
@@ -60,14 +61,39 @@ public class ColumnarBatchOutIterator extends ClosableIterator<ColumnarBatch>
 
   @Override
   public boolean hasNext0() throws IOException {
-    return nativeHasNext(iterHandle);
+    TaskWallTimeTracker t = TaskWallTimeTracker.get();
+    boolean outermost = (t.nativeNestingDepth == 0);
+    t.nativeNestingDepth++;
+    long start = outermost ? System.nanoTime() : 0;
+    try {
+      return nativeHasNext(iterHandle);
+    } finally {
+      t.nativeNestingDepth--;
+      if (outermost) {
+        t.nativeHasNextNanos += System.nanoTime() - start;
+        t.nativeHasNextCalls++;
+      }
+    }
   }
 
   @Override
   public ColumnarBatch next0() throws IOException {
-    long batchHandle = nativeNext(iterHandle);
+    TaskWallTimeTracker t = TaskWallTimeTracker.get();
+    boolean outermost = (t.nativeNestingDepth == 0);
+    t.nativeNestingDepth++;
+    long start = outermost ? System.nanoTime() : 0;
+    long batchHandle;
+    try {
+      batchHandle = nativeNext(iterHandle);
+    } finally {
+      t.nativeNestingDepth--;
+      if (outermost) {
+        t.nativeNextNanos += System.nanoTime() - start;
+        t.nativeNextCalls++;
+      }
+    }
     if (batchHandle == -1L) {
-      return null; // stream ended
+      return null;
     }
     return ColumnarBatches.create(batchHandle);
   }

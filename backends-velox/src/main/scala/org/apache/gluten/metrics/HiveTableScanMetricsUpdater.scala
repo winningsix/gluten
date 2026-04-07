@@ -48,6 +48,10 @@ class HiveTableScanMetricsUpdater(@transient val metrics: Map[String, SQLMetric]
   val localReadBytes: SQLMetric = metrics("localReadBytes")
   val ramReadBytes: SQLMetric = metrics("ramReadBytes")
   val loadLazyVectorTime: SQLMetric = metrics("loadLazyVectorTime")
+  val pinnedAllocBytes: SQLMetric = metrics("pinnedAllocBytes")
+  val pageableAllocBytes: SQLMetric = metrics("pageableAllocBytes")
+  val numCoalescedBatches: SQLMetric = metrics("numCoalescedBatches")
+  val gpuComputeTime: Option[SQLMetric] = metrics.get("gpuComputeTime")
 
   override def updateInputMetrics(inputMetrics: InputMetricsWrapper): Unit = {
     inputMetrics.bridgeIncBytesRead(rawInputBytes.value)
@@ -67,7 +71,6 @@ class HiveTableScanMetricsUpdater(@transient val metrics: Map[String, SQLMetric]
       scanTime += operatorMetrics.scanTime
       peakMemoryBytes += operatorMetrics.peakMemoryBytes
       numMemoryAllocations += operatorMetrics.numMemoryAllocations
-      // Number of dynamic filters received.
       numDynamicFiltersAccepted += operatorMetrics.numDynamicFiltersAccepted
       skippedSplits += operatorMetrics.skippedSplits
       processedSplits += operatorMetrics.processedSplits
@@ -83,9 +86,10 @@ class HiveTableScanMetricsUpdater(@transient val metrics: Map[String, SQLMetric]
       dataSourceAddSplitTime += operatorMetrics.dataSourceAddSplitTime
       dataSourceReadTime += operatorMetrics.dataSourceReadTime
       loadLazyVectorTime += operatorMetrics.loadLazyVectorTime
-      metrics("pinnedAllocBytes") += operatorMetrics.pinnedAllocBytes
-      metrics("pageableAllocBytes") += operatorMetrics.pageableAllocBytes
-      metrics("numCoalescedBatches") += operatorMetrics.numCoalescedBatches
+      pinnedAllocBytes += operatorMetrics.pinnedAllocBytes
+      pageableAllocBytes += operatorMetrics.pageableAllocBytes
+      numCoalescedBatches += operatorMetrics.numCoalescedBatches
+      gpuComputeTime.foreach(_ += operatorMetrics.gpuComputeTime)
     }
   }
 }

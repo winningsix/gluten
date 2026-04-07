@@ -28,10 +28,16 @@ case class VeloxBroadcastBuildSideRDD(
   extends BroadcastBuildSideRDD(sc, broadcasted) {
 
   override def genBroadcastBuildSideIterator(): Iterator[ColumnarBatch] = {
+    val start = System.nanoTime()
     val relation = broadcasted.value.asReadOnlyCopy()
-    Iterators
+    val iter = Iterators
       .wrap(relation.deserialized)
       .recyclePayload(batch => batch.close())
       .create()
+    val tracker =
+      org.apache.gluten.metrics.TaskWallTimeTracker.get()
+    tracker.broadcastBuildNanos +=
+      (System.nanoTime() - start)
+    iter
   }
 }
