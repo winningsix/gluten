@@ -61,23 +61,39 @@ public class ColumnarBatchOutIterator extends ClosableIterator<ColumnarBatch>
 
   @Override
   public boolean hasNext0() throws IOException {
-    long start = System.nanoTime();
-    boolean result = nativeHasNext(iterHandle);
     TaskWallTimeTracker t = TaskWallTimeTracker.get();
-    t.nativeHasNextNanos += System.nanoTime() - start;
-    t.nativeHasNextCalls++;
-    return result;
+    boolean outermost = (t.nativeNestingDepth == 0);
+    t.nativeNestingDepth++;
+    long start = outermost ? System.nanoTime() : 0;
+    try {
+      return nativeHasNext(iterHandle);
+    } finally {
+      t.nativeNestingDepth--;
+      if (outermost) {
+        t.nativeHasNextNanos += System.nanoTime() - start;
+        t.nativeHasNextCalls++;
+      }
+    }
   }
 
   @Override
   public ColumnarBatch next0() throws IOException {
-    long start = System.nanoTime();
-    long batchHandle = nativeNext(iterHandle);
     TaskWallTimeTracker t = TaskWallTimeTracker.get();
-    t.nativeNextNanos += System.nanoTime() - start;
-    t.nativeNextCalls++;
+    boolean outermost = (t.nativeNestingDepth == 0);
+    t.nativeNestingDepth++;
+    long start = outermost ? System.nanoTime() : 0;
+    long batchHandle;
+    try {
+      batchHandle = nativeNext(iterHandle);
+    } finally {
+      t.nativeNestingDepth--;
+      if (outermost) {
+        t.nativeNextNanos += System.nanoTime() - start;
+        t.nativeNextCalls++;
+      }
+    }
     if (batchHandle == -1L) {
-      return null; // stream ended
+      return null;
     }
     return ColumnarBatches.create(batchHandle);
   }

@@ -143,6 +143,7 @@ class ColumnarShuffleWriter[K, V](
         logInfo(s"Skip ColumnarBatch of ${cb.numRows} rows, ${cb.numCols} cols")
       } else {
         if (nativeShuffleWriter == -1L) {
+          val initStart = System.nanoTime()
           val compressionThreads = GlutenConfig.get.columnarShuffleCompressionThreads
           if (compressionThreads > 1) {
             logInfo(s"Parallel shuffle compression: $compressionThreads threads")
@@ -220,6 +221,10 @@ class ColumnarShuffleWriter[K, V](
                   case _ => 0L
                 }
             })
+          org.apache.gluten.metrics.TaskWallTimeTracker
+            .get()
+            .shuffleWriterInitNanos +=
+            (System.nanoTime() - initStart)
         }
 
         val rows = cb.numRows()

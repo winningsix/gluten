@@ -196,6 +196,7 @@ object TaskResources extends TaskListener with Logging {
     if (!inSparkTask()) {
       throw new IllegalStateException("Not in a Spark task")
     }
+    org.apache.gluten.metrics.TaskWallTimeTracker.get().taskStartNanos = System.nanoTime()
     val tc = getLocalTaskContext()
     RESOURCE_REGISTRIES.synchronized {
       if (RESOURCE_REGISTRIES.containsKey(tc)) {
