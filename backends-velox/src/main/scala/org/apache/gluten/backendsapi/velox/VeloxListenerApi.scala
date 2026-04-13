@@ -385,6 +385,10 @@ object VeloxListenerApi {
     // Workaround for https://github.com/apache/incubator-gluten/issues/7837
     if (isDriver && !inLocalMode(conf)) {
       parsed += (COLUMNAR_VELOX_CACHE_ENABLED.key -> "false")
+      // Disable cuDF on driver in cluster mode to prevent GPU/RMM initialization
+      // (cudaMallocAsync) on driver nodes that may not have a GPU.
+      // GPU init should only happen on executors.
+      parsed += (GlutenConfig.COLUMNAR_CUDF_ENABLED.key -> "false")
     }
 
     parsed

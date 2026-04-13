@@ -349,6 +349,18 @@ std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
             << " is busy when ::next() is called. "
             << "Will wait and try again. Task state: "
             << taskStateString(task_->state());
+#ifdef GLUTEN_ENABLE_GPU
+    if (enableCudf_) {
+      // Release GPU semaphore permit before blocking. The pipeline may
+      // have partially executed (e.g., CudfFromVelox acquired the region)
+      // before an operator signalled "blocked". All GpuGuards are
+      // stack-local and already destroyed, but gpuRegionActive and its
+      // refcount may still be held. Releasing here prevents a thread from
+      // holding a GPU permit while sleeping on a future, which can cause
+      // deadlock when all permits are consumed by sleeping threads.
+      facebook::velox::cudf_velox::endGpuRegion();
+    }
+#endif
     future.wait();
   }
 

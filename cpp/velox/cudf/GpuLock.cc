@@ -17,7 +17,9 @@
 
 #include "GpuLock.h"
 #include <condition_variable>
+#include <iostream>
 #include <mutex>
+#include <thread>
 #include <glog/logging.h>
 #include <nvtx3/nvtx3.hpp>
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
@@ -60,12 +62,20 @@ int getMaxConcurrentGpuTasks() {
 }
 
 void lockGpu() {
+  auto tid = std::this_thread::get_id();
   if (tLocalRefCount > 0) {
     ++tLocalRefCount;
+    std::cerr << "GPU_LOCK [lockGpu-reentrant] tid=" << tid
+              << " refCount=" << tLocalRefCount
+              << " caller=" << __builtin_return_address(0) << std::endl;
     return;
   }
   auto& s = getState();
   std::unique_lock<std::mutex> lock(s.mutex);
+  std::cerr << "GPU_LOCK [lockGpu-wait] tid=" << tid
+            << " activeCount=" << s.activeCount
+            << " maxConcurrent=" << s.maxConcurrent
+            << " caller=" << __builtin_return_address(0) << std::endl;
   {
     nvtx3::scoped_range_in<
         facebook::velox::cudf_velox::VeloxDomain>
@@ -78,19 +88,33 @@ void lockGpu() {
   }
   ++s.activeCount;
   tLocalRefCount = 1;
+  std::cerr << "GPU_LOCK [lockGpu-acquired] tid=" << tid
+            << " activeCount=" << s.activeCount
+            << " refCount=" << tLocalRefCount
+            << " caller=" << __builtin_return_address(0) << std::endl;
 }
 
 void unlockGpu() {
+  auto tid = std::this_thread::get_id();
   if (tLocalRefCount <= 0) {
+    std::cerr << "GPU_LOCK [unlockGpu-noop] tid=" << tid
+              << " refCount=" << tLocalRefCount
+              << " caller=" << __builtin_return_address(0) << std::endl;
     return;
   }
   --tLocalRefCount;
   if (tLocalRefCount > 0) {
+    std::cerr << "GPU_LOCK [unlockGpu-reentrant] tid=" << tid
+              << " refCount=" << tLocalRefCount
+              << " caller=" << __builtin_return_address(0) << std::endl;
     return;
   }
   auto& s = getState();
   std::unique_lock<std::mutex> lock(s.mutex);
   --s.activeCount;
+  std::cerr << "GPU_LOCK [unlockGpu-released] tid=" << tid
+            << " activeCount=" << s.activeCount
+            << " caller=" << __builtin_return_address(0) << std::endl;
   lock.unlock();
   s.cv.notify_one();
 }

@@ -33,6 +33,7 @@ IMAGE_EXPLICIT=false
 SPARK_VERSION="3.5"
 BUILD_ARROW="ON"
 ENABLE_HDFS="OFF"
+ENABLE_S3="OFF"
 REBUILD=false   # if true: skip Arrow, clear cmake cache, re-run velox+cpp+mvn only
 
 # Velox source — only used if VELOX_DIR does not exist (fallback clone).
@@ -63,6 +64,7 @@ Options:
                             (default: https://gitlab-master.nvidia.com/alfxu/velox.git)
   --velox_branch=BRANCH     Velox branch to clone (default: alfxu_dev)
   --enable_hdfs=ON|OFF      Enable HDFS support (default: OFF)
+  --enable_s3=ON|OFF        Enable S3 support (default: OFF)
   --cuda_arch=ARCH          CUDA compute architectures (default: native)
                             native     — auto-detect local GPU
                             all-major  — 70,75,80,86,89,90 (portable)
@@ -81,6 +83,7 @@ for arg in "$@"; do
     --velox_repo=*)    VELOX_REPO="${arg#*=}" ;;
     --velox_branch=*)  VELOX_BRANCH="${arg#*=}" ;;
     --enable_hdfs=*)   ENABLE_HDFS="${arg#*=}" ;;
+    --enable_s3=*)     ENABLE_S3="${arg#*=}" ;;
     --cuda_arch=*)     CUDA_ARCH="${arg#*=}"; CUDA_ARCH_EXPLICIT=true ;;
     -h|--help)         usage; exit 0 ;;
     *) echo "Unknown option: $arg"; usage; exit 1 ;;
@@ -227,6 +230,7 @@ docker exec "$CONTAINER_NAME" bash -c "
     --spark_version=${SPARK_VERSION} \
     --enable_gpu=ON \
     --enable_hdfs=${ENABLE_HDFS} \
+    --enable_s3=${ENABLE_S3} \
     --velox_home=/opt/velox \
     --velox_repo=${VELOX_REPO} \
     --velox_branch=${VELOX_BRANCH} \

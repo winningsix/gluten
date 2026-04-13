@@ -29,6 +29,7 @@
 #include "velox/exec/Task.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include "cudf/GpuLock.h"
+#include "velox/experimental/cudf/exec/GpuGuard.h"
 #endif
 
 namespace gluten {
@@ -52,7 +53,15 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
     }
 #ifdef GLUTEN_ENABLE_GPU
     if (enableCudf_) {
-      unlockGpu();
+      // Clear the thread-local GPU region flag AND release the semaphore
+      // permit. When the pipeline returns CudfVector directly to Java
+      // (no CudfToVelox), endGpuRegion() is never called inside the
+      // pipeline, leaving gpuRegionActive=true. If we only call
+      // unlockGpu() here, gpuRegionActive leaks to the next task on this
+      // thread, breaking region-based permit batching and causing
+      // per-operator acquire/release that leads to deadlock under
+      // contention.
+      facebook::velox::cudf_velox::endGpuRegion();
     }
 #endif
   }
