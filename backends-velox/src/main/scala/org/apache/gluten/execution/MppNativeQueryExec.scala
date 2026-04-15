@@ -23,8 +23,8 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
-import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, UnknownPartitioning}
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.catalyst.plans.physical.Partitioning
+import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -49,39 +49,30 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
  * @param originalPlan
  *   The original SparkPlan before MPP collapse (for explain/debugging).
  */
+/**
+ * Plan D: Wrap, don't replace.
+ *
+ * MppNativeQueryExec wraps the original plan as its child (UnaryExecNode).
+ * Spark sees the original plan (including ShuffleExchange nodes) still intact,
+ * so the "cannot transform shuffle node" validation passes.
+ *
+ * At execution time, doExecuteColumnar() does NOT call child.executeColumnar().
+ * Instead, it uses the child plan only to extract Substrait fragments, then
+ * executes via JNI → MppQueryCoordinator (streaming exchange).
+ */
 case class MppNativeQueryExec(
+    child: SparkPlan,
     fragments: Seq[NativeFragment],
-    exchanges: Seq[ExchangeSpec],
-    originalPlan: SparkPlan
-) extends SparkPlan
+    exchanges: Seq[ExchangeSpec]
+) extends UnaryExecNode
   with GlutenPlan
   with Logging {
 
-  // --- Output schema and partitioning ---
+  // --- Output schema and partitioning (delegate to child) ---
 
-  override def output: Seq[Attribute] = originalPlan.output
-
-  override def outputPartitioning: Partitioning = {
-    // The final fragment determines the output partitioning.
-    // In most cases this is the root fragment's partitioning.
-    if (fragments.nonEmpty) {
-      fragments.last.rootOperator.outputPartitioning
-    } else {
-      UnknownPartitioning(0)
-    }
-  }
-
-  override def outputOrdering: Seq[SortOrder] = {
-    if (fragments.nonEmpty) {
-      fragments.last.rootOperator.outputOrdering
-    } else {
-      Nil
-    }
-  }
-
-  // --- Leaf node from Spark's perspective ---
-
-  override def children: Seq[SparkPlan] = Nil
+  override def output: Seq[Attribute] = child.output
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+  override def outputOrdering: Seq[SortOrder] = child.outputOrdering
 
   // --- Convention support for GlutenPlan ---
 
@@ -154,6 +145,10 @@ case class MppNativeQueryExec(
     sb.toString()
   }
 
+  override protected def withNewChildInternal(newChild: SparkPlan): MppNativeQueryExec = {
+    copy(child = newChild)
+  }
+
   private def fragmentSummary: String = {
     fragments
       .map {
@@ -180,12 +175,4 @@ case class MppNativeQueryExec(
       .mkString("\n")
   }
 
-  // --- TreeNode support ---
-
-  // MppNativeQueryExec is a leaf from Spark's perspective, so no withNewChildInternal needed.
-  // But SparkPlan requires it for completeness.
-  override protected def withNewChildrenInternal(newChildren: IndexedSeq[SparkPlan]): SparkPlan = {
-    assert(newChildren.isEmpty, "MppNativeQueryExec is a leaf node and has no children")
-    this
-  }
 }

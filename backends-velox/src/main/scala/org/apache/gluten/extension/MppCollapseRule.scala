@@ -147,7 +147,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         s"${fragments.size} fragments and ${exchanges.size} exchanges. " +
         s"All stages will run concurrently with streaming exchange.")
 
-    Some(MppNativeQueryExec(fragments, exchanges, plan))
+    // Plan D: Wrap, don't replace. Keep original plan as child so Spark's
+    // shuffle/broadcast validation passes. At execution time, MppNativeQueryExec
+    // bypasses child.executeColumnar() and runs via MppQueryCoordinator instead.
+    Some(MppNativeQueryExec(child = plan, fragments = fragments, exchanges = exchanges))
   }
 
   /**
