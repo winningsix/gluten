@@ -102,9 +102,9 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     if (!isMppEnabled) {
       return plan
     }
-    logInfo("MppCollapseRule: attempting MPP collapse on query plan")
+    logWarning("MppCollapseRule: attempting MPP collapse on query plan")
     tryCollapseMpp(plan).getOrElse {
-      logInfo("MppCollapseRule: plan is not fully MPP-eligible, falling back to BSP mode")
+      logWarning("MppCollapseRule: FALLBACK TO BSP")
       plan
     }
   }
@@ -121,11 +121,16 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    */
   private def tryCollapseMpp(plan: SparkPlan): Option[MppNativeQueryExec] = {
     if (!isFullyNativeSupported(plan)) {
-      logInfo(
+      val reason = findFirstUnsupportedOperator(plan).getOrElse("unknown")
+      logWarning(
         s"MppCollapseRule: plan contains non-native operators, " +
-          s"cannot collapse to MPP: ${findFirstUnsupportedOperator(plan)}")
+          s"cannot collapse to MPP. First blocker: $reason. " +
+          s"Plan root: ${plan.getClass.getSimpleName}. " +
+          s"Plan: ${plan.treeString.take(500)}")
       return None
     }
+
+    logWarning("MppCollapseRule: plan is fully native-supported, extracting fragments...")
 
     val fragmentCounter = new AtomicInteger(0)
     val exchangeCounter = new AtomicInteger(0)
@@ -137,9 +142,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       return None
     }
 
-    logInfo(
-      s"MppCollapseRule: successfully collapsed plan into " +
-        s"${fragments.size} fragments and ${exchanges.size} exchanges")
+    logWarning(
+      s"MppCollapseRule: *** MPP MODE ACTIVE *** — collapsed plan into " +
+        s"${fragments.size} fragments and ${exchanges.size} exchanges. " +
+        s"All stages will run concurrently with streaming exchange.")
 
     Some(MppNativeQueryExec(fragments, exchanges, plan))
   }
@@ -158,7 +164,9 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
       // Broadcast exchanges cannot be absorbed — Spark requires broadcast nodes
       // to remain intact. Queries with broadcast joins fall back to BSP.
-      case _: BroadcastExchangeLike =>
+      case bc: BroadcastExchangeLike =>
+        logWarning(
+          s"MppCollapseRule: BLOCKED by BroadcastExchangeLike: ${bc.getClass.getSimpleName}")
         false
 
       // AQE query stage wrappers — check their underlying plan
@@ -172,9 +180,20 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case _: TransformSupport =>
         plan.children.forall(isFullyNativeSupported)
 
-      // Any non-native operator means we cannot do MPP
+      // ColumnarToRow at the top of the plan is OK — Spark always adds this
+      // to convert columnar output to rows for the driver. Look through it.
+      case c2r: ColumnarToRowExecBase =>
+        c2r.children.forall(isFullyNativeSupported)
+
+      // Gluten-internal columnar-to-columnar nodes (batch resize, etc.) — look through
+      case c2c: ColumnarToColumnarExec =>
+        c2c.children.forall(isFullyNativeSupported)
+
+      // Any other non-native operator means we cannot do MPP
       case other =>
-        logDebug(s"MppCollapseRule: unsupported operator ${other.getClass.getSimpleName}")
+        logWarning(
+          s"MppCollapseRule: BLOCKED by non-native operator: " +
+            s"${other.getClass.getSimpleName} (${other.simpleString(50)})")
         false
     }
   }
@@ -195,6 +214,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         findFirstUnsupportedOperator(plan.asInstanceOf[BroadcastQueryStageExec].plan)
       case _: TransformSupport =>
         plan.children.flatMap(findFirstUnsupportedOperator).headOption
+      case _: ColumnarToRowExecBase =>
+        plan.children.flatMap(findFirstUnsupportedOperator).headOption
+      case _: ColumnarToColumnarExec =>
+        plan.children.flatMap(findFirstUnsupportedOperator).headOption
       case other =>
         Some(s"${other.getClass.getSimpleName}: ${other.simpleString(20)}")
     }
@@ -214,12 +237,18 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         val partitioningSupported = isSupportedPartitioning(shuffle.outputPartitioning)
         val childSupported = shuffle.child.isInstanceOf[TransformSupport] ||
           shuffle.child.isInstanceOf[ShuffleQueryStageExec] ||
-          shuffle.child.isInstanceOf[BroadcastQueryStageExec]
+          shuffle.child.isInstanceOf[BroadcastQueryStageExec] ||
+          shuffle.child.isInstanceOf[ColumnarToColumnarExec]
 
         if (!partitioningSupported) {
-          logDebug(
-            s"MppCollapseRule: unsupported partitioning " +
+          logWarning(
+            s"MppCollapseRule: canAbsorbExchange=false: unsupported partitioning " +
               s"${shuffle.outputPartitioning.getClass.getSimpleName}")
+        }
+        if (!childSupported) {
+          logWarning(
+            s"MppCollapseRule: canAbsorbExchange=false: child not supported: " +
+              s"${shuffle.child.getClass.getSimpleName}")
         }
 
         partitioningSupported && childSupported
@@ -243,10 +272,13 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     partitioning match {
       case _: HashPartitioning => true
       case _: RoundRobinPartitioning => true
+      case _: RangePartitioning => true
       case SinglePartition => true
       case _: BroadcastPartitioning => true
       case _: UnknownPartitioning => false
-      case _ => false
+      case other =>
+        logWarning(s"MppCollapseRule: unsupported partitioning type: ${other.getClass.getSimpleName}")
+        false
     }
   }
 

@@ -25,4 +25,14 @@ class VeloxTPCHFloatSuite extends VeloxTPCHSuite {
   override protected val resourcePath: String = "/tpch-data-parquet-float"
   override def subType(): String = "float"
   override def shouldCheckGoldenFiles(): Boolean = false
+
+  override protected def sparkConf: org.apache.spark.SparkConf = {
+    super.sparkConf
+      // Override shuffle partitions to force shuffle exchanges in the plan.
+      // The parent sets it to 1, which lets Spark optimize away shuffles entirely.
+      // With 4 partitions, agg/join queries will have ShuffleExchange nodes,
+      // giving MppCollapseRule something to absorb.
+      .set("spark.sql.shuffle.partitions", "4")
+      .set("spark.sql.adaptive.enabled", "false")
+  }
 }

@@ -23,18 +23,16 @@ import org.apache.gluten.iterator.Iterators
 import org.apache.gluten.substrait.SubstraitContext
 import org.apache.gluten.substrait.plan.PlanBuilder
 import org.apache.gluten.utils.SubstraitPlanPrinterUtil
-import org.apache.gluten.vectorized.NativePlanEvaluator
+import org.apache.gluten.runtime.Runtimes
+import org.apache.gluten.vectorized.MppQueryJniWrapper
 
 import org.apache.spark.{Partition, SparkContext, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.vectorized.ColumnarBatch
-import org.apache.spark.util.SparkDirectoryUtil
 
 import com.google.common.collect.Lists
-
-import java.util.UUID
 
 import scala.collection.JavaConverters._
 
@@ -96,80 +94,66 @@ class MppNativeQueryRDD(
     val exchangeSpecsJson = serializeExchangeSpecs(exchanges)
     logDebug(s"MppNativeQueryRDD: exchange specs JSON: $exchangeSpecsJson")
 
-    // 3. Submit all fragment plans to the native runtime.
-    //    We use the existing NativePlanEvaluator infrastructure. The final fragment's
-    //    plan is the "main" plan, and the other fragment plans + exchange specs are
-    //    passed as additional metadata.
-    //
-    //    For the initial implementation, we serialize all fragment plans into a
-    //    combined plan descriptor that the native side can parse.
-    val finalFragmentPlan = fragmentPlans.last
-    val inputFragmentPlans = if (fragmentPlans.size > 1) {
-      fragmentPlans.init.toArray
-    } else {
-      Array.empty[Array[Byte]]
-    }
+    // 3. Submit all fragment plans to MppQueryCoordinator via JNI.
+    //    This launches ALL fragments concurrently (MPP all-stages-up)
+    //    and wires them together via OutputBufferManager streaming exchange.
+    logInfo(
+      s"MppNativeQueryRDD: *** LAUNCHING MPP EXECUTION *** " +
+        s"with ${fragmentPlans.size} fragments, ${exchanges.size} exchanges")
 
-    val transKernel = NativePlanEvaluator.create(
-      BackendsApiManager.getBackendName,
-      Map(
-        "spark.gluten.mpp.enabled" -> "true",
-        "spark.gluten.mpp.numFragments" -> fragments.size.toString,
-        "spark.gluten.mpp.numExchanges" -> exchanges.size.toString,
-        "spark.gluten.mpp.exchangeSpecs" -> exchangeSpecsJson
-      ).asJava
-    )
+    val numDriversPerFragment = fragments.map(_.parallelism).toArray
+    val runtime = Runtimes.contextInstance(BackendsApiManager.getBackendName, "MppQuery")
+    val jniWrapper = MppQueryJniWrapper.create(runtime)
+    val mppHandle = jniWrapper.nativeCreateMppQuery(
+      fragmentPlans.toArray,
+      numDriversPerFragment,
+      exchangeSpecsJson.getBytes("UTF-8"))
+    jniWrapper.nativeStartMppQuery(mppHandle)
 
-    val spillDirPath = SparkDirectoryUtil
-      .get()
-      .namespace("gluten-spill")
-      .mkChildDirRoundRobin(UUID.randomUUID.toString)
-      .getAbsolutePath
-
-    // Pass the final fragment plan as the main plan.
-    // Input fragment plans are passed as split infos (byte arrays) so the native
-    // side can reconstruct the full MPP topology.
-    val splitInfos: Array[Array[Byte]] =
-      if (inputFragmentPlans.nonEmpty) inputFragmentPlans else null
-
-    val resIter = transKernel.createKernelWithBatchIterator(
-      finalFragmentPlan,
-      splitInfos,
-      null, // no input iterators -- MPP fragments feed each other natively
-      split.index,
-      BackendsApiManager.getSparkPlanExecApiInstance.rewriteSpillPath(spillDirPath)
-    )
-    resIter.noMoreSplits()
+    logInfo("MppNativeQueryRDD: all MPP fragments started, streaming exchange active")
 
     val tracker = org.apache.gluten.metrics.TaskWallTimeTracker.get()
     tracker.planBuildNanos += (System.nanoTime() - planBuildStart)
 
-    // 4. Wrap the native iterator with lifecycle management.
-    //    Follow the same pattern as VeloxIteratorApi.genFirstStageIterator:
-    //    - recycleIterator: close the native iterator when done
-    //    - recyclePayload: close each batch after it has been consumed
-    //    - collectLifeMillis: track pipeline wall time
-    val wrappedIter = Iterators
-      .wrap(resIter.asScala)
-      .protectInvocationFlow()
-      .recycleIterator {
-        resIter.close()
-      }
-      .recyclePayload(batch => batch.close())
-      .collectLifeMillis(millis => pipelineTime += millis)
-      .asInterruptible(context)
-      .create()
+    // 4. Create iterator that pulls batches from MppQueryCoordinator via JNI.
+    val mppIter = new Iterator[ColumnarBatch] {
+      private var nextHandle: Long = -1L
+      private var finished = false
 
-    // Wrap with metric counting: count rows and batches as they are produced.
-    new Iterator[ColumnarBatch] {
-      override def hasNext: Boolean = wrappedIter.hasNext
+      override def hasNext: Boolean = {
+        if (finished) return false
+        if (nextHandle != -1L) return true
+        nextHandle = jniWrapper.nativeGetMppOutput(mppHandle)
+        if (nextHandle == 0L) {
+          finished = true
+          jniWrapper.nativeCloseMppQuery(mppHandle)
+          logInfo("MppNativeQueryRDD: MPP execution complete, all fragments finished")
+          false
+        } else {
+          true
+        }
+      }
+
       override def next(): ColumnarBatch = {
-        val batch = wrappedIter.next()
+        if (!hasNext) throw new NoSuchElementException("MPP iterator exhausted")
+        val handle = nextHandle
+        nextHandle = -1L
+        // Convert native handle to ColumnarBatch using Gluten's standard mechanism
+        val batch = org.apache.gluten.columnarbatch.ColumnarBatches.create(handle)
         outputRows += batch.numRows()
         outputBatches += 1
         batch
       }
     }
+
+    // Wrap with lifecycle management
+    Iterators
+      .wrap(mppIter)
+      .protectInvocationFlow()
+      .recyclePayload(batch => batch.close())
+      .collectLifeMillis(millis => pipelineTime += millis)
+      .asInterruptible(context)
+      .create()
   }
 
   /**
