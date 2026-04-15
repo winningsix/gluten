@@ -114,25 +114,28 @@ case class MppNativeQueryExec(
   }
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
-    // TODO (M4): Wire to JNI for native MPP execution.
-    // The implementation will:
-    // 1. Generate Substrait plans for each fragment via WholeStageTransformContext
-    // 2. Serialize fragment plans + exchange specs into MppExecutionDescriptor protobuf
-    // 3. Call JNI: NativePlanExecutor.executeMppPlan(descriptor)
-    // 4. Return the result RDD from the native runtime
-    //
-    // For now, this is a stub that fails at runtime if someone tries to execute
-    // an MPP plan before JNI integration is complete.
     logInfo(
-      s"MppNativeQueryExec: plan has ${fragments.size} fragments " +
+      s"MppNativeQueryExec: executing plan with ${fragments.size} fragments " +
         s"and ${exchanges.size} exchanges")
     logInfo(s"MppNativeQueryExec: fragment details:\n$fragmentSummary")
     logInfo(s"MppNativeQueryExec: exchange details:\n$exchangeSummary")
 
-    throw new UnsupportedOperationException(
-      "MPP native execution is not yet implemented. " +
-        "JNI integration is planned for M4. " +
-        s"Plan: ${fragments.size} fragments, ${exchanges.size} exchanges.")
+    // Update fragment/exchange count metrics.
+    metrics("numFragments") += fragments.size
+    metrics("numExchanges") += exchanges.size
+
+    // Create the MPP RDD that handles Substrait plan generation, JNI submission,
+    // and native iterator consumption. The RDD is single-partition because the
+    // native MPP coordinator handles all parallelism internally via streaming
+    // GPU exchanges.
+    new MppNativeQueryRDD(
+      sparkContext,
+      fragments,
+      exchanges,
+      longMetric("totalQueryTimeMs"),
+      longMetric("outputRows"),
+      longMetric("outputBatches")
+    )
   }
 
   // --- Explain / toString ---

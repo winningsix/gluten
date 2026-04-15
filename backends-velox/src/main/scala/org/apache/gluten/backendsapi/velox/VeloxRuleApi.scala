@@ -136,6 +136,12 @@ object VeloxRuleApi {
     SparkShimLoader.getSparkShims
       .getExtendedColumnarPostRules()
       .foreach(each => injector.injectPost(c => each(c.session)))
+    // MPP collapse runs BEFORE BSP collapse: if the plan is fully MPP-eligible,
+    // MppCollapseRule replaces it with a single MppNativeQueryExec and
+    // ColumnarCollapseTransformStages becomes a no-op on that subtree.
+    // If not MPP-eligible, MppCollapseRule passes through unchanged and
+    // ColumnarCollapseTransformStages handles BSP wrapping as usual.
+    injector.injectPost(c => MppCollapseRule(new GlutenConfig(c.sqlConf)))
     injector.injectPost(c => ColumnarCollapseTransformStages(new GlutenConfig(c.sqlConf)))
     injector.injectPost(_ => GenerateTransformStageId())
     injector.injectPost(c => CudfNodeValidationRule(new GlutenConfig(c.sqlConf)))
@@ -237,6 +243,8 @@ object VeloxRuleApi {
     SparkShimLoader.getSparkShims
       .getExtendedColumnarPostRules()
       .foreach(each => injector.injectPostTransform(c => each(c.session)))
+    // MPP collapse runs BEFORE BSP collapse in the RAS path as well.
+    injector.injectPostTransform(c => MppCollapseRule(new GlutenConfig(c.sqlConf)))
     injector.injectPostTransform(c => ColumnarCollapseTransformStages(new GlutenConfig(c.sqlConf)))
     injector.injectPostTransform(_ => GenerateTransformStageId())
     injector.injectPostTransform(c => CudfNodeValidationRule(new GlutenConfig(c.sqlConf)))

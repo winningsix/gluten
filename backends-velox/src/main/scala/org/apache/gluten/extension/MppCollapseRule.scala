@@ -96,7 +96,7 @@ case class ExchangeSpec(
 case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] with Logging {
 
   private val MPP_ENABLED_KEY = "spark.gluten.mpp.enabled"
-  private val MPP_ENABLED_DEFAULT = "false"
+  private val MPP_ENABLED_DEFAULT = "true"
 
   override def apply(plan: SparkPlan): SparkPlan = {
     if (!isMppEnabled) {
@@ -156,8 +156,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case exchange: ShuffleExchangeLike =>
         canAbsorbExchange(exchange) && isFullyNativeSupported(exchange.child)
 
-      case exchange: BroadcastExchangeLike =>
-        canAbsorbExchange(exchange) && exchange.children.forall(isFullyNativeSupported)
+      // Broadcast exchanges cannot be absorbed — Spark requires broadcast nodes
+      // to remain intact. Queries with broadcast joins fall back to BSP.
+      case _: BroadcastExchangeLike =>
+        false
 
       // AQE query stage wrappers — check their underlying plan
       case stage: ShuffleQueryStageExec =>

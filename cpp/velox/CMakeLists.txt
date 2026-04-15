@@ -149,6 +149,7 @@ get_filename_component(VELOX_PROTO_DIR ${VELOX_PROTO_SRC_DIR}/ DIRECTORY)
 # Build Velox backend.
 set(VELOX_SRCS
     ${VELOX_PROTO_SRCS}
+    compute/MppQueryCoordinator.cc
     compute/VeloxBackend.cc
     compute/VeloxRuntime.cc
     compute/VeloxPlanConverter.cc
@@ -156,6 +157,7 @@ set(VELOX_SRCS
     compute/iceberg/IcebergPlanConverter.cc
     jni/JniFileSystem.cc
     jni/JniUdf.cc
+    jni/MppJniWrapper.cc
     jni/VeloxJniWrapper.cc
     memory/BufferOutputStream.cc
     memory/VeloxColumnarBatch.cc
