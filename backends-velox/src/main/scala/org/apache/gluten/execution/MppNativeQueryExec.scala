@@ -98,11 +98,24 @@ case class MppNativeQueryExec(
 
   // --- Execution ---
 
+  // MppNativeQueryExec wraps the plan including ColumnarToRow.
+  // Spark calls doExecute() (row-based) on the top-level node.
+  // We execute columnar and convert to rows.
   override protected def doExecute(): RDD[InternalRow] = {
-    throw new UnsupportedOperationException(
-      s"MppNativeQueryExec does not support row-based execution. " +
-        s"Use executeColumnar() instead.")
+    doExecuteColumnar().mapPartitions { batches =>
+      batches.flatMap { batch =>
+        val numRows = batch.numRows()
+        val rows = new Array[InternalRow](numRows)
+        for (i <- 0 until numRows) {
+          rows(i) = batch.getRow(i).copy()
+        }
+        batch.close()
+        rows.iterator
+      }
+    }
   }
+
+  // supportsColumnar is already true via GlutenPlan
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
     logInfo(

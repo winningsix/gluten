@@ -303,12 +303,42 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     val fragments = scala.collection.mutable.ArrayBuffer[NativeFragment]()
     val exchanges = scala.collection.mutable.ArrayBuffer[ExchangeSpec]()
 
+    /**
+     * Check whether a node is an exchange boundary (or a wrapper around one) that should be
+     * handled by `walk` rather than `walkInFragment`. This looks through transparent wrappers:
+     * ColumnarToColumnarExec (e.g. VeloxResizeBatchesExec), ColumnarToRowExecBase, and AQE
+     * query stage nodes.
+     */
+    def isExchangeBoundary(node: SparkPlan): Boolean = {
+      node match {
+        case _: ShuffleExchangeLike | _: BroadcastExchangeLike => true
+        case _: ShuffleQueryStageExec | _: BroadcastQueryStageExec => true
+        case c2c: ColumnarToColumnarExec => isExchangeBoundary(c2c.child)
+        case c2r: ColumnarToRowExecBase => isExchangeBoundary(c2r.child)
+        case _ => false
+      }
+    }
+
+    /**
+     * Unwrap transparent wrapper nodes (ColumnarToColumnarExec, ColumnarToRowExecBase, AQE
+     * query stages) to reach the underlying exchange or TransformSupport node.
+     */
+    def unwrapToExchange(node: SparkPlan): SparkPlan = {
+      node match {
+        case c2c: ColumnarToColumnarExec => unwrapToExchange(c2c.child)
+        case c2r: ColumnarToRowExecBase => unwrapToExchange(c2r.child)
+        case stage: ShuffleQueryStageExec => unwrapToExchange(stage.plan)
+        case stage: BroadcastQueryStageExec => unwrapToExchange(stage.plan)
+        case other => other
+      }
+    }
+
     // Walk the plan, building fragments. Returns the fragment ID of the current subtree's root.
     def walk(node: SparkPlan): Int = {
       node match {
         case shuffle: ShuffleExchangeLike =>
           // The child of the exchange belongs to the producer fragment
-          val producerFragmentId = walk(unwrapQueryStage(shuffle.child))
+          val producerFragmentId = walk(unwrapToExchange(shuffle.child))
 
           // Create the consumer fragment (the exchange source side)
           val consumerFragmentId = fragmentCounter.getAndIncrement()
@@ -338,7 +368,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
         case broadcast: BroadcastExchangeLike =>
           // Similar to shuffle but with BROADCAST type
-          val childPlan = broadcast.children.headOption.map(unwrapQueryStage).getOrElse(broadcast)
+          val childPlan = broadcast.children.headOption
+            .map(unwrapToExchange).getOrElse(broadcast)
           val producerFragmentId = walk(childPlan)
 
           val consumerFragmentId = fragmentCounter.getAndIncrement()
@@ -370,20 +401,31 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         case stage: BroadcastQueryStageExec =>
           walk(stage.plan)
 
+        // Look through transparent wrapper nodes to reach the actual operator
+        case c2r: ColumnarToRowExecBase =>
+          walk(c2r.child)
+
+        case c2c: ColumnarToColumnarExec =>
+          walk(c2c.child)
+
         case transformNode =>
           // This is a TransformSupport node. Walk all children first.
-          // Children that are exchanges have already been processed and their fragment IDs returned.
-          // Children that are TransformSupport are part of the same fragment.
+          // Children that are exchanges (or wrappers around exchanges) are processed
+          // via walk(). Children that are TransformSupport are part of the same fragment.
           val childFragmentIds = transformNode.children.map {
             child =>
-              child match {
-                case _: ShuffleExchangeLike | _: BroadcastExchangeLike | _: ShuffleQueryStageExec |
-                    _: BroadcastQueryStageExec =>
-                  walk(child)
-                case _ =>
-                  // Non-exchange child — belongs to the same fragment, walk recursively
-                  walkInFragment(child)
-                  -1 // sentinel: not a separate fragment
+              if (isExchangeBoundary(child)) {
+                walk(unwrapToExchange(child))
+              } else {
+                child match {
+                  case _: ShuffleExchangeLike | _: BroadcastExchangeLike |
+                      _: ShuffleQueryStageExec | _: BroadcastQueryStageExec =>
+                    walk(child)
+                  case _ =>
+                    // Non-exchange child — belongs to the same fragment, walk recursively
+                    walkInFragment(child)
+                    -1 // sentinel: not a separate fragment
+                }
               }
           }
 
@@ -406,17 +448,26 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
      * Walk within a fragment (no exchange boundaries). This just recurses through TransformSupport
      * nodes that are part of the same fragment. We don't create new fragments here — the parent
      * call handles fragment creation.
+     *
+     * When we encounter ColumnarToColumnarExec or ColumnarToRowExecBase wrapping an exchange,
+     * we route back to walk() to handle the exchange boundary properly.
      */
     def walkInFragment(node: SparkPlan): Unit = {
       node.children.foreach {
-        case _: ShuffleExchangeLike | _: BroadcastExchangeLike | _: ShuffleQueryStageExec |
-            _: BroadcastQueryStageExec =>
-          // These should have been caught by the parent walk
-          throw new IllegalStateException(
-            "Unexpected exchange within fragment walk. " +
-              "This indicates a bug in MppCollapseRule.extractFragments.")
-        case child =>
-          walkInFragment(child)
+        child =>
+          if (isExchangeBoundary(child)) {
+            // This is a wrapper around an exchange — route to walk() to handle it
+            walk(unwrapToExchange(child))
+          } else {
+            child match {
+              case _: ShuffleExchangeLike | _: BroadcastExchangeLike | _: ShuffleQueryStageExec |
+                  _: BroadcastQueryStageExec =>
+                // Bare exchange — route to walk()
+                walk(child)
+              case _ =>
+                walkInFragment(child)
+            }
+          }
       }
     }
 
