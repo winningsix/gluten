@@ -102,10 +102,24 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     if (!isMppEnabled) {
       return plan
     }
+    // Plan C check: if MppStrategy already claimed this plan (producing
+    // MppNativeQueryExec at the strategy level), skip Plan D collapse.
+    if (alreadyHandledByMppStrategy(plan)) {
+      logWarning("MppCollapseRule: plan already handled by MppStrategy (Plan C), skipping")
+      return plan
+    }
     logWarning("MppCollapseRule: attempting MPP collapse on query plan")
     tryCollapseMpp(plan).getOrElse {
       logWarning("MppCollapseRule: FALLBACK TO BSP")
       plan
+    }
+  }
+
+  /** Check if the plan tree already contains MppNativeQueryExec (set by MppStrategy / Plan C). */
+  private def alreadyHandledByMppStrategy(plan: SparkPlan): Boolean = {
+    plan match {
+      case _: MppNativeQueryExec => true
+      case _ => plan.children.exists(alreadyHandledByMppStrategy)
     }
   }
 

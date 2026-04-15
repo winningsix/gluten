@@ -69,6 +69,10 @@ object VeloxRuleApi {
     if (BackendsApiManager.getSettings.supportAppendDataExec()) {
       injector.injectPlannerStrategy(SparkShimLoader.getSparkShims.getRewriteCreateTableAsSelect(_))
     }
+    // Plan C: MPP strategy -- intercepts entire logical plan before EnsureRequirements.
+    // Must be injected after other strategies so it can see the full logical plan.
+    // extraStrategies are tried BEFORE built-in strategies, so MppStrategy gets first shot.
+    injector.injectPlannerStrategy(session => MppStrategy(session))
   }
 
   /**
