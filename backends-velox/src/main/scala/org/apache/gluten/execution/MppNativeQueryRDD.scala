@@ -17,12 +17,7 @@
 package org.apache.gluten.execution
 
 import org.apache.gluten.backendsapi.BackendsApiManager
-import org.apache.gluten.expression.ConverterUtils
-import org.apache.gluten.extension.{ExchangeSpec, NativeFragment}
 import org.apache.gluten.iterator.Iterators
-import org.apache.gluten.substrait.SubstraitContext
-import org.apache.gluten.substrait.plan.PlanBuilder
-import org.apache.gluten.utils.SubstraitPlanPrinterUtil
 import org.apache.gluten.runtime.Runtimes
 import org.apache.gluten.vectorized.MppQueryJniWrapper
 
@@ -32,16 +27,13 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
-import com.google.common.collect.Lists
-
-import scala.collection.JavaConverters._
-
 /**
  * RDD that executes an MPP query plan via JNI.
  *
  * This is a single-partition RDD: the native MPP coordinator handles all parallelism internally.
- * Each fragment's Substrait plan is generated at compute time and submitted to the native runtime
- * as a batch of plans connected by exchange specifications.
+ * Substrait plans are pre-generated on the driver side (by [[MppNativeQueryExec]]) and passed
+ * as serialized byte arrays. This avoids accessing SparkPlan.sparkContext on executor nodes
+ * (which would cause NPE).
  *
  * The native side creates an MppQueryCoordinator that:
  *   - Launches all fragment pipelines concurrently
@@ -50,10 +42,12 @@ import scala.collection.JavaConverters._
  *
  * @param sc
  *   The SparkContext.
- * @param fragments
- *   The ordered list of native execution fragments.
- * @param exchanges
- *   The exchange specifications connecting fragments.
+ * @param fragmentPlans
+ *   Pre-serialized Substrait plan bytes for each fragment (generated on driver).
+ * @param numDriversPerFragment
+ *   The parallelism for each fragment.
+ * @param exchangeSpecsJson
+ *   JSON-serialized exchange specifications (generated on driver).
  * @param pipelineTime
  *   Metric for tracking total pipeline execution time.
  * @param outputRows
@@ -63,8 +57,9 @@ import scala.collection.JavaConverters._
  */
 class MppNativeQueryRDD(
     @transient sc: SparkContext,
-    fragments: Seq[NativeFragment],
-    exchanges: Seq[ExchangeSpec],
+    fragmentPlans: Array[Array[Byte]],
+    numDriversPerFragment: Array[Int],
+    exchangeSpecsJson: String,
     pipelineTime: SQLMetric,
     outputRows: SQLMetric,
     outputBatches: SQLMetric
@@ -79,33 +74,22 @@ class MppNativeQueryRDD(
   override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
     val planBuildStart = System.nanoTime()
 
-    // 1. Generate Substrait plans for each fragment.
-    //    Each fragment's rootOperator is a TransformSupport -- call doTransform()
-    //    to get the Substrait plan, then serialize to bytes.
-    val fragmentPlans: Seq[Array[Byte]] = fragments.map { fragment =>
-      generateSubstraitPlan(fragment)
-    }
+    // Substrait plans and exchange specs were pre-generated on the driver side
+    // (by MppNativeQueryExec.doExecuteColumnar) to avoid NPE from accessing
+    // SparkPlan.sparkContext on executors.
 
-    logInfo(
-      s"MppNativeQueryRDD: generated ${fragmentPlans.size} Substrait plans " +
-        s"for ${fragments.size} fragments")
-
-    // 2. Serialize exchange specs to JSON for the native side.
-    val exchangeSpecsJson = serializeExchangeSpecs(exchanges)
-    logDebug(s"MppNativeQueryRDD: exchange specs JSON: $exchangeSpecsJson")
-
-    // 3. Submit all fragment plans to MppQueryCoordinator via JNI.
-    //    This launches ALL fragments concurrently (MPP all-stages-up)
-    //    and wires them together via OutputBufferManager streaming exchange.
     logInfo(
       s"MppNativeQueryRDD: *** LAUNCHING MPP EXECUTION *** " +
-        s"with ${fragmentPlans.size} fragments, ${exchanges.size} exchanges")
+        s"with ${fragmentPlans.length} fragments")
+    logDebug(s"MppNativeQueryRDD: exchange specs JSON: $exchangeSpecsJson")
 
-    val numDriversPerFragment = fragments.map(_.parallelism).toArray
+    // Submit all fragment plans to MppQueryCoordinator via JNI.
+    // This launches ALL fragments concurrently (MPP all-stages-up)
+    // and wires them together via OutputBufferManager streaming exchange.
     val runtime = Runtimes.contextInstance(BackendsApiManager.getBackendName, "MppQuery")
     val jniWrapper = MppQueryJniWrapper.create(runtime)
     val mppHandle = jniWrapper.nativeCreateMppQuery(
-      fragmentPlans.toArray,
+      fragmentPlans,
       numDriversPerFragment,
       exchangeSpecsJson.getBytes("UTF-8"))
     jniWrapper.nativeStartMppQuery(mppHandle)
@@ -156,100 +140,6 @@ class MppNativeQueryRDD(
       .create()
   }
 
-  /**
-   * Generate a Substrait plan for a single fragment.
-   *
-   * Uses the same pattern as [[WholeStageTransformer.doWholeStageTransform()]]:
-   *   1. Create a SubstraitContext
-   *   2. Call doTransform() on the fragment's root operator (TransformSupport)
-   *   3. Build a PlanNode and serialize to bytes
-   */
-  private def generateSubstraitPlan(fragment: NativeFragment): Array[Byte] = {
-    val rootOp = fragment.rootOperator
-    rootOp match {
-      case ts: TransformSupport =>
-        val substraitContext = new SubstraitContext
-        val childCtx = ts.transform(substraitContext)
-        if (childCtx == null) {
-          throw new IllegalStateException(
-            s"MppNativeQueryRDD: fragment ${fragment.id} root operator " +
-              s"${rootOp.getClass.getSimpleName} returned null from doTransform()")
-        }
-
-        val outNames = childCtx.outputAttributes
-          .map(ConverterUtils.genColumnNameWithExprId)
-          .asJava
-
-        val planNode = if (BackendsApiManager.getSettings.needOutputSchemaForPlan()) {
-          val outputTypeNodes = new java.util.ArrayList[
-            org.apache.gluten.substrait.`type`.TypeNode]()
-          for (attr <- childCtx.outputAttributes) {
-            outputTypeNodes.add(
-              ConverterUtils.getTypeNode(attr.dataType, attr.nullable))
-          }
-          val outputSchema =
-            org.apache.gluten.substrait.`type`.TypeBuilder.makeStruct(false, outputTypeNodes)
-
-          PlanBuilder.makePlan(
-            substraitContext,
-            Lists.newArrayList(childCtx.root),
-            outNames,
-            outputSchema,
-            null)
-        } else {
-          PlanBuilder.makePlan(
-            substraitContext,
-            Lists.newArrayList(childCtx.root),
-            outNames)
-        }
-
-        logDebug(
-          s"MppNativeQueryRDD: fragment ${fragment.id} Substrait plan: " +
-            SubstraitPlanPrinterUtil.substraitPlanToJson(planNode.toProtobuf))
-
-        planNode.toProtobuf.toByteArray
-
-      case other =>
-        throw new IllegalStateException(
-          s"MppNativeQueryRDD: fragment ${fragment.id} root operator " +
-            s"${other.getClass.getSimpleName} is not a TransformSupport")
-    }
-  }
-
-  /**
-   * Serialize exchange specifications to JSON for the native side.
-   *
-   * Format:
-   * {{{
-   * [
-   *   {
-   *     "id": 0,
-   *     "producerFragmentId": 0,
-   *     "consumerFragmentId": 1,
-   *     "exchangeType": "HASH",
-   *     "numPartitions": 200,
-   *     "partitionKeys": ["col1#10", "col2#11"]
-   *   },
-   *   ...
-   * ]
-   * }}}
-   */
-  private def serializeExchangeSpecs(specs: Seq[ExchangeSpec]): String = {
-    val entries = specs.map { spec =>
-      val keys = spec.partitionKeys
-        .map(attr => s""""${ConverterUtils.genColumnNameWithExprId(attr)}"""")
-        .mkString("[", ", ", "]")
-      s"""{
-         |  "id": ${spec.id},
-         |  "producerFragmentId": ${spec.producerFragmentId},
-         |  "consumerFragmentId": ${spec.consumerFragmentId},
-         |  "exchangeType": "${spec.exchangeType}",
-         |  "numPartitions": ${spec.numPartitions},
-         |  "partitionKeys": $keys
-         |}""".stripMargin
-    }
-    entries.mkString("[", ", ", "]")
-  }
 }
 
 /** Simple partition for the single-partition MppNativeQueryRDD. */
