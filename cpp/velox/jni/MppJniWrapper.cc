@@ -36,6 +36,15 @@
 #include "substrait/plan.pb.h"
 #include "utils/ObjectStore.h"
 
+// Plan node types for tree rewriting.
+#include "velox/core/PlanNode.h"
+#include "velox/exec/PartitionedOutput.h"
+#include "velox/exec/RoundRobinPartitionFunction.h"
+#include "operators/plannodes/RowVectorStream.h"
+#ifdef GLUTEN_ENABLE_GPU
+#include "operators/plannodes/CudfVectorStream.h"
+#endif
+
 using namespace gluten;
 using namespace facebook;
 
@@ -72,6 +81,253 @@ struct MppQueryHandle {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Plan tree rewriting helpers
+// ---------------------------------------------------------------------------
+
+/// Check if a PlanNode is a ValueStream leaf node that should be replaced
+/// with an ExchangeNode for MPP execution.
+///
+/// ValueStream nodes appear in two forms:
+///   1. CPU: TableScanNode with "value-stream" connector ID
+///   2. GPU: CudfValueStreamNode (custom Gluten node)
+bool isValueStreamNode(const velox::core::PlanNodePtr& node) {
+  // Check for CudfValueStreamNode (GPU path).
+#ifdef GLUTEN_ENABLE_GPU
+  if (std::dynamic_pointer_cast<const CudfValueStreamNode>(node) != nullptr) {
+    return true;
+  }
+#endif
+  // Check for CPU ValueStream: TableScanNode with "value-stream" connector.
+  if (auto tableScan =
+          std::dynamic_pointer_cast<const velox::core::TableScanNode>(node)) {
+    if (tableScan->tableHandle() &&
+        tableScan->tableHandle()->connectorId() == kIteratorConnectorId) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Collect all ValueStream leaf nodes from a plan tree in depth-first order.
+/// The order matches the stream index assignment in SubstraitToVeloxPlanConverter.
+void collectValueStreamNodes(
+    const velox::core::PlanNodePtr& node,
+    std::vector<velox::core::PlanNodePtr>& result) {
+  if (isValueStreamNode(node)) {
+    result.push_back(node);
+    return;
+  }
+  for (const auto& source : node->sources()) {
+    collectValueStreamNodes(source, result);
+  }
+}
+
+/// Recursively walk a Velox plan tree, replacing a SPECIFIC ValueStream leaf
+/// node (identified by plan node ID) with an ExchangeNode. Velox PlanNodes
+/// are immutable, so when a child changes we must reconstruct the parent.
+///
+/// The function handles common single-source node types via their Builder
+/// pattern. For multi-source nodes (joins, unions) it rebuilds using
+/// their Builders. Unrecognized node types with changed children
+/// cause a VELOX_FAIL — add explicit support as needed.
+velox::core::PlanNodePtr replaceValueStreamWithExchange(
+    const velox::core::PlanNodePtr& node,
+    const std::string& targetNodeId,
+    const std::string& exchangeNodeId) {
+  // Base case: this IS the target ValueStream leaf — replace it.
+  if (isValueStreamNode(node) && node->id() == targetNodeId) {
+    LOG(INFO) << "MppJniWrapper: replacing ValueStream node '"
+              << node->id() << "' with ExchangeNode '"
+              << exchangeNodeId << "' outputType="
+              << node->outputType()->toString();
+    return std::make_shared<velox::core::ExchangeNode>(
+        exchangeNodeId,
+        node->outputType(),
+        velox::VectorSerde::Kind::kPresto);
+  }
+
+  // If this is a leaf node (no children) that is NOT ValueStream, keep it.
+  const auto& sources = node->sources();
+  if (sources.empty()) {
+    return node;
+  }
+
+  // Recurse into children.
+  std::vector<velox::core::PlanNodePtr> newSources;
+  newSources.reserve(sources.size());
+  bool anyChanged = false;
+  for (const auto& source : sources) {
+    auto newSource =
+        replaceValueStreamWithExchange(source, targetNodeId, exchangeNodeId);
+    if (newSource.get() != source.get()) {
+      anyChanged = true;
+    }
+    newSources.push_back(std::move(newSource));
+  }
+
+  // No children changed — return the original node unchanged.
+  if (!anyChanged) {
+    return node;
+  }
+
+  // Children changed — we must reconstruct this node with the new children.
+  // Handle common single-source node types using their Builder pattern.
+  // The Builder(existingNode) constructor copies all fields, then we
+  // override the source.
+
+  // FilterNode
+  if (auto filterNode =
+          std::dynamic_pointer_cast<const velox::core::FilterNode>(node)) {
+    return velox::core::FilterNode::Builder(*filterNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  // ProjectNode
+  if (auto projectNode =
+          std::dynamic_pointer_cast<const velox::core::ProjectNode>(node)) {
+    return velox::core::ProjectNode::Builder(*projectNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  // AggregationNode
+  if (auto aggNode =
+          std::dynamic_pointer_cast<const velox::core::AggregationNode>(
+              node)) {
+    return velox::core::AggregationNode::Builder(*aggNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  // OrderByNode
+  if (auto orderByNode =
+          std::dynamic_pointer_cast<const velox::core::OrderByNode>(node)) {
+    return velox::core::OrderByNode::Builder(*orderByNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  // TopNNode
+  if (auto topNNode =
+          std::dynamic_pointer_cast<const velox::core::TopNNode>(node)) {
+    return velox::core::TopNNode::Builder(*topNNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  // LimitNode
+  if (auto limitNode =
+          std::dynamic_pointer_cast<const velox::core::LimitNode>(node)) {
+    return velox::core::LimitNode::Builder(*limitNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  // HashJoinNode (2 sources: left, right)
+  if (auto hashJoinNode =
+          std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node)) {
+    return velox::core::HashJoinNode::Builder(*hashJoinNode)
+        .left(newSources[0])
+        .right(newSources[1])
+        .build();
+  }
+
+  // MergeJoinNode (2 sources: left, right)
+  if (auto mergeJoinNode =
+          std::dynamic_pointer_cast<const velox::core::MergeJoinNode>(node)) {
+    return velox::core::MergeJoinNode::Builder(*mergeJoinNode)
+        .left(newSources[0])
+        .right(newSources[1])
+        .build();
+  }
+
+  // NestedLoopJoinNode (2 sources: left, right)
+  if (auto nlJoinNode =
+          std::dynamic_pointer_cast<const velox::core::NestedLoopJoinNode>(
+              node)) {
+    return velox::core::NestedLoopJoinNode::Builder(*nlJoinNode)
+        .left(newSources[0])
+        .right(newSources[1])
+        .build();
+  }
+
+  // ExpandNode
+  if (auto expandNode =
+          std::dynamic_pointer_cast<const velox::core::ExpandNode>(node)) {
+    return velox::core::ExpandNode::Builder(*expandNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  // RowNumberNode
+  if (auto rowNumberNode =
+          std::dynamic_pointer_cast<const velox::core::RowNumberNode>(node)) {
+    return velox::core::RowNumberNode::Builder(*rowNumberNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  // TopNRowNumberNode
+  if (auto topNRowNumberNode =
+          std::dynamic_pointer_cast<const velox::core::TopNRowNumberNode>(
+              node)) {
+    return velox::core::TopNRowNumberNode::Builder(*topNRowNumberNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  // WindowNode
+  if (auto windowNode =
+          std::dynamic_pointer_cast<const velox::core::WindowNode>(node)) {
+    return velox::core::WindowNode::Builder(*windowNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  // MarkDistinctNode
+  if (auto markDistinctNode =
+          std::dynamic_pointer_cast<const velox::core::MarkDistinctNode>(
+              node)) {
+    return velox::core::MarkDistinctNode::Builder(*markDistinctNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  // EnforceSingleRowNode
+  if (auto enforceSingleRowNode =
+          std::dynamic_pointer_cast<const velox::core::EnforceSingleRowNode>(
+              node)) {
+    return velox::core::EnforceSingleRowNode::Builder(*enforceSingleRowNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  // GroupIdNode
+  if (auto groupIdNode =
+          std::dynamic_pointer_cast<const velox::core::GroupIdNode>(node)) {
+    return velox::core::GroupIdNode::Builder(*groupIdNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  // UnnestNode
+  if (auto unnestNode =
+          std::dynamic_pointer_cast<const velox::core::UnnestNode>(node)) {
+    return velox::core::UnnestNode::Builder(*unnestNode)
+        .source(newSources[0])
+        .build();
+  }
+
+  VELOX_FAIL(
+      "MppJniWrapper: unsupported plan node type '{}' (id='{}') encountered "
+      "during ValueStream replacement. Add explicit Builder support for this "
+      "node type in replaceValueStreamWithExchange().",
+      node->name(),
+      node->id());
+}
+
 /// Parse the exchange specifications from a JSON byte array.
 ///
 /// Expected format:
@@ -99,6 +355,8 @@ std::vector<MppExchangeSpec> parseExchangeSpecs(
     spec.producerFragmentId = item["producerFragmentId"].asInt();
     spec.consumerFragmentId = item["consumerFragmentId"].asInt();
     spec.exchangeNodeId = item["exchangeNodeId"].asString();
+    spec.numPartitions =
+        item.count("numPartitions") ? item["numPartitions"].asInt() : 1;
     specs.push_back(std::move(spec));
   }
   return specs;
@@ -181,10 +439,109 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     std::vector<::substrait::ReadRel_LocalFiles> emptyLocalFiles;
     auto veloxPlanNode = converter.toVeloxPlan(substraitPlan, emptyLocalFiles);
 
+    LOG(INFO) << "MppJniWrapper: fragment " << i
+              << " raw Velox plan: "
+              << veloxPlanNode->toString(/*detailed=*/true, /*recursive=*/true);
+
+    // --- Problem 2: Replace ValueStream nodes with ExchangeNode ---
+    //
+    // Consumer fragments (those that receive data from a producer via an
+    // exchange) will have ValueStream leaf nodes (from Gluten's
+    // InputIteratorTransformer → ReadRel "iterator:N"). For MPP execution
+    // these must be replaced with Velox ExchangeNode so that the
+    // ExchangeClient + RemoteConnectorSplit mechanism can wire them to the
+    // producer task's OutputBufferManager.
+    //
+    // Collect exchanges targeting this fragment as consumer, ordered by ID.
+    std::vector<const MppExchangeSpec*> inboundExchanges;
+    for (const auto& exchange : exchangeSpecs) {
+      if (exchange.consumerFragmentId == static_cast<int32_t>(i)) {
+        inboundExchanges.push_back(&exchange);
+      }
+    }
+
+    if (!inboundExchanges.empty()) {
+      // Collect ValueStream leaf nodes in depth-first order.
+      // The order matches SubstraitToVeloxPlanConverter's stream index
+      // assignment (iterator:0, iterator:1, ...).
+      std::vector<velox::core::PlanNodePtr> valueStreamNodes;
+      collectValueStreamNodes(veloxPlanNode, valueStreamNodes);
+
+      VELOX_CHECK_EQ(
+          valueStreamNodes.size(),
+          inboundExchanges.size(),
+          "Fragment {} has {} ValueStream nodes but {} inbound exchanges. "
+          "These must match 1:1.",
+          i,
+          valueStreamNodes.size(),
+          inboundExchanges.size());
+
+      // Replace each ValueStream node with the corresponding ExchangeNode.
+      // Match by position: first ValueStream (stream 0) -> first exchange, etc.
+      for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+        veloxPlanNode = replaceValueStreamWithExchange(
+            veloxPlanNode,
+            valueStreamNodes[j]->id(),
+            inboundExchanges[j]->exchangeNodeId);
+      }
+
+      LOG(INFO) << "MppJniWrapper: fragment " << i
+                << " after ValueStream->Exchange replacement: "
+                << veloxPlanNode->toString(
+                       /*detailed=*/true, /*recursive=*/true);
+    }
+
+    // --- Problem 1: Wrap with PartitionedOutputNode ---
+    //
+    // Every fragment needs a PartitionedOutputNode at the root so that
+    // OutputBufferManager gets initialized when the Task starts. Without
+    // this, the coordinator cannot read output from the root fragment and
+    // consumer fragments cannot fetch data from producer fragments.
+    //
+    // - Root fragment (id=0): single partition output (gather to coordinator)
+    // - Producer fragments: partition count from exchange spec
+    int32_t numOutputPartitions = 1;
+    for (const auto& exchange : exchangeSpecs) {
+      if (exchange.producerFragmentId == static_cast<int32_t>(i)) {
+        numOutputPartitions = exchange.numPartitions;
+        break;
+      }
+    }
+
+    auto outputNodeId = fmt::format("mpp_output_{}", i);
+    velox::core::PlanNodePtr wrappedPlan;
+
+    if (numOutputPartitions == 1) {
+      // Single-partition gather output (root fragment or single-consumer).
+      wrappedPlan = velox::core::PartitionedOutputNode::single(
+          outputNodeId,
+          veloxPlanNode->outputType(),
+          velox::VectorSerde::Kind::kPresto,
+          veloxPlanNode);
+    } else {
+      // Multi-partition output. Use round-robin for now.
+      // TODO: Implement hash partitioning based on exchange spec keys.
+      std::vector<velox::core::TypedExprPtr> noKeys;
+      wrappedPlan = std::make_shared<velox::core::PartitionedOutputNode>(
+          outputNodeId,
+          velox::core::PartitionedOutputNode::Kind::kPartitioned,
+          noKeys,
+          numOutputPartitions,
+          /*replicateNullsAndAny=*/false,
+          std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>(),
+          veloxPlanNode->outputType(),
+          velox::VectorSerde::Kind::kPresto,
+          veloxPlanNode);
+    }
+
+    LOG(INFO) << "MppJniWrapper: fragment " << i
+              << " final plan (with PartitionedOutput): "
+              << wrappedPlan->toString(/*detailed=*/true, /*recursive=*/true);
+
     // Build PlanFragment with ungrouped execution.
     std::unordered_set<velox::core::PlanNodeId> emptyGroupedIds;
     velox::core::PlanFragment planFragment{
-        veloxPlanNode,
+        wrappedPlan,
         velox::core::ExecutionStrategy::kUngrouped,
         1, // numSplitGroups
         emptyGroupedIds};

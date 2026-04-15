@@ -191,7 +191,11 @@ case class MppNativeQueryExec(
    *   3. Build a PlanNode and serialize to bytes
    */
   private def generateSubstraitPlan(fragment: NativeFragment): Array[Byte] = {
-    val rootOp = fragment.rootOperator
+    // Unwrap non-TransformSupport wrappers to find the actual native operator
+    val rootOp = unwrapToTransformSupport(fragment.rootOperator)
+    logWarning(s"generateSubstraitPlan: fragment ${fragment.id} " +
+      s"original=${fragment.rootOperator.getClass.getSimpleName} " +
+      s"unwrapped=${rootOp.getClass.getSimpleName}")
     rootOp match {
       case ts: TransformSupport =>
         val substraitContext = new SubstraitContext
@@ -243,6 +247,24 @@ case class MppNativeQueryExec(
   }
 
   /**
+   * Unwrap non-TransformSupport wrappers to find the actual native operator.
+   * Fragments may have ShuffleExchangeLike, ColumnarToColumnarExec, or
+   * ColumnarToRowExecBase as root — we need the TransformSupport child.
+   */
+  private def unwrapToTransformSupport(plan: SparkPlan): SparkPlan = {
+    plan match {
+      case ts: TransformSupport => ts
+      case c2r: ColumnarToRowExecBase => unwrapToTransformSupport(c2r.child)
+      case c2c: ColumnarToColumnarExec => unwrapToTransformSupport(c2c.child)
+      case exchange: org.apache.spark.sql.execution.exchange.ShuffleExchangeLike =>
+        unwrapToTransformSupport(exchange.child)
+      case _ =>
+        logWarning(s"unwrapToTransformSupport: cannot unwrap ${plan.getClass.getSimpleName}")
+        plan
+    }
+  }
+
+  /**
    * Serialize exchange specifications to JSON for the native side.
    */
   private def serializeExchangeSpecs(specs: Seq[ExchangeSpec]): String = {
@@ -256,6 +278,7 @@ case class MppNativeQueryExec(
          |  "consumerFragmentId": ${spec.consumerFragmentId},
          |  "exchangeType": "${spec.exchangeType}",
          |  "numPartitions": ${spec.numPartitions},
+         |  "exchangeNodeId": "mpp_exchange_source_${spec.id}",
          |  "partitionKeys": $keys
          |}""".stripMargin
     }

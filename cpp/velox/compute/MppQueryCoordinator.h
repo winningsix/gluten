@@ -64,6 +64,9 @@ struct MppExchangeSpec {
   /// PlanNodeId of the ExchangeNode in the consumer fragment's plan tree.
   /// Used as the split target when wiring RemoteConnectorSplits.
   std::string exchangeNodeId;
+
+  /// Number of output partitions for this exchange.
+  int32_t numPartitions{1};
 };
 
 /// Coordinates execution of multiple Velox Task fragments within a single
