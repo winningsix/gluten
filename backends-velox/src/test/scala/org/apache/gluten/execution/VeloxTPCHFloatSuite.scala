@@ -34,5 +34,6 @@ class VeloxTPCHFloatSuite extends VeloxTPCHSuite {
       // giving MppCollapseRule something to absorb.
       .set("spark.sql.shuffle.partitions", "4")
       .set("spark.sql.adaptive.enabled", "false")
+      .set("spark.gluten.mpp.strategy.enabled", "true")
   }
 }

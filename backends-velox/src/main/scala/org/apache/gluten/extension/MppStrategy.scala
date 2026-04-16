@@ -71,15 +71,26 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
   private var generatingShadowPlan: Boolean = false
 
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = {
-    if (!isMppStrategyEnabled) return Nil
+    if (!isMppStrategyEnabled) {
+      logWarning(s"MppStrategy: disabled (mpp.enabled=${session.conf.get(MPP_ENABLED_KEY, MPP_ENABLED_DEFAULT)}, " +
+        s"strategy.enabled=${session.conf.get(MPP_STRATEGY_KEY, MPP_STRATEGY_DEFAULT)})")
+      return Nil
+    }
     if (generatingShadowPlan) return Nil
 
-    // Only attempt MPP for top-level query plans. We match common root
-    // operators that appear at the top of SELECT queries. DDL, CTAS,
-    // and other non-query plans are left to normal Gluten BSP mode.
+    logWarning(s"MppStrategy: apply() called with ${plan.getClass.getSimpleName}")
+
     if (isTopLevelPlan(plan)) {
-      tryMpp(plan).map(Seq(_)).getOrElse(Nil)
+      logWarning(s"MppStrategy: top-level plan detected, attempting MPP...")
+      tryMpp(plan).map { exec =>
+        logWarning(s"MppStrategy: *** PLAN C ACTIVE *** returning MppNativeQueryExec")
+        Seq(exec)
+      }.getOrElse {
+        logWarning(s"MppStrategy: tryMpp returned None, falling back to BSP")
+        Nil
+      }
     } else {
+      logWarning(s"MppStrategy: not a top-level plan (${plan.getClass.getSimpleName}), skipping")
       Nil
     }
   }
