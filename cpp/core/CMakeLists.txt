@@ -151,6 +151,7 @@ set(SPARK_COLUMNAR_PLUGIN_SRCS
 
 file(MAKE_DIRECTORY ${root_directory}/releases)
 add_library(gluten STATIC ${SPARK_COLUMNAR_PLUGIN_SRCS})
+set_target_properties(gluten PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_dependencies(gluten jni_proto)
 
 if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)

@@ -288,10 +288,11 @@ if(ENABLE_JEMALLOC_STATS)
   target_link_libraries(velox PUBLIC jemalloc::jemalloc)
 endif()
 
-# Use --whole-archive so that JNI entry points (referenced only from Java, not
-# from C++) in the static gluten library are not dropped by the linker.
+# Link the static gluten core library with --whole-archive so that JNI entry
+# points (referenced only from Java, not from C++) are not dropped by the linker.
 target_link_libraries(velox PUBLIC
-  -Wl,--whole-archive gluten -Wl,--no-whole-archive)
+  -Wl,--whole-archive gluten -Wl,--no-whole-archive
+  -Wl,--allow-multiple-definition)
 
 # Requires VELOX_MONO_LIBRARY=ON when building Velox.
 import_library(facebook::velox ${VELOX_BUILD_PATH}/lib/libvelox.a)

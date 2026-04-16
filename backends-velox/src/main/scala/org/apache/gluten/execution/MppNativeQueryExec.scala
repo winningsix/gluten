@@ -117,16 +117,8 @@ case class MppNativeQueryExec(
   // --- Execution ---
 
   override protected def doExecute(): RDD[InternalRow] = {
-    val hasRealFragments = fragments.nonEmpty && fragments.head.rootOperator != null
-    if (!hasRealFragments) {
-      // Phase 2: fragment extraction happens in doExecuteColumnar(),
-      // but for row-based execution we still delegate to child BSP.
-      logWarning(
-        s"MppNativeQueryExec: doExecute() delegating to child: " +
-          s"${child.getClass.getSimpleName}")
-      return child.execute()
-    }
-    // Future: MPP execution returns columnar, convert to rows
+    // Always route through doExecuteColumnar() and convert to rows.
+    // This ensures MPP execution is used for both row-based and columnar code paths.
     doExecuteColumnar().mapPartitions { batches =>
       batches.flatMap { batch =>
         val numRows = batch.numRows()
@@ -183,19 +175,39 @@ case class MppNativeQueryExec(
       }
 
       logWarning(
-        s"MppNativeQueryExec: Phase 2 generated ${fragmentSubstraitPlans.size} Substrait plans " +
+        s"MppNativeQueryExec: generated ${fragmentSubstraitPlans.size} Substrait plans " +
           s"(sizes: ${fragmentSubstraitPlans.map(_.length).mkString("[", ", ", "]")} bytes)")
 
-      // Phase 2 milestone: delegate to child BSP execution while logging extracted plans.
-      // Phase 3 (JNI wiring) will replace this with native MPP execution.
-      logWarning(
-        "MppNativeQueryExec: Phase 2 complete. Delegating to child BSP for now. " +
-          "Phase 3 will wire Substrait plans to JNI MppQueryCoordinator.")
-      if (child.supportsColumnar) {
-        return child.executeColumnar()
+      if (extractedFragments.size >= 2 && extractedExchanges.nonEmpty) {
+        // We have real fragments with exchanges -- use MPP streaming execution!
+        logWarning(
+          s"MppNativeQueryExec: *** PHASE 3 MPP EXECUTION *** " +
+            s"${extractedFragments.size} fragments, ${extractedExchanges.size} exchanges")
+
+        val fragmentPlans = fragmentSubstraitPlans.toArray
+        val numDriversPerFragment = extractedFragments.map(_.parallelism).toArray
+        val exchangeSpecsJson = serializeExchangeSpecs(extractedExchanges)
+
+        return new MppNativeQueryRDD(
+          sparkContext,
+          fragmentPlans,
+          numDriversPerFragment,
+          exchangeSpecsJson,
+          longMetric("totalQueryTimeMs"),
+          longMetric("outputRows"),
+          longMetric("outputBatches")
+        )
       } else {
-        return child.execute().mapPartitions { rows =>
-          Iterator.empty
+        // Single fragment or no exchanges -- BSP is fine
+        logWarning(
+          s"MppNativeQueryExec: single fragment (${extractedFragments.size} fragments, " +
+            s"${extractedExchanges.size} exchanges), delegating to BSP")
+        if (child.supportsColumnar) {
+          return child.executeColumnar()
+        } else {
+          return child.execute().mapPartitions { rows =>
+            Iterator.empty
+          }
         }
       }
     }

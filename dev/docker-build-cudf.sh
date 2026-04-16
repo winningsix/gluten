@@ -255,32 +255,32 @@ echo ""
 echo "[post] Verifying JAR and native library consistency..."
 
 JAR_PATH="${GLUTEN_DIR}/package/target/gluten-velox-bundle-spark${SPARK_VERSION}_2.12-linux_amd64-1.6.0-SNAPSHOT.jar"
-CPP_LIBVELOX="${GLUTEN_DIR}/cpp/build/releases/libvelox.so"
+# Single combined library: core + backend are now merged into libgluten.so
 CPP_LIBGLUTEN="${GLUTEN_DIR}/cpp/build/releases/libgluten.so"
 
 SYNC_OK=true
-if [ -f "$JAR_PATH" ] && [ -f "$CPP_LIBVELOX" ]; then
+if [ -f "$JAR_PATH" ] && [ -f "$CPP_LIBGLUTEN" ]; then
   JAR_MTIME=$(stat -c %Y "$JAR_PATH" 2>/dev/null || stat -f %m "$JAR_PATH" 2>/dev/null)
-  SO_MTIME=$(stat -c %Y "$CPP_LIBVELOX" 2>/dev/null || stat -f %m "$CPP_LIBVELOX" 2>/dev/null)
+  SO_MTIME=$(stat -c %Y "$CPP_LIBGLUTEN" 2>/dev/null || stat -f %m "$CPP_LIBGLUTEN" 2>/dev/null)
 
   if [ "$SO_MTIME" -gt "$JAR_MTIME" ]; then
-    echo " WARNING: libvelox.so ($(date -d @$SO_MTIME '+%H:%M:%S' 2>/dev/null || date -r $SO_MTIME '+%H:%M:%S')) is newer than JAR ($(date -d @$JAR_MTIME '+%H:%M:%S' 2>/dev/null || date -r $JAR_MTIME '+%H:%M:%S'))"
+    echo " WARNING: libgluten.so ($(date -d @$SO_MTIME '+%H:%M:%S' 2>/dev/null || date -r $SO_MTIME '+%H:%M:%S')) is newer than JAR ($(date -d @$JAR_MTIME '+%H:%M:%S' 2>/dev/null || date -r $JAR_MTIME '+%H:%M:%S'))"
     echo "          JAR may contain stale native libraries!"
     SYNC_OK=false
   fi
 
-  JAR_SO_MD5=$(unzip -p "$JAR_PATH" linux/amd64/libvelox.so 2>/dev/null | md5sum | awk '{print $1}')
-  CPP_SO_MD5=$(md5sum "$CPP_LIBVELOX" | awk '{print $1}')
+  JAR_SO_MD5=$(unzip -p "$JAR_PATH" linux/amd64/libgluten.so 2>/dev/null | md5sum | awk '{print $1}')
+  CPP_SO_MD5=$(md5sum "$CPP_LIBGLUTEN" | awk '{print $1}')
   if [ "$JAR_SO_MD5" != "$CPP_SO_MD5" ]; then
-    echo " WARNING: libvelox.so MD5 mismatch!"
+    echo " WARNING: libgluten.so MD5 mismatch!"
     echo "          JAR contains:  $JAR_SO_MD5"
     echo "          C++ produced:  $CPP_SO_MD5"
     echo "          Injecting latest native libs into JAR..."
     docker exec "$CONTAINER_NAME" bash -c "
       mkdir -p /tmp/_jar_fix/linux/amd64 && \
-      cp /opt/gluten/cpp/build/releases/libgluten.so /opt/gluten/cpp/build/releases/libvelox.so /tmp/_jar_fix/linux/amd64/ && \
+      cp /opt/gluten/cpp/build/releases/libgluten.so /tmp/_jar_fix/linux/amd64/ && \
       cd /tmp/_jar_fix && \
-      jar uf /opt/gluten/package/target/gluten-velox-bundle-spark${SPARK_VERSION}_2.12-linux_amd64-1.6.0-SNAPSHOT.jar linux/amd64/libgluten.so linux/amd64/libvelox.so && \
+      jar uf /opt/gluten/package/target/gluten-velox-bundle-spark${SPARK_VERSION}_2.12-linux_amd64-1.6.0-SNAPSHOT.jar linux/amd64/libgluten.so && \
       rm -rf /tmp/_jar_fix
     "
     echo "          Native libs injected. New JAR MD5:"
