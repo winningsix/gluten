@@ -111,12 +111,11 @@ case class MppNativeQueryExec(
 
   // --- Execution ---
 
-  // MppNativeQueryExec wraps the original plan (which includes ColumnarToRow at top).
-  // For Phase 1 (BSP delegation), just execute child directly.
   override protected def doExecute(): RDD[InternalRow] = {
     val hasRealFragments = fragments.nonEmpty && fragments.head.rootOperator != null
     if (!hasRealFragments) {
-      logWarning("MppNativeQueryExec: doExecute() delegating to child.execute()")
+      // Phase 1: delegate to child BSP execution
+      logWarning(s"MppNativeQueryExec: doExecute() delegating to child: ${child.getClass.getSimpleName}")
       return child.execute()
     }
     // Phase 2: MPP execution returns columnar, convert to rows

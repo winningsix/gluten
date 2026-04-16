@@ -34,8 +34,8 @@ class VeloxTPCHFloatSuite extends VeloxTPCHSuite {
       // giving MppCollapseRule something to absorb.
       .set("spark.sql.shuffle.partitions", "4")
       .set("spark.sql.adaptive.enabled", "false")
-      // Plan D (MppCollapseRule) — wrap original plan, delegate to child BSP execution
+      // Plan C (MppStrategy) — intercept at Strategy level
       .set("spark.gluten.mpp.enabled", "true")
-      .set("spark.gluten.mpp.strategy.enabled", "false")
+      .set("spark.gluten.mpp.strategy.enabled", "true")
   }
 }

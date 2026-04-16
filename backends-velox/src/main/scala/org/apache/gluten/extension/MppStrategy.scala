@@ -89,6 +89,10 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
         case ReturnAnswer(child) => child
         case other => other
       }
+      // After unwrapping, skip commands (DDL, DML) — only queries should go MPP
+      if (queryPlan.isInstanceOf[org.apache.spark.sql.catalyst.plans.logical.Command]) {
+        return Nil
+      }
       logWarning(s"MppStrategy: top-level plan detected (${plan.getClass.getSimpleName} " +
         s"→ ${queryPlan.getClass.getSimpleName}), attempting MPP...")
       tryMpp(queryPlan).map { exec =>
@@ -118,17 +122,10 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
    * We avoid intercepting DDL commands, CTAS, or other non-query plans.
    */
   private def isTopLevelPlan(plan: LogicalPlan): Boolean = {
+    // Only match ReturnAnswer — this is the outermost wrapper Spark adds for queries.
+    // This ensures we create exactly ONE MppNativeQueryExec per query, not nested ones.
     plan match {
-      case _: ReturnAnswer => true  // Spark wraps top-level queries in ReturnAnswer
-      case _: Sort => true
-      case _: Aggregate => true
-      case _: Project => true
-      case _: GlobalLimit => true
-      case _: LocalLimit => true
-      case _: Filter => true
-      case _: Join => true
-      case _: Distinct => true
-      case _: SubqueryAlias => true
+      case _: ReturnAnswer => true
       case _ => false
     }
   }
@@ -183,9 +180,25 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
     // Use MppSchemaOnlyExec as child — it provides schema only, never executes.
     // MppNativeQueryExec.doExecuteColumnar() generates its own execution plan
     // via JNI/MppQueryCoordinator, independent of the child.
+    logWarning(s"MppStrategy: logicalPlan=${logicalPlan.getClass.getSimpleName} " +
+      s"children.size=${logicalPlan.children.size} " +
+      s"children=${logicalPlan.children.map(_.getClass.getSimpleName)}")
+    // Use planLater on each child of logicalPlan — Spark will plan them normally
+    // (with ShuffleExchange, WholeStageTransformer etc.). At execution time,
+    // MppNativeQueryExec walks the planned children to extract fragment info.
+    val plannedChild = if (logicalPlan.children.size == 1) {
+      planLater(logicalPlan.children.head)
+    } else if (logicalPlan.children.size > 1) {
+      // Multi-child (e.g., Join) — plan first child for now, handle join later
+      planLater(logicalPlan.children.head)
+    } else {
+      // Leaf node — use schema-only placeholder
+      MppSchemaOnlyExec(logicalPlan.output)
+    }
+
     Some(
       MppNativeQueryExec(
-        child = MppSchemaOnlyExec(logicalPlan.output),
+        child = plannedChild,
         fragments = fragments,
         exchanges = exchanges,
         originalLogicalPlan = logicalPlan
