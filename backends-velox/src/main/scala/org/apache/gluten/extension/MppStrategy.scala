@@ -59,7 +59,7 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
 
   private val MPP_ENABLED_KEY = "spark.gluten.mpp.enabled"
   private val MPP_STRATEGY_KEY = "spark.gluten.mpp.strategy.enabled"
-  private val MPP_ENABLED_DEFAULT = "false"
+  private val MPP_ENABLED_DEFAULT = "true"
   private val MPP_STRATEGY_DEFAULT = "false"
 
   /**
@@ -81,8 +81,15 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
     logWarning(s"MppStrategy: apply() called with ${plan.getClass.getSimpleName}")
 
     if (isTopLevelPlan(plan)) {
-      logWarning(s"MppStrategy: top-level plan detected, attempting MPP...")
-      tryMpp(plan).map { exec =>
+      // Unwrap ReturnAnswer — it's just a Spark wrapper, not a real operator.
+      // The shadow planner needs the actual query plan, not ReturnAnswer.
+      val queryPlan = plan match {
+        case ReturnAnswer(child) => child
+        case other => other
+      }
+      logWarning(s"MppStrategy: top-level plan detected (${plan.getClass.getSimpleName} " +
+        s"→ ${queryPlan.getClass.getSimpleName}), attempting MPP...")
+      tryMpp(queryPlan).map { exec =>
         logWarning(s"MppStrategy: *** PLAN C ACTIVE *** returning MppNativeQueryExec")
         Seq(exec)
       }.getOrElse {
@@ -110,6 +117,7 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
    */
   private def isTopLevelPlan(plan: LogicalPlan): Boolean = {
     plan match {
+      case _: ReturnAnswer => true  // Spark wraps top-level queries in ReturnAnswer
       case _: Sort => true
       case _: Aggregate => true
       case _: Project => true
@@ -130,46 +138,28 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
   private def tryMpp(logicalPlan: LogicalPlan): Option[MppNativeQueryExec] = {
     logWarning("MppStrategy: attempting Plan C MPP transformation")
 
-    // Step 1: Generate a shadow physical plan with exchange boundaries.
-    val shadowPlan = try {
-      generateShadowPlan(logicalPlan)
-    } catch {
-      case e: Exception =>
-        logWarning(s"MppStrategy: shadow plan generation failed: ${e.getMessage}", e)
-        return None
-    }
+    // Plan C Approach: Return MppNativeQueryExec with planLater(logicalPlan) as child.
+    // Spark will plan the child normally (including EnsureRequirements inserting
+    // ShuffleExchange nodes). Then at execution time, MppNativeQueryExec examines
+    // its child's physical plan to extract fragment/exchange info.
+    //
+    // This avoids the "cannot transform shuffle node" issue because MppNativeQueryExec
+    // is inserted BEFORE ShuffleExchange nodes exist. Spark adds them to the child
+    // plan, and we read them — never replace them.
 
-    if (shadowPlan.isEmpty) {
-      logWarning("MppStrategy: shadow plan generation returned None, falling back to BSP")
-      return None
-    }
-
-    val physicalPlan = shadowPlan.get
-
-    logWarning(s"MppStrategy: shadow plan generated:\n${physicalPlan.treeString}")
-
-    // Step 2: Check for BroadcastExchange nodes -- fall back to BSP if present.
-    if (containsBroadcastExchange(physicalPlan)) {
-      logWarning("MppStrategy: plan contains BroadcastExchange, falling back to BSP")
-      return None
-    }
-
-    // Step 3: Extract fragment boundaries and exchange specs from the shadow plan.
-    val (fragments, exchanges) = extractFragmentsFromShadowPlan(physicalPlan)
-
-    if (fragments.isEmpty) {
-      logWarning("MppStrategy: no fragments extracted, falling back to BSP")
-      return None
-    }
+    // For now, create placeholder fragments — the real extraction happens at execution time
+    // from the child physical plan.
+    val fragments = Seq(NativeFragment(
+      id = 0,
+      rootOperator = null, // Will be populated at execution time from child plan
+      outputAttributes = logicalPlan.output,
+      parallelism = session.conf.get("spark.sql.shuffle.partitions", "200").toInt
+    ))
+    val exchanges = Seq.empty[ExchangeSpec]
 
     logWarning(
-      s"MppStrategy: *** MPP MODE (Plan C) *** fragmented plan into " +
-        s"${fragments.size} fragments and ${exchanges.size} exchanges")
-    fragments.foreach { f =>
-      logWarning(
-        s"  Fragment ${f.id}: parallelism=${f.parallelism}, " +
-          s"root=${f.rootOperator.simpleString(40)}")
-    }
+      s"MppStrategy: *** MPP MODE (Plan C) *** query=${logicalPlan.getClass.getSimpleName}, " +
+        s"fragments will be extracted at execution time from child physical plan")
     exchanges.foreach { e =>
       logWarning(
         s"  Exchange ${e.id}: F${e.producerFragmentId} -> F${e.consumerFragmentId} " +
@@ -180,12 +170,13 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
     // there are no intermediate shuffle statistics to observe.
     session.conf.set("spark.sql.adaptive.enabled", "false")
 
-    // Step 5: Build the MppNativeQueryExec. Use a schema-only leaf as child
-    // since we bypass the normal physical plan entirely.
-    val schemaChild = MppSchemaOnlyExec(logicalPlan.output)
+    // Step 5: Build the MppNativeQueryExec with planLater(logicalPlan) as child.
+    // Spark will plan the child normally (including EnsureRequirements).
+    // At execution time, MppNativeQueryExec examines child's physical plan
+    // to extract fragments and exchange boundaries.
     Some(
       MppNativeQueryExec(
-        child = schemaChild,
+        child = planLater(logicalPlan),
         fragments = fragments,
         exchanges = exchanges
       ))
@@ -222,8 +213,20 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
 
       // Use Spark's internal QueryExecution to generate the physical plan.
       // executedPlan runs: planner -> prepareForExecution (EnsureRequirements etc.)
-      val qe = session.sessionState.executePlan(logicalPlan)
-      Some(qe.executedPlan)
+      // Approach: use Spark's planner to get physical plan, then manually
+      // run preparations. The key is planLater() — Spark strategies can
+      // defer child planning. We plan children normally, then examine
+      // the resulting physical plan for ShuffleExchange nodes.
+      //
+      // IMPORTANT: We must use the ORIGINAL planner (not create new QueryExecution)
+      // because we're inside a strategy call — creating a new QE causes recursion
+      // or short-circuits to CommandResultExec.
+      //
+      // Instead, use planLater to let Spark plan the children normally,
+      // then we intercept and wrap.
+      val physicalPlan = planLater(logicalPlan)
+      logWarning(s"MppStrategy: planLater result class=${physicalPlan.getClass.getSimpleName}")
+      Some(physicalPlan)
     } finally {
       generatingShadowPlan = false
       session.conf.set(MPP_ENABLED_KEY, prevMppEnabled)
