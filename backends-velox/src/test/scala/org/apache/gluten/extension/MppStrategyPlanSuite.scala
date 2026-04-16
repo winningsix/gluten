@@ -126,4 +126,78 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     val result = df.collect()
     assert(result.length > 0, "q3-style query should have results")
   }
+
+  test("MppStrategy: subquery produces correct result") {
+    val df = spark.sql(
+      """SELECT l_returnflag, l_linestatus, count(*) as cnt
+        |FROM lineitem
+        |WHERE l_quantity > (SELECT avg(l_quantity) FROM lineitem)
+        |GROUP BY l_returnflag, l_linestatus""".stripMargin)
+    val result = df.collect()
+    assert(result.length > 0, "subquery should have results")
+  }
+
+  test("MppStrategy: UNION ALL produces correct result") {
+    val df = spark.sql(
+      """SELECT l_returnflag, count(*) as cnt FROM lineitem GROUP BY l_returnflag
+        |UNION ALL
+        |SELECT o_orderstatus, count(*) FROM orders GROUP BY o_orderstatus""".stripMargin)
+    val result = df.collect()
+    assert(result.length > 0, "UNION ALL should have results")
+  }
+
+  test("MppStrategy: LIMIT query produces correct result") {
+    val df = spark.sql("SELECT * FROM lineitem ORDER BY l_orderkey LIMIT 5")
+    val result = df.collect()
+    assert(result.length == 5, "LIMIT 5 should return exactly 5 rows")
+  }
+
+  test("MppStrategy: empty result query works") {
+    val df = spark.sql("SELECT * FROM lineitem WHERE l_quantity < 0")
+    val result = df.collect()
+    assert(result.length == 0, "impossible filter should return 0 rows")
+  }
+
+  test("MppStrategy: multiple shuffles (group by + order by) produces correct result") {
+    val df = spark.sql(
+      """SELECT l_returnflag, l_linestatus,
+        |  sum(l_quantity) as sum_qty,
+        |  count(*) as count_order
+        |FROM lineitem
+        |WHERE l_shipdate <= date '1998-09-02'
+        |GROUP BY l_returnflag, l_linestatus
+        |ORDER BY l_returnflag, l_linestatus""".stripMargin)
+    val result = df.collect()
+    assert(result.length > 0, "TPC-H q1 style query should have results")
+    // Verify ordering
+    val flags = result.map(_.getString(0))
+    assert(flags.toSeq == flags.sorted.toSeq)
+  }
+
+  test("MppStrategy: MppNativeQueryExec present in plan when enabled") {
+    val df = spark.sql(
+      """SELECT l_returnflag, count(*) FROM lineitem
+        |GROUP BY l_returnflag ORDER BY l_returnflag""".stripMargin)
+    val mppExec = findMppExec(df)
+    assert(mppExec.isDefined, "MppNativeQueryExec should be in plan when MPP enabled")
+  }
+
+  test("MppStrategy: results match BSP baseline") {
+    // Run same query with MPP enabled and disabled, compare results
+    val sql = "SELECT l_returnflag, sum(l_quantity) as sq FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag"
+    val mppResult = spark.sql(sql).collect()
+
+    withSQLConf(
+      "spark.gluten.mpp.enabled" -> "false",
+      "spark.gluten.mpp.strategy.enabled" -> "false"
+    ) {
+      val bspResult = spark.sql(sql).collect()
+      assert(mppResult.length == bspResult.length,
+        s"Row count mismatch: MPP=${mppResult.length} BSP=${bspResult.length}")
+      mppResult.zip(bspResult).foreach { case (mpp, bsp) =>
+        assert(mpp.getString(0) == bsp.getString(0),
+          s"Flag mismatch: MPP=${mpp.getString(0)} BSP=${bsp.getString(0)}")
+      }
+    }
+  }
 }

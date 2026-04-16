@@ -180,21 +180,11 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
     // Use MppSchemaOnlyExec as child — it provides schema only, never executes.
     // MppNativeQueryExec.doExecuteColumnar() generates its own execution plan
     // via JNI/MppQueryCoordinator, independent of the child.
-    logWarning(s"MppStrategy: logicalPlan=${logicalPlan.getClass.getSimpleName} " +
-      s"children.size=${logicalPlan.children.size} " +
-      s"children=${logicalPlan.children.map(_.getClass.getSimpleName)}")
-    // Use planLater on each child of logicalPlan — Spark will plan them normally
-    // (with ShuffleExchange, WholeStageTransformer etc.). At execution time,
-    // MppNativeQueryExec walks the planned children to extract fragment info.
-    val plannedChild = if (logicalPlan.children.size == 1) {
-      planLater(logicalPlan.children.head)
-    } else if (logicalPlan.children.size > 1) {
-      // Multi-child (e.g., Join) — plan first child for now, handle join later
-      planLater(logicalPlan.children.head)
-    } else {
-      // Leaf node — use schema-only placeholder
-      MppSchemaOnlyExec(logicalPlan.output)
-    }
+    // planLater(logicalPlan) — plan the ENTIRE query (Sort/Aggregate/etc.)
+    // MppStrategy claims ReturnAnswer; logicalPlan is ReturnAnswer.child.
+    // Since they're different nodes, no recursion conflict.
+    // Spark will plan logicalPlan normally → with ShuffleExchange, Gluten rules, etc.
+    val plannedChild = planLater(logicalPlan)
 
     Some(
       MppNativeQueryExec(

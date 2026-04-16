@@ -102,10 +102,16 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     if (!isMppEnabled) {
       return plan
     }
-    // Plan C check: if MppStrategy already claimed this plan (producing
-    // MppNativeQueryExec at the strategy level), skip Plan D collapse.
+    // When Plan C (MppStrategy) is enabled, disable Plan D entirely.
+    // MppStrategy handles MPP at the Strategy level; MppCollapseRule
+    // would interfere with subqueries and cause "cannot transform shuffle node".
+    val strategyEnabled = SQLConf.get.getConfString(
+      "spark.gluten.mpp.strategy.enabled", "false").toBoolean
+    if (strategyEnabled) {
+      return plan
+    }
+    // Plan C check: if MppStrategy already claimed this plan
     if (alreadyHandledByMppStrategy(plan)) {
-      logWarning("MppCollapseRule: plan already handled by MppStrategy (Plan C), skipping")
       return plan
     }
     logWarning("MppCollapseRule: attempting MPP collapse on query plan")
