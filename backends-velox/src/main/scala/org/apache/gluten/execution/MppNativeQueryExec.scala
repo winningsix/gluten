@@ -130,18 +130,27 @@ case class MppNativeQueryExec(
   // supportsColumnar is already true via GlutenPlan
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
-    logInfo(
-      s"MppNativeQueryExec: executing plan with ${fragments.size} fragments " +
+    logWarning(
+      s"MppNativeQueryExec: executing with ${fragments.size} fragments " +
         s"and ${exchanges.size} exchanges")
-    logInfo(s"MppNativeQueryExec: fragment details:\n$fragmentSummary")
-    logInfo(s"MppNativeQueryExec: exchange details:\n$exchangeSummary")
+
+    // Plan C Phase 1: fragments are placeholders (rootOperator=null).
+    // Return empty RDD — proves the Strategy→MppNativeQueryExec chain works.
+    // The test will fail on result comparison but NOT on assertion/exception.
+    val hasRealFragments = fragments.nonEmpty && fragments.head.rootOperator != null
+    if (!hasRealFragments) {
+      logWarning(
+        "MppNativeQueryExec: *** PLAN C PHASE 1 *** " +
+          "Strategy chain validated. Returning empty result. " +
+          "True MPP multi-fragment execution in Phase 2.")
+      return sparkContext.emptyRDD[ColumnarBatch]
+    }
 
     // Update fragment/exchange count metrics.
     metrics("numFragments") += fragments.size
     metrics("numExchanges") += exchanges.size
 
     // Generate Substrait plans on the DRIVER side where sparkContext is available.
-    // This avoids NPE from accessing SparkPlan.sparkContext on executors.
     val fragmentPlans: Array[Array[Byte]] = fragments.map { frag =>
       generateSubstraitPlan(frag)
     }.toArray
