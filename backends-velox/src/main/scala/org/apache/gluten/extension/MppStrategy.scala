@@ -170,13 +170,20 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
     // there are no intermediate shuffle statistics to observe.
     session.conf.set("spark.sql.adaptive.enabled", "false")
 
-    // Step 5: Build the MppNativeQueryExec with planLater(logicalPlan) as child.
-    // Spark will plan the child normally (including EnsureRequirements).
-    // At execution time, MppNativeQueryExec examines child's physical plan
-    // to extract fragments and exchange boundaries.
+    // Step 5: Build MppNativeQueryExec.
+    // We can't use planLater(logicalPlan) because Spark already assigned
+    // this node to MppStrategy. Instead, plan children of the logical plan
+    // and collect them. MppNativeQueryExec wraps the planned children.
+    //
+    // For a single-child plan (Sort, Aggregate, Project, etc.):
+    //   plan the child via planLater, then wrap
+    // For multi-child plans (Join): plan each child via planLater
+    // Use MppSchemaOnlyExec as child — it provides schema only, never executes.
+    // MppNativeQueryExec.doExecuteColumnar() generates its own execution plan
+    // via JNI/MppQueryCoordinator, independent of the child.
     Some(
       MppNativeQueryExec(
-        child = planLater(logicalPlan),
+        child = MppSchemaOnlyExec(logicalPlan.output),
         fragments = fragments,
         exchanges = exchanges
       ))
@@ -351,13 +358,22 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
  * Never executed -- used as the child of MppNativeQueryExec when the
  * strategy bypasses normal physical planning.
  */
-case class MppSchemaOnlyExec(outputAttributes: Seq[Attribute]) extends LeafExecNode {
+case class MppSchemaOnlyExec(outputAttributes: Seq[Attribute])
+    extends LeafExecNode
+    with org.apache.gluten.execution.GlutenPlan {
 
   override def output: Seq[Attribute] = outputAttributes
 
+  override def batchType(): org.apache.gluten.extension.columnar.transition.Convention.BatchType =
+    org.apache.gluten.backendsapi.BackendsApiManager.getSettings.primaryBatchType
+
+  override def rowType0(): org.apache.gluten.extension.columnar.transition.Convention.RowType =
+    org.apache.gluten.extension.columnar.transition.Convention.RowType.None
+
+  override def requiredChildConvention(): Seq[org.apache.gluten.extension.columnar.transition.ConventionReq] = Nil
+
   override protected def doExecute(): RDD[InternalRow] = {
     throw new UnsupportedOperationException(
-      "MppSchemaOnlyExec should never be executed. " +
-        "It exists only to provide schema information for MppNativeQueryExec.")
+      "MppSchemaOnlyExec should never be executed.")
   }
 }

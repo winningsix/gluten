@@ -92,7 +92,10 @@ case class MppNativeQueryExec(
 
   override def rowType0(): Convention.RowType = Convention.RowType.None
 
-  override def requiredChildConvention(): Seq[ConventionReq] = Nil
+  // Must match children.size (1 child = MppSchemaOnlyExec or planLater)
+  override def requiredChildConvention(): Seq[ConventionReq] = {
+    children.map(_ => ConventionReq.any)
+  }
 
   // --- Metrics ---
 
