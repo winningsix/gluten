@@ -144,17 +144,18 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       return None
     }
 
-    logWarning("MppCollapseRule: plan is fully native-supported, extracting fragments...")
+    logWarning("MppCollapseRule: plan is fully native-supported, wrapping with MppNativeQueryExec")
 
-    val fragmentCounter = new AtomicInteger(0)
-    val exchangeCounter = new AtomicInteger(0)
-
-    val (fragments, exchanges) = extractFragments(plan, fragmentCounter, exchangeCounter)
-
-    if (fragments.isEmpty) {
-      logWarning("MppCollapseRule: no fragments extracted from plan")
-      return None
-    }
+    // Phase 1: wrap plan with placeholder fragments. The child plan is NOT modified.
+    // MppNativeQueryExec.doExecuteColumnar() will delegate to child.executeColumnar()
+    // (BSP execution). True MPP fragment extraction comes in Phase 2.
+    val fragments = Seq(NativeFragment(
+      id = 0,
+      rootOperator = null, // placeholder — real extraction in Phase 2
+      outputAttributes = plan.output,
+      parallelism = 4
+    ))
+    val exchanges = Seq.empty[ExchangeSpec]
 
     logWarning(
       s"MppCollapseRule: *** MPP MODE ACTIVE *** — collapsed plan into " +

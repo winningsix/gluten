@@ -60,6 +60,8 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
   private val MPP_ENABLED_KEY = "spark.gluten.mpp.enabled"
   private val MPP_STRATEGY_KEY = "spark.gluten.mpp.strategy.enabled"
   private val MPP_ENABLED_DEFAULT = "true"
+  // Disable Plan C for now — shadow plan generation returns CommandResultExec.
+  // Use Plan D (MppCollapseRule) which has a working child plan.
   private val MPP_STRATEGY_DEFAULT = "false"
 
   /**
@@ -185,7 +187,8 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
       MppNativeQueryExec(
         child = MppSchemaOnlyExec(logicalPlan.output),
         fragments = fragments,
-        exchanges = exchanges
+        exchanges = exchanges,
+        originalLogicalPlan = logicalPlan
       ))
   }
 
