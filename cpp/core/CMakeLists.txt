@@ -150,16 +150,8 @@ set(SPARK_COLUMNAR_PLUGIN_SRCS
     jni/JniCommon.cc)
 
 file(MAKE_DIRECTORY ${root_directory}/releases)
-add_library(gluten SHARED ${SPARK_COLUMNAR_PLUGIN_SRCS})
+add_library(gluten STATIC ${SPARK_COLUMNAR_PLUGIN_SRCS})
 add_dependencies(gluten jni_proto)
-
-# Hide symbols of some static dependencies. Otherwise, if such dependencies are
-# already statically linked to libvelox.so, a runtime error will be reported:
-# xxx is being linked both statically and dynamically.
-if(NOT CMAKE_SYSTEM_NAME MATCHES "Darwin")
-  target_link_options(
-    gluten PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/symbols.map)
-endif()
 
 if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
   execute_process(
@@ -216,9 +208,6 @@ target_include_directories(
   gluten
   PUBLIC ${CMAKE_SYSTEM_INCLUDE_PATH} ${JNI_INCLUDE_DIRS}
          ${CMAKE_CURRENT_SOURCE_DIR} ${PROTO_OUTPUT_DIR} ${PROTOBUF_INCLUDE})
-set_target_properties(gluten PROPERTIES LIBRARY_OUTPUT_DIRECTORY
-                                        ${root_directory}/releases)
-
 if(BUILD_TESTS)
   add_subdirectory(tests)
 endif()
@@ -233,17 +222,5 @@ target_link_libraries(gluten PUBLIC Arrow::arrow
                                     Arrow::arrow_bundled_dependencies)
 target_link_libraries(gluten PRIVATE google::glog)
 
-install(TARGETS gluten DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/resources/libhdfs.so
         DESTINATION ${LIBHDFS3_DESTINATION})
-
-add_custom_command(
-  TARGET gluten
-  POST_BUILD
-  COMMAND ld $<TARGET_FILE:gluten> || true
-  COMMENT "Checking ld result of libgluten.so")
-add_custom_command(
-  TARGET gluten
-  POST_BUILD
-  COMMAND ldd $<TARGET_FILE:gluten> || true
-  COMMENT "Checking ldd result of libgluten.so")

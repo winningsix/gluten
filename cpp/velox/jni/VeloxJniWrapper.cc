@@ -70,6 +70,12 @@ extern "C" {
 #endif
 
 jint JNI_OnLoad(JavaVM* vm, void*) {
+  // Initialize core Gluten JNI (class refs, shuffle infrastructure, etc.).
+  jint coreResult = gluten_core_jni_onload(vm, nullptr);
+  if (coreResult != jniVersion) {
+    return JNI_ERR;
+  }
+
   JNIEnv* env;
   if (vm->GetEnv(reinterpret_cast<void**>(&env), jniVersion) != JNI_OK) {
     return JNI_ERR;
@@ -105,8 +111,10 @@ void JNI_OnUnload(JavaVM* vm, void*) {
 
   finalizeVeloxJniUDF(env);
   finalizeVeloxJniFileSystem(env);
-  getJniErrorState()->close();
-  getJniCommonState()->close();
+
+  // Teardown core Gluten JNI (class refs, protobuf shutdown, etc.).
+  gluten_core_jni_onunload(vm, nullptr);
+
   google::ShutdownGoogleLogging();
 }
 

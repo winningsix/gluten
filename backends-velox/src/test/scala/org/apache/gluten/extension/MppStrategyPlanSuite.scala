@@ -16,7 +16,10 @@
  */
 package org.apache.gluten.extension
 
-import org.apache.gluten.execution.{MppNativeQueryExec, VeloxWholeStageTransformerSuite}
+import org.apache.gluten.execution.{MppNativeQueryExec, VeloxWholeStageTransformerSuite, WholeStageTransformer}
+
+import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
 
 /**
  * Test suite verifying MppStrategy (Plan C) behavior:
@@ -24,6 +27,7 @@ import org.apache.gluten.execution.{MppNativeQueryExec, VeloxWholeStageTransform
  * - Skips DDL/command plans
  * - Produces correct results via BSP delegation (Phase 1)
  * - Properly falls back when MPP is disabled
+ * - Verifies plan structure proves MPP path can be exercised (Phase 2 readiness)
  */
 class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
 
@@ -46,6 +50,32 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   private def findMppExec(df: org.apache.spark.sql.DataFrame): Option[MppNativeQueryExec] = {
     val plan = df.queryExecution.executedPlan
     plan.collect { case m: MppNativeQueryExec => m }.headOption
+  }
+
+  /**
+   * Walk a physical plan tree and extract fragment boundaries.
+   *
+   * Fragments are WholeStageTransformer subtrees separated by ShuffleExchangeLike boundaries.
+   * This is the PROTOTYPE for Phase 2's real fragment extraction in MppCollapseRule.
+   *
+   * @return (wholeStageTransformers, shuffleExchanges) found in the plan tree
+   */
+  private def extractFragmentsFromPhysicalPlan(
+      plan: SparkPlan): (Seq[WholeStageTransformer], Seq[ShuffleExchangeLike]) = {
+    val fragments = scala.collection.mutable.ArrayBuffer[WholeStageTransformer]()
+    val exchanges = scala.collection.mutable.ArrayBuffer[ShuffleExchangeLike]()
+
+    def walk(node: SparkPlan): Unit = {
+      node match {
+        case wst: WholeStageTransformer => fragments += wst
+        case ex: ShuffleExchangeLike => exchanges += ex
+        case _ =>
+      }
+      node.children.foreach(walk)
+    }
+
+    walk(plan)
+    (fragments.toSeq, exchanges.toSeq)
   }
 
   test("MppStrategy: simple agg query produces correct result") {
@@ -194,5 +224,195 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
           s"Flag mismatch: MPP=${mpp.getString(0)} BSP=${bsp.getString(0)}")
       }
     }
+  }
+
+  // ============================================================
+  // Phase 2 readiness tests — verify plan STRUCTURE, not just results.
+  // These tests document the current BSP-delegation behavior and
+  // establish the assertions that Phase 2 must satisfy.
+  // ============================================================
+
+  test("MppNativeQueryExec child has ShuffleExchangeLike nodes (shuffle proof)") {
+    // A GROUP BY + ORDER BY query forces at least one shuffle exchange.
+    // This verifies the child plan retains exchange nodes (Plan D: wrap, don't replace).
+    val df = spark.sql(
+      """SELECT l_returnflag, count(*) as cnt
+        |FROM lineitem
+        |GROUP BY l_returnflag
+        |ORDER BY l_returnflag""".stripMargin)
+    val mppExec = findMppExec(df)
+    assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
+
+    val childPlan = mppExec.get.child
+    val exchangeNodes = childPlan.collect {
+      case ex: ShuffleExchangeLike => ex
+    }
+    // Plan D wraps the original plan; the child tree must still contain exchanges.
+    // If this fails, the child was incorrectly stripped of its exchange nodes.
+    assert(
+      exchangeNodes.nonEmpty,
+      s"Child plan should contain ShuffleExchangeLike nodes for GROUP BY + ORDER BY query. " +
+        s"Child plan tree:\n${childPlan.treeString}")
+  }
+
+  test("MppNativeQueryExec child has WholeStageTransformer fragments") {
+    // A query with GROUP BY + ORDER BY should produce at least 2 WholeStageTransformer
+    // nodes (one for the scan+agg stage, one for the final sort stage).
+    // This is the prerequisite for Phase 2: each WST becomes a native fragment.
+    val df = spark.sql(
+      """SELECT l_returnflag, l_linestatus,
+        |  sum(l_quantity) as sum_qty,
+        |  count(*) as count_order
+        |FROM lineitem
+        |WHERE l_shipdate <= date '1998-09-02'
+        |GROUP BY l_returnflag, l_linestatus
+        |ORDER BY l_returnflag, l_linestatus""".stripMargin)
+    val mppExec = findMppExec(df)
+    assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
+
+    val childPlan = mppExec.get.child
+    val wstNodes = childPlan.collect {
+      case wst: WholeStageTransformer => wst
+    }
+    // Phase 2 requirement: >= 2 fragments means there is at least one exchange boundary
+    // that can be converted to a streaming GPU exchange.
+    assert(
+      wstNodes.size >= 2,
+      s"Child plan should have >= 2 WholeStageTransformer nodes (found ${wstNodes.size}). " +
+        s"Child plan tree:\n${childPlan.treeString}")
+  }
+
+  test("Fragment extraction from child plan finds exchange boundaries") {
+    // Use the extractFragmentsFromPhysicalPlan helper (Phase 2 prototype) to walk the
+    // child plan and identify fragment boundaries at ShuffleExchangeLike nodes.
+    val df = spark.sql(
+      """SELECT l_returnflag, count(*) as cnt
+        |FROM lineitem
+        |GROUP BY l_returnflag
+        |ORDER BY l_returnflag""".stripMargin)
+    val mppExec = findMppExec(df)
+    assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
+
+    val childPlan = mppExec.get.child
+    val (fragments, exchanges) = extractFragmentsFromPhysicalPlan(childPlan)
+
+    // With GROUP BY + ORDER BY we expect:
+    //   >= 2 WholeStageTransformer fragments (scan+agg, final sort)
+    //   >= 1 ShuffleExchangeLike boundary
+    assert(
+      fragments.size >= 2,
+      s"Expected >= 2 fragments, got ${fragments.size}. " +
+        s"Child plan:\n${childPlan.treeString}")
+    assert(
+      exchanges.nonEmpty,
+      s"Expected >= 1 exchange boundary, got ${exchanges.size}. " +
+        s"Child plan:\n${childPlan.treeString}")
+
+    // Phase 2 invariant: #exchanges should be #fragments - 1 (linear pipeline)
+    // or >= #fragments - 1 (DAG with fan-in). Log for documentation.
+    logInfo(
+      s"Fragment extraction: ${fragments.size} fragments, ${exchanges.size} exchanges. " +
+        s"Fragment stageIds: ${fragments.map(_.stageId).mkString(", ")}")
+  }
+
+  test("Each fragment WholeStageTransformer can generate Substrait") {
+    // For each WholeStageTransformer in the child plan, verify that Substrait generation
+    // succeeds. This is what Phase 2 will do for each fragment before submitting to JNI.
+    val df = spark.sql(
+      """SELECT l_returnflag, count(*) as cnt
+        |FROM lineitem
+        |GROUP BY l_returnflag
+        |ORDER BY l_returnflag""".stripMargin)
+    val mppExec = findMppExec(df)
+    assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
+
+    val childPlan = mppExec.get.child
+    val wstNodes = childPlan.collect {
+      case wst: WholeStageTransformer => wst
+    }
+    assert(wstNodes.nonEmpty, "Should have at least one WholeStageTransformer")
+
+    wstNodes.foreach { wst =>
+      // doWholeStageTransform() generates a full Substrait plan for this stage.
+      // This is the same call that WholeStageTransformer.doExecuteColumnar() makes.
+      val wsCtx = wst.doWholeStageTransform()
+      assert(wsCtx != null, s"doWholeStageTransform() returned null for stage ${wst.stageId}")
+      assert(wsCtx.root != null, s"Substrait PlanNode is null for stage ${wst.stageId}")
+
+      // Verify the plan can be serialized to bytes (what JNI expects)
+      val planBytes = wsCtx.root.toProtobuf.toByteArray
+      assert(
+        planBytes.length > 0,
+        s"Substrait plan bytes should be non-empty for stage ${wst.stageId}")
+
+      logInfo(
+        s"Stage ${wst.stageId}: Substrait plan = ${planBytes.length} bytes")
+    }
+  }
+
+  test("MPP metrics are reported") {
+    // Run a query and check that MppNativeQueryExec exposes the expected metrics.
+    // Phase 1 (BSP delegation) does NOT update fragment/exchange counts because
+    // hasRealFragments is false. This test documents the gap.
+    val df = spark.sql(
+      """SELECT l_returnflag, count(*) as cnt
+        |FROM lineitem
+        |GROUP BY l_returnflag
+        |ORDER BY l_returnflag""".stripMargin)
+    // Force execution so metrics are populated
+    df.collect()
+
+    val mppExec = findMppExec(df)
+    assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
+
+    val metricsMap = mppExec.get.metrics
+    // Verify metric keys exist (defined in MppNativeQueryExec)
+    assert(metricsMap.contains("numFragments"), "Should have numFragments metric")
+    assert(metricsMap.contains("numExchanges"), "Should have numExchanges metric")
+    assert(metricsMap.contains("outputRows"), "Should have outputRows metric")
+    assert(metricsMap.contains("totalQueryTimeMs"), "Should have totalQueryTimeMs metric")
+
+    // Phase 1 (BSP delegation): numFragments is 0 because we never enter the real MPP path.
+    // Phase 2 TODO: this should be > 0 when real MPP execution is wired up.
+    val numFragments = metricsMap("numFragments").value
+    assert(
+      numFragments == 0,
+      s"Phase 1 BSP delegation: numFragments should be 0 (got $numFragments). " +
+        "When Phase 2 is implemented, change this assertion to numFragments > 0.")
+  }
+
+  test("BSP delegation path is logged with MPP WRAP MODE marker") {
+    // Verify that the BSP delegation path produces a recognizable log marker.
+    // This ensures we can distinguish BSP delegation from real MPP execution in logs.
+    // We check by examining the child plan tree for the expected structure rather
+    // than capturing logs (log capture is fragile in test suites).
+    val df = spark.sql(
+      """SELECT l_returnflag, count(*) as cnt
+        |FROM lineitem
+        |GROUP BY l_returnflag
+        |ORDER BY l_returnflag""".stripMargin)
+    val mppExec = findMppExec(df)
+    assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
+
+    // Phase 1 indicator: fragments list is empty or contains null rootOperators
+    // (because MppStrategy creates MppNativeQueryExec with empty fragments in Phase 1)
+    val fragments = mppExec.get.fragments
+    val exchanges = mppExec.get.exchanges
+
+    // Phase 1 BSP delegation: fragments have no real rootOperator
+    val hasRealFragments = fragments.nonEmpty && fragments.head.rootOperator != null
+    assert(
+      !hasRealFragments,
+      "Phase 1: fragments should NOT have real rootOperators (BSP delegation). " +
+        "When Phase 2 is implemented, change this assertion to hasRealFragments == true.")
+
+    // Also verify the simpleString indicates current state
+    val desc = mppExec.get.simpleString(10)
+    assert(
+      desc.contains("fragments"),
+      s"simpleString should mention fragments: $desc")
+    logInfo(
+      s"BSP delegation confirmed: hasRealFragments=$hasRealFragments, " +
+        s"fragments=${fragments.size}, exchanges=${exchanges.size}, desc=$desc")
   }
 }

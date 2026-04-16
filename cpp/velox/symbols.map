@@ -3,6 +3,8 @@
     extern "C++" {
         *gluten::*;
         *facebook::velox::*;
+        *protobuf::*;
+        *substrait::*;
     };
 
     Java_org_apache_gluten_*;

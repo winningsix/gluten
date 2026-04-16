@@ -32,6 +32,12 @@
 
 static jint jniVersion = JNI_VERSION_1_8;
 
+// Core JNI init/teardown -- called from the combined JNI_OnLoad/JNI_OnUnload
+// in VeloxJniWrapper.cc when both core and backend are linked into a single
+// shared library (libgluten.so).
+extern "C" jint gluten_core_jni_onload(JavaVM* vm, void* reserved);
+extern "C" void gluten_core_jni_onunload(JavaVM* vm, void* reserved);
+
 static inline std::string jStringToCString(JNIEnv* env, jstring string) {
   if (!string) {
     return {};

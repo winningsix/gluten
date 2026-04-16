@@ -232,8 +232,12 @@ endif()
 
 add_library(velox SHARED ${VELOX_SRCS})
 
-if(ENABLE_GLUTEN_VCPKG AND NOT CMAKE_SYSTEM_NAME MATCHES "Darwin")
-  # Hide some symbols to avoid conflict.
+# Produce libgluten.so instead of libvelox.so so that a single shared library
+# contains both core Gluten JNI symbols and backend (Velox/MPP) JNI symbols.
+set_target_properties(velox PROPERTIES OUTPUT_NAME gluten)
+
+if(NOT CMAKE_SYSTEM_NAME MATCHES "Darwin")
+  # Export JNI entry points and Gluten/Velox C++ symbols; hide everything else.
   target_link_options(
     velox PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/symbols.map)
 endif()
@@ -284,7 +288,10 @@ if(ENABLE_JEMALLOC_STATS)
   target_link_libraries(velox PUBLIC jemalloc::jemalloc)
 endif()
 
-target_link_libraries(velox PUBLIC gluten)
+# Use --whole-archive so that JNI entry points (referenced only from Java, not
+# from C++) in the static gluten library are not dropped by the linker.
+target_link_libraries(velox PUBLIC
+  -Wl,--whole-archive gluten -Wl,--no-whole-archive)
 
 # Requires VELOX_MONO_LIBRARY=ON when building Velox.
 import_library(facebook::velox ${VELOX_BUILD_PATH}/lib/libvelox.a)
@@ -458,9 +465,9 @@ add_custom_command(
   TARGET velox
   POST_BUILD
   COMMAND ld $<TARGET_FILE:velox> || true
-  COMMENT "Checking ld result of libvelox.so")
+  COMMENT "Checking ld result of libgluten.so (combined)")
 add_custom_command(
   TARGET velox
   POST_BUILD
   COMMAND ldd $<TARGET_FILE:velox> || true
-  COMMENT "Checking ldd result of libvelox.so")
+  COMMENT "Checking ldd result of libgluten.so (combined)")
