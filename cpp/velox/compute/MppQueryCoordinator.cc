@@ -81,6 +81,34 @@ MppQueryCoordinator::MppQueryCoordinator(
         fragmentSpecs_[i].id,
         i);
   }
+
+  // Compute the root fragment: the one whose id never appears as a
+  // producerFragmentId in any exchange. For a single-fragment plan that's
+  // trivially fragment 0. For a multi-fragment DAG exactly one fragment
+  // has no downstream consumer; any other shape is a planner bug.
+  std::vector<bool> isProducer(fragmentSpecs_.size(), false);
+  for (auto& exchange : exchangeSpecs_) {
+    VELOX_CHECK_GE(exchange.producerFragmentId, 0);
+    VELOX_CHECK_LT(
+        static_cast<size_t>(exchange.producerFragmentId),
+        fragmentSpecs_.size());
+    isProducer[exchange.producerFragmentId] = true;
+  }
+  for (size_t i = 0; i < fragmentSpecs_.size(); ++i) {
+    if (!isProducer[i]) {
+      VELOX_CHECK_EQ(
+          rootFragmentId_,
+          -1,
+          "Multiple root fragments (no downstream consumer): {} and {}",
+          rootFragmentId_,
+          fragmentSpecs_[i].id);
+      rootFragmentId_ = fragmentSpecs_[i].id;
+    }
+  }
+  VELOX_CHECK_NE(
+      rootFragmentId_,
+      -1,
+      "No root fragment (every fragment is a producer; exchange DAG has a cycle)");
 }
 
 std::shared_ptr<MppQueryCoordinator> MppQueryCoordinator::create(
@@ -254,7 +282,7 @@ void MppQueryCoordinator::start() {
 
 bool MppQueryCoordinator::fetchNextOutputPage(
     std::vector<std::unique_ptr<folly::IOBuf>>& iobufs) {
-  auto rootTaskId = makeTaskId(0);
+  auto rootTaskId = makeTaskId(rootFragmentId_);
   constexpr int32_t kDestination = 0;
   constexpr uint64_t kMaxBytes = std::numeric_limits<uint64_t>::max();
 
@@ -332,7 +360,7 @@ RowVectorPtr MppQueryCoordinator::next() {
 
       // Get the output type from the root fragment's plan node.
       auto outputType = std::dynamic_pointer_cast<const RowType>(
-          fragmentSpecs_[0].planFragment.planNode->outputType());
+          fragmentSpecs_[rootFragmentId_].planFragment.planNode->outputType());
       VELOX_CHECK(
           outputType != nullptr, "Root fragment must have RowType output");
 

@@ -119,21 +119,11 @@ case class MppNativeQueryExec(
   // --- Execution ---
 
   override protected def doExecute(): RDD[InternalRow] = {
-    // Always route through doExecuteColumnar() and convert to rows.
-    // This ensures MPP execution is used for both row-based and columnar code paths.
-    doExecuteColumnar().mapPartitions {
-      batches =>
-        batches.flatMap {
-          batch =>
-            val numRows = batch.numRows()
-            val rows = new Array[InternalRow](numRows)
-            for (i <- 0 until numRows) {
-              rows(i) = batch.getRow(i).copy()
-            }
-            batch.close()
-            rows.iterator
-        }
-    }
+    // Gluten ColumnarBatch uses IndicatorVectorBase (native-pointer wrappers),
+    // which does not support Spark's standard row-access path
+    // (ColumnarBatchRow.copy -> isNullAt throws UnsupportedOperationException).
+    // Delegate to VeloxColumnarToRowExec, which does the conversion via JNI.
+    VeloxColumnarToRowExec(this).doExecute()
   }
 
   // supportsColumnar is already true via GlutenPlan

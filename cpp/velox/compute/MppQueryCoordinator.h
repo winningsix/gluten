@@ -32,10 +32,13 @@
 namespace gluten {
 
 /// Describes a single plan fragment to be executed as a Velox Task.
-/// Fragment 0 is the root fragment by convention; its output is consumed
-/// by the coordinator via OutputBufferManager::getData().
+/// The root fragment is the one whose id never appears as a
+/// producerFragmentId in any MppExchangeSpec. Its output is consumed by
+/// the coordinator via OutputBufferManager::getData().
 struct MppFragmentSpec {
-  /// Fragment identifier (0 = root).
+  /// Fragment identifier. Fragments are numbered contiguously starting
+  /// at 0; the root is NOT necessarily id 0 (Scala-side emission typically
+  /// puts leaf/producer fragments first and the root last).
   int32_t id;
 
   /// The Velox plan fragment (plan tree + execution strategy).
@@ -109,8 +112,9 @@ class MppQueryCoordinator {
   /// Exchange wiring is done via RemoteConnectorSplits after all tasks start.
   void start();
 
-  /// Get the next batch of output from the root fragment (fragment 0).
-  /// The root fragment must have a PartitionedOutput node with 1 destination.
+  /// Get the next batch of output from the root fragment (the one with
+  /// no downstream consumer in the exchange graph). The root fragment
+  /// must have a PartitionedOutput node with 1 destination.
   /// Returns nullptr when no more data is available.
   facebook::velox::RowVectorPtr next();
 
@@ -153,6 +157,11 @@ class MppQueryCoordinator {
   std::vector<MppExchangeSpec> exchangeSpecs_;
   std::shared_ptr<facebook::velox::core::QueryCtx> queryCtx_;
   folly::Executor* executor_;
+
+  /// Id of the fragment whose output is the final query result (the one
+  /// that is never a producer in any exchange). Computed in the
+  /// constructor from exchangeSpecs_.
+  int32_t rootFragmentId_{-1};
 
   /// One Velox Task per fragment, indexed by fragment id.
   std::vector<std::shared_ptr<facebook::velox::exec::Task>> tasks_;
