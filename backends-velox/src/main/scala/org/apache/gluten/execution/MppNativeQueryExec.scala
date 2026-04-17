@@ -22,6 +22,7 @@ import org.apache.gluten.extension.{ExchangeSpec, NativeFragment}
 import org.apache.gluten.extension.columnar.transition.{Convention, ConventionReq}
 import org.apache.gluten.substrait.SubstraitContext
 import org.apache.gluten.substrait.plan.PlanBuilder
+import org.apache.gluten.substrait.rel.SplitInfo
 import org.apache.gluten.utils.SubstraitPlanPrinterUtil
 
 import org.apache.spark.internal.Logging
@@ -36,6 +37,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import com.google.common.collect.Lists
+import io.substrait.proto.ReadRel
 
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -66,13 +68,13 @@ import scala.collection.mutable
 /**
  * Plan D: Wrap, don't replace.
  *
- * MppNativeQueryExec wraps the original plan as its child (UnaryExecNode).
- * Spark sees the original plan (including ShuffleExchange nodes) still intact,
- * so the "cannot transform shuffle node" validation passes.
+ * MppNativeQueryExec wraps the original plan as its child (UnaryExecNode). Spark sees the original
+ * plan (including ShuffleExchange nodes) still intact, so the "cannot transform shuffle node"
+ * validation passes.
  *
- * At execution time, doExecuteColumnar() does NOT call child.executeColumnar().
- * Instead, it uses the child plan only to extract Substrait fragments, then
- * executes via JNI → MppQueryCoordinator (streaming exchange).
+ * At execution time, doExecuteColumnar() does NOT call child.executeColumnar(). Instead, it uses
+ * the child plan only to extract Substrait fragments, then executes via JNI → MppQueryCoordinator
+ * (streaming exchange).
  */
 case class MppNativeQueryExec(
     child: SparkPlan,
@@ -119,16 +121,18 @@ case class MppNativeQueryExec(
   override protected def doExecute(): RDD[InternalRow] = {
     // Always route through doExecuteColumnar() and convert to rows.
     // This ensures MPP execution is used for both row-based and columnar code paths.
-    doExecuteColumnar().mapPartitions { batches =>
-      batches.flatMap { batch =>
-        val numRows = batch.numRows()
-        val rows = new Array[InternalRow](numRows)
-        for (i <- 0 until numRows) {
-          rows(i) = batch.getRow(i).copy()
+    doExecuteColumnar().mapPartitions {
+      batches =>
+        batches.flatMap {
+          batch =>
+            val numRows = batch.numRows()
+            val rows = new Array[InternalRow](numRows)
+            for (i <- 0 until numRows) {
+              rows(i) = batch.getRow(i).copy()
+            }
+            batch.close()
+            rows.iterator
         }
-        batch.close()
-        rows.iterator
-      }
     }
   }
 
@@ -145,8 +149,7 @@ case class MppNativeQueryExec(
     val hasRealFragments = fragments.nonEmpty && fragments.head.rootOperator != null
     if (!hasRealFragments) {
       // Phase 2: Extract fragments from child BSP plan and generate Substrait plans.
-      logWarning(
-        s"MppNativeQueryExec: child plan tree:\n${child.treeString.take(2000)}")
+      logWarning(s"MppNativeQueryExec: child plan tree:\n${child.treeString.take(2000)}")
 
       val (extractedFragments, extractedExchanges) = extractFragmentsFromChildPlan()
       logWarning(
@@ -154,24 +157,26 @@ case class MppNativeQueryExec(
           s"and ${extractedExchanges.size} exchanges from child plan")
 
       // Log each fragment for debugging
-      extractedFragments.foreach { frag =>
-        val rootName = if (frag.rootOperator != null) {
-          frag.rootOperator.getClass.getSimpleName
-        } else "<null>"
-        logWarning(
-          s"  Fragment ${frag.id}: root=$rootName, " +
-            s"output=${frag.outputAttributes.map(_.name).mkString("[", ", ", "]")}, " +
-            s"parallelism=${frag.parallelism}")
+      extractedFragments.foreach {
+        frag =>
+          val rootName = if (frag.rootOperator != null) {
+            frag.rootOperator.getClass.getSimpleName
+          } else "<null>"
+          logWarning(
+            s"  Fragment ${frag.id}: root=$rootName, " +
+              s"output=${frag.outputAttributes.map(_.name).mkString("[", ", ", "]")}, " +
+              s"parallelism=${frag.parallelism}")
       }
-      extractedExchanges.foreach { ex =>
-        logWarning(
-          s"  Exchange ${ex.id}: F${ex.producerFragmentId} -> F${ex.consumerFragmentId} " +
-            s"(${ex.exchangeType}, ${ex.numPartitions} partitions)")
+      extractedExchanges.foreach {
+        ex =>
+          logWarning(
+            s"  Exchange ${ex.id}: F${ex.producerFragmentId} -> F${ex.consumerFragmentId} " +
+              s"(${ex.exchangeType}, ${ex.numPartitions} partitions)")
       }
 
       // Generate Substrait plan for each fragment
-      val fragmentSubstraitPlans = extractedFragments.map { frag =>
-        generateSubstraitForFragment(frag)
+      val fragmentSubstraitPlans = extractedFragments.map {
+        frag => generateSubstraitForFragment(frag)
       }
 
       logWarning(
@@ -188,11 +193,22 @@ case class MppNativeQueryExec(
         val numDriversPerFragment = extractedFragments.map(_.parallelism).toArray
         val exchangeSpecsJson = serializeExchangeSpecs(extractedExchanges)
 
+        // Extract scan split infos for each fragment.
+        // Scan-containing fragments (leaf fragments) have LeafTransformSupport
+        // nodes with file paths. Non-scan fragments get empty arrays.
+        val fragmentSplitInfos: Array[Array[Array[Byte]]] =
+          extractedFragments.map(extractSplitInfosForFragment).toArray
+
+        logWarning(
+          s"MppNativeQueryExec: split infos per fragment: " +
+            s"${fragmentSplitInfos.map(_.length).mkString("[", ", ", "]")}")
+
         return new MppNativeQueryRDD(
           sparkContext,
           fragmentPlans,
           numDriversPerFragment,
           exchangeSpecsJson,
+          fragmentSplitInfos,
           longMetric("totalQueryTimeMs"),
           longMetric("outputRows"),
           longMetric("outputBatches")
@@ -205,9 +221,7 @@ case class MppNativeQueryExec(
         if (child.supportsColumnar) {
           return child.executeColumnar()
         } else {
-          return child.execute().mapPartitions { rows =>
-            Iterator.empty
-          }
+          return child.execute().mapPartitions(rows => Iterator.empty)
         }
       }
     }
@@ -217,15 +231,18 @@ case class MppNativeQueryExec(
     metrics("numExchanges") += exchanges.size
 
     // Generate Substrait plans on the DRIVER side where sparkContext is available.
-    val fragmentPlans: Array[Array[Byte]] = fragments.map { frag =>
-      generateSubstraitPlan(frag)
+    val fragmentPlans: Array[Array[Byte]] = fragments.map {
+      frag => generateSubstraitPlan(frag)
     }.toArray
 
     val numDriversPerFragment = fragments.map(_.parallelism).toArray
     val exchangeSpecsJson = serializeExchangeSpecs(exchanges)
 
-    logInfo(
-      s"MppNativeQueryExec: generated ${fragmentPlans.length} Substrait plans on driver")
+    logInfo(s"MppNativeQueryExec: generated ${fragmentPlans.length} Substrait plans on driver")
+
+    // Extract split infos for pre-built fragments
+    val fragmentSplitInfos: Array[Array[Array[Byte]]] =
+      fragments.map(extractSplitInfosForFragment).toArray
 
     // RDD only receives serialized bytes — no SparkPlan references.
     new MppNativeQueryRDD(
@@ -233,6 +250,7 @@ case class MppNativeQueryExec(
       fragmentPlans,
       numDriversPerFragment,
       exchangeSpecsJson,
+      fragmentSplitInfos,
       longMetric("totalQueryTimeMs"),
       longMetric("outputRows"),
       longMetric("outputBatches")
@@ -275,8 +293,8 @@ case class MppNativeQueryExec(
    *               WholeStageTransformer [Agg]  <- Fragment (producer)
    * }}}
    *
-   * Each [[WholeStageTransformer]] between exchange boundaries is a "fragment".
-   * Each [[ShuffleExchangeLike]] is an "exchange boundary" connecting two fragments.
+   * Each [[WholeStageTransformer]] between exchange boundaries is a "fragment". Each
+   * [[ShuffleExchangeLike]] is an "exchange boundary" connecting two fragments.
    *
    * We do NOT modify the child plan tree -- only read it.
    */
@@ -287,11 +305,10 @@ case class MppNativeQueryExec(
     val exchangeCounter = new AtomicInteger(0)
 
     /**
-     * Walk the plan tree depth-first. Returns the fragment ID of the subtree rooted at `plan`.
-     * At WholeStageTransformer: creates a new fragment.
-     * At ShuffleExchangeLike: creates an exchange spec connecting producer to consumer.
-     * At wrapper nodes (ColumnarToRow, ColumnarToColumnar, InputIterator, ColumnarInputAdapter):
-     *   passes through to the child.
+     * Walk the plan tree depth-first. Returns the fragment ID of the subtree rooted at `plan`. At
+     * WholeStageTransformer: creates a new fragment. At ShuffleExchangeLike: creates an exchange
+     * spec connecting producer to consumer. At wrapper nodes (ColumnarToRow, ColumnarToColumnar,
+     * InputIterator, ColumnarInputAdapter): passes through to the child.
      */
     def walk(plan: SparkPlan): Int = {
       plan match {
@@ -314,8 +331,8 @@ case class MppNativeQueryExec(
           // Link exchange specs: each exchange child's consumer is this fragment
           childExchangeFragIds.zip(findExchangeNodes(wst)).foreach {
             case (producerFragId, exchangeNode) =>
-              val (exchangeType, partitionKeys) = classifyPartitioning(
-                exchangeNode.outputPartitioning)
+              val (exchangeType, partitionKeys) =
+                classifyPartitioning(exchangeNode.outputPartitioning)
               extractedExchanges += ExchangeSpec(
                 id = exchangeCounter.getAndIncrement(),
                 producerFragmentId = producerFragId,
@@ -346,9 +363,10 @@ case class MppNativeQueryExec(
         case other =>
           // For other nodes, walk all children and return the last fragment ID found
           var lastFragId = -1
-          other.children.foreach { c =>
-            val fid = walk(c)
-            if (fid >= 0) lastFragId = fid
+          other.children.foreach {
+            c =>
+              val fid = walk(c)
+              if (fid >= 0) lastFragId = fid
           }
           lastFragId
       }
@@ -363,9 +381,9 @@ case class MppNativeQueryExec(
   }
 
   /**
-   * Find ShuffleExchangeLike nodes that are direct exchange children of a
-   * WholeStageTransformer (reachable through InputIteratorTransformer ->
-   * ColumnarInputAdapter -> ... -> ShuffleExchangeLike chain).
+   * Find ShuffleExchangeLike nodes that are direct exchange children of a WholeStageTransformer
+   * (reachable through InputIteratorTransformer -> ColumnarInputAdapter -> ... ->
+   * ShuffleExchangeLike chain).
    */
   private def findExchangeChildren(wst: WholeStageTransformer): Seq[SparkPlan] = {
     val result = mutable.ArrayBuffer[SparkPlan]()
@@ -388,13 +406,11 @@ case class MppNativeQueryExec(
   }
 
   /**
-   * Find the actual ShuffleExchangeLike nodes corresponding to the exchange children
-   * found by [[findExchangeChildren]]. Unwraps ColumnarInputAdapter and other wrappers.
+   * Find the actual ShuffleExchangeLike nodes corresponding to the exchange children found by
+   * [[findExchangeChildren]]. Unwraps ColumnarInputAdapter and other wrappers.
    */
   private def findExchangeNodes(wst: WholeStageTransformer): Seq[ShuffleExchangeLike] = {
-    findExchangeChildren(wst).flatMap { child =>
-      unwrapToExchange(child)
-    }
+    findExchangeChildren(wst).flatMap(child => unwrapToExchange(child))
   }
 
   /** Unwrap wrapper nodes to find the ShuffleExchangeLike underneath. */
@@ -446,13 +462,13 @@ case class MppNativeQueryExec(
   /**
    * Generate a Substrait plan for a fragment extracted from the child BSP plan.
    *
-   * Uses [[WholeStageTransformer.doWholeStageTransform()]] which calls transform()
-   * on the WST's internal operator tree. The transform stops at
-   * [[InputIteratorTransformer]] boundaries, producing a Substrait plan that covers
-   * exactly the operators between exchange boundaries -- which is what we want for
-   * each MPP fragment.
+   * Uses [[WholeStageTransformer.doWholeStageTransform()]] which calls transform() on the WST's
+   * internal operator tree. The transform stops at [[InputIteratorTransformer]] boundaries,
+   * producing a Substrait plan that covers exactly the operators between exchange boundaries --
+   * which is what we want for each MPP fragment.
    *
-   * @return serialized Substrait plan bytes
+   * @return
+   *   serialized Substrait plan bytes
    */
   private def generateSubstraitForFragment(fragment: NativeFragment): Array[Byte] = {
     fragment.rootOperator match {
@@ -485,18 +501,18 @@ case class MppNativeQueryExec(
   /**
    * Generate a Substrait plan for a single fragment.
    *
-   * Must be called on the driver side where SparkPlan.sparkContext is available.
-   * Uses the same pattern as [[WholeStageTransformer.doWholeStageTransform()]]:
-   *   1. Create a SubstraitContext
-   *   2. Call transform() on the fragment's root operator (TransformSupport)
-   *   3. Build a PlanNode and serialize to bytes
+   * Must be called on the driver side where SparkPlan.sparkContext is available. Uses the same
+   * pattern as [[WholeStageTransformer.doWholeStageTransform()]]:
+   *   1. Create a SubstraitContext 2. Call transform() on the fragment's root operator
+   *      (TransformSupport) 3. Build a PlanNode and serialize to bytes
    */
   private def generateSubstraitPlan(fragment: NativeFragment): Array[Byte] = {
     // Unwrap non-TransformSupport wrappers to find the actual native operator
     val rootOp = unwrapToTransformSupport(fragment.rootOperator)
-    logWarning(s"generateSubstraitPlan: fragment ${fragment.id} " +
-      s"original=${fragment.rootOperator.getClass.getSimpleName} " +
-      s"unwrapped=${rootOp.getClass.getSimpleName}")
+    logWarning(
+      s"generateSubstraitPlan: fragment ${fragment.id} " +
+        s"original=${fragment.rootOperator.getClass.getSimpleName} " +
+        s"unwrapped=${rootOp.getClass.getSimpleName}")
     rootOp match {
       case ts: TransformSupport =>
         val substraitContext = new SubstraitContext
@@ -512,11 +528,10 @@ case class MppNativeQueryExec(
           .asJava
 
         val planNode = if (BackendsApiManager.getSettings.needOutputSchemaForPlan()) {
-          val outputTypeNodes = new java.util.ArrayList[
-            org.apache.gluten.substrait.`type`.TypeNode]()
+          val outputTypeNodes =
+            new java.util.ArrayList[org.apache.gluten.substrait.`type`.TypeNode]()
           for (attr <- childCtx.outputAttributes) {
-            outputTypeNodes.add(
-              ConverterUtils.getTypeNode(attr.dataType, attr.nullable))
+            outputTypeNodes.add(ConverterUtils.getTypeNode(attr.dataType, attr.nullable))
           }
           val outputSchema =
             org.apache.gluten.substrait.`type`.TypeBuilder.makeStruct(false, outputTypeNodes)
@@ -528,10 +543,7 @@ case class MppNativeQueryExec(
             outputSchema,
             null)
         } else {
-          PlanBuilder.makePlan(
-            substraitContext,
-            Lists.newArrayList(childCtx.root),
-            outNames)
+          PlanBuilder.makePlan(substraitContext, Lists.newArrayList(childCtx.root), outNames)
         }
 
         logDebug(
@@ -548,9 +560,9 @@ case class MppNativeQueryExec(
   }
 
   /**
-   * Unwrap non-TransformSupport wrappers to find the actual native operator.
-   * Fragments may have ShuffleExchangeLike, ColumnarToColumnarExec, or
-   * ColumnarToRowExecBase as root — we need the TransformSupport child.
+   * Unwrap non-TransformSupport wrappers to find the actual native operator. Fragments may have
+   * ShuffleExchangeLike, ColumnarToColumnarExec, or ColumnarToRowExecBase as root — we need the
+   * TransformSupport child.
    */
   private def unwrapToTransformSupport(plan: SparkPlan): SparkPlan = {
     plan match {
@@ -565,23 +577,22 @@ case class MppNativeQueryExec(
     }
   }
 
-  /**
-   * Serialize exchange specifications to JSON for the native side.
-   */
+  /** Serialize exchange specifications to JSON for the native side. */
   private def serializeExchangeSpecs(specs: Seq[ExchangeSpec]): String = {
-    val entries = specs.map { spec =>
-      val keys = spec.partitionKeys
-        .map(attr => s""""${ConverterUtils.genColumnNameWithExprId(attr)}"""")
-        .mkString("[", ", ", "]")
-      s"""{
-         |  "id": ${spec.id},
-         |  "producerFragmentId": ${spec.producerFragmentId},
-         |  "consumerFragmentId": ${spec.consumerFragmentId},
-         |  "exchangeType": "${spec.exchangeType}",
-         |  "numPartitions": ${spec.numPartitions},
-         |  "exchangeNodeId": "mpp_exchange_source_${spec.id}",
-         |  "partitionKeys": $keys
-         |}""".stripMargin
+    val entries = specs.map {
+      spec =>
+        val keys = spec.partitionKeys
+          .map(attr => s""""${ConverterUtils.genColumnNameWithExprId(attr)}"""")
+          .mkString("[", ", ", "]")
+        s"""{
+           |  "id": ${spec.id},
+           |  "producerFragmentId": ${spec.producerFragmentId},
+           |  "consumerFragmentId": ${spec.consumerFragmentId},
+           |  "exchangeType": "${spec.exchangeType}",
+           |  "numPartitions": ${spec.numPartitions},
+           |  "exchangeNodeId": "mpp_exchange_source_${spec.id}",
+           |  "partitionKeys": $keys
+           |}""".stripMargin
     }
     entries.mkString("[", ", ", "]")
   }
@@ -611,6 +622,78 @@ case class MppNativeQueryExec(
             ")"
       }
       .mkString("\n")
+  }
+
+  // --- Scan split info extraction for MPP Phase 3 ---
+
+  /**
+   * Extract serialized split infos for a fragment's scan nodes.
+   *
+   * For scan-containing fragments (leaf fragments with file scans), this collects ALL partition
+   * file splits from each LeafTransformSupport and merges them into a single protobuf per leaf.
+   * This gives the native MppQueryCoordinator all file paths to scan.
+   *
+   * Non-scan fragments (consumers with exchange inputs) return an empty array.
+   *
+   * @return
+   *   Array of protobuf byte arrays, one per leaf scan in the fragment.
+   */
+  private def extractSplitInfosForFragment(fragment: NativeFragment): Array[Array[Byte]] = {
+    fragment.rootOperator match {
+      case wst: WholeStageTransformer =>
+        val leafTransformers = findLeafTransformersInWST(wst)
+        if (leafTransformers.nonEmpty) {
+          logWarning(
+            s"extractSplitInfosForFragment: fragment ${fragment.id} has " +
+              s"${leafTransformers.size} leaf scan(s)")
+          leafTransformers.map {
+            leaf =>
+              val allPartitionSplits = leaf.getSplitInfos
+              logWarning(
+                s"  leaf ${leaf.getClass.getSimpleName}: " +
+                  s"${allPartitionSplits.size} partition splits")
+              mergeSplitInfosToBytes(allPartitionSplits)
+          }.toArray
+        } else {
+          Array.empty[Array[Byte]]
+        }
+      case _ => Array.empty[Array[Byte]]
+    }
+  }
+
+  /**
+   * Find all [[LeafTransformSupport]] nodes within a WholeStageTransformer. These are the file scan
+   * operators (e.g., FileSourceScanExecTransformer). Mirrors
+   * WholeStageTransformer.findAllLeafTransformers().
+   */
+  private def findLeafTransformersInWST(wst: WholeStageTransformer): Seq[LeafTransformSupport] = {
+    def collect(plan: SparkPlan): Seq[LeafTransformSupport] = plan match {
+      case leaf: LeafTransformSupport => Seq(leaf)
+      case ts: TransformSupport => ts.children.flatMap(collect)
+      case _ => Seq.empty
+    }
+    collect(wst.child)
+  }
+
+  /**
+   * Merge split infos from all partitions into a single protobuf.
+   *
+   * In BSP, each partition gets its own SplitInfo (a subset of files). For MPP, the coordinator
+   * needs ALL files, so we merge all partitions' file items into one ReadRel.LocalFiles protobuf.
+   */
+  private def mergeSplitInfosToBytes(splitInfos: Seq[SplitInfo]): Array[Byte] = {
+    val builder = ReadRel.LocalFiles.newBuilder()
+    splitInfos.foreach {
+      si =>
+        // SplitInfo.toProtobuf returns Message; parse as typed LocalFiles
+        val localFiles = ReadRel.LocalFiles.parseFrom(si.toProtobuf.toByteArray)
+        builder.addAllItems(localFiles.getItemsList)
+    }
+    val merged = builder.build()
+    logWarning(
+      s"mergeSplitInfosToBytes: merged ${splitInfos.size} partitions " +
+        s"into ${merged.getItemsCount} file items")
+    merged.toByteArray
   }
 
 }

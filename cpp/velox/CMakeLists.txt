@@ -430,6 +430,10 @@ if(BUILD_EXAMPLES)
 endif()
 
 if(ENABLE_GPU)
+  # Propagate GPU flag to velox target so MppJniWrapper.cc and other sources
+  # can use #ifdef GLUTEN_ENABLE_GPU for GPU-specific code paths.
+  target_compile_definitions(velox PRIVATE GLUTEN_ENABLE_GPU)
+
   find_package(cudf CONFIG REQUIRED)
 
   import_library(
@@ -446,6 +450,10 @@ if(ENABLE_GPU)
     facebook::velox::velox_cudf_hive_connector
     ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/libvelox_cudf_hive_connector.a
   )
+  import_library(
+    facebook::velox::velox_cudf_exchange
+    ${VELOX_BUILD_PATH}/velox/experimental/cudf/exchange/libvelox_cudf_exchange.a
+  )
 
   target_compile_definitions(
     velox PRIVATE LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
@@ -459,6 +467,7 @@ if(ENABLE_GPU)
     velox
     PUBLIC facebook::velox::velox_cudf_exec facebook::velox::velox_cudf_vector
            facebook::velox::velox_cudf_hive_connector
+           facebook::velox::velox_cudf_exchange
            facebook::velox::velox_cudf_expression cudf::cudf velox_curl)
 endif()
 

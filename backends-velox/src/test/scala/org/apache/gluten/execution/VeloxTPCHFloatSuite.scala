@@ -17,9 +17,9 @@
 package org.apache.gluten.execution
 
 /**
- * TPC-H suite using float (double) data instead of decimal.
- * This avoids Velox decimal precision bugs (a_precision not defined)
- * that cause q18/q20/q21 to fail with the default decimal parquet data.
+ * TPC-H suite using float (double) data instead of decimal. This avoids Velox decimal precision
+ * bugs (a_precision not defined) that cause q18/q20/q21 to fail with the default decimal parquet
+ * data.
  */
 class VeloxTPCHFloatSuite extends VeloxTPCHSuite {
   override protected val resourcePath: String = "/tpch-data-parquet-float"

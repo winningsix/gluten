@@ -20,8 +20,18 @@
 #include <fmt/format.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 
+// Must be included before any header that (transitively) pulls in
+// CudfHiveConnectorSplit.h, because that header only forward-declares
+// cudf::io::source_info. When this TU instantiates the destructor of
+// std::shared_ptr<CudfHiveConnectorSplit> (via make_shared in inline code
+// such as CudfHiveConnectorSplitBuilder::build()), the compiler needs the
+// full definition of cudf::io::source_info to emit unique_ptr's deleter.
+#include <cudf/io/types.hpp>
+
+#include "config/VeloxConfig.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/memory/ByteStream.h"
+#include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/OutputBufferManager.h"
 #include "velox/exec/SerializedPage.h"
@@ -35,10 +45,9 @@ namespace gluten {
 
 namespace {
 
-/// Task ID prefix for local GPU exchange. The "local://" scheme is recognized
-/// by Velox's built-in LocalExchangeSource (used in testing). A production
-/// GPU exchange would use a custom scheme like "gpu-local://".
-constexpr const char* kTaskIdPrefix = "local://";
+/// Task ID prefix for GPU exchange. The "gpu-local://" scheme is recognized
+/// by LocalGpuExchangeSource (velox/experimental/cudf/exchange/).
+constexpr const char* kTaskIdPrefix = "gpu-local://";
 
 } // namespace
 
@@ -175,6 +184,67 @@ void MppQueryCoordinator::start() {
               << " producer=" << producerTaskId
               << " -> consumer fragment " << exchange.consumerFragmentId
               << " exchange node " << exchange.exchangeNodeId;
+  }
+
+  // Phase 3: Add file scan splits to scan-containing fragments.
+  //
+  // Leaf fragments that read from files (e.g., Parquet scans) need their
+  // file paths injected as HiveConnectorSplits. This mirrors the pattern
+  // in WholeStageResultIterator::noMoreSplits().
+  for (auto& spec : fragmentSpecs_) {
+    if (spec.scanNodeIds.empty()) {
+      continue;
+    }
+    auto& task = tasks_[spec.id];
+    VELOX_CHECK_EQ(
+        spec.scanNodeIds.size(),
+        spec.scanInfos.size(),
+        "Fragment {} has {} scan node IDs but {} scan infos",
+        spec.id,
+        spec.scanNodeIds.size(),
+        spec.scanInfos.size());
+
+    for (size_t i = 0; i < spec.scanNodeIds.size(); i++) {
+      const auto& scanInfo = spec.scanInfos[i];
+      const auto& scanNodeId = spec.scanNodeIds[i];
+      // Use the connector ID from the plan's TableScanNode.
+      // This is critical: "test-hive" → Velox Hive connector,
+      // "cudf-hive" → cuDF GPU connector (handles type casting).
+      const auto& connectorId = (i < spec.scanConnectorIds.size() &&
+                                  !spec.scanConnectorIds[i].empty())
+          ? spec.scanConnectorIds[i]
+          : kHiveConnectorId;
+
+      for (size_t j = 0; j < scanInfo->paths.size(); j++) {
+        std::unordered_map<std::string, std::optional<std::string>> partitionKeys;
+        if (!scanInfo->partitionColumns.empty() &&
+            j < scanInfo->partitionColumns.size()) {
+          for (const auto& [key, value] : scanInfo->partitionColumns[j]) {
+            partitionKeys[key] = value;
+          }
+        }
+
+        // Use HiveConnectorSplit with the appropriate connector ID.
+        // When connectorId is "cudf-hive", Velox routes to the cuDF connector
+        // which handles type coercion (BIGINT→DOUBLE) via libcudf.
+        auto connectorSplit =
+            std::make_shared<connector::hive::HiveConnectorSplit>(
+                connectorId,
+                scanInfo->paths[j],
+                scanInfo->format,
+                scanInfo->starts[j],
+                scanInfo->lengths[j],
+                partitionKeys);
+
+        task->addSplit(scanNodeId, Split(std::move(connectorSplit)));
+      }
+      task->noMoreSplits(scanNodeId);
+
+      LOG(WARNING) << "MppQueryCoordinator: added " << scanInfo->paths.size()
+                   << " scan splits (connector='" << connectorId
+                   << "') to fragment " << spec.id
+                   << " scan node " << scanNodeId;
+    }
   }
 }
 

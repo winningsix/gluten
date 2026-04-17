@@ -23,11 +23,11 @@ import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
 
 /**
  * Test suite verifying MppStrategy (Plan C) behavior:
- * - Correctly intercepts query plans
- * - Skips DDL/command plans
- * - Produces correct results via BSP delegation (Phase 1)
- * - Properly falls back when MPP is disabled
- * - Verifies plan structure proves MPP path can be exercised (Phase 2 readiness)
+ *   - Correctly intercepts query plans
+ *   - Skips DDL/command plans
+ *   - Produces correct results via BSP delegation (Phase 1)
+ *   - Properly falls back when MPP is disabled
+ *   - Verifies plan structure proves MPP path can be exercised (Phase 2 readiness)
  */
 class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
 
@@ -55,10 +55,11 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   /**
    * Walk a physical plan tree and extract fragment boundaries.
    *
-   * Fragments are WholeStageTransformer subtrees separated by ShuffleExchangeLike boundaries.
-   * This is the PROTOTYPE for Phase 2's real fragment extraction in MppCollapseRule.
+   * Fragments are WholeStageTransformer subtrees separated by ShuffleExchangeLike boundaries. This
+   * is the PROTOTYPE for Phase 2's real fragment extraction in MppCollapseRule.
    *
-   * @return (wholeStageTransformers, shuffleExchanges) found in the plan tree
+   * @return
+   *   (wholeStageTransformers, shuffleExchanges) found in the plan tree
    */
   private def extractFragmentsFromPhysicalPlan(
       plan: SparkPlan): (Seq[WholeStageTransformer], Seq[ShuffleExchangeLike]) = {
@@ -86,11 +87,10 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   }
 
   test("MppStrategy: group by agg query produces correct result") {
-    val df = spark.sql(
-      """SELECT l_returnflag, count(*) as cnt
-        |FROM lineitem
-        |GROUP BY l_returnflag
-        |ORDER BY l_returnflag""".stripMargin)
+    val df = spark.sql("""SELECT l_returnflag, count(*) as cnt
+                         |FROM lineitem
+                         |GROUP BY l_returnflag
+                         |ORDER BY l_returnflag""".stripMargin)
     val result = df.collect()
     assert(result.length > 0, "should have results")
     val flags = result.map(_.getString(0))
@@ -98,10 +98,9 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   }
 
   test("MppStrategy: join query produces correct result") {
-    val df = spark.sql(
-      """SELECT count(*)
-        |FROM lineitem l JOIN orders o ON l.l_orderkey = o.o_orderkey
-        |WHERE o.o_orderstatus = 'F'""".stripMargin)
+    val df = spark.sql("""SELECT count(*)
+                         |FROM lineitem l JOIN orders o ON l.l_orderkey = o.o_orderkey
+                         |WHERE o.o_orderstatus = 'F'""".stripMargin)
     val result = df.collect()
     assert(result.length == 1)
     assert(result(0).getLong(0) > 0)
@@ -130,43 +129,40 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   }
 
   test("MppStrategy: TPC-H q6 produces correct result") {
-    val df = spark.sql(
-      """SELECT sum(l_extendedprice * l_discount) as revenue
-        |FROM lineitem
-        |WHERE l_shipdate >= date '1994-01-01'
-        |  AND l_shipdate < date '1995-01-01'
-        |  AND l_discount BETWEEN 0.05 AND 0.07
-        |  AND l_quantity < 24""".stripMargin)
+    val df = spark.sql("""SELECT sum(l_extendedprice * l_discount) as revenue
+                         |FROM lineitem
+                         |WHERE l_shipdate >= date '1994-01-01'
+                         |  AND l_shipdate < date '1995-01-01'
+                         |  AND l_discount BETWEEN 0.05 AND 0.07
+                         |  AND l_quantity < 24""".stripMargin)
     val result = df.collect()
     assert(result.length == 1, "q6 should return 1 row")
   }
 
   test("MppStrategy: multi-table join produces result") {
     // Simplified join without strict date filters (test data is tiny)
-    val df = spark.sql(
-      """SELECT count(*) as cnt
-        |FROM orders o
-        |JOIN lineitem l ON l.l_orderkey = o.o_orderkey""".stripMargin)
+    val df = spark.sql("""SELECT count(*) as cnt
+                         |FROM orders o
+                         |JOIN lineitem l ON l.l_orderkey = o.o_orderkey""".stripMargin)
     val result = df.collect()
     assert(result.length == 1)
     assert(result(0).getLong(0) > 0, "join should produce results")
   }
 
   test("MppStrategy: subquery produces correct result") {
-    val df = spark.sql(
-      """SELECT l_returnflag, l_linestatus, count(*) as cnt
-        |FROM lineitem
-        |WHERE l_quantity > (SELECT avg(l_quantity) FROM lineitem)
-        |GROUP BY l_returnflag, l_linestatus""".stripMargin)
+    val df = spark.sql("""SELECT l_returnflag, l_linestatus, count(*) as cnt
+                         |FROM lineitem
+                         |WHERE l_quantity > (SELECT avg(l_quantity) FROM lineitem)
+                         |GROUP BY l_returnflag, l_linestatus""".stripMargin)
     val result = df.collect()
     assert(result.length > 0, "subquery should have results")
   }
 
   test("MppStrategy: UNION ALL produces correct result") {
-    val df = spark.sql(
-      """SELECT l_returnflag, count(*) as cnt FROM lineitem GROUP BY l_returnflag
-        |UNION ALL
-        |SELECT o_orderstatus, count(*) FROM orders GROUP BY o_orderstatus""".stripMargin)
+    val df =
+      spark.sql("""SELECT l_returnflag, count(*) as cnt FROM lineitem GROUP BY l_returnflag
+                  |UNION ALL
+                  |SELECT o_orderstatus, count(*) FROM orders GROUP BY o_orderstatus""".stripMargin)
     val result = df.collect()
     assert(result.length > 0, "UNION ALL should have results")
   }
@@ -184,14 +180,13 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   }
 
   test("MppStrategy: multiple shuffles (group by + order by) produces correct result") {
-    val df = spark.sql(
-      """SELECT l_returnflag, l_linestatus,
-        |  sum(l_quantity) as sum_qty,
-        |  count(*) as count_order
-        |FROM lineitem
-        |WHERE l_shipdate <= date '1998-09-02'
-        |GROUP BY l_returnflag, l_linestatus
-        |ORDER BY l_returnflag, l_linestatus""".stripMargin)
+    val df = spark.sql("""SELECT l_returnflag, l_linestatus,
+                         |  sum(l_quantity) as sum_qty,
+                         |  count(*) as count_order
+                         |FROM lineitem
+                         |WHERE l_shipdate <= date '1998-09-02'
+                         |GROUP BY l_returnflag, l_linestatus
+                         |ORDER BY l_returnflag, l_linestatus""".stripMargin)
     val result = df.collect()
     assert(result.length > 0, "TPC-H q1 style query should have results")
     // Verify ordering
@@ -200,16 +195,16 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   }
 
   test("MppStrategy: MppNativeQueryExec present in plan when enabled") {
-    val df = spark.sql(
-      """SELECT l_returnflag, count(*) FROM lineitem
-        |GROUP BY l_returnflag ORDER BY l_returnflag""".stripMargin)
+    val df = spark.sql("""SELECT l_returnflag, count(*) FROM lineitem
+                         |GROUP BY l_returnflag ORDER BY l_returnflag""".stripMargin)
     val mppExec = findMppExec(df)
     assert(mppExec.isDefined, "MppNativeQueryExec should be in plan when MPP enabled")
   }
 
   test("MppStrategy: results match BSP baseline") {
     // Run same query with MPP enabled and disabled, compare results
-    val sql = "SELECT l_returnflag, sum(l_quantity) as sq FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag"
+    val sql =
+      "SELECT l_returnflag, sum(l_quantity) as sq FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag"
     val mppResult = spark.sql(sql).collect()
 
     withSQLConf(
@@ -217,11 +212,14 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
       "spark.gluten.mpp.strategy.enabled" -> "false"
     ) {
       val bspResult = spark.sql(sql).collect()
-      assert(mppResult.length == bspResult.length,
+      assert(
+        mppResult.length == bspResult.length,
         s"Row count mismatch: MPP=${mppResult.length} BSP=${bspResult.length}")
-      mppResult.zip(bspResult).foreach { case (mpp, bsp) =>
-        assert(mpp.getString(0) == bsp.getString(0),
-          s"Flag mismatch: MPP=${mpp.getString(0)} BSP=${bsp.getString(0)}")
+      mppResult.zip(bspResult).foreach {
+        case (mpp, bsp) =>
+          assert(
+            mpp.getString(0) == bsp.getString(0),
+            s"Flag mismatch: MPP=${mpp.getString(0)} BSP=${bsp.getString(0)}")
       }
     }
   }
@@ -235,45 +233,40 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   test("MppNativeQueryExec child has ShuffleExchangeLike nodes (shuffle proof)") {
     // A GROUP BY + ORDER BY query forces at least one shuffle exchange.
     // This verifies the child plan retains exchange nodes (Plan D: wrap, don't replace).
-    val df = spark.sql(
-      """SELECT l_returnflag, count(*) as cnt
-        |FROM lineitem
-        |GROUP BY l_returnflag
-        |ORDER BY l_returnflag""".stripMargin)
+    val df = spark.sql("""SELECT l_returnflag, count(*) as cnt
+                         |FROM lineitem
+                         |GROUP BY l_returnflag
+                         |ORDER BY l_returnflag""".stripMargin)
     val mppExec = findMppExec(df)
     assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
 
     val childPlan = mppExec.get.child
-    val exchangeNodes = childPlan.collect {
-      case ex: ShuffleExchangeLike => ex
-    }
+    val exchangeNodes = childPlan.collect { case ex: ShuffleExchangeLike => ex }
     // Plan D wraps the original plan; the child tree must still contain exchanges.
     // If this fails, the child was incorrectly stripped of its exchange nodes.
     assert(
       exchangeNodes.nonEmpty,
       s"Child plan should contain ShuffleExchangeLike nodes for GROUP BY + ORDER BY query. " +
-        s"Child plan tree:\n${childPlan.treeString}")
+        s"Child plan tree:\n${childPlan.treeString}"
+    )
   }
 
   test("MppNativeQueryExec child has WholeStageTransformer fragments") {
     // A query with GROUP BY + ORDER BY should produce at least 2 WholeStageTransformer
     // nodes (one for the scan+agg stage, one for the final sort stage).
     // This is the prerequisite for Phase 2: each WST becomes a native fragment.
-    val df = spark.sql(
-      """SELECT l_returnflag, l_linestatus,
-        |  sum(l_quantity) as sum_qty,
-        |  count(*) as count_order
-        |FROM lineitem
-        |WHERE l_shipdate <= date '1998-09-02'
-        |GROUP BY l_returnflag, l_linestatus
-        |ORDER BY l_returnflag, l_linestatus""".stripMargin)
+    val df = spark.sql("""SELECT l_returnflag, l_linestatus,
+                         |  sum(l_quantity) as sum_qty,
+                         |  count(*) as count_order
+                         |FROM lineitem
+                         |WHERE l_shipdate <= date '1998-09-02'
+                         |GROUP BY l_returnflag, l_linestatus
+                         |ORDER BY l_returnflag, l_linestatus""".stripMargin)
     val mppExec = findMppExec(df)
     assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
 
     val childPlan = mppExec.get.child
-    val wstNodes = childPlan.collect {
-      case wst: WholeStageTransformer => wst
-    }
+    val wstNodes = childPlan.collect { case wst: WholeStageTransformer => wst }
     // Phase 2 requirement: >= 2 fragments means there is at least one exchange boundary
     // that can be converted to a streaming GPU exchange.
     assert(
@@ -285,11 +278,10 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   test("Fragment extraction from child plan finds exchange boundaries") {
     // Use the extractFragmentsFromPhysicalPlan helper (Phase 2 prototype) to walk the
     // child plan and identify fragment boundaries at ShuffleExchangeLike nodes.
-    val df = spark.sql(
-      """SELECT l_returnflag, count(*) as cnt
-        |FROM lineitem
-        |GROUP BY l_returnflag
-        |ORDER BY l_returnflag""".stripMargin)
+    val df = spark.sql("""SELECT l_returnflag, count(*) as cnt
+                         |FROM lineitem
+                         |GROUP BY l_returnflag
+                         |ORDER BY l_returnflag""".stripMargin)
     val mppExec = findMppExec(df)
     assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
 
@@ -318,35 +310,32 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   test("Each fragment WholeStageTransformer can generate Substrait") {
     // For each WholeStageTransformer in the child plan, verify that Substrait generation
     // succeeds. This is what Phase 2 will do for each fragment before submitting to JNI.
-    val df = spark.sql(
-      """SELECT l_returnflag, count(*) as cnt
-        |FROM lineitem
-        |GROUP BY l_returnflag
-        |ORDER BY l_returnflag""".stripMargin)
+    val df = spark.sql("""SELECT l_returnflag, count(*) as cnt
+                         |FROM lineitem
+                         |GROUP BY l_returnflag
+                         |ORDER BY l_returnflag""".stripMargin)
     val mppExec = findMppExec(df)
     assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
 
     val childPlan = mppExec.get.child
-    val wstNodes = childPlan.collect {
-      case wst: WholeStageTransformer => wst
-    }
+    val wstNodes = childPlan.collect { case wst: WholeStageTransformer => wst }
     assert(wstNodes.nonEmpty, "Should have at least one WholeStageTransformer")
 
-    wstNodes.foreach { wst =>
-      // doWholeStageTransform() generates a full Substrait plan for this stage.
-      // This is the same call that WholeStageTransformer.doExecuteColumnar() makes.
-      val wsCtx = wst.doWholeStageTransform()
-      assert(wsCtx != null, s"doWholeStageTransform() returned null for stage ${wst.stageId}")
-      assert(wsCtx.root != null, s"Substrait PlanNode is null for stage ${wst.stageId}")
+    wstNodes.foreach {
+      wst =>
+        // doWholeStageTransform() generates a full Substrait plan for this stage.
+        // This is the same call that WholeStageTransformer.doExecuteColumnar() makes.
+        val wsCtx = wst.doWholeStageTransform()
+        assert(wsCtx != null, s"doWholeStageTransform() returned null for stage ${wst.stageId}")
+        assert(wsCtx.root != null, s"Substrait PlanNode is null for stage ${wst.stageId}")
 
-      // Verify the plan can be serialized to bytes (what JNI expects)
-      val planBytes = wsCtx.root.toProtobuf.toByteArray
-      assert(
-        planBytes.length > 0,
-        s"Substrait plan bytes should be non-empty for stage ${wst.stageId}")
+        // Verify the plan can be serialized to bytes (what JNI expects)
+        val planBytes = wsCtx.root.toProtobuf.toByteArray
+        assert(
+          planBytes.length > 0,
+          s"Substrait plan bytes should be non-empty for stage ${wst.stageId}")
 
-      logInfo(
-        s"Stage ${wst.stageId}: Substrait plan = ${planBytes.length} bytes")
+        logInfo(s"Stage ${wst.stageId}: Substrait plan = ${planBytes.length} bytes")
     }
   }
 
@@ -354,11 +343,10 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     // Run a query and check that MppNativeQueryExec exposes the expected metrics.
     // Phase 1 (BSP delegation) does NOT update fragment/exchange counts because
     // hasRealFragments is false. This test documents the gap.
-    val df = spark.sql(
-      """SELECT l_returnflag, count(*) as cnt
-        |FROM lineitem
-        |GROUP BY l_returnflag
-        |ORDER BY l_returnflag""".stripMargin)
+    val df = spark.sql("""SELECT l_returnflag, count(*) as cnt
+                         |FROM lineitem
+                         |GROUP BY l_returnflag
+                         |ORDER BY l_returnflag""".stripMargin)
     // Force execution so metrics are populated
     df.collect()
 
@@ -378,7 +366,8 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     assert(
       numFragments == 0,
       s"Phase 1 BSP delegation: numFragments should be 0 (got $numFragments). " +
-        "When Phase 2 is implemented, change this assertion to numFragments > 0.")
+        "When Phase 2 is implemented, change this assertion to numFragments > 0."
+    )
   }
 
   test("BSP delegation path is logged with MPP WRAP MODE marker") {
@@ -386,11 +375,10 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     // This ensures we can distinguish BSP delegation from real MPP execution in logs.
     // We check by examining the child plan tree for the expected structure rather
     // than capturing logs (log capture is fragile in test suites).
-    val df = spark.sql(
-      """SELECT l_returnflag, count(*) as cnt
-        |FROM lineitem
-        |GROUP BY l_returnflag
-        |ORDER BY l_returnflag""".stripMargin)
+    val df = spark.sql("""SELECT l_returnflag, count(*) as cnt
+                         |FROM lineitem
+                         |GROUP BY l_returnflag
+                         |ORDER BY l_returnflag""".stripMargin)
     val mppExec = findMppExec(df)
     assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
 
@@ -404,13 +392,12 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     assert(
       !hasRealFragments,
       "Phase 1: fragments should NOT have real rootOperators (BSP delegation). " +
-        "When Phase 2 is implemented, change this assertion to hasRealFragments == true.")
+        "When Phase 2 is implemented, change this assertion to hasRealFragments == true."
+    )
 
     // Also verify the simpleString indicates current state
     val desc = mppExec.get.simpleString(10)
-    assert(
-      desc.contains("fragments"),
-      s"simpleString should mention fragments: $desc")
+    assert(desc.contains("fragments"), s"simpleString should mention fragments: $desc")
     logInfo(
       s"BSP delegation confirmed: hasRealFragments=$hasRealFragments, " +
         s"fragments=${fragments.size}, exchanges=${exchanges.size}, desc=$desc")

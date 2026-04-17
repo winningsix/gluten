@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "substrait/SubstraitToVeloxPlan.h"
 #include "velox/common/future/VeloxPromise.h"
 #include "velox/core/PlanFragment.h"
 #include "velox/core/QueryCtx.h"
@@ -46,6 +47,14 @@ struct MppFragmentSpec {
 
   /// Number of driver threads for this fragment.
   int32_t numDrivers{1};
+
+  /// Scan split information for table scan nodes in this fragment.
+  /// Only populated for scan-containing (leaf) fragments.
+  std::vector<std::shared_ptr<SplitInfo>> scanInfos;
+  std::vector<facebook::velox::core::PlanNodeId> scanNodeIds;
+  /// Connector IDs for each scan node (e.g., "test-hive" or "cudf-hive").
+  /// Must match the TableScanNode's connector ID in the plan.
+  std::vector<std::string> scanConnectorIds;
 };
 
 /// Describes a data exchange between two fragments.

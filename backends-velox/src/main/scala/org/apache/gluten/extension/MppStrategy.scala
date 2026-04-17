@@ -32,28 +32,25 @@ import org.apache.spark.sql.internal.SQLConf
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Plan C: MppStrategy intercepts the entire logical plan at the strategy level
- * and generates a single MppNativeQueryExec that executes all fragments
- * concurrently via Velox's MppQueryCoordinator.
+ * Plan C: MppStrategy intercepts the entire logical plan at the strategy level and generates a
+ * single MppNativeQueryExec that executes all fragments concurrently via Velox's
+ * MppQueryCoordinator.
  *
- * This runs BEFORE EnsureRequirements -- no ShuffleExchange nodes are ever
- * created for MPP queries. The strategy:
+ * This runs BEFORE EnsureRequirements -- no ShuffleExchange nodes are ever created for MPP queries.
+ * The strategy:
  *
  *   1. Checks if MPP is enabled via `spark.gluten.mpp.enabled` and
- *      `spark.gluten.mpp.strategy.enabled`.
- *   2. Generates a "shadow" physical plan using Spark's internal planner
- *      (with MPP disabled to avoid recursion).
- *   3. Runs the shadow plan through `QueryExecution.executedPlan` to get
- *      ShuffleExchange boundaries inserted by EnsureRequirements.
- *   4. Walks the shadow plan to extract fragment boundaries and exchange specs.
- *   5. Returns a single MppNativeQueryExec containing all fragments.
+ *      `spark.gluten.mpp.strategy.enabled`. 2. Generates a "shadow" physical plan using Spark's
+ *      internal planner (with MPP disabled to avoid recursion). 3. Runs the shadow plan through
+ *      `QueryExecution.executedPlan` to get ShuffleExchange boundaries inserted by
+ *      EnsureRequirements. 4. Walks the shadow plan to extract fragment boundaries and exchange
+ *      specs. 5. Returns a single MppNativeQueryExec containing all fragments.
  *
- * If the plan contains BroadcastExchange nodes or any unsupported operators,
- * MppStrategy returns Nil (falls back to Gluten BSP mode).
+ * If the plan contains BroadcastExchange nodes or any unsupported operators, MppStrategy returns
+ * Nil (falls back to Gluten BSP mode).
  *
- * When MppStrategy claims a plan, it disables AQE for that query because
- * MPP runs all stages concurrently -- there are no intermediate statistics
- * to observe.
+ * When MppStrategy claims a plan, it disables AQE for that query because MPP runs all stages
+ * concurrently -- there are no intermediate statistics to observe.
  */
 case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging {
 
@@ -65,17 +62,18 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
   private val MPP_STRATEGY_DEFAULT = "false"
 
   /**
-   * Guard flag to prevent re-entrant shadow plan generation.
-   * When we generate the shadow plan, Spark's planner will call this strategy
-   * again. The flag ensures we return Nil during shadow planning.
+   * Guard flag to prevent re-entrant shadow plan generation. When we generate the shadow plan,
+   * Spark's planner will call this strategy again. The flag ensures we return Nil during shadow
+   * planning.
    */
   @transient
   private var generatingShadowPlan: Boolean = false
 
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = {
     if (!isMppStrategyEnabled) {
-      logWarning(s"MppStrategy: disabled (mpp.enabled=${session.conf.get(MPP_ENABLED_KEY, MPP_ENABLED_DEFAULT)}, " +
-        s"strategy.enabled=${session.conf.get(MPP_STRATEGY_KEY, MPP_STRATEGY_DEFAULT)})")
+      logWarning(
+        s"MppStrategy: disabled (mpp.enabled=${session.conf.get(MPP_ENABLED_KEY, MPP_ENABLED_DEFAULT)}, " +
+          s"strategy.enabled=${session.conf.get(MPP_STRATEGY_KEY, MPP_STRATEGY_DEFAULT)})")
       return Nil
     }
     if (generatingShadowPlan) return Nil
@@ -93,15 +91,19 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
       if (queryPlan.isInstanceOf[org.apache.spark.sql.catalyst.plans.logical.Command]) {
         return Nil
       }
-      logWarning(s"MppStrategy: top-level plan detected (${plan.getClass.getSimpleName} " +
-        s"→ ${queryPlan.getClass.getSimpleName}), attempting MPP...")
-      tryMpp(queryPlan).map { exec =>
-        logWarning(s"MppStrategy: *** PLAN C ACTIVE *** returning MppNativeQueryExec")
-        Seq(exec)
-      }.getOrElse {
-        logWarning(s"MppStrategy: tryMpp returned None, falling back to BSP")
-        Nil
-      }
+      logWarning(
+        s"MppStrategy: top-level plan detected (${plan.getClass.getSimpleName} " +
+          s"→ ${queryPlan.getClass.getSimpleName}), attempting MPP...")
+      tryMpp(queryPlan)
+        .map {
+          exec =>
+            logWarning(s"MppStrategy: *** PLAN C ACTIVE *** returning MppNativeQueryExec")
+            Seq(exec)
+        }
+        .getOrElse {
+          logWarning(s"MppStrategy: tryMpp returned None, falling back to BSP")
+          Nil
+        }
     } else {
       logWarning(s"MppStrategy: not a top-level plan (${plan.getClass.getSimpleName}), skipping")
       Nil
@@ -118,8 +120,8 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
   }
 
   /**
-   * Check whether the logical plan looks like a top-level query root.
-   * We avoid intercepting DDL commands, CTAS, or other non-query plans.
+   * Check whether the logical plan looks like a top-level query root. We avoid intercepting DDL
+   * commands, CTAS, or other non-query plans.
    */
   private def isTopLevelPlan(plan: LogicalPlan): Boolean = {
     // Only match ReturnAnswer — this is the outermost wrapper Spark adds for queries.
@@ -131,8 +133,8 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
   }
 
   /**
-   * Attempt to build an MPP execution plan for the given logical plan.
-   * Returns None if the plan cannot be fully handled in MPP mode.
+   * Attempt to build an MPP execution plan for the given logical plan. Returns None if the plan
+   * cannot be fully handled in MPP mode.
    */
   private def tryMpp(logicalPlan: LogicalPlan): Option[MppNativeQueryExec] = {
     logWarning("MppStrategy: attempting Plan C MPP transformation")
@@ -148,21 +150,23 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
 
     // For now, create placeholder fragments — the real extraction happens at execution time
     // from the child physical plan.
-    val fragments = Seq(NativeFragment(
-      id = 0,
-      rootOperator = null, // Will be populated at execution time from child plan
-      outputAttributes = logicalPlan.output,
-      parallelism = session.conf.get("spark.sql.shuffle.partitions", "200").toInt
-    ))
+    val fragments = Seq(
+      NativeFragment(
+        id = 0,
+        rootOperator = null, // Will be populated at execution time from child plan
+        outputAttributes = logicalPlan.output,
+        parallelism = session.conf.get("spark.sql.shuffle.partitions", "200").toInt
+      ))
     val exchanges = Seq.empty[ExchangeSpec]
 
     logWarning(
       s"MppStrategy: *** MPP MODE (Plan C) *** query=${logicalPlan.getClass.getSimpleName}, " +
         s"fragments will be extracted at execution time from child physical plan")
-    exchanges.foreach { e =>
-      logWarning(
-        s"  Exchange ${e.id}: F${e.producerFragmentId} -> F${e.consumerFragmentId} " +
-          s"(${e.exchangeType}, ${e.numPartitions} partitions)")
+    exchanges.foreach {
+      e =>
+        logWarning(
+          s"  Exchange ${e.id}: F${e.producerFragmentId} -> F${e.consumerFragmentId} " +
+            s"(${e.exchangeType}, ${e.numPartitions} partitions)")
     }
 
     // Step 4: Disable AQE for this query. MPP runs all stages concurrently --
@@ -196,12 +200,11 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
   }
 
   /**
-   * Generate a "shadow" physical plan by running Spark's internal planner
-   * (with MPP fully disabled) and letting EnsureRequirements insert
-   * ShuffleExchange nodes.
+   * Generate a "shadow" physical plan by running Spark's internal planner (with MPP fully disabled)
+   * and letting EnsureRequirements insert ShuffleExchange nodes.
    *
-   * We use `QueryExecution.executedPlan` which runs the full preparation
-   * pipeline including EnsureRequirements.
+   * We use `QueryExecution.executedPlan` which runs the full preparation pipeline including
+   * EnsureRequirements.
    *
    * To avoid infinite recursion, we:
    *   - Set the `generatingShadowPlan` flag (prevents re-entrant calls)
@@ -257,17 +260,15 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
   }
 
   /**
-   * Walk the shadow physical plan (which has ShuffleExchange nodes inserted
-   * by EnsureRequirements) and extract NativeFragment + ExchangeSpec lists.
+   * Walk the shadow physical plan (which has ShuffleExchange nodes inserted by EnsureRequirements)
+   * and extract NativeFragment + ExchangeSpec lists.
    *
-   * We match on ShuffleExchangeLike (the Spark trait) rather than a specific
-   * implementation because the shadow plan may contain either Spark's
-   * ShuffleExchangeExec or Gluten's ColumnarShuffleExchangeExec depending
-   * on which columnar rules ran.
+   * We match on ShuffleExchangeLike (the Spark trait) rather than a specific implementation because
+   * the shadow plan may contain either Spark's ShuffleExchangeExec or Gluten's
+   * ColumnarShuffleExchangeExec depending on which columnar rules ran.
    *
-   * Each contiguous subtree of non-exchange operators becomes a fragment.
-   * Each ShuffleExchangeLike becomes an exchange boundary linking a producer
-   * fragment to a consumer fragment.
+   * Each contiguous subtree of non-exchange operators becomes a fragment. Each ShuffleExchangeLike
+   * becomes an exchange boundary linking a producer fragment to a consumer fragment.
    */
   private def extractFragmentsFromShadowPlan(
       plan: SparkPlan): (Seq[NativeFragment], Seq[ExchangeSpec]) = {
@@ -343,8 +344,7 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
       case _: BroadcastPartitioning =>
         ("BROADCAST", Seq.empty)
       case other =>
-        logWarning(
-          s"MppStrategy: unexpected partitioning type: ${other.getClass.getSimpleName}")
+        logWarning(s"MppStrategy: unexpected partitioning type: ${other.getClass.getSimpleName}")
         ("HASH", Seq.empty)
     }
   }
@@ -360,13 +360,12 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
 }
 
 /**
- * A minimal leaf SparkPlan that provides schema information only.
- * Never executed -- used as the child of MppNativeQueryExec when the
- * strategy bypasses normal physical planning.
+ * A minimal leaf SparkPlan that provides schema information only. Never executed -- used as the
+ * child of MppNativeQueryExec when the strategy bypasses normal physical planning.
  */
 case class MppSchemaOnlyExec(outputAttributes: Seq[Attribute])
-    extends LeafExecNode
-    with org.apache.gluten.execution.GlutenPlan {
+  extends LeafExecNode
+  with org.apache.gluten.execution.GlutenPlan {
 
   override def output: Seq[Attribute] = outputAttributes
 
@@ -376,10 +375,10 @@ case class MppSchemaOnlyExec(outputAttributes: Seq[Attribute])
   override def rowType0(): org.apache.gluten.extension.columnar.transition.Convention.RowType =
     org.apache.gluten.extension.columnar.transition.Convention.RowType.None
 
-  override def requiredChildConvention(): Seq[org.apache.gluten.extension.columnar.transition.ConventionReq] = Nil
+  override def requiredChildConvention()
+      : Seq[org.apache.gluten.extension.columnar.transition.ConventionReq] = Nil
 
   override protected def doExecute(): RDD[InternalRow] = {
-    throw new UnsupportedOperationException(
-      "MppSchemaOnlyExec should never be executed.")
+    throw new UnsupportedOperationException("MppSchemaOnlyExec should never be executed.")
   }
 }

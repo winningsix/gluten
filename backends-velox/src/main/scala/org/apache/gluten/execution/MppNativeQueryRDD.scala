@@ -31,9 +31,9 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
  * RDD that executes an MPP query plan via JNI.
  *
  * This is a single-partition RDD: the native MPP coordinator handles all parallelism internally.
- * Substrait plans are pre-generated on the driver side (by [[MppNativeQueryExec]]) and passed
- * as serialized byte arrays. This avoids accessing SparkPlan.sparkContext on executor nodes
- * (which would cause NPE).
+ * Substrait plans are pre-generated on the driver side (by [[MppNativeQueryExec]]) and passed as
+ * serialized byte arrays. This avoids accessing SparkPlan.sparkContext on executor nodes (which
+ * would cause NPE).
  *
  * The native side creates an MppQueryCoordinator that:
  *   - Launches all fragment pipelines concurrently
@@ -60,6 +60,7 @@ class MppNativeQueryRDD(
     fragmentPlans: Array[Array[Byte]],
     numDriversPerFragment: Array[Int],
     exchangeSpecsJson: String,
+    fragmentSplitInfos: Array[Array[Array[Byte]]],
     pipelineTime: SQLMetric,
     outputRows: SQLMetric,
     outputBatches: SQLMetric
@@ -91,7 +92,8 @@ class MppNativeQueryRDD(
     val mppHandle = jniWrapper.nativeCreateMppQuery(
       fragmentPlans,
       numDriversPerFragment,
-      exchangeSpecsJson.getBytes("UTF-8"))
+      exchangeSpecsJson.getBytes("UTF-8"),
+      fragmentSplitInfos)
     jniWrapper.nativeStartMppQuery(mppHandle)
 
     logInfo("MppNativeQueryRDD: all MPP fragments started, streaming exchange active")

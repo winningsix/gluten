@@ -31,6 +31,7 @@
 #include "compute/VeloxBackend.h"
 #include "compute/VeloxPlanConverter.h"
 #include "compute/VeloxRuntime.h"
+#include "config/VeloxConfig.h"
 #include "memory/VeloxColumnarBatch.h"
 #include "memory/VeloxMemoryManager.h"
 #include "substrait/plan.pb.h"
@@ -38,11 +39,13 @@
 
 // Plan node types for tree rewriting.
 #include "velox/core/PlanNode.h"
+#include "velox/exec/ExchangeSource.h"
 #include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/RoundRobinPartitionFunction.h"
 #include "operators/plannodes/RowVectorStream.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include "operators/plannodes/CudfVectorStream.h"
+#include "velox/experimental/cudf/exchange/LocalGpuExchangeSource.h"
 #endif
 
 using namespace gluten;
@@ -84,6 +87,26 @@ struct MppQueryHandle {
 // ---------------------------------------------------------------------------
 // Plan tree rewriting helpers
 // ---------------------------------------------------------------------------
+
+/// Find a TableScanNode by plan node ID and return its connector ID.
+/// Returns empty string if not found.
+std::string getTableScanConnectorId(
+    const velox::core::PlanNodePtr& plan,
+    const velox::core::PlanNodeId& nodeId) {
+  if (auto tableScan =
+          std::dynamic_pointer_cast<const velox::core::TableScanNode>(plan)) {
+    if (tableScan->id() == nodeId && tableScan->tableHandle()) {
+      return tableScan->tableHandle()->connectorId();
+    }
+  }
+  for (const auto& source : plan->sources()) {
+    auto result = getTableScanConnectorId(source, nodeId);
+    if (!result.empty()) {
+      return result;
+    }
+  }
+  return "";
+}
 
 /// Check if a PlanNode is a ValueStream leaf node that should be replaced
 /// with an ExchangeNode for MPP execution.
@@ -378,7 +401,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     jobject wrapper,
     jobjectArray substraitPlansArr,
     jintArray numDriversArr,
-    jbyteArray exchangeSpecsJsonArr) {
+    jbyteArray exchangeSpecsJsonArr,
+    jobjectArray splitInfosPerFragArr) {
   JNI_METHOD_START
 
   auto ctx = getRuntime(env, wrapper);
@@ -401,6 +425,19 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       reinterpret_cast<const uint8_t*>(safeExchangeJson.elems()),
       env->GetArrayLength(exchangeSpecsJsonArr));
   const auto numExchanges = exchangeSpecs.size();
+
+  // --- Register GPU ExchangeSource for intra-process exchange ---
+  // MPP uses Velox's ExchangeNode/OutputBufferManager for streaming data
+  // between fragments. The "gpu-local://" prefix is handled by
+  // LocalGpuExchangeSource from the cudf exchange module.
+#ifdef GLUTEN_ENABLE_GPU
+  static std::once_flag gpuExchangeRegistered;
+  std::call_once(gpuExchangeRegistered, []() {
+    velox::exec::ExchangeSource::registerFactory(
+        facebook::velox::cudf_velox::createLocalGpuExchangeSource);
+    LOG(INFO) << "MppJniWrapper: registered LocalGpuExchangeSource factory";
+  });
+#endif
 
   // --- Convert each Substrait plan to a Velox PlanNode ---
 
@@ -425,19 +462,103 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
         fmt::format("Failed to parse Substrait plan for fragment {}", i));
 
     // Convert Substrait -> Velox PlanNode.
-    // We use an empty input iterator list and no local files since MPP
-    // fragments get their input from Exchange nodes, not from file scans
-    // or Java iterators.
+    // Merge backend config + runtime session config. Backend config has static
+    // settings; session config has per-query overrides (e.g., cudf=true).
+    auto backendConf = VeloxBackend::get()->getBackendConf();
+    auto mergedMap = backendConf->rawConfigsCopy();
+    for (const auto& [key, val] : runtime->getConfMap()) {
+      mergedMap[key] = val;
+    }
+    auto sessionCfg = std::make_shared<velox::config::ConfigBase>(
+        std::move(mergedMap));
+    LOG(WARNING) << "MppJniWrapper: fragment " << i
+                << " cudf.enabled="
+                << sessionCfg->get<std::string>(
+                       "spark.gluten.sql.columnar.cudf", "NOT_SET")
+                << " cudf.enableTableScan="
+                << sessionCfg->get<std::string>(
+                       "spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan",
+                       "NOT_SET")
+                << " cudf.backend.enabled="
+                << sessionCfg->get<std::string>(
+                       "spark.gluten.sql.columnar.backend.velox.cudf.enabled",
+                       "NOT_SET")
+                << " confMap.size=" << runtime->getConfMap().size();
+    // Count inbound exchanges for this fragment (= number of stream inputs).
+    // Consumer fragments have ValueStream nodes that need input iterators
+    // during plan conversion. We provide nullptr placeholders since these
+    // nodes get replaced with ExchangeNode after conversion.
+    int32_t numStreamInputs = 0;
+    for (const auto& exchange : exchangeSpecs) {
+      if (exchange.consumerFragmentId == static_cast<int32_t>(i)) {
+        numStreamInputs++;
+      }
+    }
+    std::vector<std::shared_ptr<ResultIterator>> placeholderIters(
+        numStreamInputs, nullptr);
+
     VeloxPlanConverter converter(
         veloxPool.get(),
-        VeloxBackend::get()->getBackendConf().get(),
-        /*rowVectors=*/{},
+        sessionCfg.get(),
+        placeholderIters,
         /*writeFilesTempPath=*/std::nullopt,
         /*writeFileName=*/std::nullopt,
         /*validationMode=*/false);
 
-    std::vector<::substrait::ReadRel_LocalFiles> emptyLocalFiles;
-    auto veloxPlanNode = converter.toVeloxPlan(substraitPlan, emptyLocalFiles);
+    // Parse split infos for this fragment from byte[][][] parameter.
+    std::vector<::substrait::ReadRel_LocalFiles> localFiles;
+    if (splitInfosPerFragArr != nullptr) {
+      auto fragSplitArr = static_cast<jobjectArray>(
+          env->GetObjectArrayElement(splitInfosPerFragArr, i));
+      if (fragSplitArr != nullptr) {
+        jsize numSplits = env->GetArrayLength(fragSplitArr);
+        for (jsize j = 0; j < numSplits; ++j) {
+          auto splitBytes = static_cast<jbyteArray>(
+              env->GetObjectArrayElement(fragSplitArr, j));
+          auto safeSplitBytes = getByteArrayElementsSafe(env, splitBytes);
+          auto splitSize = env->GetArrayLength(splitBytes);
+          ::substrait::ReadRel_LocalFiles localFile;
+          GLUTEN_CHECK(
+              parseProtobuf(
+                  reinterpret_cast<const uint8_t*>(safeSplitBytes.elems()),
+                  splitSize,
+                  &localFile),
+              fmt::format(
+                  "Failed to parse split info for fragment {} split {}", i, j));
+          LOG(INFO) << "MppJniWrapper: fragment " << i
+                    << " split " << j << " has "
+                    << localFile.items_size() << " file items";
+          localFiles.push_back(std::move(localFile));
+          env->DeleteLocalRef(splitBytes);
+        }
+        env->DeleteLocalRef(fragSplitArr);
+      }
+    }
+
+    auto veloxPlanNode = converter.toVeloxPlan(substraitPlan, localFiles);
+
+    // Extract scan split info from the converter BEFORE tree rewriting.
+    // For scan-containing fragments, this captures file scan node IDs and
+    // their associated SplitInfo (paths, starts, lengths, format).
+    std::vector<std::shared_ptr<SplitInfo>> fragScanInfos;
+    std::vector<velox::core::PlanNodeId> fragScanNodeIds;
+    {
+      std::vector<velox::core::PlanNodeId> streamIds; // unused for MPP
+      VeloxRuntime::getInfoAndIds(
+          converter.splitInfos(),
+          veloxPlanNode->leafPlanNodeIds(),
+          fragScanInfos,
+          fragScanNodeIds,
+          streamIds);
+      if (!fragScanNodeIds.empty()) {
+        LOG(INFO) << "MppJniWrapper: fragment " << i
+                  << " has " << fragScanNodeIds.size() << " scan node(s)";
+        for (size_t si = 0; si < fragScanNodeIds.size(); ++si) {
+          LOG(INFO) << "  scan node " << fragScanNodeIds[si]
+                    << ": " << fragScanInfos[si]->paths.size() << " file(s)";
+        }
+      }
+    }
 
     LOG(INFO) << "MppJniWrapper: fragment " << i
               << " raw Velox plan: "
@@ -551,6 +672,26 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     fragSpec.planFragment = std::move(planFragment);
     fragSpec.destination = 0; // output partition index
     fragSpec.numDrivers = safeNumDrivers.elems()[i];
+    fragSpec.scanInfos = std::move(fragScanInfos);
+    fragSpec.scanNodeIds = std::move(fragScanNodeIds);
+    // Determine connector IDs for scan nodes.
+    // When cuDF is enabled, the plan may still have "test-hive" due to
+    // useCudfTableHandle() logic. Override to "cudf-hive" when cudf config
+    // is fully enabled, since MPP needs the GPU connector for type coercion.
+    for (const auto& scanNodeId : fragSpec.scanNodeIds) {
+      // For MPP, always use cudf-hive connector when GPU is enabled.
+      // The plan may have "test-hive" due to SubstraitToVeloxPlanConverter
+      // logic, but CudfHiveConnectorSplit needs cudf-hive connector ID.
+#ifdef GLUTEN_ENABLE_GPU
+      auto connectorId = std::string(kCudfHiveConnectorId);
+#else
+      auto connectorId = getTableScanConnectorId(veloxPlanNode, scanNodeId);
+#endif
+      LOG(WARNING) << "MppJniWrapper: fragment " << i
+                   << " scan node " << scanNodeId
+                   << " connector: '" << connectorId << "'";
+      fragSpec.scanConnectorIds.push_back(std::move(connectorId));
+    }
 
     fragmentSpecs.push_back(std::move(fragSpec));
 
@@ -573,7 +714,11 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   // since Velox tasks use the executor passed to Task::start() (the
   // coordinator calls task->start(numDrivers) which uses Task's internal
   // executor registration). The spill executor is optional.
-  auto memoryPool = runtime->memoryManager()->getAggregateMemoryPool();
+  // Create a dedicated aggregate child pool for the MPP query.
+  // QueryCtx needs an aggregate pool so it can create leaf child pools
+  // for each Task's operators.
+  auto rootPool = runtime->memoryManager()->getAggregateMemoryPool();
+  auto mppPool = rootPool->addAggregateChild("MppQuery");
   std::unordered_map<std::string, std::shared_ptr<velox::config::ConfigBase>>
       connectorConfigs;
   auto queryCtx = velox::core::QueryCtx::create(
@@ -581,7 +726,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       velox::core::QueryConfig{{}},
       connectorConfigs,
       VeloxBackend::get()->getAsyncDataCache(),
-      memoryPool,
+      mppPool,
       /*spillExecutor=*/nullptr,
       "MppQuery");
 

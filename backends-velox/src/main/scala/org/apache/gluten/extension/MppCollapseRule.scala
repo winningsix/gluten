@@ -105,8 +105,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // When Plan C (MppStrategy) is enabled, disable Plan D entirely.
     // MppStrategy handles MPP at the Strategy level; MppCollapseRule
     // would interfere with subqueries and cause "cannot transform shuffle node".
-    val strategyEnabled = SQLConf.get.getConfString(
-      "spark.gluten.mpp.strategy.enabled", "false").toBoolean
+    val strategyEnabled =
+      SQLConf.get.getConfString("spark.gluten.mpp.strategy.enabled", "false").toBoolean
     if (strategyEnabled) {
       return plan
     }
@@ -155,12 +155,13 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // Phase 1: wrap plan with placeholder fragments. The child plan is NOT modified.
     // MppNativeQueryExec.doExecuteColumnar() will delegate to child.executeColumnar()
     // (BSP execution). True MPP fragment extraction comes in Phase 2.
-    val fragments = Seq(NativeFragment(
-      id = 0,
-      rootOperator = null, // placeholder — real extraction in Phase 2
-      outputAttributes = plan.output,
-      parallelism = 4
-    ))
+    val fragments = Seq(
+      NativeFragment(
+        id = 0,
+        rootOperator = null, // placeholder — real extraction in Phase 2
+        outputAttributes = plan.output,
+        parallelism = 4
+      ))
     val exchanges = Seq.empty[ExchangeSpec]
 
     logWarning(
@@ -301,7 +302,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case _: BroadcastPartitioning => true
       case _: UnknownPartitioning => false
       case other =>
-        logWarning(s"MppCollapseRule: unsupported partitioning type: ${other.getClass.getSimpleName}")
+        logWarning(
+          s"MppCollapseRule: unsupported partitioning type: ${other.getClass.getSimpleName}")
         false
     }
   }
@@ -325,10 +327,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     val exchanges = scala.collection.mutable.ArrayBuffer[ExchangeSpec]()
 
     /**
-     * Check whether a node is an exchange boundary (or a wrapper around one) that should be
-     * handled by `walk` rather than `walkInFragment`. This looks through transparent wrappers:
-     * ColumnarToColumnarExec (e.g. VeloxResizeBatchesExec), ColumnarToRowExecBase, and AQE
-     * query stage nodes.
+     * Check whether a node is an exchange boundary (or a wrapper around one) that should be handled
+     * by `walk` rather than `walkInFragment`. This looks through transparent wrappers:
+     * ColumnarToColumnarExec (e.g. VeloxResizeBatchesExec), ColumnarToRowExecBase, and AQE query
+     * stage nodes.
      */
     def isExchangeBoundary(node: SparkPlan): Boolean = {
       node match {
@@ -341,8 +343,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     }
 
     /**
-     * Unwrap transparent wrapper nodes (ColumnarToColumnarExec, ColumnarToRowExecBase, AQE
-     * query stages) to reach the underlying exchange or TransformSupport node.
+     * Unwrap transparent wrapper nodes (ColumnarToColumnarExec, ColumnarToRowExecBase, AQE query
+     * stages) to reach the underlying exchange or TransformSupport node.
      */
     def unwrapToExchange(node: SparkPlan): SparkPlan = {
       node match {
@@ -390,7 +392,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         case broadcast: BroadcastExchangeLike =>
           // Similar to shuffle but with BROADCAST type
           val childPlan = broadcast.children.headOption
-            .map(unwrapToExchange).getOrElse(broadcast)
+            .map(unwrapToExchange)
+            .getOrElse(broadcast)
           val producerFragmentId = walk(childPlan)
 
           val consumerFragmentId = fragmentCounter.getAndIncrement()
@@ -470,8 +473,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
      * nodes that are part of the same fragment. We don't create new fragments here — the parent
      * call handles fragment creation.
      *
-     * When we encounter ColumnarToColumnarExec or ColumnarToRowExecBase wrapping an exchange,
-     * we route back to walk() to handle the exchange boundary properly.
+     * When we encounter ColumnarToColumnarExec or ColumnarToRowExecBase wrapping an exchange, we
+     * route back to walk() to handle the exchange boundary properly.
      */
     def walkInFragment(node: SparkPlan): Unit = {
       node.children.foreach {
