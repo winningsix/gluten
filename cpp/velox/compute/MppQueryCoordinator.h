@@ -162,6 +162,11 @@ class MppQueryCoordinator {
   /// Output buffer reading state for the root fragment.
   std::shared_ptr<facebook::velox::exec::OutputBufferManager> bufferManager_;
   int64_t outputSequence_{0};
+
+  /// Leaf memory pool for deserializing pages in next(). Velox requires
+  /// allocations to happen on leaf pools, not the aggregate root returned
+  /// by queryCtx_->pool(). Created lazily on first next() call.
+  std::shared_ptr<facebook::velox::memory::MemoryPool> deserializePool_;
 };
 
 } // namespace gluten

@@ -336,10 +336,17 @@ RowVectorPtr MppQueryCoordinator::next() {
       VELOX_CHECK(
           outputType != nullptr, "Root fragment must have RowType output");
 
+      // Velox allocations must happen on a leaf pool, not the aggregate
+      // root returned by queryCtx_->pool(). Create one lazily.
+      if (deserializePool_ == nullptr) {
+        deserializePool_ =
+            queryCtx_->pool()->addLeafChild("mpp_deserialize");
+      }
+
       RowVectorPtr result;
       VectorStreamGroup::read(
           inputStream.get(),
-          queryCtx_->pool(),
+          deserializePool_.get(),
           outputType,
           getVectorSerde(),
           &result,

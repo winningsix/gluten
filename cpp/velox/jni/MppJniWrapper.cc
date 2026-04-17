@@ -746,7 +746,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   handle->executor = std::move(executor);
   handle->queryCtx = std::move(queryCtx);
   handle->coordinator = std::move(coordinator);
-  handle->memoryPool = std::move(memoryPool);
+  handle->memoryPool = std::move(veloxPool);
 
   auto handleId = ctx->saveObject(std::static_pointer_cast<void>(handle));
 
