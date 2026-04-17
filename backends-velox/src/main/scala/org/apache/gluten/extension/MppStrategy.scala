@@ -57,7 +57,7 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
   private val MPP_ENABLED_KEY = "spark.gluten.mpp.enabled"
   private val MPP_STRATEGY_KEY = "spark.gluten.mpp.strategy.enabled"
   private val MPP_ENABLED_DEFAULT = "true"
-  // Disable Plan C for now — shadow plan generation returns CommandResultExec.
+  // Disable Plan C for now - shadow plan generation returns CommandResultExec.
   // Use Plan D (MppCollapseRule) which has a working child plan.
   private val MPP_STRATEGY_DEFAULT = "false"
 
@@ -72,7 +72,8 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = {
     if (!isMppStrategyEnabled) {
       logWarning(
-        s"MppStrategy: disabled (mpp.enabled=${session.conf.get(MPP_ENABLED_KEY, MPP_ENABLED_DEFAULT)}, " +
+        s"MppStrategy: disabled (" +
+          s"mpp.enabled=${session.conf.get(MPP_ENABLED_KEY, MPP_ENABLED_DEFAULT)}, " +
           s"strategy.enabled=${session.conf.get(MPP_STRATEGY_KEY, MPP_STRATEGY_DEFAULT)})")
       return Nil
     }
@@ -81,19 +82,19 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
     logWarning(s"MppStrategy: apply() called with ${plan.getClass.getSimpleName}")
 
     if (isTopLevelPlan(plan)) {
-      // Unwrap ReturnAnswer — it's just a Spark wrapper, not a real operator.
+      // Unwrap ReturnAnswer - it's just a Spark wrapper, not a real operator.
       // The shadow planner needs the actual query plan, not ReturnAnswer.
       val queryPlan = plan match {
         case ReturnAnswer(child) => child
         case other => other
       }
-      // After unwrapping, skip commands (DDL, DML) — only queries should go MPP
+      // After unwrapping, skip commands (DDL, DML) - only queries should go MPP
       if (queryPlan.isInstanceOf[org.apache.spark.sql.catalyst.plans.logical.Command]) {
         return Nil
       }
       logWarning(
         s"MppStrategy: top-level plan detected (${plan.getClass.getSimpleName} " +
-          s"→ ${queryPlan.getClass.getSimpleName}), attempting MPP...")
+          s"-> ${queryPlan.getClass.getSimpleName}), attempting MPP...")
       tryMpp(queryPlan)
         .map {
           exec =>
@@ -124,7 +125,7 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
    * commands, CTAS, or other non-query plans.
    */
   private def isTopLevelPlan(plan: LogicalPlan): Boolean = {
-    // Only match ReturnAnswer — this is the outermost wrapper Spark adds for queries.
+    // Only match ReturnAnswer - this is the outermost wrapper Spark adds for queries.
     // This ensures we create exactly ONE MppNativeQueryExec per query, not nested ones.
     plan match {
       case _: ReturnAnswer => true
@@ -146,9 +147,9 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
     //
     // This avoids the "cannot transform shuffle node" issue because MppNativeQueryExec
     // is inserted BEFORE ShuffleExchange nodes exist. Spark adds them to the child
-    // plan, and we read them — never replace them.
+    // plan, and we read them - never replace them.
 
-    // For now, create placeholder fragments — the real extraction happens at execution time
+    // For now, create placeholder fragments - the real extraction happens at execution time
     // from the child physical plan.
     val fragments = Seq(
       NativeFragment(
@@ -181,13 +182,13 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
     // For a single-child plan (Sort, Aggregate, Project, etc.):
     //   plan the child via planLater, then wrap
     // For multi-child plans (Join): plan each child via planLater
-    // Use MppSchemaOnlyExec as child — it provides schema only, never executes.
+    // Use MppSchemaOnlyExec as child - it provides schema only, never executes.
     // MppNativeQueryExec.doExecuteColumnar() generates its own execution plan
     // via JNI/MppQueryCoordinator, independent of the child.
-    // planLater(logicalPlan) — plan the ENTIRE query (Sort/Aggregate/etc.)
+    // planLater(logicalPlan) - plan the ENTIRE query (Sort/Aggregate/etc.)
     // MppStrategy claims ReturnAnswer; logicalPlan is ReturnAnswer.child.
     // Since they're different nodes, no recursion conflict.
-    // Spark will plan logicalPlan normally → with ShuffleExchange, Gluten rules, etc.
+    // Spark will plan logicalPlan normally -> with ShuffleExchange, Gluten rules, etc.
     val plannedChild = planLater(logicalPlan)
 
     Some(
@@ -230,12 +231,12 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
       // Use Spark's internal QueryExecution to generate the physical plan.
       // executedPlan runs: planner -> prepareForExecution (EnsureRequirements etc.)
       // Approach: use Spark's planner to get physical plan, then manually
-      // run preparations. The key is planLater() — Spark strategies can
+      // run preparations. The key is planLater() - Spark strategies can
       // defer child planning. We plan children normally, then examine
       // the resulting physical plan for ShuffleExchange nodes.
       //
       // IMPORTANT: We must use the ORIGINAL planner (not create new QueryExecution)
-      // because we're inside a strategy call — creating a new QE causes recursion
+      // because we're inside a strategy call - creating a new QE causes recursion
       // or short-circuits to CommandResultExec.
       //
       // Instead, use planLater to let Spark plan the children normally,

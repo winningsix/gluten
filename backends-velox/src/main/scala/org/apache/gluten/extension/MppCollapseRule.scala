@@ -81,7 +81,7 @@ case class ExchangeSpec(
  *
  * In BSP (Bulk Synchronous Parallel) mode, Gluten breaks the plan at every ShuffleExchange into
  * separate stages, each wrapped in a [[WholeStageTransformer]]. In MPP mode, ALL stages run
- * concurrently with streaming GPU exchange — no BSP barriers.
+ * concurrently with streaming GPU exchange - no BSP barriers.
  *
  * This rule:
  *   1. Walks the Catalyst physical plan tree (after AQE finalization). 2. Identifies chains of
@@ -158,14 +158,14 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     val fragments = Seq(
       NativeFragment(
         id = 0,
-        rootOperator = null, // placeholder — real extraction in Phase 2
+        rootOperator = null, // placeholder - real extraction in Phase 2
         outputAttributes = plan.output,
         parallelism = 4
       ))
     val exchanges = Seq.empty[ExchangeSpec]
 
     logWarning(
-      s"MppCollapseRule: *** MPP MODE ACTIVE *** — collapsed plan into " +
+      s"MppCollapseRule: *** MPP MODE ACTIVE *** - collapsed plan into " +
         s"${fragments.size} fragments and ${exchanges.size} exchanges. " +
         s"All stages will run concurrently with streaming exchange.")
 
@@ -187,14 +187,14 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case exchange: ShuffleExchangeLike =>
         canAbsorbExchange(exchange) && isFullyNativeSupported(exchange.child)
 
-      // Broadcast exchanges cannot be absorbed — Spark requires broadcast nodes
+      // Broadcast exchanges cannot be absorbed - Spark requires broadcast nodes
       // to remain intact. Queries with broadcast joins fall back to BSP.
       case bc: BroadcastExchangeLike =>
         logWarning(
           s"MppCollapseRule: BLOCKED by BroadcastExchangeLike: ${bc.getClass.getSimpleName}")
         false
 
-      // AQE query stage wrappers — check their underlying plan
+      // AQE query stage wrappers - check their underlying plan
       case stage: ShuffleQueryStageExec =>
         isFullyNativeSupported(stage.plan)
 
@@ -205,12 +205,12 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case _: TransformSupport =>
         plan.children.forall(isFullyNativeSupported)
 
-      // ColumnarToRow at the top of the plan is OK — Spark always adds this
+      // ColumnarToRow at the top of the plan is OK - Spark always adds this
       // to convert columnar output to rows for the driver. Look through it.
       case c2r: ColumnarToRowExecBase =>
         c2r.children.forall(isFullyNativeSupported)
 
-      // Gluten-internal columnar-to-columnar nodes (batch resize, etc.) — look through
+      // Gluten-internal columnar-to-columnar nodes (batch resize, etc.) - look through
       case c2c: ColumnarToColumnarExec =>
         c2c.children.forall(isFullyNativeSupported)
 
@@ -279,7 +279,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         partitioningSupported && childSupported
 
       case broadcast: BroadcastExchangeLike =>
-        // Broadcast exchanges are supported — the native side will handle broadcast
+        // Broadcast exchanges are supported - the native side will handle broadcast
         // as a special exchange type
         broadcast.children.forall {
           child =>
@@ -446,7 +446,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
                       _: ShuffleQueryStageExec | _: BroadcastQueryStageExec =>
                     walk(child)
                   case _ =>
-                    // Non-exchange child — belongs to the same fragment, walk recursively
+                    // Non-exchange child - belongs to the same fragment, walk recursively
                     walkInFragment(child)
                     -1 // sentinel: not a separate fragment
                 }
@@ -470,7 +470,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
     /**
      * Walk within a fragment (no exchange boundaries). This just recurses through TransformSupport
-     * nodes that are part of the same fragment. We don't create new fragments here — the parent
+     * nodes that are part of the same fragment. We don't create new fragments here - the parent
      * call handles fragment creation.
      *
      * When we encounter ColumnarToColumnarExec or ColumnarToRowExecBase wrapping an exchange, we
@@ -480,13 +480,13 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       node.children.foreach {
         child =>
           if (isExchangeBoundary(child)) {
-            // This is a wrapper around an exchange — route to walk() to handle it
+            // This is a wrapper around an exchange - route to walk() to handle it
             walk(unwrapToExchange(child))
           } else {
             child match {
               case _: ShuffleExchangeLike | _: BroadcastExchangeLike | _: ShuffleQueryStageExec |
                   _: BroadcastQueryStageExec =>
-                // Bare exchange — route to walk()
+                // Bare exchange - route to walk()
                 walk(child)
               case _ =>
                 walkInFragment(child)

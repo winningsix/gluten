@@ -204,7 +204,8 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   test("MppStrategy: results match BSP baseline") {
     // Run same query with MPP enabled and disabled, compare results
     val sql =
-      "SELECT l_returnflag, sum(l_quantity) as sq FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag"
+      "SELECT l_returnflag, sum(l_quantity) as sq FROM lineitem " +
+        "GROUP BY l_returnflag ORDER BY l_returnflag"
     val mppResult = spark.sql(sql).collect()
 
     withSQLConf(
@@ -225,7 +226,7 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   }
 
   // ============================================================
-  // Phase 2 readiness tests — verify plan STRUCTURE, not just results.
+  // Phase 2 readiness tests - verify plan STRUCTURE, not just results.
   // These tests document the current BSP-delegation behavior and
   // establish the assertions that Phase 2 must satisfy.
   // ============================================================

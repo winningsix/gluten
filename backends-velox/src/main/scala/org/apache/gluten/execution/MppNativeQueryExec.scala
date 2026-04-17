@@ -73,7 +73,7 @@ import scala.collection.mutable
  * validation passes.
  *
  * At execution time, doExecuteColumnar() does NOT call child.executeColumnar(). Instead, it uses
- * the child plan only to extract Substrait fragments, then executes via JNI → MppQueryCoordinator
+ * the child plan only to extract Substrait fragments, then executes via JNI -> MppQueryCoordinator
  * (streaming exchange).
  */
 case class MppNativeQueryExec(
@@ -244,7 +244,7 @@ case class MppNativeQueryExec(
     val fragmentSplitInfos: Array[Array[Array[Byte]]] =
       fragments.map(extractSplitInfosForFragment).toArray
 
-    // RDD only receives serialized bytes — no SparkPlan references.
+    // RDD only receives serialized bytes - no SparkPlan references.
     new MppNativeQueryRDD(
       sparkContext,
       fragmentPlans,
@@ -561,7 +561,7 @@ case class MppNativeQueryExec(
 
   /**
    * Unwrap non-TransformSupport wrappers to find the actual native operator. Fragments may have
-   * ShuffleExchangeLike, ColumnarToColumnarExec, or ColumnarToRowExecBase as root — we need the
+   * ShuffleExchangeLike, ColumnarToColumnarExec, or ColumnarToRowExecBase as root - we need the
    * TransformSupport child.
    */
   private def unwrapToTransformSupport(plan: SparkPlan): SparkPlan = {
