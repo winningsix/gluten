@@ -214,12 +214,14 @@ void MppQueryCoordinator::start() {
         queryCtx_,
         Task::ExecutionMode::kParallel);
 
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: starting fragment "
+                 << spec.id << " taskId=" << taskId
+                 << " drivers=" << spec.numDrivers
+                 << " destination=" << spec.destination;
     task->start(spec.numDrivers);
     tasks_[spec.id] = std::move(task);
-
-    LOG(INFO) << "MppQueryCoordinator: started fragment " << spec.id
-              << " as task " << taskId
-              << " with " << spec.numDrivers << " drivers";
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: started fragment "
+                 << spec.id << " state=" << static_cast<int>(tasks_[spec.id]->state());
   }
 
   // Phase 2: Wire exchanges by adding RemoteConnectorSplits.
@@ -237,15 +239,18 @@ void MppQueryCoordinator::start() {
         exchange.consumerFragmentId,
         exchange.id);
 
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                 << "]: wiring exchange " << exchange.id
+                 << " producer=" << producerTaskId
+                 << " -> consumer(F" << exchange.consumerFragmentId << ")"
+                 << " exchangeNode=" << exchange.exchangeNodeId
+                 << " consumerState=" << static_cast<int>(consumerTask->state());
     consumerTask->addSplit(
         exchange.exchangeNodeId,
         Split(std::make_shared<RemoteConnectorSplit>(producerTaskId)));
     consumerTask->noMoreSplits(exchange.exchangeNodeId);
-
-    LOG(INFO) << "MppQueryCoordinator: wired exchange " << exchange.id
-              << " producer=" << producerTaskId
-              << " -> consumer fragment " << exchange.consumerFragmentId
-              << " exchange node " << exchange.exchangeNodeId;
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                 << "]: exchange " << exchange.id << " wired";
   }
 
   // Phase 3: Add file scan splits to scan-containing fragments.
@@ -324,14 +329,23 @@ bool MppQueryCoordinator::fetchNextOutputPage(
   auto dataPromise =
       ContinuePromise("MppQueryCoordinator::fetchNextOutputPage");
 
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+               << "]: fetchNextOutputPage rootTask=" << rootTaskId
+               << " seq=" << outputSequence_
+               << " rootState=" << static_cast<int>(tasks_[rootFragmentId_]->state());
+
   auto ok = bufferManager_->getData(
       rootTaskId,
       kDestination,
       kMaxBytes,
       outputSequence_,
-      [&](std::vector<std::unique_ptr<folly::IOBuf>> pages,
-          int64_t inSequence,
-          std::vector<int64_t> /*remainingBytes*/) {
+      [&, this](std::vector<std::unique_ptr<folly::IOBuf>> pages,
+                int64_t inSequence,
+                std::vector<int64_t> /*remainingBytes*/) {
+        LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                     << "]: getData callback fired"
+                     << " pages=" << pages.size()
+                     << " inSeq=" << inSequence;
         for (auto& page : pages) {
           if (page != nullptr) {
             ++inSequence;
@@ -346,8 +360,8 @@ bool MppQueryCoordinator::fetchNextOutputPage(
       });
 
   if (!ok) {
-    // Task not found in OutputBufferManager. This can happen if the root
-    // task finished without producing any output or was already cleaned up.
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                 << "]: getData returned ok=false (task not registered?)";
     noMoreData_ = true;
     return false;
   }
