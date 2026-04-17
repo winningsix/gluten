@@ -127,14 +127,45 @@ std::shared_ptr<MppQueryCoordinator> MppQueryCoordinator::create(
 }
 
 MppQueryCoordinator::~MppQueryCoordinator() {
-  // Best-effort cleanup: abort any tasks still running.
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: destructor entry"
+               << " started=" << started_
+               << " tasks=" << tasks_.size()
+               << " rootFragmentId=" << rootFragmentId_;
   if (started_) {
+    // Abort any still-running tasks and wait for all tasks to reach a
+    // terminal state, then remove their OutputBuffer entries from the
+    // global OutputBufferManager. Failing to call removeTask() leaks the
+    // producer-side buffer (and its pages) into the process-wide manager,
+    // which causes subsequent MPP queries in the same JVM to hang because
+    // ExchangeClient state there is not cleanly reset.
     try {
       abort();
     } catch (...) {
-      // Swallow exceptions in destructor.
+    }
+    for (auto& task : tasks_) {
+      if (task == nullptr) {
+        continue;
+      }
+      // Best-effort wait for terminal state. Cap to avoid blocking shutdown
+      // indefinitely on a stuck task — if we time out, we still proceed with
+      // removeTask, accepting that the task may log warnings.
+      if (!isTerminalState(task->state())) {
+        try {
+          task->taskCompletionFuture().wait(std::chrono::seconds(5));
+        } catch (...) {
+        }
+      }
+      const auto& tid = task->taskId();
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                   << "]: removeTask(" << tid
+                   << ") state=" << static_cast<int>(task->state());
+      try {
+        bufferManager_->removeTask(tid);
+      } catch (...) {
+      }
     }
   }
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: destructor exit";
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +188,9 @@ bool MppQueryCoordinator::isTerminalState(TaskState state) {
 void MppQueryCoordinator::start() {
   VELOX_CHECK(!started_, "MppQueryCoordinator already started");
   started_ = true;
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: start() "
+               << fragmentSpecs_.size() << " fragments, rootFragmentId="
+               << rootFragmentId_;
 
   // Phase 1: Create and start a Velox Task for each fragment.
   //
@@ -408,14 +442,28 @@ bool MppQueryCoordinator::isFinished() const {
 
 void MppQueryCoordinator::abort() {
   if (!started_) {
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                 << "]: abort() called before start(), skipping";
     return;
   }
-
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: abort() begin";
   for (auto& task : tasks_) {
-    if (!isTerminalState(task->state())) {
+    if (task == nullptr) {
+      continue;
+    }
+    auto state = task->state();
+    if (!isTerminalState(state)) {
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                   << "]: requestAbort(" << task->taskId()
+                   << ") state=" << static_cast<int>(state);
       task->requestAbort();
+    } else {
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                   << "]: already-terminal " << task->taskId()
+                   << " state=" << static_cast<int>(state);
     }
   }
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: abort() end";
 }
 
 // ---------------------------------------------------------------------------
