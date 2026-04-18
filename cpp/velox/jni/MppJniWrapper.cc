@@ -730,8 +730,18 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       /*spillExecutor=*/nullptr,
       "MppQuery");
 
-  // Generate a unique query ID.
-  auto queryId = fmt::format("mpp-{}", reinterpret_cast<uintptr_t>(queryCtx.get()));
+  // Generate a process-unique query ID. Previously we used the queryCtx
+  // pointer address, but the allocator freely reuses addresses across
+  // consecutive queries in the same JVM: when iter N's queryCtx is
+  // destructed and iter N+1 happens to allocate at the same address, the
+  // two queries end up with identical queryIds and therefore identical
+  // taskIds. Stale state keyed by taskId (ExchangeClient remoteTaskIds_,
+  // LocalGpuExchangeSource timeouts_, etc.) then bridges the two queries
+  // and hangs the second one. Use a monotonically increasing counter
+  // instead.
+  static std::atomic<uint64_t> gMppQueryCounter{0};
+  auto queryId =
+      fmt::format("mpp-{}", gMppQueryCounter.fetch_add(1, std::memory_order_relaxed));
 
   // Create the coordinator.
   auto coordinator = MppQueryCoordinator::create(
