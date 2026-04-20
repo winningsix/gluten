@@ -762,13 +762,39 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
 
   // --- Create execution resources ---
 
-  // Thread pool for task execution. Size proportional to total drivers.
-  int32_t totalDrivers = 0;
-  for (auto& spec : fragmentSpecs) {
-    totalDrivers += spec.numDrivers;
+  // Thread pool for task execution. Must account for consumer-fragment
+  // replication: a fragment that consumes an N-partition exchange is
+  // materialized by MppQueryCoordinator as N sibling Tasks (one per
+  // destination), so its driver count is replicaCount * numDrivers, not
+  // just numDrivers. Mirror the replica-count derivation from
+  // MppQueryCoordinator::start() so the pool is sized for the *physical*
+  // driver count the coordinator will actually spawn.
+  std::vector<int32_t> replicaCount(fragmentSpecs.size(), 1);
+  for (const auto& exchange : exchangeSpecs) {
+    const auto consumer = exchange.consumerFragmentId;
+    const auto n = std::max(1, exchange.numPartitions);
+    if (replicaCount[consumer] == 1) {
+      replicaCount[consumer] = n;
+    }
+    // Consistency check deferred to coordinator (VELOX_CHECK_EQ there).
   }
-  // At least 4 threads, at most 32, with some headroom for exchange I/O.
-  int32_t poolSize = std::max(4, std::min(32, totalDrivers * 2));
+  int32_t totalPhysicalDrivers = 0;
+  for (size_t i = 0; i < fragmentSpecs.size(); ++i) {
+    // Replicated fragments use 1 driver per replica (matches
+    // GpuMultiFragmentTest convention); non-replicated fragments use
+    // spec.numDrivers.
+    int32_t perReplicaDrivers =
+        replicaCount[i] == 1 ? std::max(1, fragmentSpecs[i].numDrivers) : 1;
+    totalPhysicalDrivers += replicaCount[i] * perReplicaDrivers;
+  }
+  // At least 4 threads. Size = 2x physical drivers for exchange I/O +
+  // producer-wait headroom. No hard ceiling — Velox drivers yield on
+  // GPU/exchange waits, so oversubscribing a few hundred threads is fine
+  // and cheaper than starving.
+  int32_t poolSize = std::max(4, totalPhysicalDrivers * 2);
+  LOG(WARNING) << "MppJniWrapper: threadPool size=" << poolSize
+               << " physicalDrivers=" << totalPhysicalDrivers
+               << " fragments=" << fragmentSpecs.size();
   auto executor =
       std::make_shared<folly::CPUThreadPoolExecutor>(poolSize);
 
