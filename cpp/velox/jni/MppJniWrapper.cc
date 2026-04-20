@@ -733,7 +733,6 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     MppFragmentSpec fragSpec;
     fragSpec.id = static_cast<int32_t>(i);
     fragSpec.planFragment = std::move(planFragment);
-    fragSpec.destination = 0; // output partition index
     fragSpec.numDrivers = safeNumDrivers.elems()[i];
     fragSpec.scanInfos = std::move(fragScanInfos);
     fragSpec.scanNodeIds = std::move(fragScanNodeIds);

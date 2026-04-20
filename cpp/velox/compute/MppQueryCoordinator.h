@@ -44,11 +44,9 @@ struct MppFragmentSpec {
   /// The Velox plan fragment (plan tree + execution strategy).
   facebook::velox::core::PlanFragment planFragment;
 
-  /// Destination partition index for PartitionedOutput.
-  /// Typically 0 for the root fragment.
-  int32_t destination{0};
-
   /// Number of driver threads for this fragment.
+  /// For replicated consumers (replicas > 1) this is interpreted per-replica;
+  /// today we override to 1/replica when replicated. TODO: scale with N/cores.
   int32_t numDrivers{1};
 
   /// Scan split information for table scan nodes in this fragment.
@@ -151,8 +149,11 @@ class MppQueryCoordinator {
       std::shared_ptr<facebook::velox::core::QueryCtx> queryCtx,
       folly::Executor* executor);
 
-  /// Build the task ID string for a given fragment.
-  std::string makeTaskId(int32_t fragmentId) const;
+  /// Build the task ID string for a given fragment + replica index.
+  /// Every Task ID carries a replica suffix, including single-replica
+  /// fragments (replicaIdx=0), so exchange wiring treats all fragments
+  /// uniformly (no special case for replicated vs non-replicated).
+  std::string makeTaskId(int32_t fragmentId, int32_t replicaIdx) const;
 
   /// Check if a task state is terminal.
   static bool isTerminalState(facebook::velox::exec::TaskState state);
@@ -174,14 +175,29 @@ class MppQueryCoordinator {
   /// constructor from exchangeSpecs_.
   int32_t rootFragmentId_{-1};
 
-  /// One Velox Task per fragment, indexed by fragment id.
-  std::vector<std::shared_ptr<facebook::velox::exec::Task>> tasks_;
+  /// Physical Tasks per fragment, indexed as fragmentTasks_[fragId][replicaIdx].
+  /// Inner size = fragmentReplicaCount_[fragId]. For fragments consuming an
+  /// N-partition exchange inner size is N; for leaf/non-consumer fragments
+  /// inner size is 1. Each replica i carries destination=i at Task::create.
+  std::vector<std::vector<std::shared_ptr<facebook::velox::exec::Task>>>
+      fragmentTasks_;
+
+  /// Per-fragment replica count. Derived at start() from inbound exchanges'
+  /// numPartitions. Fragments with no inbound exchange have count = 1.
+  std::vector<int32_t> fragmentReplicaCount_;
+
   bool started_{false};
   bool noMoreData_{false};
 
-  /// Output buffer reading state for the root fragment.
+  /// Output buffer reading state for the root fragment. When root is
+  /// replicated we track per-replica sequence + atEnd. Drain strategy is
+  /// selected at start() time based on root's inbound exchange type.
   std::shared_ptr<facebook::velox::exec::OutputBufferManager> bufferManager_;
-  int64_t outputSequence_{0};
+  std::vector<int64_t> rootOutputSequence_;
+  std::vector<bool> rootReplicaAtEnd_;
+  int32_t rootFetchCursor_{0};
+  /// True for RANGE (order-preserving) drain; false for round-robin.
+  bool rootDrainSequential_{false};
 
   /// Leaf memory pool for deserializing pages in next(). Velox requires
   /// allocations to happen on leaf pools, not the aggregate root returned

@@ -127,9 +127,14 @@ std::shared_ptr<MppQueryCoordinator> MppQueryCoordinator::create(
 }
 
 MppQueryCoordinator::~MppQueryCoordinator() {
+  size_t totalTasks = 0;
+  for (auto& replicas : fragmentTasks_) {
+    totalTasks += replicas.size();
+  }
   LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: destructor entry"
                << " started=" << started_
-               << " tasks=" << tasks_.size()
+               << " fragments=" << fragmentTasks_.size()
+               << " totalTasks=" << totalTasks
                << " rootFragmentId=" << rootFragmentId_;
   if (started_) {
     // Abort any still-running tasks and wait for all tasks to reach a
@@ -142,26 +147,28 @@ MppQueryCoordinator::~MppQueryCoordinator() {
       abort();
     } catch (...) {
     }
-    for (auto& task : tasks_) {
-      if (task == nullptr) {
-        continue;
-      }
-      // Best-effort wait for terminal state. Cap to avoid blocking shutdown
-      // indefinitely on a stuck task — if we time out, we still proceed with
-      // removeTask, accepting that the task may log warnings.
-      if (!isTerminalState(task->state())) {
+    for (auto& replicas : fragmentTasks_) {
+      for (auto& task : replicas) {
+        if (task == nullptr) {
+          continue;
+        }
+        // Best-effort wait for terminal state. Cap to avoid blocking shutdown
+        // indefinitely on a stuck task — if we time out, we still proceed
+        // with removeTask, accepting that the task may log warnings.
+        if (!isTerminalState(task->state())) {
+          try {
+            task->taskCompletionFuture().wait(std::chrono::seconds(5));
+          } catch (...) {
+          }
+        }
+        const auto& tid = task->taskId();
+        LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                     << "]: removeTask(" << tid
+                     << ") state=" << static_cast<int>(task->state());
         try {
-          task->taskCompletionFuture().wait(std::chrono::seconds(5));
+          bufferManager_->removeTask(tid);
         } catch (...) {
         }
-      }
-      const auto& tid = task->taskId();
-      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: removeTask(" << tid
-                   << ") state=" << static_cast<int>(task->state());
-      try {
-        bufferManager_->removeTask(tid);
-      } catch (...) {
       }
     }
   }
@@ -172,8 +179,14 @@ MppQueryCoordinator::~MppQueryCoordinator() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-std::string MppQueryCoordinator::makeTaskId(int32_t fragmentId) const {
-  return fmt::format("{}{}-{}", kTaskIdPrefix, queryId_, fragmentId);
+std::string MppQueryCoordinator::makeTaskId(
+    int32_t fragmentId,
+    int32_t replicaIdx) const {
+  // Unified convention: every Task ID is suffixed by replica index, even
+  // for single-replica fragments (replicaIdx=0). Matches GpuMultiFragmentTest
+  // pattern and avoids special-cases in exchange wiring.
+  return fmt::format(
+      "{}{}-{}-p{}", kTaskIdPrefix, queryId_, fragmentId, replicaIdx);
 }
 
 bool MppQueryCoordinator::isTerminalState(TaskState state) {
@@ -203,54 +216,121 @@ void MppQueryCoordinator::start() {
   // We start ALL fragments before wiring exchanges so that producer tasks'
   // output buffers are already registered in OutputBufferManager when
   // consumers try to fetch data.
-  tasks_.resize(fragmentSpecs_.size());
-  for (auto& spec : fragmentSpecs_) {
-    auto taskId = makeTaskId(spec.id);
-
-    auto task = Task::create(
-        taskId,
-        spec.planFragment,
-        spec.destination,
-        queryCtx_,
-        Task::ExecutionMode::kParallel);
-
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: starting fragment "
-                 << spec.id << " taskId=" << taskId
-                 << " drivers=" << spec.numDrivers
-                 << " destination=" << spec.destination;
-    task->start(spec.numDrivers);
-    tasks_[spec.id] = std::move(task);
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: started fragment "
-                 << spec.id << " state=" << static_cast<int>(tasks_[spec.id]->state());
+  //
+  // --- Derive per-fragment replica count from inbound exchanges ---
+  // A fragment with no inbound exchange (leaf) runs as one replica.
+  // A fragment that consumes exchange(s) runs as N replicas where N =
+  // numPartitions. Multiple inbound exchanges (e.g., join) must agree on N.
+  fragmentReplicaCount_.assign(fragmentSpecs_.size(), 1);
+  for (auto& exchange : exchangeSpecs_) {
+    const auto consumer = exchange.consumerFragmentId;
+    const auto n = std::max(1, exchange.numPartitions);
+    auto& slot = fragmentReplicaCount_[consumer];
+    if (slot == 1) {
+      slot = n;
+    } else {
+      VELOX_CHECK_EQ(
+          slot,
+          n,
+          "Fragment {} has inbound exchanges with inconsistent numPartitions "
+          "({} vs {}). All inbound exchanges must agree.",
+          consumer,
+          slot,
+          n);
+    }
   }
 
-  // Phase 2: Wire exchanges by adding RemoteConnectorSplits.
-  //
-  // For each exchange, we tell the consumer task where to find the producer's
-  // output. This mirrors the pattern in MultiFragmentTest::addRemoteSplits():
-  //   task->addSplit(exchangeNodeId, Split(RemoteConnectorSplit(producerTaskId)))
-  //   task->noMoreSplits(exchangeNodeId)
+  // Decide root drain strategy: sequential for RANGE (order-preserving);
+  // round-robin otherwise. If the root has no inbound exchange (single
+  // fragment query), replica count is 1 and strategy is moot.
+  rootDrainSequential_ = false;
   for (auto& exchange : exchangeSpecs_) {
-    auto producerTaskId = makeTaskId(exchange.producerFragmentId);
-    auto& consumerTask = tasks_[exchange.consumerFragmentId];
-    VELOX_CHECK(
-        consumerTask != nullptr,
-        "Consumer fragment {} not found for exchange {}",
-        exchange.consumerFragmentId,
-        exchange.id);
+    if (exchange.consumerFragmentId == rootFragmentId_) {
+      if (exchange.partitionType == "RANGE") {
+        rootDrainSequential_ = true;
+      }
+      break; // root consumes at most one exchange
+    }
+  }
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+               << "]: rootFragmentId=" << rootFragmentId_
+               << " replicas=" << fragmentReplicaCount_[rootFragmentId_]
+               << " drain="
+               << (rootDrainSequential_ ? "sequential" : "roundRobin");
 
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                 << "]: wiring exchange " << exchange.id
-                 << " producer=" << producerTaskId
-                 << " -> consumer(F" << exchange.consumerFragmentId << ")"
-                 << " exchangeNode=" << exchange.exchangeNodeId
-                 << " consumerState=" << static_cast<int>(consumerTask->state());
-    consumerTask->addSplit(
-        exchange.exchangeNodeId,
-        Split(std::make_shared<RemoteConnectorSplit>(producerTaskId)));
-    consumerTask->noMoreSplits(exchange.exchangeNodeId);
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                 << "]: exchange " << exchange.id << " wired";
+  // --- Create Tasks: one per (fragment, replica) ---
+  fragmentTasks_.assign(fragmentSpecs_.size(), {});
+  for (auto& spec : fragmentSpecs_) {
+    const auto replicas = fragmentReplicaCount_[spec.id];
+    fragmentTasks_[spec.id].reserve(replicas);
+    // TODO: scale per-replica driver count with N and core budget. Default
+    // to 1/replica for replicated fragments (matches GpuMultiFragmentTest);
+    // preserve Scala-supplied numDrivers for non-replicated fragments.
+    const auto perReplicaDrivers =
+        replicas == 1 ? std::max(1, spec.numDrivers) : 1;
+    for (int32_t i = 0; i < replicas; ++i) {
+      auto taskId = makeTaskId(spec.id, i);
+      auto task = Task::create(
+          taskId,
+          spec.planFragment,
+          /*destination=*/i,
+          queryCtx_,
+          Task::ExecutionMode::kParallel);
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                   << "]: starting fragment " << spec.id << " replica " << i
+                   << "/" << replicas << " taskId=" << taskId
+                   << " drivers=" << perReplicaDrivers
+                   << " destination=" << i;
+      task->start(perReplicaDrivers);
+      fragmentTasks_[spec.id].push_back(std::move(task));
+    }
+  }
+
+  // Phase 2: Wire exchanges via RemoteConnectorSplits (cartesian product).
+  //
+  // For each exchange E(producer P, consumer C) with M producer replicas and
+  // N consumer replicas: each of the N consumer replicas adds M splits (one
+  // per producer replica) to its ExchangeNode. Consumer replica i is pinned
+  // to destination=i (set at Task::create), so it fetches bucket-i from every
+  // producer replica. This mirrors Presto's BasePlanFragmenter pattern: one
+  // RemoteSourceNode per consumer, listing all upstream Task IDs; Velox
+  // exchange operator fans them in at runtime.
+  //
+  // Task count stays O(k*N) across the query; split count is O(N*M) per
+  // exchange (but splits are lightweight Velox objects, not Task lifecycles).
+  for (auto& exchange : exchangeSpecs_) {
+    auto& producerReplicas = fragmentTasks_[exchange.producerFragmentId];
+    auto& consumerReplicas = fragmentTasks_[exchange.consumerFragmentId];
+    VELOX_CHECK(!producerReplicas.empty() && !consumerReplicas.empty());
+
+    std::vector<std::string> producerTaskIds;
+    producerTaskIds.reserve(producerReplicas.size());
+    for (size_t j = 0; j < producerReplicas.size(); ++j) {
+      producerTaskIds.push_back(
+          makeTaskId(exchange.producerFragmentId, static_cast<int32_t>(j)));
+    }
+
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: wiring exchange "
+                 << exchange.id << " type=" << exchange.partitionType
+                 << " producerF=" << exchange.producerFragmentId << " ("
+                 << producerReplicas.size() << " replicas)"
+                 << " -> consumerF=" << exchange.consumerFragmentId << " ("
+                 << consumerReplicas.size() << " replicas)"
+                 << " exchangeNode=" << exchange.exchangeNodeId;
+
+    for (size_t i = 0; i < consumerReplicas.size(); ++i) {
+      auto& consumerTask = consumerReplicas[i];
+      for (const auto& prodId : producerTaskIds) {
+        consumerTask->addSplit(
+            exchange.exchangeNodeId,
+            Split(std::make_shared<RemoteConnectorSplit>(prodId)));
+      }
+      consumerTask->noMoreSplits(exchange.exchangeNodeId);
+    }
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: exchange "
+                 << exchange.id << " wired ("
+                 << (producerReplicas.size() * consumerReplicas.size())
+                 << " splits total)";
   }
 
   // Phase 3: Add file scan splits to scan-containing fragments.
@@ -262,7 +342,16 @@ void MppQueryCoordinator::start() {
     if (spec.scanNodeIds.empty()) {
       continue;
     }
-    auto& task = tasks_[spec.id];
+    // Scan-bearing fragments are always leaves (no inbound exchange) and
+    // therefore have exactly one replica.
+    VELOX_CHECK_EQ(
+        fragmentTasks_[spec.id].size(),
+        1u,
+        "Scan-bearing fragment {} has {} replicas; scans are only wired to "
+        "leaf fragments which must be single-replica.",
+        spec.id,
+        fragmentTasks_[spec.id].size());
+    auto& task = fragmentTasks_[spec.id][0];
     VELOX_CHECK_EQ(
         spec.scanNodeIds.size(),
         spec.scanInfos.size(),
@@ -321,63 +410,112 @@ void MppQueryCoordinator::start() {
 
 bool MppQueryCoordinator::fetchNextOutputPage(
     std::vector<std::unique_ptr<folly::IOBuf>>& iobufs) {
-  auto rootTaskId = makeTaskId(rootFragmentId_);
-  constexpr int32_t kDestination = 0;
+  const auto rootReplicas = fragmentReplicaCount_[rootFragmentId_];
+  constexpr int32_t kDestination = 0; // each root Task gathers to dest 0
   constexpr uint64_t kMaxBytes = std::numeric_limits<uint64_t>::max();
 
-  bool complete = false;
-  auto dataPromise =
-      ContinuePromise("MppQueryCoordinator::fetchNextOutputPage");
+  if (rootOutputSequence_.empty()) {
+    rootOutputSequence_.assign(rootReplicas, 0);
+    rootReplicaAtEnd_.assign(rootReplicas, false);
+  }
 
-  LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-               << "]: fetchNextOutputPage rootTask=" << rootTaskId
-               << " seq=" << outputSequence_
-               << " rootState=" << static_cast<int>(tasks_[rootFragmentId_]->state());
-
-  auto ok = bufferManager_->getData(
-      rootTaskId,
-      kDestination,
-      kMaxBytes,
-      outputSequence_,
-      [&, this](std::vector<std::unique_ptr<folly::IOBuf>> pages,
-                int64_t inSequence,
-                std::vector<int64_t> /*remainingBytes*/) {
-        LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                     << "]: getData callback fired"
-                     << " pages=" << pages.size()
-                     << " inSeq=" << inSequence;
-        for (auto& page : pages) {
-          if (page != nullptr) {
-            ++inSequence;
-            iobufs.push_back(std::move(page));
-          } else {
-            // nullptr page signals end-of-stream.
-            complete = true;
-          }
+  // Drain policy:
+  //   - Sequential: finish replica 0 fully before moving to 1, etc. Used
+  //     for RANGE to preserve global ORDER BY.
+  //   - Round-robin: fair across replicas for HASH/ROUND_ROBIN/BROADCAST
+  //     where no global order contract exists.
+  auto pickNext = [&]() -> int32_t {
+    if (rootDrainSequential_) {
+      for (int32_t i = 0; i < rootReplicas; ++i) {
+        if (!rootReplicaAtEnd_[i]) {
+          return i;
         }
-        outputSequence_ = inSequence;
-        dataPromise.setValue();
-      });
+      }
+      return -1;
+    }
+    for (int32_t attempted = 0; attempted < rootReplicas; ++attempted) {
+      int32_t idx = rootFetchCursor_ % rootReplicas;
+      rootFetchCursor_ = (rootFetchCursor_ + 1) % rootReplicas;
+      if (!rootReplicaAtEnd_[idx]) {
+        return idx;
+      }
+    }
+    return -1;
+  };
 
-  if (!ok) {
+  for (int32_t attempts = 0; attempts < rootReplicas; ++attempts) {
+    int32_t idx = pickNext();
+    if (idx < 0) {
+      noMoreData_ = true;
+      return false;
+    }
+    auto rootTaskId = makeTaskId(rootFragmentId_, idx);
+    bool complete = false;
+    auto dataPromise =
+        ContinuePromise("MppQueryCoordinator::fetchNextOutputPage");
+    auto requestedSeq = rootOutputSequence_[idx];
+
     LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                 << "]: getData returned ok=false (task not registered?)";
-    noMoreData_ = true;
-    return false;
+                 << "]: fetchNextOutputPage rootTask=" << rootTaskId
+                 << " seq=" << requestedSeq
+                 << " rootState="
+                 << static_cast<int>(fragmentTasks_[rootFragmentId_][idx]->state());
+
+    auto ok = bufferManager_->getData(
+        rootTaskId,
+        kDestination,
+        kMaxBytes,
+        requestedSeq,
+        [&](std::vector<std::unique_ptr<folly::IOBuf>> pages,
+            int64_t inSequence,
+            std::vector<int64_t> /*remainingBytes*/) {
+          LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                       << "]: getData callback fired"
+                       << " replica=" << idx
+                       << " pages=" << pages.size()
+                       << " inSeq=" << inSequence;
+          for (auto& page : pages) {
+            if (page != nullptr) {
+              ++inSequence;
+              iobufs.push_back(std::move(page));
+            } else {
+              complete = true;
+            }
+          }
+          rootOutputSequence_[idx] = inSequence;
+          dataPromise.setValue();
+        });
+
+    if (!ok) {
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                   << "]: getData returned ok=false for replica=" << idx
+                   << " (task not registered?)";
+      rootReplicaAtEnd_[idx] = true;
+      continue;
+    }
+
+    dataPromise.getSemiFuture().wait();
+
+    if (complete) {
+      rootReplicaAtEnd_[idx] = true;
+      bufferManager_->acknowledge(
+          rootTaskId, kDestination, rootOutputSequence_[idx]);
+      bufferManager_->deleteResults(rootTaskId, kDestination);
+    }
+
+    if (!iobufs.empty()) {
+      return true;
+    }
+    // Empty poll (timeout or end-of-stream with no data): loop to try
+    // another replica. For sequential drain, pickNext returns the same
+    // replica again until it reaches end; for round-robin, advance.
   }
 
-  // Block until the callback fires (either with data or end-of-stream).
-  dataPromise.getSemiFuture().wait();
-
-  if (complete) {
-    noMoreData_ = true;
-    // Acknowledge receipt and clean up the output buffer.
-    bufferManager_->acknowledge(rootTaskId, kDestination, outputSequence_);
-    bufferManager_->deleteResults(rootTaskId, kDestination);
-  }
-
-  // Return true if we got at least one data page.
-  return !iobufs.empty();
+  noMoreData_ = std::all_of(
+      rootReplicaAtEnd_.begin(),
+      rootReplicaAtEnd_.end(),
+      [](bool b) { return b; });
+  return false;
 }
 
 RowVectorPtr MppQueryCoordinator::next() {
@@ -442,9 +580,11 @@ bool MppQueryCoordinator::isFinished() const {
   if (!started_) {
     return false;
   }
-  for (auto& task : tasks_) {
-    if (!isTerminalState(task->state())) {
-      return false;
+  for (auto& replicas : fragmentTasks_) {
+    for (auto& task : replicas) {
+      if (!isTerminalState(task->state())) {
+        return false;
+      }
     }
   }
   return true;
@@ -461,20 +601,22 @@ void MppQueryCoordinator::abort() {
     return;
   }
   LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: abort() begin";
-  for (auto& task : tasks_) {
-    if (task == nullptr) {
-      continue;
-    }
-    auto state = task->state();
-    if (!isTerminalState(state)) {
-      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: requestAbort(" << task->taskId()
-                   << ") state=" << static_cast<int>(state);
-      task->requestAbort();
-    } else {
-      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: already-terminal " << task->taskId()
-                   << " state=" << static_cast<int>(state);
+  for (auto& replicas : fragmentTasks_) {
+    for (auto& task : replicas) {
+      if (task == nullptr) {
+        continue;
+      }
+      auto state = task->state();
+      if (!isTerminalState(state)) {
+        LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                     << "]: requestAbort(" << task->taskId()
+                     << ") state=" << static_cast<int>(state);
+        task->requestAbort();
+      } else {
+        LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                     << "]: already-terminal " << task->taskId()
+                     << " state=" << static_cast<int>(state);
+      }
     }
   }
   LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: abort() end";
@@ -489,31 +631,35 @@ void MppQueryCoordinator::waitForCompletion() {
 
   std::exception_ptr firstError;
 
-  for (auto& task : tasks_) {
-    if (isTerminalState(task->state())) {
-      // Already done; check for error.
+  for (auto& replicas : fragmentTasks_) {
+    for (auto& task : replicas) {
+      if (isTerminalState(task->state())) {
+        // Already done; check for error.
+        if (auto error = task->error()) {
+          if (!firstError) {
+            firstError = error;
+          }
+        }
+        continue;
+      }
+
+      // Block until this task reaches a terminal state.
+      auto future = task->taskCompletionFuture();
+      std::move(future).wait();
+
       if (auto error = task->error()) {
         if (!firstError) {
           firstError = error;
         }
       }
-      continue;
-    }
-
-    // Block until this task reaches a terminal state.
-    auto future = task->taskCompletionFuture();
-    std::move(future).wait();
-
-    if (auto error = task->error()) {
-      if (!firstError) {
-        firstError = error;
-      }
     }
   }
 
   // Clean up output buffer entries for all tasks.
-  for (auto& task : tasks_) {
-    bufferManager_->removeTask(task->taskId());
+  for (auto& replicas : fragmentTasks_) {
+    for (auto& task : replicas) {
+      bufferManager_->removeTask(task->taskId());
+    }
   }
 
   if (firstError) {
