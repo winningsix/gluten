@@ -440,20 +440,19 @@ case class MppNativeQueryExec(
     }
   }
 
-  /** Infer the parallelism for a fragment based on its output partitioning.
+  /**
+   * Infer the parallelism for a fragment based on its output partitioning.
    *
-   *  In MPP mode every fragment runs in-process as a set of Velox drivers,
-   *  so the "parallelism" here becomes the driver count passed to
-   *  task->start(numDrivers). With the default of spark.sql.shuffle.partitions
-   *  (=200) on a 16-core single-GPU executor this spawns 200 driver threads
-   *  per fragment, which (a) thrashes on 16 cores, (b) contends heavily on
-   *  the GpuSemaphore (maxConcurrentGpuTasks ~= 6), and (c) leaves dozens of
-   *  drivers with zero scan splits that still have to start/teardown. In
-   *  practice this also correlates with a producer livelock that prevents
-   *  F0 from ever signaling noMoreData (observed 2026-04-17).
+   * In MPP mode every fragment runs in-process as a set of Velox drivers, so the "parallelism" here
+   * becomes the driver count passed to task->start(numDrivers). With the default of
+   * spark.sql.shuffle.partitions (=200) on a 16-core single-GPU executor this spawns 200 driver
+   * threads per fragment, which (a) thrashes on 16 cores, (b) contends heavily on the GpuSemaphore
+   * (maxConcurrentGpuTasks ~= 6), and (c) leaves dozens of drivers with zero scan splits that still
+   * have to start/teardown. In practice this also correlates with a producer livelock that prevents
+   * F0 from ever signaling noMoreData (observed 2026-04-17).
    *
-   *  Cap driver count at the executor core count. On multi-executor M2
-   *  this still gives the right parallelism (each executor caps locally).
+   * Cap driver count at the executor core count. On multi-executor M2 this still gives the right
+   * parallelism (each executor caps locally).
    */
   private def inferParallelism(plan: SparkPlan): Int = {
     val raw = plan.outputPartitioning match {
