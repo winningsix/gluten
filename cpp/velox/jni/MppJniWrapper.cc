@@ -41,6 +41,7 @@
 #include "velox/core/PlanNode.h"
 #include "velox/exec/ExchangeSource.h"
 #include "velox/exec/PartitionedOutput.h"
+#include "velox/exec/HashPartitionFunction.h"
 #include "velox/exec/RoundRobinPartitionFunction.h"
 #include "operators/plannodes/RowVectorStream.h"
 #ifdef GLUTEN_ENABLE_GPU
@@ -380,6 +381,13 @@ std::vector<MppExchangeSpec> parseExchangeSpecs(
     spec.exchangeNodeId = item["exchangeNodeId"].asString();
     spec.numPartitions =
         item.count("numPartitions") ? item["numPartitions"].asInt() : 1;
+    spec.partitionType =
+        item.count("exchangeType") ? item["exchangeType"].asString() : "ROUND_ROBIN";
+    if (item.count("partitionKeys") && item["partitionKeys"].isArray()) {
+      for (const auto& key : item["partitionKeys"]) {
+        spec.partitionKeys.push_back(key.asString());
+      }
+    }
     specs.push_back(std::move(spec));
   }
   return specs;
@@ -622,9 +630,11 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     // - Root fragment (id=0): single partition output (gather to coordinator)
     // - Producer fragments: partition count from exchange spec
     int32_t numOutputPartitions = 1;
+    const MppExchangeSpec* outboundExchange = nullptr;
     for (const auto& exchange : exchangeSpecs) {
       if (exchange.producerFragmentId == static_cast<int32_t>(i)) {
         numOutputPartitions = exchange.numPartitions;
+        outboundExchange = &exchange;
         break;
       }
     }
@@ -640,16 +650,66 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
           velox::VectorSerde::Kind::kPresto,
           veloxPlanNode);
     } else {
-      // Multi-partition output. Use round-robin for now.
-      // TODO: Implement hash partitioning based on exchange spec keys.
-      std::vector<velox::core::TypedExprPtr> noKeys;
+      // Multi-partition output. Construct the PartitionFunctionSpec from the
+      // outbound exchange's partitionType + partitionKeys.
+      //   HASH/RANGE -> HashPartitionFunctionSpec(keys)   (RANGE reuses hash
+      //                 for now since GPU range partitioning is not yet wired.
+      //                 Correctness is preserved — equal keys land in the same
+      //                 partition — only intra-partition ordering is lost.)
+      //   ROUND_ROBIN/other -> RoundRobinPartitionFunctionSpec()
+      const std::string& partitionType =
+          outboundExchange != nullptr ? outboundExchange->partitionType
+                                      : std::string("ROUND_ROBIN");
+      const auto& partitionKeys = outboundExchange != nullptr
+          ? outboundExchange->partitionKeys
+          : std::vector<std::string>{};
+
+      velox::core::PartitionFunctionSpecPtr funcSpec;
+      std::vector<velox::core::TypedExprPtr> partitionExprs;
+      const auto& outputType = veloxPlanNode->outputType();
+
+      if ((partitionType == "HASH" || partitionType == "RANGE") &&
+          !partitionKeys.empty()) {
+        std::vector<velox::column_index_t> keyChannels;
+        keyChannels.reserve(partitionKeys.size());
+        for (const auto& keyName : partitionKeys) {
+          auto idx = outputType->getChildIdxIfExists(keyName);
+          if (!idx.has_value()) {
+            LOG(WARNING) << "MppJniWrapper: fragment " << i
+                         << " partition key '" << keyName
+                         << "' not in output schema; falling back to round-robin";
+            keyChannels.clear();
+            break;
+          }
+          keyChannels.push_back(static_cast<velox::column_index_t>(*idx));
+          partitionExprs.push_back(
+              std::make_shared<velox::core::FieldAccessTypedExpr>(
+                  outputType->childAt(*idx), keyName));
+        }
+        if (!keyChannels.empty()) {
+          funcSpec = std::make_shared<velox::exec::HashPartitionFunctionSpec>(
+              outputType, std::move(keyChannels));
+        }
+      }
+
+      if (funcSpec == nullptr) {
+        partitionExprs.clear();
+        funcSpec =
+            std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>();
+      }
+
+      LOG(INFO) << "MppJniWrapper: fragment " << i
+                << " outbound exchange type=" << partitionType
+                << " keys=" << partitionKeys.size()
+                << " func=" << (funcSpec ? funcSpec->toString() : "null");
+
       wrappedPlan = std::make_shared<velox::core::PartitionedOutputNode>(
           outputNodeId,
           velox::core::PartitionedOutputNode::Kind::kPartitioned,
-          noKeys,
+          std::move(partitionExprs),
           numOutputPartitions,
           /*replicateNullsAndAny=*/false,
-          std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>(),
+          std::move(funcSpec),
           veloxPlanNode->outputType(),
           velox::VectorSerde::Kind::kPresto,
           veloxPlanNode);

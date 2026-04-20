@@ -79,6 +79,16 @@ struct MppExchangeSpec {
 
   /// Number of output partitions for this exchange.
   int32_t numPartitions{1};
+
+  /// Partitioning type, mirrored from Scala ExchangeSpec.exchangeType.
+  /// One of "HASH", "ROUND_ROBIN", "SINGLE", "RANGE", "BROADCAST".
+  /// Drives which PartitionFunctionSpec the producer's PartitionedOutputNode
+  /// uses (see MppJniWrapper.cc). Default "ROUND_ROBIN" for backward compat.
+  std::string partitionType{"ROUND_ROBIN"};
+
+  /// For partitioned exchanges (HASH, RANGE), the names of the partitioning
+  /// key columns. Must match columns in the producer's output schema.
+  std::vector<std::string> partitionKeys;
 };
 
 /// Coordinates execution of multiple Velox Task fragments within a single

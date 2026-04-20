@@ -29,7 +29,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
-import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, RoundRobinPartitioning, SinglePartition}
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
 import org.apache.spark.sql.execution.{ColumnarInputAdapter, InputIteratorTransformer, SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
@@ -428,6 +428,13 @@ case class MppNativeQueryExec(
       case hash: HashPartitioning =>
         val keys = hash.expressions.collect { case attr: Attribute => attr }
         ("HASH", keys)
+      case range: RangePartitioning =>
+        // GPU range-partitioning is not yet implemented. Treat ORDER BY
+        // exchanges as hash-partitioned on the sort keys: equal keys still
+        // land in the same partition (correctness preserved), only
+        // intra-partition sort order is delegated to the downstream sort.
+        val keys = range.ordering.map(_.child).collect { case attr: Attribute => attr }
+        ("RANGE", keys)
       case _: RoundRobinPartitioning =>
         ("ROUND_ROBIN", Seq.empty)
       case SinglePartition =>

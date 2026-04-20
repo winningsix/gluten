@@ -515,6 +515,9 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case hash: HashPartitioning =>
         val keys = hash.expressions.collect { case attr: Attribute => attr }
         ("HASH", keys)
+      case range: RangePartitioning =>
+        val keys = range.ordering.map(_.child).collect { case attr: Attribute => attr }
+        ("RANGE", keys)
       case _: RoundRobinPartitioning =>
         ("ROUND_ROBIN", Seq.empty)
       case SinglePartition =>
