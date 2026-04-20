@@ -447,7 +447,7 @@ case class MppNativeQueryExec(
    *  task->start(numDrivers). With the default of spark.sql.shuffle.partitions
    *  (=200) on a 16-core single-GPU executor this spawns 200 driver threads
    *  per fragment, which (a) thrashes on 16 cores, (b) contends heavily on
-   *  the GpuSemaphore (maxConcurrentGpuTasks≈6), and (c) leaves dozens of
+   *  the GpuSemaphore (maxConcurrentGpuTasks ~= 6), and (c) leaves dozens of
    *  drivers with zero scan splits that still have to start/teardown. In
    *  practice this also correlates with a producer livelock that prevents
    *  F0 from ever signaling noMoreData (observed 2026-04-17).
