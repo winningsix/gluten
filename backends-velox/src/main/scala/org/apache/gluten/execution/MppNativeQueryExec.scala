@@ -181,7 +181,7 @@ case class MppNativeQueryExec(
 
         val fragmentPlans = fragmentSubstraitPlans.toArray
         val numDriversPerFragment = extractedFragments.map(_.parallelism).toArray
-        val exchangeSpecsJson = serializeExchangeSpecs(extractedExchanges)
+        val exchangeSpecsJson = serializeExchangeSpecs(extractedExchanges, extractedFragments)
 
         // Extract scan split infos for each fragment.
         // Scan-containing fragments (leaf fragments) have LeafTransformSupport
@@ -226,7 +226,7 @@ case class MppNativeQueryExec(
     }.toArray
 
     val numDriversPerFragment = fragments.map(_.parallelism).toArray
-    val exchangeSpecsJson = serializeExchangeSpecs(exchanges)
+    val exchangeSpecsJson = serializeExchangeSpecs(exchanges, fragments)
 
     logInfo(s"MppNativeQueryExec: generated ${fragmentPlans.length} Substrait plans on driver")
 
@@ -596,12 +596,14 @@ case class MppNativeQueryExec(
    * native side uses these indices directly as Velox keyChannels (Velox synthesizes its own column
    * names like n<frag>_<idx>, so Spark-style names such as "l_returnflag#84" would never match).
    */
-  private def serializeExchangeSpecs(specs: Seq[ExchangeSpec]): String = {
+  private def serializeExchangeSpecs(
+      specs: Seq[ExchangeSpec],
+      producerFragments: Seq[NativeFragment]): String = {
     val entries = specs.map {
       spec =>
         val producerOutput =
-          if (spec.producerFragmentId >= 0 && spec.producerFragmentId < fragments.size) {
-            fragments(spec.producerFragmentId).outputAttributes
+          if (spec.producerFragmentId >= 0 && spec.producerFragmentId < producerFragments.size) {
+            producerFragments(spec.producerFragmentId).outputAttributes
           } else {
             Seq.empty[Attribute]
           }
