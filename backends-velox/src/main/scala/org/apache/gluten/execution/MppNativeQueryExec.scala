@@ -601,7 +601,7 @@ case class MppNativeQueryExec(
       spec =>
         val producerOutput =
           if (spec.producerFragmentId >= 0 && spec.producerFragmentId < fragments.size) {
-            fragments(spec.producerFragmentId).output
+            fragments(spec.producerFragmentId).outputAttributes
           } else {
             Seq.empty[Attribute]
           }
