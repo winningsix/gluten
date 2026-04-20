@@ -21,8 +21,16 @@
 #include <mutex>
 #include <thread>
 #include <glog/logging.h>
-#include <nvtx3/nvtx3.hpp>
-#include "velox/experimental/cudf/exec/NvtxHelper.h"
+
+// MPP livelock diagnosis: GpuLock is bypassed entirely. lockGpu/unlockGpu
+// early-return with no futex/cv wait so we can prove the lock is a symptom,
+// not the root cause of the MppNativeQueryExec hang on Q1.
+// Symbols are kept exported so other TUs that reference them still link.
+// Stderr markers are compiled out to keep executor logs quiet; flip
+// GLUTEN_GPULOCK_TRACE to 1 to re-enable.
+#ifndef GLUTEN_GPULOCK_TRACE
+#define GLUTEN_GPULOCK_TRACE 0
+#endif
 
 namespace gluten {
 
@@ -40,8 +48,6 @@ GpuLockState& getState() {
   return state;
 }
 
-thread_local int tLocalRefCount = 0;
-
 } // namespace
 
 void setMaxConcurrentGpuTasks(int n) {
@@ -49,7 +55,8 @@ void setMaxConcurrentGpuTasks(int n) {
   std::unique_lock<std::mutex> lock(s.mutex);
   int prev = s.maxConcurrent;
   s.maxConcurrent = std::max(1, n);
-  LOG(INFO) << "GPU concurrency: " << prev << " -> " << s.maxConcurrent;
+  LOG(INFO) << "GPU concurrency (bypassed): " << prev << " -> "
+            << s.maxConcurrent;
   if (s.maxConcurrent > prev) {
     s.cv.notify_all();
   }
@@ -62,61 +69,19 @@ int getMaxConcurrentGpuTasks() {
 }
 
 void lockGpu() {
-  auto tid = std::this_thread::get_id();
-  if (tLocalRefCount > 0) {
-    ++tLocalRefCount;
-    std::cerr << "GPU_LOCK [lockGpu-reentrant] tid=" << tid
-              << " refCount=" << tLocalRefCount
-              << " caller=" << __builtin_return_address(0) << std::endl;
-    return;
-  }
-  auto& s = getState();
-  std::unique_lock<std::mutex> lock(s.mutex);
-  std::cerr << "GPU_LOCK [lockGpu-wait] tid=" << tid
-            << " activeCount=" << s.activeCount
-            << " maxConcurrent=" << s.maxConcurrent
-            << " caller=" << __builtin_return_address(0) << std::endl;
-  {
-    nvtx3::scoped_range_in<
-        facebook::velox::cudf_velox::VeloxDomain>
-        waitRange(nvtx3::event_attributes{
-            "GpuLock::wait",
-            nvtx3::rgb{255, 69, 0}});
-    s.cv.wait(lock, [&] {
-      return s.activeCount < s.maxConcurrent;
-    });
-  }
-  ++s.activeCount;
-  tLocalRefCount = 1;
-  std::cerr << "GPU_LOCK [lockGpu-acquired] tid=" << tid
-            << " activeCount=" << s.activeCount
-            << " refCount=" << tLocalRefCount
-            << " caller=" << __builtin_return_address(0) << std::endl;
+  // MPP livelock diagnosis: no-op. No futex/cv wait.
+#if GLUTEN_GPULOCK_TRACE
+  std::cerr << "GPU_LOCK [lockGpu-bypass] tid="
+            << std::this_thread::get_id() << std::endl;
+#endif
 }
 
 void unlockGpu() {
-  auto tid = std::this_thread::get_id();
-  if (tLocalRefCount <= 0) {
-    std::cerr << "GPU_LOCK [unlockGpu-noop] tid=" << tid
-              << " refCount=" << tLocalRefCount
-              << " caller=" << __builtin_return_address(0) << std::endl;
-    return;
-  }
-  --tLocalRefCount;
-  if (tLocalRefCount > 0) {
-    std::cerr << "GPU_LOCK [unlockGpu-reentrant] tid=" << tid
-              << " refCount=" << tLocalRefCount
-              << " caller=" << __builtin_return_address(0) << std::endl;
-    return;
-  }
-  auto& s = getState();
-  std::unique_lock<std::mutex> lock(s.mutex);
-  --s.activeCount;
-  std::cerr << "GPU_LOCK [unlockGpu-released] tid=" << tid
-            << " activeCount=" << s.activeCount
-            << " caller=" << __builtin_return_address(0) << std::endl;
-  lock.unlock();
-  s.cv.notify_one();
+  // MPP livelock diagnosis: no-op. Paired with the bypassed lockGpu.
+#if GLUTEN_GPULOCK_TRACE
+  std::cerr << "GPU_LOCK [unlockGpu-bypass] tid="
+            << std::this_thread::get_id() << std::endl;
+#endif
 }
 
 } // namespace gluten
