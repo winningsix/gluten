@@ -589,12 +589,12 @@ case class MppNativeQueryExec(
     }
   }
 
-  /** Serialize exchange specifications to JSON for the native side.
+  /**
+   * Serialize exchange specifications to JSON for the native side.
    *
-   *  Resolves partition keys to column indices against the producer fragment's
-   *  output schema. The native side uses these indices directly as Velox
-   *  keyChannels (Velox synthesizes its own column names like n<frag>_<idx>,
-   *  so Spark-style names such as "l_returnflag#84" would never match).
+   * Resolves partition keys to column indices against the producer fragment's output schema. The
+   * native side uses these indices directly as Velox keyChannels (Velox synthesizes its own column
+   * names like n<frag>_<idx>, so Spark-style names such as "l_returnflag#84" would never match).
    */
   private def serializeExchangeSpecs(specs: Seq[ExchangeSpec]): String = {
     val entries = specs.map {
