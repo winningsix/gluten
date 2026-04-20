@@ -383,9 +383,11 @@ std::vector<MppExchangeSpec> parseExchangeSpecs(
         item.count("numPartitions") ? item["numPartitions"].asInt() : 1;
     spec.partitionType =
         item.count("exchangeType") ? item["exchangeType"].asString() : "ROUND_ROBIN";
-    if (item.count("partitionKeys") && item["partitionKeys"].isArray()) {
-      for (const auto& key : item["partitionKeys"]) {
-        spec.partitionKeys.push_back(key.asString());
+    if (item.count("partitionKeyIndices") &&
+        item["partitionKeyIndices"].isArray()) {
+      for (const auto& key : item["partitionKeyIndices"]) {
+        spec.partitionKeyIndices.push_back(
+            static_cast<int32_t>(key.asInt()));
       }
     }
     specs.push_back(std::move(spec));
@@ -660,31 +662,32 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       const std::string& partitionType =
           outboundExchange != nullptr ? outboundExchange->partitionType
                                       : std::string("ROUND_ROBIN");
-      const auto& partitionKeys = outboundExchange != nullptr
-          ? outboundExchange->partitionKeys
-          : std::vector<std::string>{};
+      const auto& keyIndices = outboundExchange != nullptr
+          ? outboundExchange->partitionKeyIndices
+          : std::vector<int32_t>{};
 
       velox::core::PartitionFunctionSpecPtr funcSpec;
       std::vector<velox::core::TypedExprPtr> partitionExprs;
       const auto& outputType = veloxPlanNode->outputType();
+      const auto numFields = static_cast<int32_t>(outputType->size());
 
       if ((partitionType == "HASH" || partitionType == "RANGE") &&
-          !partitionKeys.empty()) {
+          !keyIndices.empty()) {
         std::vector<velox::column_index_t> keyChannels;
-        keyChannels.reserve(partitionKeys.size());
-        for (const auto& keyName : partitionKeys) {
-          auto idx = outputType->getChildIdxIfExists(keyName);
-          if (!idx.has_value()) {
+        keyChannels.reserve(keyIndices.size());
+        for (auto idx : keyIndices) {
+          if (idx < 0 || idx >= numFields) {
             LOG(WARNING) << "MppJniWrapper: fragment " << i
-                         << " partition key '" << keyName
-                         << "' not in output schema; falling back to round-robin";
+                         << " partition key index " << idx
+                         << " out of range (output has " << numFields
+                         << " fields); falling back to round-robin";
             keyChannels.clear();
             break;
           }
-          keyChannels.push_back(static_cast<velox::column_index_t>(*idx));
+          keyChannels.push_back(static_cast<velox::column_index_t>(idx));
           partitionExprs.push_back(
               std::make_shared<velox::core::FieldAccessTypedExpr>(
-                  outputType->childAt(*idx), keyName));
+                  outputType->childAt(idx), outputType->nameOf(idx)));
         }
         if (!keyChannels.empty()) {
           funcSpec = std::make_shared<velox::exec::HashPartitionFunctionSpec>(
@@ -700,7 +703,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
 
       LOG(INFO) << "MppJniWrapper: fragment " << i
                 << " outbound exchange type=" << partitionType
-                << " keys=" << partitionKeys.size()
+                << " keyIndices=" << keyIndices.size()
                 << " func=" << (funcSpec ? funcSpec->toString() : "null");
 
       wrappedPlan = std::make_shared<velox::core::PartitionedOutputNode>(

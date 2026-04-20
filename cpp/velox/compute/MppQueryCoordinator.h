@@ -86,9 +86,10 @@ struct MppExchangeSpec {
   /// uses (see MppJniWrapper.cc). Default "ROUND_ROBIN" for backward compat.
   std::string partitionType{"ROUND_ROBIN"};
 
-  /// For partitioned exchanges (HASH, RANGE), the names of the partitioning
-  /// key columns. Must match columns in the producer's output schema.
-  std::vector<std::string> partitionKeys;
+  /// For partitioned exchanges (HASH, RANGE), the column indices of the
+  /// partitioning keys in the producer's output schema. Used directly as
+  /// Velox keyChannels for HashPartitionFunctionSpec.
+  std::vector<int32_t> partitionKeyIndices;
 };
 
 /// Coordinates execution of multiple Velox Task fragments within a single

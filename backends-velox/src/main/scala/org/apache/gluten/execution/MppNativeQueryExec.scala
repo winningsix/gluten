@@ -589,13 +589,36 @@ case class MppNativeQueryExec(
     }
   }
 
-  /** Serialize exchange specifications to JSON for the native side. */
+  /** Serialize exchange specifications to JSON for the native side.
+   *
+   *  Resolves partition keys to column indices against the producer fragment's
+   *  output schema. The native side uses these indices directly as Velox
+   *  keyChannels (Velox synthesizes its own column names like n<frag>_<idx>,
+   *  so Spark-style names such as "l_returnflag#84" would never match).
+   */
   private def serializeExchangeSpecs(specs: Seq[ExchangeSpec]): String = {
     val entries = specs.map {
       spec =>
-        val keys = spec.partitionKeys
-          .map(attr => s""""${ConverterUtils.genColumnNameWithExprId(attr)}"""")
-          .mkString("[", ", ", "]")
+        val producerOutput =
+          if (spec.producerFragmentId >= 0 && spec.producerFragmentId < fragments.size) {
+            fragments(spec.producerFragmentId).output
+          } else {
+            Seq.empty[Attribute]
+          }
+        val indices = spec.partitionKeys.flatMap {
+          attr =>
+            val idx = producerOutput.indexWhere(_.exprId == attr.exprId)
+            if (idx < 0) {
+              logWarning(
+                s"MppNativeQueryExec: partition key ${attr.name}#${attr.exprId.id} not in " +
+                  s"producer fragment ${spec.producerFragmentId} output " +
+                  s"(size=${producerOutput.size}); exchange will fall back to round-robin")
+              None
+            } else {
+              Some(idx)
+            }
+        }
+        val keyIndicesJson = indices.mkString("[", ", ", "]")
         s"""{
            |  "id": ${spec.id},
            |  "producerFragmentId": ${spec.producerFragmentId},
@@ -603,7 +626,7 @@ case class MppNativeQueryExec(
            |  "exchangeType": "${spec.exchangeType}",
            |  "numPartitions": ${spec.numPartitions},
            |  "exchangeNodeId": "mpp_exchange_source_${spec.id}",
-           |  "partitionKeys": $keys
+           |  "partitionKeyIndices": $keyIndicesJson
            |}""".stripMargin
     }
     entries.mkString("[", ", ", "]")
