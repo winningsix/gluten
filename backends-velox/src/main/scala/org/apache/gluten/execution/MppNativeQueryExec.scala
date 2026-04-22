@@ -30,7 +30,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
-import org.apache.spark.sql.execution.{ColumnarInputAdapter, ExecSubqueryExpression, InputIteratorTransformer, SparkPlan, SQLExecution, UnaryExecNode}
+import org.apache.spark.sql.execution.{ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, InputIteratorTransformer, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
@@ -383,9 +383,53 @@ case class MppNativeQueryExec(
 
         case reused: ReusedExchangeExec =>
           // The ReusedExchangeExec.child is the same JVM object as the original
-          // Exchange. Walk it — memoization guarantees we return the already-
+          // Exchange. Walk it -- memoization guarantees we return the already-
           // assigned producer fragment id.
           walk(reused.child)
+
+        case topk: TakeOrderedAndProjectExecTransformer =>
+          // TopN-at-root: the query ends in a global Sort+Limit(+Project) that
+          // BSP implements by gathering every producer partition on a single
+          // task. In the MPP dump we model this as a dedicated single-driver
+          // fragment fed by a SINGLE exchange, mirroring what
+          // TakeOrderedAndProjectExecTransformer.doExecuteColumnar builds at
+          // runtime: Project(Limit(Sort(InputIteratorTransformer(producer)))).
+          val producerFragId = walk(topk.child)
+          val topkFragId = fragmentCounter.getAndIncrement()
+
+          // Build the consumer pipeline. wrapInputIteratorTransformer produces
+          // InputIteratorTransformer(ColumnarInputAdapter(plan)); at Substrait
+          // time the InputIteratorTransformer terminates the tree with a
+          // ReadRel, so the producer WST's operators are NOT re-serialized.
+          val inputIter =
+            ColumnarCollapseTransformStages.wrapInputIteratorTransformer(topk.child)
+          val sortPlan = SortExecTransformer(topk.sortOrder, global = false, inputIter)
+          val limitPlan = LimitExecTransformer(sortPlan, topk.offset.toLong, topk.limit)
+          val consumerRoot: SparkPlan =
+            if (topk.projectList != topk.child.output) {
+              ProjectExecTransformer(topk.projectList, limitPlan)
+            } else {
+              limitPlan
+            }
+          val stageCounter = ColumnarCollapseTransformStages.getTransformStageCounter(topk)
+          val wrappingWst =
+            WholeStageTransformer(consumerRoot)(stageCounter.incrementAndGet())
+
+          extractedFragments += NativeFragment(
+            id = topkFragId,
+            rootOperator = wrappingWst,
+            outputAttributes = topk.output,
+            parallelism = 1
+          )
+          extractedExchanges += ExchangeSpec(
+            id = exchangeCounter.getAndIncrement(),
+            producerFragmentId = producerFragId,
+            consumerFragmentId = topkFragId,
+            exchangeType = "SINGLE",
+            numPartitions = 1,
+            partitionKeys = Seq.empty
+          )
+          topkFragId
 
         case c2r: ColumnarToRowExecBase =>
           walk(c2r.child)
