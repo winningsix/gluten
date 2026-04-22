@@ -31,7 +31,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
 import org.apache.spark.sql.execution.{ColumnarInputAdapter, ExecSubqueryExpression, InputIteratorTransformer, SparkPlan, SQLExecution, UnaryExecNode}
-import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ShuffleExchangeLike}
+import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -322,6 +322,9 @@ case class MppNativeQueryExec(
   private def extractFragmentsFromChildPlan(): (Seq[NativeFragment], Seq[ExchangeSpec]) = {
     val extractedFragments = mutable.ArrayBuffer[NativeFragment]()
     val extractedExchanges = mutable.ArrayBuffer[ExchangeSpec]()
+    // Memoize producer fragment ids by Exchange so ReusedExchangeExec (which shares the
+    // same Exchange reference as the original) reuses rather than creates a duplicate.
+    val exchangeToProducerFragId = mutable.HashMap[Exchange, Int]()
     val fragmentCounter = new AtomicInteger(0)
     val exchangeCounter = new AtomicInteger(0)
 
@@ -366,8 +369,23 @@ case class MppNativeQueryExec(
           fragId
 
         case exchange: ShuffleExchangeLike =>
-          // Exchange boundary: walk the producer side (exchange.child)
-          walk(unwrapTransparent(exchange.child))
+          // Exchange boundary: walk the producer side (exchange.child). Memoize so a
+          // subsequent ReusedExchangeExec pointing at the same Exchange reuses it.
+          exchangeToProducerFragId.getOrElseUpdate(
+            exchange.asInstanceOf[Exchange],
+            walk(unwrapTransparent(exchange.child)))
+
+        case bex: BroadcastExchangeLike =>
+          // Same memoization for broadcast exchanges.
+          exchangeToProducerFragId.getOrElseUpdate(
+            bex.asInstanceOf[Exchange],
+            walk(unwrapTransparent(bex.child)))
+
+        case reused: ReusedExchangeExec =>
+          // The ReusedExchangeExec.child is the same JVM object as the original
+          // Exchange. Walk it — memoization guarantees we return the already-
+          // assigned producer fragment id.
+          walk(reused.child)
 
         case c2r: ColumnarToRowExecBase =>
           walk(c2r.child)
@@ -439,6 +457,7 @@ case class MppNativeQueryExec(
     plan match {
       case ex: ShuffleExchangeLike => Some(ex.asInstanceOf[Exchange])
       case ex: BroadcastExchangeLike => Some(ex.asInstanceOf[Exchange])
+      case reused: ReusedExchangeExec => unwrapToExchange(reused.child)
       case cia: ColumnarInputAdapter => unwrapToExchange(cia.child)
       case c2c: ColumnarToColumnarExec => unwrapToExchange(c2c.child)
       case c2r: ColumnarToRowExecBase => unwrapToExchange(c2r.child)
