@@ -20,11 +20,12 @@ import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution._
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, PlanExpression}
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ScalarSubquery, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
+import org.apache.spark.sql.execution.command.DataWritingCommandExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, ShuffleExchangeLike}
 import org.apache.spark.sql.internal.SQLConf
 
@@ -115,9 +116,21 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       return plan
     }
     logWarning("MppCollapseRule: attempting MPP collapse on query plan")
-    tryCollapseMpp(plan).getOrElse {
-      logWarning("MppCollapseRule: FALLBACK TO BSP")
-      plan
+    plan match {
+      case dwce: DataWritingCommandExec =>
+        // Collapse the query subtree; keep DWCE at the root so Spark still drives
+        // the file-write path. MppNativeQueryExec produces the result the writer consumes.
+        tryCollapseMpp(dwce.child)
+          .map(mppChild => dwce.withNewChildren(Seq(mppChild)))
+          .getOrElse {
+            logWarning("MppCollapseRule: FALLBACK TO BSP (inside DataWritingCommandExec)")
+            plan
+          }
+      case _ =>
+        tryCollapseMpp(plan).getOrElse {
+          logWarning("MppCollapseRule: FALLBACK TO BSP")
+          plan
+        }
     }
   }
 
@@ -152,6 +165,12 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
     logWarning("MppCollapseRule: plan is fully native-supported, wrapping with MppNativeQueryExec")
 
+    // Rewrite any whitelisted vanilla FilterExec/ProjectExec (only present because
+    // of a ScalarSubquery in their expressions) into their transformer counterparts
+    // so ColumnarCollapseTransformStages, which runs right after this rule, can
+    // absorb them into a WholeStageTransformer like any other native operator.
+    val rewritten = rewriteSubqueryFilterProject(plan)
+
     // Phase 1: wrap plan with placeholder fragments. The child plan is NOT modified.
     // MppNativeQueryExec.doExecuteColumnar() will delegate to child.executeColumnar()
     // (BSP execution). True MPP fragment extraction comes in Phase 2.
@@ -159,7 +178,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       NativeFragment(
         id = 0,
         rootOperator = null, // placeholder - real extraction in Phase 2
-        outputAttributes = plan.output,
+        outputAttributes = rewritten.output,
         parallelism = 4
       ))
     val exchanges = Seq.empty[ExchangeSpec]
@@ -172,7 +191,21 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // Plan D: Wrap, don't replace. Keep original plan as child so Spark's
     // shuffle/broadcast validation passes. At execution time, MppNativeQueryExec
     // bypasses child.executeColumnar() and runs via MppQueryCoordinator instead.
-    Some(MppNativeQueryExec(child = plan, fragments = fragments, exchanges = exchanges))
+    Some(MppNativeQueryExec(child = rewritten, fragments = fragments, exchanges = exchanges))
+  }
+
+  /**
+   * Replace whitelisted vanilla FilterExec/ProjectExec nodes (those carrying a ScalarSubquery in
+   * their expressions) with their transformer equivalents so the normal BSP wrapping path can
+   * absorb them into a WholeStageTransformer.
+   */
+  private def rewriteSubqueryFilterProject(plan: SparkPlan): SparkPlan = {
+    plan.transformUp {
+      case f: FilterExec if containsScalarSubquery(f.condition) =>
+        FilterExecTransformer(f.condition, f.child)
+      case p: ProjectExec if p.projectList.exists(containsScalarSubquery) =>
+        ProjectExecTransformer(p.projectList, p.child)
+    }
   }
 
   /**
@@ -187,12 +220,17 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case exchange: ShuffleExchangeLike =>
         canAbsorbExchange(exchange) && isFullyNativeSupported(exchange.child)
 
-      // Broadcast exchanges cannot be absorbed - Spark requires broadcast nodes
-      // to remain intact. Queries with broadcast joins fall back to BSP.
+      // Broadcast exchanges are absorbable when the build side is itself a fully
+      // native TransformSupport subtree (recurse into children, same as shuffle).
+      // The native MPP runtime treats BROADCAST as a distinct exchange type.
       case bc: BroadcastExchangeLike =>
-        logWarning(
-          s"MppCollapseRule: BLOCKED by BroadcastExchangeLike: ${bc.getClass.getSimpleName}")
-        false
+        val absorbable = canAbsorbExchange(bc) && bc.children.forall(isFullyNativeSupported)
+        if (!absorbable) {
+          logWarning(
+            s"MppCollapseRule: BLOCKED by BroadcastExchangeLike: " +
+              s"${bc.getClass.getSimpleName} (build side not fully native)")
+        }
+        absorbable
 
       // AQE query stage wrappers - check their underlying plan
       case stage: ShuffleQueryStageExec =>
@@ -214,6 +252,22 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case c2c: ColumnarToColumnarExec =>
         c2c.children.forall(isFullyNativeSupported)
 
+      // TakeOrderedAndProjectExecTransformer wraps a sort+limit+project over a
+      // TransformSupport child; treat it as a transparent wrapper and recurse.
+      case topk: TakeOrderedAndProjectExecTransformer =>
+        isFullyNativeSupported(topk.child)
+
+      // Vanilla FilterExec/ProjectExec only land here when Gluten's columnar
+      // validator refused to convert them -- typically because their expression
+      // tree contains an uncorrelated ScalarSubquery (Q11, Q22). The subquery's
+      // result is materialized by Spark's ReusedSubqueryExec mechanism and
+      // injected as a Substrait literal at build time by ScalarSubqueryTransformer.
+      // Whitelist these so the outer plan can collapse to MPP.
+      case f: FilterExec if containsScalarSubquery(f.condition) =>
+        isFullyNativeSupported(f.child)
+      case p: ProjectExec if p.projectList.exists(containsScalarSubquery) =>
+        isFullyNativeSupported(p.child)
+
       // Any other non-native operator means we cannot do MPP
       case other =>
         logWarning(
@@ -221,6 +275,19 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
             s"${other.getClass.getSimpleName} (${other.simpleString(50)})")
         false
     }
+  }
+
+  /**
+   * Walk an expression tree; return true iff it contains a [[ScalarSubquery]] reference. Used to
+   * whitelist vanilla FilterExec/ProjectExec that Gluten could not validate purely because of an
+   * uncorrelated scalar subquery -- the Substrait converter injects it as a literal later.
+   */
+  private def containsScalarSubquery(expr: Expression): Boolean = {
+    expr.find {
+      case _: ScalarSubquery => true
+      case _: PlanExpression[_] => true
+      case _ => false
+    }.isDefined
   }
 
   /**
@@ -242,6 +309,12 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case _: ColumnarToRowExecBase =>
         plan.children.flatMap(findFirstUnsupportedOperator).headOption
       case _: ColumnarToColumnarExec =>
+        plan.children.flatMap(findFirstUnsupportedOperator).headOption
+      case _: TakeOrderedAndProjectExecTransformer =>
+        plan.children.flatMap(findFirstUnsupportedOperator).headOption
+      case f: FilterExec if containsScalarSubquery(f.condition) =>
+        plan.children.flatMap(findFirstUnsupportedOperator).headOption
+      case p: ProjectExec if p.projectList.exists(containsScalarSubquery) =>
         plan.children.flatMap(findFirstUnsupportedOperator).headOption
       case other =>
         Some(s"${other.getClass.getSimpleName}: ${other.simpleString(20)}")

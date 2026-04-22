@@ -17,8 +17,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "substrait/SubstraitToVeloxPlan.h"
@@ -26,6 +28,7 @@
 #include "velox/core/PlanFragment.h"
 #include "velox/core/QueryCtx.h"
 #include "velox/exec/Exchange.h"
+#include "velox/exec/SerializedPage.h"
 #include "velox/exec/OutputBufferManager.h"
 #include "velox/exec/Task.h"
 
@@ -160,9 +163,15 @@ class MppQueryCoordinator {
 
   /// Fetch the next page of serialized data from the root task's output buffer.
   /// Returns true if data was fetched, false if at end-of-stream.
-  /// Populates `iobufs` with the received pages.
+  /// Populates `pages` with the received SerializedPageBase objects. Uses
+  /// OutputBufferManager::getPages (SerializedPageBase-callback) rather than
+  /// getData (IOBuf-callback) so that GpuSerializedPage (which has no CPU
+  /// IOBuf representation) can flow through zero-copy. next() unwraps each
+  /// page: GpuSerializedPage -> CudfVector (zero-copy GPU); PrestoSerializedPage
+  /// -> RowVector via VectorStreamGroup::read (CPU deserialize fallback).
   bool fetchNextOutputPage(
-      std::vector<std::unique_ptr<folly::IOBuf>>& iobufs);
+      std::vector<std::unique_ptr<facebook::velox::exec::SerializedPageBase>>&
+          pages);
 
   std::string queryId_;
   std::vector<MppFragmentSpec> fragmentSpecs_;
@@ -198,6 +207,12 @@ class MppQueryCoordinator {
   int32_t rootFetchCursor_{0};
   /// True for RANGE (order-preserving) drain; false for round-robin.
   bool rootDrainSequential_{false};
+
+  /// Watchdog thread periodically (every 5s after start) logs state of
+  /// every (fragId, replicaIdx) Task so we can diagnose where the pipeline
+  /// is stalling. Runs until destructor.
+  std::thread watchdogThread_;
+  std::atomic<bool> watchdogStop_{false};
 
   /// Leaf memory pool for deserializing pages in next(). Velox requires
   /// allocations to happen on leaf pools, not the aggregate root returned

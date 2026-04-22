@@ -46,6 +46,8 @@
 #include "operators/plannodes/RowVectorStream.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include "operators/plannodes/CudfVectorStream.h"
+#include "velox/experimental/cudf/exchange/GpuExchangeNode.h"
+#include "velox/experimental/cudf/exchange/GpuPartitionedOutputNode.h"
 #include "velox/experimental/cudf/exchange/LocalGpuExchangeSource.h"
 #endif
 
@@ -165,10 +167,19 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
               << node->id() << "' with ExchangeNode '"
               << exchangeNodeId << "' outputType="
               << node->outputType()->toString();
+#ifdef GLUTEN_ENABLE_GPU
+    // Use the GPU-aware exchange node so the generated GpuExchange
+    // operator unwraps CudfVector-carrying pages directly (zero-copy)
+    // and avoids the Presto serde checkTypeEncoding path that fails
+    // for CudfVector VARCHAR columns.
+    return std::make_shared<velox::cudf_velox::GpuExchangeNode>(
+        exchangeNodeId, node->outputType());
+#else
     return std::make_shared<velox::core::ExchangeNode>(
         exchangeNodeId,
         node->outputType(),
         velox::VectorSerde::Kind::kPresto);
+#endif
   }
 
   // If this is a leaf node (no children) that is NOT ValueStream, keep it.
@@ -706,6 +717,20 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
                 << " keyIndices=" << keyIndices.size()
                 << " func=" << (funcSpec ? funcSpec->toString() : "null");
 
+#ifdef GLUTEN_ENABLE_GPU
+      // MPP GPU sink: partition CudfVector input on GPU and publish
+      // GpuSerializedPages to OutputBufferManager without D2H copy.
+      // Avoids PrestoVectorSerde, which misclassifies CudfVector VARCHAR
+      // encodings and breaks consumer deserialization.
+      wrappedPlan = std::make_shared<velox::cudf_velox::GpuPartitionedOutputNode>(
+          outputNodeId,
+          velox::cudf_velox::GpuPartitionedOutputNode::Kind::kPartitioned,
+          std::move(partitionExprs),
+          numOutputPartitions,
+          std::move(funcSpec),
+          veloxPlanNode->outputType(),
+          veloxPlanNode);
+#else
       wrappedPlan = std::make_shared<velox::core::PartitionedOutputNode>(
           outputNodeId,
           velox::core::PartitionedOutputNode::Kind::kPartitioned,
@@ -716,6 +741,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
           veloxPlanNode->outputType(),
           velox::VectorSerde::Kind::kPresto,
           veloxPlanNode);
+#endif
     }
 
     LOG(INFO) << "MppJniWrapper: fragment " << i
@@ -809,9 +835,19 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   auto mppPool = rootPool->addAggregateChild("MppQuery");
   std::unordered_map<std::string, std::shared_ptr<velox::config::ConfigBase>>
       connectorConfigs;
+  // Velox's OutputBuffer.bufferedBytes_ is a single scalar shared across ALL
+  // destinations of a Task; enqueue blocks when it exceeds max_*_buffer_size.
+  // Default 32 MB is catastrophic at N>=16: 32MB/N per destination trips
+  // backpressure on the first few pages, stalling the producer pipeline and
+  // never firing noMoreData to downstream. Raise to 1 GB to give chained
+  // exchanges breathing room at N up to ~200.
+  std::unordered_map<std::string, std::string> queryConfigMap = {
+      {velox::core::QueryConfig::kMaxOutputBufferSize, "1073741824"},
+      {velox::core::QueryConfig::kMaxPartitionedOutputBufferSize, "1073741824"},
+  };
   auto queryCtx = velox::core::QueryCtx::create(
       executor.get(),
-      velox::core::QueryConfig{{}},
+      velox::core::QueryConfig{std::move(queryConfigMap)},
       connectorConfigs,
       VeloxBackend::get()->getAsyncDataCache(),
       mppPool,

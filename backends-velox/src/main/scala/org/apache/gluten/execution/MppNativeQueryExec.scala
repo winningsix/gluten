@@ -29,9 +29,9 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
-import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
-import org.apache.spark.sql.execution.{ColumnarInputAdapter, InputIteratorTransformer, SparkPlan, UnaryExecNode}
-import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
+import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ExecSubqueryExpression, InputIteratorTransformer, SparkPlan, SQLExecution, UnaryExecNode}
+import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -39,6 +39,9 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
 import com.google.common.collect.Lists
 import io.substrait.proto.ReadRel
 
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Paths}
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.JavaConverters._
@@ -133,6 +136,14 @@ case class MppNativeQueryExec(
       s"MppNativeQueryExec: executing with ${fragments.size} fragments " +
         s"and ${exchanges.size} exchanges")
 
+    // Materialize any ScalarSubquery results in the child plan before driver-side
+    // Substrait generation. ScalarSubqueryTransformer.doTransform calls
+    // query.eval(InternalRow.empty), which requires updateResult() to have run.
+    // In BSP this happens via SparkPlan.prepareSubqueries on the enclosing plan;
+    // because MppNativeQueryExec bypasses child.executeColumnar() we drive it
+    // explicitly here so Q11/Q22-style uncorrelated subqueries become literals.
+    materializeScalarSubqueries(child)
+
     // Plan D: child is the original BSP plan (with ShuffleExchange intact).
     // Phase 1: delegate to child BSP execution to prove the wrap chain works.
     // Phase 2: replace with real MPP multi-fragment streaming execution.
@@ -193,6 +204,16 @@ case class MppNativeQueryExec(
           s"MppNativeQueryExec: split infos per fragment: " +
             s"${fragmentSplitInfos.map(_.length).mkString("[", ", ", "]")}")
 
+        // Optional dump-to-disk of the multi-fragment plan for offline C++ replay
+        // (spark.gluten.mpp.substraitDumpDir). No-op when the config is empty.
+        dumpPlanIfEnabled(
+          fragmentPlans,
+          numDriversPerFragment,
+          extractedFragments,
+          extractedExchanges,
+          exchangeSpecsJson,
+          fragmentSplitInfos)
+
         return new MppNativeQueryRDD(
           sparkContext,
           fragmentPlans,
@@ -233,6 +254,16 @@ case class MppNativeQueryExec(
     // Extract split infos for pre-built fragments
     val fragmentSplitInfos: Array[Array[Array[Byte]]] =
       fragments.map(extractSplitInfosForFragment).toArray
+
+    // Optional dump-to-disk of the multi-fragment plan for offline C++ replay
+    // (spark.gluten.mpp.substraitDumpDir). No-op when the config is empty.
+    dumpPlanIfEnabled(
+      fragmentPlans,
+      numDriversPerFragment,
+      fragments,
+      exchanges,
+      exchangeSpecsJson,
+      fragmentSplitInfos)
 
     // RDD only receives serialized bytes - no SparkPlan references.
     new MppNativeQueryRDD(
@@ -399,18 +430,44 @@ case class MppNativeQueryExec(
    * Find the actual ShuffleExchangeLike nodes corresponding to the exchange children found by
    * [[findExchangeChildren]]. Unwraps ColumnarInputAdapter and other wrappers.
    */
-  private def findExchangeNodes(wst: WholeStageTransformer): Seq[ShuffleExchangeLike] = {
+  private def findExchangeNodes(wst: WholeStageTransformer): Seq[Exchange] = {
     findExchangeChildren(wst).flatMap(child => unwrapToExchange(child))
   }
 
-  /** Unwrap wrapper nodes to find the ShuffleExchangeLike underneath. */
-  private def unwrapToExchange(plan: SparkPlan): Option[ShuffleExchangeLike] = {
+  /** Unwrap wrapper nodes to find the Exchange (shuffle or broadcast) underneath. */
+  private def unwrapToExchange(plan: SparkPlan): Option[Exchange] = {
     plan match {
-      case ex: ShuffleExchangeLike => Some(ex)
+      case ex: ShuffleExchangeLike => Some(ex.asInstanceOf[Exchange])
+      case ex: BroadcastExchangeLike => Some(ex.asInstanceOf[Exchange])
       case cia: ColumnarInputAdapter => unwrapToExchange(cia.child)
       case c2c: ColumnarToColumnarExec => unwrapToExchange(c2c.child)
       case c2r: ColumnarToRowExecBase => unwrapToExchange(c2r.child)
       case _ => None
+    }
+  }
+
+  /**
+   * Walk the plan tree and force every [[ScalarSubquery]] (and any other
+   * [[ExecSubqueryExpression]]) to materialize. Spark normally drives this through
+   * SparkPlan.prepareSubqueries during the executeQuery() prepare phase; we call it explicitly
+   * because [[MppNativeQueryExec]] bypasses child.executeColumnar() and generates Substrait on the
+   * driver instead. After this returns, Gluten's ScalarSubqueryTransformer can safely call
+   * query.eval(InternalRow.empty) and emit a Substrait Literal. Spark's ReusedSubqueryExec
+   * mechanism ensures identical subqueries share a single execution.
+   */
+  private def materializeScalarSubqueries(plan: SparkPlan): Unit = {
+    plan.foreach {
+      node =>
+        node.expressions.foreach {
+          expr =>
+            expr.foreach {
+              case sub: ExecSubqueryExpression =>
+                sub.plan.prepare()
+                // Idempotent: updateResult blocks on the underlying future and stores the row.
+                sub.updateResult()
+              case _ =>
+            }
+        }
     }
   }
 
@@ -439,6 +496,8 @@ case class MppNativeQueryExec(
         ("ROUND_ROBIN", Seq.empty)
       case SinglePartition =>
         ("SINGLE", Seq.empty)
+      case _: BroadcastPartitioning =>
+        ("BROADCAST", Seq.empty)
       case other =>
         logWarning(
           s"MppNativeQueryExec: unexpected partitioning type: " +
@@ -731,6 +790,213 @@ case class MppNativeQueryExec(
       s"mergeSplitInfosToBytes: merged ${splitInfos.size} partitions " +
         s"into ${merged.getItemsCount} file items")
     merged.toByteArray
+  }
+
+  // --- Substrait plan dump (offline C++ replay) ---
+
+  /**
+   * If `spark.gluten.mpp.substraitDumpDir` is set, write the fully-collapsed multi-fragment
+   * Substrait plan plus exchange wiring to that directory. This lets a separate C++ harness
+   * (`mpp-substrait-runner`) replay the plan directly against Velox-cudf without going through
+   * Spark.
+   *
+   * Layout per query: `<dumpDir>/<queryId>/`:
+   *   - `fragment-<id>.pb` -- raw Substrait Plan protobuf bytes (byte-identical to what the JNI
+   *     bridge receives).
+   *   - `manifest.json` -- small human-readable descriptor of fragments + exchanges.
+   *   - `query.sql` -- best-effort logical / child plan text for debugging.
+   *
+   * The dump is a driver-side side-effect only. It must never fail the query: any I/O error is
+   * logged as a warning and the normal native execution continues.
+   */
+  private def dumpPlanIfEnabled(
+      fragmentPlans: Array[Array[Byte]],
+      numDriversPerFragment: Array[Int],
+      fragmentSpecs: Seq[NativeFragment],
+      exchangeSpecs: Seq[ExchangeSpec],
+      exchangeSpecsJson: String,
+      fragmentSplitInfos: Array[Array[Array[Byte]]]): Unit = {
+    val dumpDir =
+      SQLConf.get.getConfString("spark.gluten.mpp.substraitDumpDir", "").trim
+    if (dumpDir.isEmpty) {
+      return
+    }
+    try {
+      val queryId = deriveQueryId()
+      val outDir = Paths.get(dumpDir, queryId)
+      Files.createDirectories(outDir)
+
+      // 1. Fragment protobufs -- identical bytes to what goes through JNI.
+      var i = 0
+      while (i < fragmentPlans.length) {
+        val target = outDir.resolve(f"fragment-$i%d.pb")
+        Files.write(target, fragmentPlans(i))
+        i += 1
+      }
+
+      // 1b. Per-fragment scan splits. One file per leaf scan inside a fragment;
+      // raw ReadRel.LocalFiles protobuf bytes, byte-identical to what the JNI
+      // bridge passes as splitInfosPerFragArr[fragmentId][leafIdx]. Fragments
+      // without leaf scans (exchange-only consumer fragments) write no files.
+      var fi = 0
+      while (fi < fragmentSplitInfos.length) {
+        val leaves = fragmentSplitInfos(fi)
+        var li = 0
+        while (li < leaves.length) {
+          val target = outDir.resolve(f"splits-frag$fi%d-leaf$li%d.pb")
+          Files.write(target, leaves(li))
+          li += 1
+        }
+        fi += 1
+      }
+
+      // 2. manifest.json
+      val manifestBytes =
+        buildManifestJson(
+          queryId,
+          fragmentPlans,
+          numDriversPerFragment,
+          fragmentSpecs,
+          exchangeSpecs,
+          fragmentSplitInfos)
+          .getBytes(StandardCharsets.UTF_8)
+      Files.write(outDir.resolve("manifest.json"), manifestBytes)
+
+      // 3. exchange-specs.json -- byte-for-byte the same JSON that currently goes through JNI as
+      // the `exchangeSpecsJson` parameter to nativeCreateMppQuery. The C++ harness can feed this
+      // directly into the same parseExchangeSpecs() code path.
+      Files.write(
+        outDir.resolve("exchange-specs.json"),
+        exchangeSpecsJson.getBytes(StandardCharsets.UTF_8))
+
+      // 4. query.sql -- best-effort plan text for debugging.
+      val sqlBytes = deriveQueryText().getBytes(StandardCharsets.UTF_8)
+      Files.write(outDir.resolve("query.sql"), sqlBytes)
+
+      val totalSplitFiles = fragmentSplitInfos.map(_.length).sum
+      logWarning(
+        s"MppNativeQueryExec: dumped Substrait plan " +
+          s"(${fragmentPlans.length} fragments, ${exchangeSpecs.size} exchanges, " +
+          s"$totalSplitFiles split files) to $outDir")
+    } catch {
+      case t: Throwable =>
+        logWarning(
+          s"MppNativeQueryExec: failed to dump Substrait plan to '$dumpDir' " +
+            s"(${t.getClass.getSimpleName}: ${t.getMessage}); continuing with native execution",
+          t
+        )
+    }
+  }
+
+  /**
+   * Best-effort stable identifier for this query. Uses Spark's SQL execution id when running inside
+   * a DataFrame action (the normal path) so the dump directory lines up with the Spark UI query id.
+   * Falls back to a random UUID when unavailable (e.g. explain-only callers).
+   */
+  private def deriveQueryId(): String = {
+    val execId = Option(sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY))
+    execId.filter(_.nonEmpty).getOrElse("q-" + UUID.randomUUID().toString)
+  }
+
+  /** Render the original logical plan (if we captured it) or the child plan tree as debug SQL. */
+  private def deriveQueryText(): String = {
+    if (originalLogicalPlan != null) {
+      originalLogicalPlan.toString()
+    } else {
+      child.treeString
+    }
+  }
+
+  /**
+   * Build a JSON manifest describing the dumped plan. We inline JSON construction to avoid adding a
+   * new JSON library dependency; this matches [[serializeExchangeSpecs]] above, which does the
+   * same. Strings are escaped for the two characters that actually show up in plan text:
+   * backslashes and double quotes. Control characters (newlines, tabs) are passed through inside
+   * JSON strings via \n / \t.
+   */
+  private def buildManifestJson(
+      queryId: String,
+      fragmentPlans: Array[Array[Byte]],
+      numDriversPerFragment: Array[Int],
+      fragmentSpecs: Seq[NativeFragment],
+      exchangeSpecs: Seq[ExchangeSpec],
+      fragmentSplitInfos: Array[Array[Array[Byte]]]): String = {
+    def esc(s: String): String = {
+      val sb = new StringBuilder(s.length + 2)
+      var i = 0
+      while (i < s.length) {
+        val c = s.charAt(i)
+        c match {
+          case '\\' => sb.append("\\\\")
+          case '"' => sb.append("\\\"")
+          case '\n' => sb.append("\\n")
+          case '\r' => sb.append("\\r")
+          case '\t' => sb.append("\\t")
+          case ch if ch < 0x20 => sb.append(f"\\u$ch%04x")
+          case ch => sb.append(ch)
+        }
+        i += 1
+      }
+      sb.toString()
+    }
+    def schemaString(attrs: Seq[Attribute]): String = {
+      attrs
+        .map(a => s"${a.name}:${a.dataType.catalogString}${if (a.nullable) "?" else ""}")
+        .mkString(",")
+    }
+
+    // Fragment entries. isFinal = the fragment whose output Spark ultimately consumes;
+    // by convention fragment id 0 in both the Plan C / Plan D construction paths.
+    val fragmentEntries = fragmentSpecs.zipWithIndex.map {
+      case (frag, idx) =>
+        val parallelism = if (idx < numDriversPerFragment.length) {
+          numDriversPerFragment(idx)
+        } else frag.parallelism
+        val planSize = if (idx < fragmentPlans.length) fragmentPlans(idx).length else 0
+        // Split files for this fragment's leaf scans. Empty for exchange-only
+        // consumer fragments. Ordering matches JNI splitInfosPerFragArr[fragId].
+        val splitFiles = if (idx < fragmentSplitInfos.length) {
+          fragmentSplitInfos(idx).indices
+            .map(li => s""""splits-frag$idx-leaf$li.pb"""")
+            .mkString("[", ", ", "]")
+        } else "[]"
+        s"""    {
+           |      "id": ${frag.id},
+           |      "parallelism": $parallelism,
+           |      "outputSchema": "${esc(schemaString(frag.outputAttributes))}",
+           |      "planBytes": $planSize,
+           |      "planFile": "fragment-${frag.id}.pb",
+           |      "splitFiles": $splitFiles,
+           |      "isFinal": ${frag.id == 0}
+           |    }""".stripMargin
+    }
+
+    val exchangeEntries = exchangeSpecs.map {
+      spec =>
+        val keyNames = spec.partitionKeys
+          .map(a => "\"" + esc(a.name) + "\"")
+          .mkString("[", ", ", "]")
+        s"""    {
+           |      "id": ${spec.id},
+           |      "producer": ${spec.producerFragmentId},
+           |      "consumer": ${spec.consumerFragmentId},
+           |      "type": "${esc(spec.exchangeType)}",
+           |      "numPartitions": ${spec.numPartitions},
+           |      "partitioningKeys": $keyNames
+           |    }""".stripMargin
+    }
+
+    s"""{
+       |  "queryId": "${esc(queryId)}",
+       |  "numFragments": ${fragmentSpecs.size},
+       |  "fragments": [
+       |${fragmentEntries.mkString(",\n")}
+       |  ],
+       |  "exchanges": [
+       |${exchangeEntries.mkString(",\n")}
+       |  ]
+       |}
+       |""".stripMargin
   }
 
 }

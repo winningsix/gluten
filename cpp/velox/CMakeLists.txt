@@ -149,6 +149,7 @@ get_filename_component(VELOX_PROTO_DIR ${VELOX_PROTO_SRC_DIR}/ DIRECTORY)
 # Build Velox backend.
 set(VELOX_SRCS
     ${VELOX_PROTO_SRCS}
+    compute/MppDumpLoader.cc
     compute/MppQueryCoordinator.cc
     compute/VeloxBackend.cc
     compute/VeloxRuntime.cc
@@ -267,7 +268,13 @@ target_include_directories(
          ${CMAKE_CURRENT_SOURCE_DIR}
          ${VELOX_HOME}
          ${PROTO_OUTPUT_DIR}
-         ${PROTOBUF_INCLUDE})
+         ${PROTOBUF_INCLUDE}
+         # Forward gluten's public include dirs (substrait/*.pb.h etc.) to
+         # downstream consumers. Previously propagated transitively via
+         # `target_link_libraries(velox PUBLIC ... gluten ...)`, which now
+         # only lives in velox's PRIVATE scope to avoid baking libgluten.a
+         # into consumers a second time.
+         $<TARGET_PROPERTY:gluten,INTERFACE_INCLUDE_DIRECTORIES>)
 
 set_target_properties(velox PROPERTIES LIBRARY_OUTPUT_DIRECTORY
                                        ${root_directory}/releases)
@@ -290,18 +297,27 @@ endif()
 
 # Link the static gluten core library with --whole-archive so that JNI entry
 # points (referenced only from Java, not from C++) are not dropped by the linker.
-target_link_libraries(velox PUBLIC
+# Keep this PRIVATE: the whole-archive/allow-multiple-definition dance is only
+# needed for libgluten.so's own build. Propagating it via PUBLIC causes every
+# downstream consumer (executables, plugin .so's) to bake libgluten.a +
+# libprotobuf.a into themselves a second time, which FATALs at runtime when
+# protobuf's global descriptor pool detects the same .proto registered twice.
+target_link_libraries(velox PRIVATE
   -Wl,--whole-archive gluten -Wl,--no-whole-archive
   -Wl,--allow-multiple-definition)
 
 # Requires VELOX_MONO_LIBRARY=ON when building Velox.
 import_library(facebook::velox ${VELOX_BUILD_PATH}/lib/libvelox.a)
 
+# velox/tpch/gen generator functions (mk_region, sd_cust, etc.) live in
+# libdbgen.a. When libvelox.a is whole-archive'd into libgluten.so, velox's
+# tpch code is pulled in and needs these symbols regardless of BUILD_TESTS.
+import_library(facebook::velox::dbgen
+               ${VELOX_BUILD_PATH}/velox/tpch/gen/dbgen/libdbgen.a)
+
 if(BUILD_TESTS)
   add_duckdb()
 
-  import_library(facebook::velox::dbgen
-                 ${VELOX_BUILD_PATH}/velox/tpch/gen/dbgen/libdbgen.a)
   target_link_libraries(facebook::velox INTERFACE facebook::velox::dbgen)
 
   import_library(
@@ -328,9 +344,29 @@ if(BUILD_TESTS)
   target_link_libraries(velox PUBLIC facebook::velox::exec_test_lib)
 endif()
 
-target_link_libraries(velox PUBLIC facebook::velox)
+# PRIVATE + whole-archive: facebook::velox is libvelox.a (STATIC IMPORTED).
+# Baked into libgluten.so; must NOT propagate to consumers or its globals
+# (gflags like velox_memory_num_shared_leaf_pools) fire twice. `--whole-archive`
+# pulls in every .o so that APIs consumers call but libgluten.so's own code
+# doesn't reference (e.g. folly::Init, various init helpers) are still present
+# in libgluten.so for dynamic symbol lookup.
+target_link_libraries(velox PRIVATE
+  -Wl,--whole-archive facebook::velox -Wl,--no-whole-archive
+  facebook::velox::dbgen)
 
-target_link_libraries(velox PUBLIC Folly::folly)
+# PRIVATE + whole-archive: Folly::folly is libfolly.a (STATIC IMPORTED).
+# Same reasoning as facebook::velox above — PRIVATE prevents double-registration
+# of folly's own gflags in consumers; whole-archive ensures consumer-only APIs
+# (folly::Init, etc.) are present in libgluten.so for symbol lookup.
+target_link_libraries(velox PRIVATE
+  -Wl,--whole-archive Folly::folly -Wl,--no-whole-archive)
+
+# glog is SHARED (libglog.so); consumers whose code calls google::LOG /
+# google::SetLogDestination need it on their link line. Propagate PUBLIC so
+# downstream executables/plugins inherit it automatically. (The PRIVATE chain
+# through `gluten -> google::glog` used to cover this implicitly; no longer
+# propagates now that the gluten whole-archive hunk is PRIVATE.)
+target_link_libraries(velox PUBLIC google::glog)
 
 find_re2()
 target_link_libraries(velox PUBLIC ${RE2_LIBRARY})
@@ -429,6 +465,12 @@ if(BUILD_EXAMPLES)
   add_subdirectory(udf/examples)
 endif()
 
+# Standalone developer tool binaries (mpp-substrait-runner, etc).
+# Always added so `cmake --build --target mpp-substrait-runner` works
+# without needing to re-run cmake with an extra flag. The binaries link
+# against the existing `velox` target so they incur no extra heavy deps.
+add_subdirectory(tools)
+
 if(ENABLE_GPU)
   # Propagate GPU flag to velox target so MppJniWrapper.cc and other sources
   # can use #ifdef GLUTEN_ENABLE_GPU for GPU-specific code paths.
@@ -463,12 +505,19 @@ if(ENABLE_GPU)
     velox_curl PROPERTIES IMPORTED_LOCATION
                           ${VELOX_BUILD_PATH}/_deps/curl-build/lib/libcurl.so)
 
+  # Static cuDF integration archives: PRIVATE + whole-archive. Like
+  # facebook::velox, these need every .o pulled in so consumer-used APIs
+  # end up exported from libgluten.so.
   target_link_libraries(
     velox
-    PUBLIC facebook::velox::velox_cudf_exec facebook::velox::velox_cudf_vector
-           facebook::velox::velox_cudf_hive_connector
-           facebook::velox::velox_cudf_exchange
-           facebook::velox::velox_cudf_expression cudf::cudf velox_curl)
+    PRIVATE -Wl,--whole-archive
+            facebook::velox::velox_cudf_exec facebook::velox::velox_cudf_vector
+            facebook::velox::velox_cudf_hive_connector
+            facebook::velox::velox_cudf_exchange
+            facebook::velox::velox_cudf_expression
+            -Wl,--no-whole-archive)
+  # Shared libs consumers need at link time (cudf::cudf, libcurl): PUBLIC.
+  target_link_libraries(velox PUBLIC cudf::cudf velox_curl)
 endif()
 
 add_custom_command(

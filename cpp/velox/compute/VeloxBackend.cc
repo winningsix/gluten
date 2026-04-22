@@ -123,7 +123,12 @@ void VeloxBackend::init(
     }
   }
   FLAGS_logtostderr = true;
-  google::InitGoogleLogging("gluten");
+  // folly::Init (used by mpp-substrait-runner and other standalone tools)
+  // already initializes glog; double-init FATALs. JNI path has no prior
+  // init, so this guard is a no-op there.
+  if (!google::IsGoogleLoggingInitialized()) {
+    google::InitGoogleLogging("gluten");
+  }
 
   // Allow growing buffer in another task through its memory pool.
   FLAGS_velox_memory_pool_capacity_transfer_across_tasks =

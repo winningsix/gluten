@@ -19,6 +19,7 @@
 
 #include <fmt/format.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <unordered_set>
 
 // Must be included before any header that (transitively) pulls in
 // CudfHiveConnectorSplit.h, because that header only forward-declares
@@ -33,9 +34,11 @@
 #include "velox/common/memory/ByteStream.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/exec/Exchange.h"
+#include "velox/exec/OutputBuffer.h"
 #include "velox/exec/OutputBufferManager.h"
 #include "velox/exec/SerializedPage.h"
 #include "velox/exec/Task.h"
+#include "velox/experimental/cudf/exchange/GpuSerializedPage.h"
 #include "velox/vector/VectorStream.h"
 
 using namespace facebook::velox;
@@ -127,6 +130,11 @@ std::shared_ptr<MppQueryCoordinator> MppQueryCoordinator::create(
 }
 
 MppQueryCoordinator::~MppQueryCoordinator() {
+  // Stop the watchdog first so it doesn't touch half-destructed state.
+  watchdogStop_ = true;
+  if (watchdogThread_.joinable()) {
+    watchdogThread_.join();
+  }
   size_t totalTasks = 0;
   for (auto& replicas : fragmentTasks_) {
     totalTasks += replicas.size();
@@ -402,6 +410,74 @@ void MppQueryCoordinator::start() {
                    << " scan node " << scanNodeId;
     }
   }
+
+  // Diagnostic watchdog: every 5s dump the state of every (fragId, replicaIdx)
+  // Task so we can see where a hang is happening. Cheap: N_tasks log lines
+  // per 5s. Stops on destructor.
+  watchdogThread_ = std::thread([this]() {
+    int tick = 0;
+    // Track which failed taskIds we've already logged to avoid repeating the
+    // same error message every tick.
+    std::unordered_set<std::string> reportedFailures;
+    while (!watchdogStop_.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      if (watchdogStop_.load(std::memory_order_acquire)) {
+        break;
+      }
+      ++tick;
+      // Summarize per-fragment state counts (more scannable than per-task).
+      for (size_t f = 0; f < fragmentTasks_.size(); ++f) {
+        int counts[5] = {0, 0, 0, 0, 0}; // running,finished,canceled,aborted,failed
+        for (auto& task : fragmentTasks_[f]) {
+          if (!task) continue;
+          auto s = static_cast<int>(task->state());
+          if (s >= 0 && s < 5) {
+            counts[s]++;
+          }
+        }
+        LOG(WARNING) << "MppWatchdog[" << queryId_ << "] tick=" << tick
+                     << " frag=" << f
+                     << " replicas=" << fragmentTasks_[f].size()
+                     << " running=" << counts[0]
+                     << " finished=" << counts[1]
+                     << " canceled=" << counts[2]
+                     << " aborted=" << counts[3]
+                     << " failed=" << counts[4];
+      }
+      // Dump error message for any newly-failed task. Velox Task::setError is
+      // completely silent (only stashes exception_), so without this the only
+      // visible signal is the watchdog's failed-count going up.
+      for (size_t f = 0; f < fragmentTasks_.size(); ++f) {
+        for (auto& task : fragmentTasks_[f]) {
+          if (!task) continue;
+          if (task->state() != TaskState::kFailed) continue;
+          const auto& tid = task->taskId();
+          if (reportedFailures.insert(tid).second) {
+            LOG(ERROR) << "MppWatchdog[" << queryId_ << "] tick=" << tick
+                       << " FAILED-TASK taskId=" << tid
+                       << " frag=" << f
+                       << " errorMessage={" << task->errorMessage() << "}";
+          }
+        }
+      }
+      // Sample a few non-terminal tasks with full taskId for deeper debugging.
+      int sampled = 0;
+      for (size_t f = 0; f < fragmentTasks_.size() && sampled < 6; ++f) {
+        for (auto& task : fragmentTasks_[f]) {
+          if (!task) continue;
+          if (!isTerminalState(task->state())) {
+            LOG(WARNING) << "MppWatchdog[" << queryId_ << "] tick=" << tick
+                         << " non-terminal taskId=" << task->taskId()
+                         << " state=" << static_cast<int>(task->state())
+                         << " numDrivers=" << task->numTotalDrivers()
+                         << " numFinishedDrivers="
+                         << task->numFinishedDrivers();
+            if (++sampled >= 6) break;
+          }
+        }
+      }
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +485,7 @@ void MppQueryCoordinator::start() {
 // ---------------------------------------------------------------------------
 
 bool MppQueryCoordinator::fetchNextOutputPage(
-    std::vector<std::unique_ptr<folly::IOBuf>>& iobufs) {
+    std::vector<std::unique_ptr<SerializedPageBase>>& pages) {
   const auto rootReplicas = fragmentReplicaCount_[rootFragmentId_];
   constexpr int32_t kDestination = 0; // each root Task gathers to dest 0
   constexpr uint64_t kMaxBytes = std::numeric_limits<uint64_t>::max();
@@ -461,23 +537,23 @@ bool MppQueryCoordinator::fetchNextOutputPage(
                  << " rootState="
                  << static_cast<int>(fragmentTasks_[rootFragmentId_][idx]->state());
 
-    auto ok = bufferManager_->getData(
+    auto ok = bufferManager_->getPages(
         rootTaskId,
         kDestination,
         kMaxBytes,
         requestedSeq,
-        [&](std::vector<std::unique_ptr<folly::IOBuf>> pages,
+        [&](std::vector<std::unique_ptr<SerializedPageBase>> gotPages,
             int64_t inSequence,
             std::vector<int64_t> /*remainingBytes*/) {
           LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                       << "]: getData callback fired"
+                       << "]: getPages callback fired"
                        << " replica=" << idx
-                       << " pages=" << pages.size()
+                       << " pages=" << gotPages.size()
                        << " inSeq=" << inSequence;
-          for (auto& page : pages) {
+          for (auto& page : gotPages) {
             if (page != nullptr) {
               ++inSequence;
-              iobufs.push_back(std::move(page));
+              pages.push_back(std::move(page));
             } else {
               complete = true;
             }
@@ -488,7 +564,7 @@ bool MppQueryCoordinator::fetchNextOutputPage(
 
     if (!ok) {
       LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: getData returned ok=false for replica=" << idx
+                   << "]: getPages returned ok=false for replica=" << idx
                    << " (task not registered?)";
       rootReplicaAtEnd_[idx] = true;
       continue;
@@ -503,7 +579,7 @@ bool MppQueryCoordinator::fetchNextOutputPage(
       bufferManager_->deleteResults(rootTaskId, kDestination);
     }
 
-    if (!iobufs.empty()) {
+    if (!pages.empty()) {
       return true;
     }
     // Empty poll (timeout or end-of-stream with no data): loop to try
@@ -527,36 +603,53 @@ RowVectorPtr MppQueryCoordinator::next() {
 
   // Keep fetching until we get data pages or hit end-of-stream.
   while (!noMoreData_) {
-    std::vector<std::unique_ptr<folly::IOBuf>> iobufs;
-    bool gotData = fetchNextOutputPage(iobufs);
+    std::vector<std::unique_ptr<SerializedPageBase>> pages;
+    bool gotData = fetchNextOutputPage(pages);
 
     if (!gotData) {
       return nullptr;
     }
 
-    // Deserialize the first IOBuf into a RowVector.
-    // Each IOBuf corresponds to one serialized page from PartitionedOutput.
-    // For simplicity, we deserialize one page per call. If multiple pages
-    // were received in one getData callback, the remaining pages will be
-    // fetched in subsequent next() calls (they are already acknowledged
-    // by sequence advancement).
-    for (auto& iobuf : iobufs) {
-      auto page = std::make_unique<PrestoSerializedPage>(std::move(iobuf));
-      auto inputStream = page->prepareStreamForDeserialize();
+    // Unwrap and return the first non-null page. Two shapes are possible:
+    //   1. GpuSerializedPage wrapped in SharedSerializedPage (zero-copy GPU):
+    //      pull out the CudfVector (RowVector subclass) -- no D2H copy.
+    //   2. PrestoSerializedPage or raw IOBuf-backed page (CPU path): deserialize
+    //      via VectorStreamGroup::read into a fresh RowVector.
+    // Remaining pages in the batch are discarded here; they will be re-fetched
+    // on subsequent next() calls. Sequence ack already advanced inside
+    // fetchNextOutputPage() so this is safe.
+    for (auto& page : pages) {
+      if (!page) {
+        continue;
+      }
 
-      // Get the output type from the root fragment's plan node.
+      // Case 1: GPU page. OutputBufferManager wraps outgoing pages in
+      // SharedSerializedPage; peek through to find the GpuSerializedPage.
+      cudf_velox::GpuSerializedPage* gpuPage = nullptr;
+      if (auto* shared = dynamic_cast<SharedSerializedPage*>(page.get())) {
+        gpuPage = dynamic_cast<cudf_velox::GpuSerializedPage*>(
+            shared->innerShared().get());
+      } else {
+        gpuPage = dynamic_cast<cudf_velox::GpuSerializedPage*>(page.get());
+      }
+      if (gpuPage != nullptr) {
+        // cudfVector() is CudfVector (RowVector subclass). Returning it as
+        // RowVectorPtr keeps data on GPU; downstream consumers (runner main
+        // loop) see it as an opaque RowVector.
+        return gpuPage->cudfVector();
+      }
+
+      // Case 2: CPU page. Deserialize via Presto serde. Preserves backward
+      // compatibility with the old CPU-only gather path.
+      auto inputStream = page->prepareStreamForDeserialize();
       auto outputType = std::dynamic_pointer_cast<const RowType>(
           fragmentSpecs_[rootFragmentId_].planFragment.planNode->outputType());
       VELOX_CHECK(
           outputType != nullptr, "Root fragment must have RowType output");
-
-      // Velox allocations must happen on a leaf pool, not the aggregate
-      // root returned by queryCtx_->pool(). Create one lazily.
       if (deserializePool_ == nullptr) {
         deserializePool_ =
             queryCtx_->pool()->addLeafChild("mpp_deserialize");
       }
-
       RowVectorPtr result;
       VectorStreamGroup::read(
           inputStream.get(),

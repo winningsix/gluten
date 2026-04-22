@@ -3,8 +3,24 @@
     extern "C++" {
         *gluten::*;
         *facebook::velox::*;
+        *fmt::*;
+        *folly::*;
         *protobuf::*;
         *substrait::*;
+        # gflags internals (fLB/fLI32/fLI64/fLU64/fLD/fLS namespaces hold
+        # FLAGS_*, FLAGS_no*, and override helpers for each flag type).
+        # Exported so downstream executables / plugins that use velox
+        # flags directly (e.g. FLAGS_velox_memory_leak_check_enabled via
+        # memory::MemoryManager::initialize) can resolve them against
+        # libgluten.so at link time. Without this, velox's static archive
+        # would have to be re-linked into every consumer, re-registering
+        # every flag and FATAL-ing at startup.
+        *fLB::*;
+        *fLI32::*;
+        *fLI64::*;
+        *fLU64::*;
+        *fLD::*;
+        *fLS::*;
     };
 
     Java_org_apache_gluten_*;
