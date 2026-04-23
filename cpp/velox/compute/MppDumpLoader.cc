@@ -271,7 +271,7 @@ MppDumpLoadResult loadMppQueryFromDump(
 
   // Precompute consumer replica counts from non-broadcast inbound exchanges.
   // BROADCAST inbound carries numPartitions=1; it must not drive consumer
-  // parallelism (see plan/issue-broadcast-fanout.md / COORD-01 commit 730b23d4c).
+  // parallelism (see plan/issue-broadcast-fanout.md).
   // We use this to size broadcast producers' PartitionedOutputNode fan-out below.
   const size_t numFragmentsEarly =
       std::max<size_t>(splitFilesByFrag.size(), 1);
@@ -459,7 +459,7 @@ MppDumpLoadResult loadMppQueryFromDump(
       // kBroadcast code path never actually invokes (broadcast bypasses the
       // partition function -- see OutputBuffer::enqueueBroadcastOutputLocked).
       //
-      // See plan/issue-broadcast-fanout.md (BCAST-01); the coordinator calls
+      // See plan/issue-broadcast-fanout.md; the coordinator calls
       // updateOutputBuffers(N, noMore=true) after wiring so
       // isFinishedLocked() can terminate.
       const int32_t fanout =

@@ -284,7 +284,7 @@ void MppQueryCoordinator::start() {
   // any driver runs. Otherwise producer enqueues to the default 1-slot
   // buffer and replicas 1..N-1 of the consumer fragment never see data
   // (build-side table is null -> CudfHashJoinBuild fails with
-  // "tbl != nullptr"). See plan/issue-broadcast-fanout.md (BCAST-01).
+  // "tbl != nullptr"). See plan/issue-broadcast-fanout.md.
   std::vector<int32_t> broadcastFanout(fragmentSpecs_.size(), 0);
   for (const auto& exchange : exchangeSpecs_) {
     if (exchange.partitionType != "BROADCAST") {
@@ -305,9 +305,14 @@ void MppQueryCoordinator::start() {
     // TODO: scale per-replica driver count with N and core budget. Default
     // to 1/replica for replicated fragments (matches GpuMultiFragmentTest);
     // preserve Scala-supplied numDrivers for non-replicated fragments.
-    const auto perReplicaDrivers =
-        replicas == 1 ? std::max(1, spec.numDrivers) : 1;
+    // Pin broadcast producers to 1 driver so the kBroadcast
+    // OutputBuffer's end-marker fires deterministically on the one
+    // noMoreData() call (stock Velox end-marker only fires when ALL drivers
+    // have called noMoreData; multi-driver broadcast hangs when any driver
+    // receives zero splits or blocks for any other reason).
     const auto bcastN = broadcastFanout[spec.id];
+    const auto perReplicaDrivers = (bcastN > 0) ? 1
+        : (replicas == 1 ? std::max(1, spec.numDrivers) : 1);
     for (int32_t i = 0; i < replicas; ++i) {
       auto taskId = makeTaskId(spec.id, i);
       auto task = Task::create(
