@@ -227,10 +227,20 @@ void MppQueryCoordinator::start() {
   //
   // --- Derive per-fragment replica count from inbound exchanges ---
   // A fragment with no inbound exchange (leaf) runs as one replica.
-  // A fragment that consumes exchange(s) runs as N replicas where N =
-  // numPartitions. Multiple inbound exchanges (e.g., join) must agree on N.
+  // A fragment that consumes exchange(s) runs as N replicas where N is driven
+  // by the HASH / RANGE / ROUND_ROBIN inbound exchanges (consumer parallelism).
+  // BROADCAST inbound exchanges carry numPartitions=1 by design (one producer
+  // payload replicated to every consumer replica) and must NOT be used to
+  // derive consumer parallelism. All non-broadcast inbound exchanges at a
+  // given consumer must still agree on N.
+  // NOTE: broadcast fan-out correctness (every replica actually receives the
+  // one producer payload) is tracked separately as open issue #5 in
+  // plan/mpp-22q-status.md -- this block only sets the replica count.
   fragmentReplicaCount_.assign(fragmentSpecs_.size(), 1);
   for (auto& exchange : exchangeSpecs_) {
+    if (exchange.partitionType == "BROADCAST") {
+      continue;
+    }
     const auto consumer = exchange.consumerFragmentId;
     const auto n = std::max(1, exchange.numPartitions);
     auto& slot = fragmentReplicaCount_[consumer];
@@ -240,8 +250,9 @@ void MppQueryCoordinator::start() {
       VELOX_CHECK_EQ(
           slot,
           n,
-          "Fragment {} has inbound exchanges with inconsistent numPartitions "
-          "({} vs {}). All inbound exchanges must agree.",
+          "Fragment {} has inbound non-broadcast exchanges with inconsistent "
+          "numPartitions ({} vs {}). All HASH/RANGE/ROUND_ROBIN inbound "
+          "exchanges must agree.",
           consumer,
           slot,
           n);
