@@ -269,6 +269,27 @@ MppDumpLoadResult loadMppQueryFromDump(
 
   auto splitFilesByFrag = readSplitFilesFromManifest(manifest);
 
+  // Precompute consumer replica counts from non-broadcast inbound exchanges.
+  // BROADCAST inbound carries numPartitions=1; it must not drive consumer
+  // parallelism (see plan/issue-broadcast-fanout.md / COORD-01 commit 730b23d4c).
+  // We use this to size broadcast producers' PartitionedOutputNode fan-out below.
+  const size_t numFragmentsEarly =
+      std::max<size_t>(splitFilesByFrag.size(), 1);
+  std::vector<int32_t> consumerReplicas(numFragmentsEarly, 1);
+  for (const auto& ex : exchangeSpecs) {
+    if (ex.partitionType == "BROADCAST") {
+      continue;
+    }
+    const auto n = std::max(1, ex.numPartitions);
+    if (ex.consumerFragmentId >= 0 &&
+        static_cast<size_t>(ex.consumerFragmentId) < consumerReplicas.size()) {
+      auto& slot = consumerReplicas[ex.consumerFragmentId];
+      if (slot == 1) {
+        slot = n;
+      }
+    }
+  }
+
   // Fragment count is the number of fragment-*.pb files (or manifest entries).
   size_t numFragments = splitFilesByFrag.size();
   // If manifest has fragments but no splitFiles, splitFilesByFrag sizing still
@@ -422,7 +443,50 @@ MppDumpLoadResult loadMppQueryFromDump(
     auto outputNodeId = fmt::format("mpp_output_{}", i);
     velox::core::PlanNodePtr wrappedPlan;
 
-    if (numOutputPartitions == 1) {
+    if (outboundExchange != nullptr &&
+        outboundExchange->partitionType == "BROADCAST") {
+      // BROADCAST edge: one producer payload must reach every consumer
+      // replica. Emit a kBroadcast PartitionedOutputNode with fanout=N so
+      // Velox's OutputBuffer allocates N DestinationBuffers and replicates
+      // the shared payload (via enqueueBroadcastOutputLocked).
+      //
+      // We DO NOT use PartitionedOutputNode::broadcast(id, N): that factory
+      // attaches a GatherPartitionFunctionSpec whose create() is
+      // VELOX_UNREACHABLE. The CPU exec::PartitionedOutput constructor calls
+      // spec.create(N) when N>1 (PartitionedOutput.cpp:172-174), which blows
+      // up before our adapter can swap in GpuPartitionedOutput. Work around
+      // by attaching a harmless RoundRobinPartitionFunctionSpec that the
+      // kBroadcast code path never actually invokes (broadcast bypasses the
+      // partition function -- see OutputBuffer::enqueueBroadcastOutputLocked).
+      //
+      // See plan/issue-broadcast-fanout.md (BCAST-01); the coordinator calls
+      // updateOutputBuffers(N, noMore=true) after wiring so
+      // isFinishedLocked() can terminate.
+      const int32_t fanout =
+          (outboundExchange->consumerFragmentId >= 0 &&
+           static_cast<size_t>(outboundExchange->consumerFragmentId) <
+               consumerReplicas.size())
+          ? consumerReplicas[outboundExchange->consumerFragmentId]
+          : 1;
+      // numPartitions must be 1 at plan construction for kBroadcast --
+      // Velox's PartitionedOutput ctor asserts VELOX_USER_CHECK_EQ(1,
+      // numDestinations_) when !isPartitioned() (PartitionedOutput.cpp:200-201).
+      // The actual fan-out to N consumer replicas is set later by
+      // MppQueryCoordinator calling task->updateOutputBuffers(fanout, true)
+      // after Phase-2 wiring. The `fanout` value here is kept just for
+      // bookkeeping / future reference; it is not passed to the plan node.
+      (void)fanout;
+      wrappedPlan = std::make_shared<velox::core::PartitionedOutputNode>(
+          outputNodeId,
+          velox::core::PartitionedOutputNode::Kind::kBroadcast,
+          std::vector<velox::core::TypedExprPtr>{},
+          /*numPartitions=*/1,
+          /*replicateNullsAndAny=*/false,
+          std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>(),
+          veloxPlanNode->outputType(),
+          velox::VectorSerde::Kind::kPresto,
+          veloxPlanNode);
+    } else if (numOutputPartitions == 1) {
       // CPU PartitionedOutput, see consumer-side comment above.
       wrappedPlan = velox::core::PartitionedOutputNode::single(
           outputNodeId,

@@ -277,6 +277,26 @@ void MppQueryCoordinator::start() {
                << " drain="
                << (rootDrainSequential_ ? "sequential" : "roundRobin");
 
+  // --- Precompute: is fragment `i` a BROADCAST producer, and if so, what is
+  // its consumer fragment's replica count? For those, we call
+  // updateOutputBuffers(N, /*noMoreBuffers=*/true) BEFORE task->start() so
+  // Velox's kBroadcast OutputBuffer has all N destination slots ready before
+  // any driver runs. Otherwise producer enqueues to the default 1-slot
+  // buffer and replicas 1..N-1 of the consumer fragment never see data
+  // (build-side table is null -> CudfHashJoinBuild fails with
+  // "tbl != nullptr"). See plan/issue-broadcast-fanout.md (BCAST-01).
+  std::vector<int32_t> broadcastFanout(fragmentSpecs_.size(), 0);
+  for (const auto& exchange : exchangeSpecs_) {
+    if (exchange.partitionType != "BROADCAST") {
+      continue;
+    }
+    const auto producer = exchange.producerFragmentId;
+    if (producer >= 0 && static_cast<size_t>(producer) < broadcastFanout.size()) {
+      broadcastFanout[producer] =
+          std::max(1, fragmentReplicaCount_[exchange.consumerFragmentId]);
+    }
+  }
+
   // --- Create Tasks: one per (fragment, replica) ---
   fragmentTasks_.assign(fragmentSpecs_.size(), {});
   for (auto& spec : fragmentSpecs_) {
@@ -287,6 +307,7 @@ void MppQueryCoordinator::start() {
     // preserve Scala-supplied numDrivers for non-replicated fragments.
     const auto perReplicaDrivers =
         replicas == 1 ? std::max(1, spec.numDrivers) : 1;
+    const auto bcastN = broadcastFanout[spec.id];
     for (int32_t i = 0; i < replicas; ++i) {
       auto taskId = makeTaskId(spec.id, i);
       auto task = Task::create(
@@ -299,8 +320,20 @@ void MppQueryCoordinator::start() {
                    << "]: starting fragment " << spec.id << " replica " << i
                    << "/" << replicas << " taskId=" << taskId
                    << " drivers=" << perReplicaDrivers
-                   << " destination=" << i;
+                   << " destination=" << i
+                   << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN)
+                                  : std::string{});
       task->start(perReplicaDrivers);
+      if (bcastN > 0) {
+        // Task::start() has now initializePartitionOutput() registered the
+        // kBroadcast OutputBuffer with numBuffers=1 (the plan's placeholder).
+        // Expand to N destination buffers AND stamp noMoreBuffers=true so
+        // enqueueBroadcastOutputLocked replicates every page to all N
+        // consumer replicas and isFinishedLocked() can eventually return.
+        // Drivers have been scheduled but scan-leaf producers block on
+        // splits (added in Phase 3), so this happens before any enqueue.
+        task->updateOutputBuffers(bcastN, /*noMoreBuffers=*/true);
+      }
       fragmentTasks_[spec.id].push_back(std::move(task));
     }
   }
@@ -351,6 +384,10 @@ void MppQueryCoordinator::start() {
                  << (producerReplicas.size() * consumerReplicas.size())
                  << " splits total)";
   }
+
+  // Phase 2.5: broadcast producer output buffer fan-out already set in
+  // Phase 1 (before task->start()); nothing to do here. See the
+  // broadcastFanout precompute above for the ordering rationale.
 
   // Phase 3: Add file scan splits to scan-containing fragments.
   //
