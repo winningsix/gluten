@@ -116,7 +116,15 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       return plan
     }
     logWarning("MppCollapseRule: attempting MPP collapse on query plan")
-    plan match {
+    // Presto-style rewrite: turn every uncorrelated ScalarSubquery still dangling off a Filter /
+    // Project into a BroadcastExchange + BroadcastNestedLoopJoin(Inner). This folds the subquery
+    // into the main plan tree (so MPP absorbs it as an additional fragment) instead of leaving it
+    // as a driver-materialized sibling. We apply the rewrite up front so downstream collapse /
+    // walk logic sees a tree with no ScalarSubquery expressions left. If MPP collapse ultimately
+    // fails we fall back to the ORIGINAL (unrewritten) plan so Spark's BSP path can run the
+    // query unchanged.
+    val preRewritten = RewriteUncorrelatedScalarSubquery(plan)
+    preRewritten match {
       case dwce: DataWritingCommandExec =>
         // Collapse the query subtree; keep DWCE at the root so Spark still drives
         // the file-write path. MppNativeQueryExec produces the result the writer consumes.
@@ -127,7 +135,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
             plan
           }
       case _ =>
-        tryCollapseMpp(plan).getOrElse {
+        tryCollapseMpp(preRewritten).getOrElse {
           logWarning("MppCollapseRule: FALLBACK TO BSP")
           plan
         }
