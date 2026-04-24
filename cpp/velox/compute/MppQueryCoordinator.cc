@@ -39,6 +39,7 @@
 #include "velox/exec/SerializedPage.h"
 #include "velox/exec/Task.h"
 #include "velox/experimental/cudf/exchange/GpuSerializedPage.h"
+#include "velox/experimental/cudf/exchange/InProcessChannel.h"
 #include "velox/vector/VectorStream.h"
 
 using namespace facebook::velox;
@@ -48,9 +49,23 @@ namespace gluten {
 
 namespace {
 
-/// Task ID prefix for GPU exchange. The "gpu-local://" scheme is recognized
-/// by LocalGpuExchangeSource (velox/experimental/cudf/exchange/).
-constexpr const char* kTaskIdPrefix = "gpu-local://";
+/// Pick the task-id prefix once. USE_INPROC_CHANNEL=1 selects the new
+/// single-machine single-GPU InProcessChannel path (bypasses
+/// OutputBufferManager entirely). Otherwise fall back to "gpu-local://"
+/// which goes through OutputBufferManager via LocalGpuExchangeSource.
+std::string pickTaskIdPrefix() {
+  const char* v = std::getenv("USE_INPROC_CHANNEL");
+  if (v != nullptr) {
+    std::string s(v);
+    if (!s.empty() && s != "0" && s != "false" && s != "no" && s != "off") {
+      return "gpu-inproc://";
+    }
+  }
+  return "gpu-local://";
+}
+
+/// Task ID prefix for GPU exchange. Chosen once at process startup.
+const std::string kTaskIdPrefix = pickTaskIdPrefix();
 
 } // namespace
 
@@ -177,6 +192,13 @@ MppQueryCoordinator::~MppQueryCoordinator() {
           bufferManager_->removeTask(tid);
         } catch (...) {
         }
+        // Also drop any in-process channels registered for this task. This
+        // path is a no-op when taskId prefix is "gpu-local://" (registry has
+        // no entries).
+        try {
+          cudf_velox::InProcessChannelRegistry::get().removeTask(tid);
+        } catch (...) {
+        }
       }
     }
   }
@@ -190,11 +212,21 @@ MppQueryCoordinator::~MppQueryCoordinator() {
 std::string MppQueryCoordinator::makeTaskId(
     int32_t fragmentId,
     int32_t replicaIdx) const {
-  // Unified convention: every Task ID is suffixed by replica index, even
-  // for single-replica fragments (replicaIdx=0). Matches GpuMultiFragmentTest
-  // pattern and avoids special-cases in exchange wiring.
+  // Root fragment's output is consumed directly by this coordinator via
+  // OutputBufferManager::getPages(), so its taskId must keep the
+  // "gpu-local://" prefix even when USE_INPROC_CHANNEL=1 (otherwise
+  // GpuPartitionedOutput would route the root's output to
+  // InProcessChannel and the coordinator's read would hang).
+  //
+  // Non-root fragments are consumed by another Task via an ExchangeNode;
+  // for those, the configured kTaskIdPrefix applies (gpu-inproc:// when
+  // the env flag is on, gpu-local:// otherwise).
+  constexpr const char* kRootPrefix = "gpu-local://";
+  const char* prefix = (fragmentId == rootFragmentId_)
+      ? kRootPrefix
+      : kTaskIdPrefix.c_str();
   return fmt::format(
-      "{}{}-{}-p{}", kTaskIdPrefix, queryId_, fragmentId, replicaIdx);
+      "{}{}-{}-p{}", prefix, queryId_, fragmentId, replicaIdx);
 }
 
 bool MppQueryCoordinator::isTerminalState(TaskState state) {
@@ -832,10 +864,12 @@ void MppQueryCoordinator::waitForCompletion() {
     }
   }
 
-  // Clean up output buffer entries for all tasks.
+  // Clean up output buffer entries and in-process channels for all tasks.
   for (auto& replicas : fragmentTasks_) {
     for (auto& task : replicas) {
       bufferManager_->removeTask(task->taskId());
+      cudf_velox::InProcessChannelRegistry::get().removeTask(
+          task->taskId());
     }
   }
 

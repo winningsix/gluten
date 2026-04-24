@@ -79,6 +79,7 @@
 // (ENABLE_GPU=ON) since that's the path we're iterating on; we add a soft
 // fallback so a non-GPU build still links.
 #ifdef GLUTEN_ENABLE_GPU
+#include "velox/experimental/cudf/exchange/GpuInProcExchangeSource.h"
 #include "velox/experimental/cudf/exchange/LocalGpuExchangeSource.h"
 #endif
 
@@ -544,13 +545,18 @@ int main(int argc, char** argv) {
   }
 
 #ifdef GLUTEN_ENABLE_GPU
-  // Register the GPU exchange source factory. The coordinator uses
-  // "gpu-local://" task IDs which are routed to this factory.
+  // Register the GPU exchange source factories. The coordinator picks a
+  // task-id prefix per its own USE_INPROC_CHANNEL env flag; the Source
+  // factory chain tries each factory in order. Registering both keeps
+  // backwards compat for the "gpu-local://" path while enabling the new
+  // "gpu-inproc://" path.
+  exec::ExchangeSource::registerFactory(
+      cudf_velox::createGpuInProcExchangeSource);
   exec::ExchangeSource::registerFactory(
       cudf_velox::createLocalGpuExchangeSource);
   cudf_velox::testingStartLocalGpuExchangeSource();
-  LOG(WARNING) << "mpp-substrait-runner: registered LocalGpuExchangeSource "
-               << "factory and called testingStartLocalGpuExchangeSource";
+  LOG(WARNING) << "mpp-substrait-runner: registered "
+               << "GpuInProcExchangeSource + LocalGpuExchangeSource factories";
 #else
   LOG(WARNING)
       << "mpp-substrait-runner: built without GLUTEN_ENABLE_GPU; "
