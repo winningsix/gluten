@@ -1357,7 +1357,8 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::constructCudfValueStreamNode(
     VELOX_CHECK_LT(streamIdx, inputIters_.size(), "Could not find stream index {} in input iterator list.", streamIdx);
     iterator = std::move(inputIters_[streamIdx]);
   }
-  auto node = std::make_shared<CudfValueStreamNode>(nextPlanNodeId(), outputType, std::move(iterator));
+  auto node = std::make_shared<CudfValueStreamNode>(
+      nextPlanNodeId(), outputType, std::move(iterator), streamIdx);
 
   auto splitInfo = std::make_shared<SplitInfo>();
   splitInfo->leafType = SplitInfo::LeafType::TRIVIAL_LEAF;

@@ -327,8 +327,12 @@ class CudfValueStreamNode final : public facebook::velox::core::PlanNode {
   CudfValueStreamNode(
       const facebook::velox::core::PlanNodeId& id,
       const facebook::velox::RowTypePtr& outputType,
-      std::shared_ptr<ResultIterator> iterator)
-      : facebook::velox::core::PlanNode(id), outputType_(outputType), iterator_(std::move(iterator)) {}
+      std::shared_ptr<ResultIterator> iterator,
+      int32_t streamIdx = -1)
+      : facebook::velox::core::PlanNode(id),
+        outputType_(outputType),
+        iterator_(std::move(iterator)),
+        streamIdx_(streamIdx) {}
 
   const facebook::velox::RowTypePtr& outputType() const override {
     return outputType_;
@@ -340,6 +344,14 @@ class CudfValueStreamNode final : public facebook::velox::core::PlanNode {
 
   ResultIterator* iterator() const {
     return iterator_.get();
+  }
+
+  // Index into the consumer fragment's inbound stream list. Used by the
+  // standalone runner's LocalPartition assembler to pair ValueStream leaves
+  // with the corresponding inbound ExchangeSpec. -1 when unknown (e.g.
+  // constructed outside the substrait converter).
+  int32_t streamIdx() const {
+    return streamIdx_;
   }
 
   std::string_view name() const override {
@@ -355,6 +367,7 @@ class CudfValueStreamNode final : public facebook::velox::core::PlanNode {
 
   const facebook::velox::RowTypePtr outputType_;
   std::shared_ptr<ResultIterator> iterator_;
+  const int32_t streamIdx_;
   const std::vector<facebook::velox::core::PlanNodePtr> kEmptySources_;
 };
 

@@ -497,6 +497,37 @@ void MppQueryCoordinator::start() {
                      << " aborted=" << counts[3]
                      << " failed=" << counts[4];
       }
+      // Temporary (LOCAL-01 Q3 OOM diagnosis): dump per-operator memory
+      // reservation once per tick so we can see which operator is holding
+      // 30 GB on the GPU path.
+      if (tick <= 6 || tick % 5 == 0) {
+        std::function<void(memory::MemoryPool*, int)> dumpPool =
+            [&](memory::MemoryPool* pool, int depth) {
+              if (!pool) return;
+              const auto reserved = pool->reservedBytes();
+              const auto peak = pool->peakBytes();
+              if (reserved > 0 || peak > 0) {
+                LOG(WARNING) << "MemPool[" << queryId_ << "] tick=" << tick
+                             << " " << std::string(depth * 2, ' ')
+                             << pool->name()
+                             << " reserved=" << reserved
+                             << " peak=" << peak;
+              }
+              pool->visitChildren([&](memory::MemoryPool* child) {
+                dumpPool(child, depth + 1);
+                return true;
+              });
+            };
+        for (size_t f = 0; f < fragmentTasks_.size(); ++f) {
+          for (auto& task : fragmentTasks_[f]) {
+            if (!task) continue;
+            if (task->pool() != nullptr) {
+              dumpPool(task->pool(), 0);
+            }
+          }
+        }
+      }
+
       // Dump error message for any newly-failed task. Velox Task::setError is
       // completely silent (only stashes exception_), so without this the only
       // visible signal is the watchdog's failed-count going up.
