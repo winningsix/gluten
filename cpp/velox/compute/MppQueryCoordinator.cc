@@ -39,6 +39,7 @@
 #include "velox/exec/OutputBufferManager.h"
 #include "velox/exec/SerializedPage.h"
 #include "velox/exec/Task.h"
+#include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/vector/VectorStream.h"
 
 using namespace facebook::velox;
@@ -380,12 +381,30 @@ void MppQueryCoordinator::start() {
                  << consumerReplicas.size() << " replicas)"
                  << " exchangeNode=" << exchange.exchangeNodeId;
 
+    // Build the IBM ucx-exchange URL format expected by
+    // UcxExchangeSource::extractTaskAndDestinationId:
+    //   http://127.0.0.1:<port-3>/v1/task/<bareTaskId>/results/<dest>
+    // The "+3" port hack is documented in UcxExchangeSource::create
+    // (host port = uri.port() + 3). The producer publishes via the same
+    // single per-process Communicator, so loopback + the bare task id
+    // suffices; UcxExchangeServer/Source detect same-Communicator and
+    // bypass the wire via IntraNodeTransferRegistry.
+    auto comm = velox::ucx_exchange::Communicator::getInstance();
+    const int urlPort = static_cast<int>(comm->getListenerPort()) - 3;
+    auto stripScheme = [](const std::string& s) -> std::string {
+      auto pos = s.find("://");
+      return pos == std::string::npos ? s : s.substr(pos + 3);
+    };
     for (size_t i = 0; i < consumerReplicas.size(); ++i) {
       auto& consumerTask = consumerReplicas[i];
       for (const auto& prodId : producerTaskIds) {
+        const auto bare = stripScheme(prodId);
+        const auto url = fmt::format(
+            "http://127.0.0.1:{}/v1/task/{}/results/{}",
+            urlPort, bare, i);
         consumerTask->addSplit(
             exchange.exchangeNodeId,
-            Split(std::make_shared<RemoteConnectorSplit>(prodId)));
+            Split(std::make_shared<RemoteConnectorSplit>(url)));
       }
       consumerTask->noMoreSplits(exchange.exchangeNodeId);
     }
