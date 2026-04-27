@@ -552,7 +552,7 @@ if(ENABLE_GPU)
   target_link_libraries(velox PUBLIC
     ${VELOX_BUILD_PATH}/_deps/rmm-build/librmm.so
     ${VELOX_BUILD_PATH}/_deps/rapids_logger-build/librapids_logger.so
-    ${VELOX_BUILD_PATH}/_deps/kvikio-build/cpp/libkvikio.so
+    ${VELOX_BUILD_PATH}/_deps/kvikio-build/libkvikio.so
     /usr/local/cuda/lib64/libcudart.so)
 endif()
 
