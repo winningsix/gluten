@@ -64,6 +64,10 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport {
       .set("spark.gluten.mpp.singlePartitionSort", "true")
       .set("spark.gluten.mpp.removeRedundantShuffle", "true")
       .set("spark.gluten.mpp.fuseBroadcastBuilds", "true")
+      // Run on cudf (GPU) where supported.
+      .set("spark.gluten.sql.columnar.cudf", "true")
+      .set("spark.gluten.sql.columnar.backend.velox.cudf.enabled", "true")
+      .set("spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan", "true")
       // Dump every MppNativeQueryExec plan for offline diagnosis if the run fails.
       .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps-tpch-sf1k")
   }
