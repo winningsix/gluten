@@ -174,12 +174,16 @@ arrow::Status VeloxGpuHashShuffleWriter::write(std::shared_ptr<ColumnarBatch> cb
         }
 
         if (hasComplexType_) {
+          // IBM toVeloxColumn requires a 5th arg: the rmm device async
+          // resource ref. Use cudf_velox::get_output_mr() (the same MR
+          // used by other gluten cpp toCudfTable / toVeloxColumn calls).
           auto cpuRv =
               cudf_velox::with_arrow::toVeloxColumn(
                   cudfVec->getTableView(),
                   veloxPool_.get(),
                   std::string(""),
-                  cudfVec->stream());
+                  cudfVec->stream(),
+                  cudf_velox::get_output_mr());
           auto cpuBatch =
               std::make_shared<VeloxColumnarBatch>(cpuRv);
           return VeloxHashShuffleWriter::write(

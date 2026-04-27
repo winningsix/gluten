@@ -24,6 +24,7 @@
 // in the IBM-baseline switch. PinnedArrowMemoryPool below is now backed by
 // arrow::default_memory_pool(); cudaMemcpyAsync still works against
 // pageable host memory, just without the pinned-DMA fast path.
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"

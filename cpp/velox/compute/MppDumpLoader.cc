@@ -39,8 +39,10 @@
 #include "operators/plannodes/RowVectorStream.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include "operators/plannodes/CudfVectorStream.h"
-#include "velox/experimental/cudf/exchange/GpuExchangeNode.h"
-#include "velox/experimental/cudf/exchange/GpuPartitionedOutputNode.h"
+// IBM-baseline velox dropped velox/experimental/cudf/exchange/. The
+// runtime swap to UcxExchange / UcxPartitionedOutput is performed by
+// IBM cudf's OperatorAdapters when transportType=kUcx, so this file
+// emits plain velox::core::ExchangeNode / PartitionedOutputNode.
 #endif
 
 namespace fs = std::filesystem;
