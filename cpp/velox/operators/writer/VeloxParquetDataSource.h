@@ -17,7 +17,10 @@
 
 #pragma once
 
-#include <arrow/filesystem/filesystem.h>
+// arrow/filesystem/filesystem.h was unused in this header; gluten uses
+// velox::filesystems::getFileSystem (see .cc). System Arrow in IBM-baseline
+// build env (presto/prestissimo-dependency:centos9) doesn't ship the
+// arrow/filesystem/ subtree, so drop the include outright.
 #include <arrow/memory_pool.h>
 #include <arrow/record_batch.h>
 #include <arrow/type.h>

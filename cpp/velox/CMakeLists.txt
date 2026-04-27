@@ -272,6 +272,11 @@ target_include_directories(
          # `#include "ucxx/api.h"`.
          /opt/velox/_build/ucx-probe/_deps/ucxx-src/cpp/include
          ${VELOX_BUILD_PATH}/_deps/ucxx-src/cpp/include
+         # cudf headers fetched by velox FetchContent. The cudf interop
+         # types (e.g. cudf/io/types.hpp) aren't propagated through the
+         # velox cudf static-library targets, so add the source path
+         # explicitly. Required by MppQueryCoordinator.cc + others.
+         ${VELOX_BUILD_PATH}/_deps/cudf-src/cpp/include
          ${CMAKE_CURRENT_SOURCE_DIR}
          ${VELOX_HOME}
          ${PROTO_OUTPUT_DIR}
