@@ -293,8 +293,16 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorConfig(
   hiveConfMap[facebook::velox::connector::hive::HiveConfig::kLoadQuantum] =
       conf->get<std::string>(kLoadQuantum, "268435456"); // 256M
   auto footerEstimatedSize = conf->get<std::string>(kDirectorySizeGuess, "32768"); // 32K
-  hiveConfMap[facebook::velox::connector::hive::HiveConfig::kFooterEstimatedSize] =
+  // HiveConfig::kFooterEstimatedSize was removed in the IBM-baseline switch
+  // and replaced by per-format speculative-IO-size keys. Apply the same
+  // value to both Parquet and ORC keys so callers configuring the legacy
+  // Spark "footerEstimatedSize" still affect IBM Hive's tail-read sizing.
+  auto footerSize =
       conf->get<std::string>(kFooterEstimatedSize, footerEstimatedSize); // 32K
+  hiveConfMap[facebook::velox::connector::hive::HiveConfig::
+                  kParquetFooterSpeculativeIoSize] = footerSize;
+  hiveConfMap[facebook::velox::connector::hive::HiveConfig::
+                  kOrcFooterSpeculativeIoSize] = footerSize;
   hiveConfMap[facebook::velox::connector::hive::HiveConfig::kFilePreloadThreshold] =
       conf->get<std::string>(kFilePreloadThreshold, "1048576"); // 1M
 

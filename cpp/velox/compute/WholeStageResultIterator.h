@@ -29,7 +29,8 @@
 #include "velox/exec/Task.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include "cudf/GpuLock.h"
-#include "velox/experimental/cudf/exec/GpuGuard.h"
+// GpuGuard.h removed in IBM-baseline switch (header is gone). Diagnostic
+// thread-guard dropped per the IBM-baseline port; functionality is unaffected.
 #endif
 
 namespace gluten {
@@ -51,19 +52,9 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
       // calling .wait() may take no effect in single thread execution mode
       task_->requestCancel().wait();
     }
-#ifdef GLUTEN_ENABLE_GPU
-    if (enableCudf_) {
-      // Clear the thread-local GPU region flag AND release the semaphore
-      // permit. When the pipeline returns CudfVector directly to Java
-      // (no CudfToVelox), endGpuRegion() is never called inside the
-      // pipeline, leaving gpuRegionActive=true. If we only call
-      // unlockGpu() here, gpuRegionActive leaks to the next task on this
-      // thread, breaking region-based permit batching and causing
-      // per-operator acquire/release that leads to deadlock under
-      // contention.
-      facebook::velox::cudf_velox::endGpuRegion();
-    }
-#endif
+    // GPU thread-region tracking dropped in IBM-baseline switch (GpuGuard /
+    // endGpuRegion removed). The diagnostic semaphore-permit cleanup is no
+    // longer needed; cuDF stream-pool + RMM thread-safety handle concurrency.
   }
 
   std::shared_ptr<ColumnarBatch> next() override;

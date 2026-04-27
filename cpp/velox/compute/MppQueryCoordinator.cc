@@ -19,6 +19,7 @@
 
 #include <fmt/format.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/io/IOBuf.h>
 #include <unordered_set>
 
 // Must be included before any header that (transitively) pulls in
@@ -193,7 +194,7 @@ std::string MppQueryCoordinator::makeTaskId(
     int32_t fragmentId,
     int32_t replicaIdx) const {
   // Root-fragment output is consumed by this coordinator via
-  // OutputBufferManager::getPages() (kHttp PartitionedOutput).
+  // OutputBufferManager::getData() (kHttp PartitionedOutput).
   // Non-root fragment edges flow through IBM's UCX / IntraNodeTransfer
   // path; they share the same task-id prefix because routing is decided
   // by adapters, not by the prefix.
@@ -625,23 +626,29 @@ bool MppQueryCoordinator::fetchNextOutputPage(
                  << " rootState="
                  << static_cast<int>(fragmentTasks_[rootFragmentId_][idx]->state());
 
-    auto ok = bufferManager_->getPages(
+    // IBM-baseline: OutputBufferManager exposes getData (IOBuf-vector
+    // callback) instead of getPages (SerializedPageBase-vector callback).
+    // Wrap each IOBuf in a PrestoSerializedPage so the downstream
+    // prepareStreamForDeserialize() call site keeps working unchanged.
+    auto ok = bufferManager_->getData(
         rootTaskId,
         kDestination,
         kMaxBytes,
         requestedSeq,
-        [&](std::vector<std::unique_ptr<SerializedPageBase>> gotPages,
+        [&](std::vector<std::unique_ptr<folly::IOBuf>> gotPages,
             int64_t inSequence,
             std::vector<int64_t> /*remainingBytes*/) {
           LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                       << "]: getPages callback fired"
+                       << "]: getData callback fired"
                        << " replica=" << idx
                        << " pages=" << gotPages.size()
                        << " inSeq=" << inSequence;
-          for (auto& page : gotPages) {
-            if (page != nullptr) {
+          for (auto& iobuf : gotPages) {
+            if (iobuf != nullptr) {
               ++inSequence;
-              pages.push_back(std::move(page));
+              pages.push_back(
+                  std::make_unique<PrestoSerializedPage>(
+                      std::move(iobuf)));
             } else {
               complete = true;
             }
@@ -652,7 +659,7 @@ bool MppQueryCoordinator::fetchNextOutputPage(
 
     if (!ok) {
       LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: getPages returned ok=false for replica=" << idx
+                   << "]: getData returned ok=false for replica=" << idx
                    << " (task not registered?)";
       rootReplicaAtEnd_[idx] = true;
       continue;

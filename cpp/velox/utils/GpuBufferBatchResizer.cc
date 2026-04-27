@@ -20,7 +20,10 @@
 #include "memory/GpuBufferColumnarBatch.h"
 #include "utils/Timer.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
-#include "velox/experimental/cudf/exec/PinnedHostMemory.h"
+// PinnedHostMemory.h (and the PreferredPinnedPool it exposes) was removed
+// in the IBM-baseline switch. PinnedArrowMemoryPool below is now backed by
+// arrow::default_memory_pool(); cudaMemcpyAsync still works against
+// pageable host memory, just without the pinned-DMA fast path.
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -50,73 +53,51 @@ namespace gluten {
 
 namespace {
 
-/// arrow::MemoryPool backed by PreferredPinnedPool (pinned pool → pageable
-/// malloc).  Composed buffers allocated here can be DMA'd directly by
-/// cudaMemcpyAsync when pinned; CUDA transparently handles pageable buffers
-/// via internal staging.
-///
-/// Global singleton — Arrow buffers may be freed on a different thread.
-/// The pinnedFlags_ map is mutex-protected for cross-thread safety.
+/// arrow::MemoryPool used to allocate the host-side staging buffers that
+/// later get DMA'd to the GPU. The IBM-baseline switch removed the
+/// PreferredPinnedPool that previously backed this pool, so we now defer
+/// to arrow::default_memory_pool() (pageable). cudaMemcpyAsync still works
+/// — CUDA transparently stages pageable host buffers — at a small
+/// throughput cost vs true pinned memory.
 class PinnedArrowMemoryPool : public arrow::MemoryPool {
  public:
-  using Pool = facebook::velox::cudf_velox::PreferredPinnedPool;
-
   static PinnedArrowMemoryPool& instance() {
     static PinnedArrowMemoryPool pool;
     return pool;
   }
 
-  arrow::Status Allocate(int64_t size, int64_t /*alignment*/, uint8_t** out) override {
-    auto [ptr, pinned] = Pool::instance().allocate(static_cast<size_t>(size));
-    *out = static_cast<uint8_t*>(ptr);
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      pinnedFlags_[*out] = pinned;
-    }
-    bytesAllocated_.fetch_add(size, std::memory_order_relaxed);
-    return arrow::Status::OK();
+  arrow::Status Allocate(int64_t size, int64_t alignment, uint8_t** out)
+      override {
+    return arrow::default_memory_pool()->Allocate(size, alignment, out);
   }
 
-  arrow::Status Reallocate(int64_t oldSize, int64_t newSize, int64_t alignment, uint8_t** ptr) override {
-    uint8_t* newBuf = nullptr;
-    ARROW_RETURN_NOT_OK(Allocate(newSize, alignment, &newBuf));
-    if (oldSize > 0 && *ptr) {
-      std::memcpy(newBuf, *ptr, std::min(oldSize, newSize));
-      Free(*ptr, oldSize, alignment);
-    }
-    *ptr = newBuf;
-    return arrow::Status::OK();
+  arrow::Status Reallocate(
+      int64_t oldSize,
+      int64_t newSize,
+      int64_t alignment,
+      uint8_t** ptr) override {
+    return arrow::default_memory_pool()->Reallocate(
+        oldSize, newSize, alignment, ptr);
   }
 
-  void Free(uint8_t* buffer, int64_t size, int64_t /*alignment*/) override {
+  void Free(uint8_t* buffer, int64_t size, int64_t alignment) override {
     if (!buffer) return;
-    bool pinned = false;
-    {
-      std::lock_guard<std::mutex> lock(mu_);
-      auto it = pinnedFlags_.find(buffer);
-      if (it != pinnedFlags_.end()) {
-        pinned = it->second;
-        pinnedFlags_.erase(it);
-      }
-    }
-    Pool::instance().deallocate(buffer, static_cast<size_t>(size), pinned);
-    bytesAllocated_.fetch_sub(size, std::memory_order_relaxed);
+    arrow::default_memory_pool()->Free(buffer, size, alignment);
   }
 
   int64_t bytes_allocated() const override {
-    return bytesAllocated_.load(std::memory_order_relaxed);
+    return arrow::default_memory_pool()->bytes_allocated();
   }
 
   int64_t max_memory() const override { return -1; }
   int64_t total_bytes_allocated() const override { return -1; }
   int64_t num_allocations() const override { return -1; }
-  std::string backend_name() const override { return "preferred_pinned"; }
+  std::string backend_name() const override {
+    return "default_pageable";
+  }
 
  private:
   PinnedArrowMemoryPool() = default;
-  std::atomic<int64_t> bytesAllocated_{0};
-  std::mutex mu_;
-  std::unordered_map<uint8_t*, bool> pinnedFlags_;
 };
 
 /// Count null values from a CPU-resident Arrow validity bitmask (bit SET =

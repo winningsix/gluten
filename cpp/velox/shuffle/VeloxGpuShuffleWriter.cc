@@ -22,7 +22,11 @@
 
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
-#include "velox/experimental/cudf/exec/PinnedHostMemory.h"
+// PinnedHostMemory.h removed in IBM-baseline switch. We substitute the
+// pinned host-memory API with a minimal local std::vector<uint8_t>-backed
+// shim. cudaMemcpyAsync still works against pageable memory (CUDA stages
+// internally) at a small throughput cost vs true pinned memory; pending a
+// long-term port to the IBM cuda host-memory pool.
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 
 #include <cudf/binaryop.hpp>
@@ -40,15 +44,35 @@ namespace gluten {
 
 using namespace facebook::velox;
 using CudfVector = facebook::velox::cudf_velox::CudfVector;
-using PinnedHostBuffer =
-    facebook::velox::cudf_velox::PinnedHostBuffer;
 
 namespace {
 
-// arrow::Buffer backed by PinnedHostBuffer for zero-copy D2H.
-// Pinned memory enables fast PCIe DMA. The PinnedHostBuffer
-// lifetime is tied to this arrow::Buffer via shared_ptr, so
-// downstream consumers (compression tasks) keep it alive.
+// Pinned-host-buffer substitute used for D2H staging. The original
+// facebook::velox::cudf_velox::PinnedHostBuffer was removed in the
+// IBM-baseline switch; we shim it with a plain std::vector<uint8_t> so
+// existing call sites (size()/data()) keep compiling. cudaMemcpyAsync
+// still works against pageable memory; the throughput penalty vs true
+// pinned memory is the only regression here.
+class PinnedHostBuffer {
+ public:
+  explicit PinnedHostBuffer(int64_t size) : data_(static_cast<size_t>(size)) {}
+  uint8_t* data() {
+    return data_.data();
+  }
+  const uint8_t* data() const {
+    return data_.data();
+  }
+  size_t size() const {
+    return data_.size();
+  }
+
+ private:
+  std::vector<uint8_t> data_;
+};
+
+// arrow::Buffer backed by PinnedHostBuffer for D2H staging.
+// The PinnedHostBuffer lifetime is tied to this arrow::Buffer via
+// shared_ptr, so downstream consumers (compression tasks) keep it alive.
 class PinnedArrowBuffer : public arrow::Buffer {
  public:
   explicit PinnedArrowBuffer(

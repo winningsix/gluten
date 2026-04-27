@@ -239,8 +239,9 @@ WholeStageResultIterator::WholeStageResultIterator(
     // which the cuDF Parquet reader would treat as a complete file, failing
     // the header/footer magic check.
     if (!cudfFileInfos.empty()) {
-      const int64_t targetBytes =
-          velox::cudf_velox::CudfConfig::getInstance().gpuTargetBatchBytes;
+      // CudfConfig.gpuTargetBatchBytes was removed in the IBM-baseline
+      // switch. Hard-coded to 2GB pending a long-term port to QueryConfig.
+      const int64_t targetBytes = int64_t{2L * 1024 * 1024 * 1024};
       size_t i = 0;
       while (i < cudfFileInfos.size()) {
         const auto& primary = cudfFileInfos[i];
@@ -349,18 +350,10 @@ std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
             << " is busy when ::next() is called. "
             << "Will wait and try again. Task state: "
             << taskStateString(task_->state());
-#ifdef GLUTEN_ENABLE_GPU
-    if (enableCudf_) {
-      // Release GPU semaphore permit before blocking. The pipeline may
-      // have partially executed (e.g., CudfFromVelox acquired the region)
-      // before an operator signalled "blocked". All GpuGuards are
-      // stack-local and already destroyed, but gpuRegionActive and its
-      // refcount may still be held. Releasing here prevents a thread from
-      // holding a GPU permit while sleeping on a future, which can cause
-      // deadlock when all permits are consumed by sleeping threads.
-      facebook::velox::cudf_velox::endGpuRegion();
-    }
-#endif
+    // GPU thread-region tracking dropped in IBM-baseline switch
+    // (endGpuRegion removed). cuDF operators are stream-safe and RMM is
+    // thread-safe, so blocking on the future without releasing a permit
+    // does not cause deadlock in this configuration.
     future.wait();
   }
 

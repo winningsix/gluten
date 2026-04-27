@@ -25,6 +25,7 @@
 #include "velox/common/memory/Memory.h"
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/arrow/Bridge.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -49,7 +50,9 @@ std::shared_ptr<ColumnarBatch> VeloxGpuColumnarBatchSerializer::deserialize(uint
 
   GpuLockGuard gpuLock;
   auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
-  auto table = cudf_velox::with_arrow::toCudfTable(rv, veloxPool_.get(), stream);
+  // IBM-baseline toCudfTable requires an mr argument; use the cudf output mr.
+  auto table = cudf_velox::with_arrow::toCudfTable(
+      rv, veloxPool_.get(), stream, cudf_velox::get_output_mr());
   auto vector = std::make_shared<cudf_velox::CudfVector>(
       veloxPool_.get(), rowType_, numRows, std::move(table), stream);
   return std::make_shared<VeloxColumnarBatch>(vector, vb->numColumns());

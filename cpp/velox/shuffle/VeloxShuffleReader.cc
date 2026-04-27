@@ -878,7 +878,10 @@ VeloxRssSortShuffleReaderDeserializer::VeloxRssSortShuffleReaderDeserializer(
       rowType_(rowType),
       batchSize_(batchSize),
       veloxCompressionType_(veloxCompressionType),
-      serde_(getNamedVectorSerde(facebook::velox::VectorSerde::Kind::kPresto)),
+      // IBM-baseline getNamedVectorSerde takes a const std::string& kind
+      // (was VectorSerde::Kind enum). The Presto serde registers itself
+      // under the literal "Presto" (PrestoVectorSerde::kSerdeKind).
+      serde_(getNamedVectorSerde(std::string{"Presto"})),
       deserializeTime_(deserializeTime) {
   serdeOptions_ = {false, veloxCompressionType_};
 }

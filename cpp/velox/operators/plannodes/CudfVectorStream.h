@@ -28,10 +28,12 @@
 #include "velox/exec/Task.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfOperator.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include <cudf/concatenate.hpp>
 #include <nvtx3/nvtx3.hpp>
 
 namespace gluten {
@@ -108,10 +110,11 @@ class CudfVectorStream : public CudfVectorStreamBase {
       ResultIterator* iterator,
       const facebook::velox::RowTypePtr& outputType)
       : CudfVectorStreamBase(driverCtx, pool, iterator, outputType) {
-    targetBatchBytes_ =
-        facebook::velox::cudf_velox::CudfConfig::getInstance().gpuTargetBatchBytes;
-    targetBatchRows_ =
-        facebook::velox::cudf_velox::CudfConfig::getInstance().gpuTargetBatchRows;
+    // CudfConfig.gpuTargetBatchBytes / gpuTargetBatchRows fields were removed
+    // in the IBM-baseline switch. Hard-coded to reasonable defaults pending
+    // a long-term port to QueryConfig.
+    targetBatchBytes_ = int64_t{2L * 1024 * 1024 * 1024}; // 2GB
+    targetBatchRows_ = int32_t{1'000'000};                 // 1M rows
   }
 
   bool hasPending() const {
@@ -273,9 +276,30 @@ class CudfVectorStream : public CudfVectorStreamBase {
       GpuLockGuard gpuLock;
       auto stream =
           facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
-      auto tbl = facebook::velox::cudf_velox::
-          with_arrow::toCudfTableBatched(
-              pendingRows_, pool_, stream);
+      // toCudfTableBatched (vector input) was removed in the IBM-baseline
+      // switch in favour of single-RowVector toCudfTable. Convert each
+      // pending row vector individually, then concatenate the resulting
+      // cudf::tables on the GPU. mr supplied via get_output_mr().
+      auto mr = facebook::velox::cudf_velox::get_output_mr();
+      std::unique_ptr<cudf::table> tbl;
+      if (pendingRows_.size() == 1) {
+        tbl = facebook::velox::cudf_velox::with_arrow::toCudfTable(
+            pendingRows_.front(), pool_, stream, mr);
+      } else {
+        std::vector<std::unique_ptr<cudf::table>> parts;
+        parts.reserve(pendingRows_.size());
+        for (auto& rv : pendingRows_) {
+          parts.emplace_back(
+              facebook::velox::cudf_velox::with_arrow::toCudfTable(
+                  rv, pool_, stream, mr));
+        }
+        std::vector<cudf::table_view> views;
+        views.reserve(parts.size());
+        for (const auto& p : parts) {
+          views.push_back(p->view());
+        }
+        tbl = cudf::concatenate(views, stream, mr);
+      }
       VELOX_CHECK_NOT_NULL(tbl);
       const auto size = tbl->num_rows();
 
