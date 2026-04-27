@@ -241,7 +241,7 @@ core::PlanNodePtr makeSingleFragmentPlan(memory::MemoryPool* pool) {
 
   // Single-destination gather; coordinator reads from destination 0.
   auto partitionedOut = core::PartitionedOutputNode::single(
-      "out-0", rowType, VectorSerde::Kind::kPresto, values);
+      "out-0", rowType, std::string{"Presto"}, values);
 
   return partitionedOut;
 }
@@ -540,7 +540,7 @@ int main(int argc, char** argv) {
   if (!isRegisteredVectorSerde()) {
     serializer::presto::PrestoVectorSerde::registerVectorSerde();
   }
-  if (!isRegisteredNamedVectorSerde(VectorSerde::Kind::kPresto)) {
+  if (!isRegisteredNamedVectorSerde(std::string{"Presto"})) {
     serializer::presto::PrestoVectorSerde::registerNamedVectorSerde();
   }
 

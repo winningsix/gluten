@@ -131,7 +131,7 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
     return std::make_shared<velox::core::ExchangeNode>(
         exchangeNodeId,
         node->outputType(),
-        velox::VectorSerde::Kind::kPresto);
+        std::string{"Presto"});
   }
 
   const auto& sources = node->sources();
@@ -484,14 +484,14 @@ MppDumpLoadResult loadMppQueryFromDump(
           /*replicateNullsAndAny=*/false,
           std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>(),
           veloxPlanNode->outputType(),
-          velox::VectorSerde::Kind::kPresto,
+          std::string{"Presto"},
           veloxPlanNode);
     } else if (numOutputPartitions == 1) {
       // CPU PartitionedOutput, see consumer-side comment above.
       wrappedPlan = velox::core::PartitionedOutputNode::single(
           outputNodeId,
           veloxPlanNode->outputType(),
-          velox::VectorSerde::Kind::kPresto,
+          std::string{"Presto"},
           veloxPlanNode);
     } else {
       const std::string& partitionType = outboundExchange
@@ -548,7 +548,7 @@ MppDumpLoadResult loadMppQueryFromDump(
           /*replicateNullsAndAny=*/false,
           std::move(funcSpec),
           veloxPlanNode->outputType(),
-          velox::VectorSerde::Kind::kPresto,
+          std::string{"Presto"},
           veloxPlanNode);
     }
 

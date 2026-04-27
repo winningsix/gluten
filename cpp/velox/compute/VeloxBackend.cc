@@ -188,16 +188,12 @@ void VeloxBackend::init(
          backendConf_->get(kCudfMemoryResource, kCudfMemoryResourceDefault)},
         {velox::cudf_velox::CudfConfig::kCudfMemoryPercent,
          backendConf_->get(kCudfMemoryPercent, kCudfMemoryPercentDefault)},
-        {velox::cudf_velox::CudfConfig::kCudfGpuTargetBatchRows,
-         backendConf_->get(kCudfGpuTargetBatchRows, kCudfGpuTargetBatchRowsDefault)},
-        {velox::cudf_velox::CudfConfig::kCudfGpuTargetBatchBytes,
-         backendConf_->get(kCudfGpuTargetBatchBytes, kCudfGpuTargetBatchBytesDefault)},
-        {velox::cudf_velox::CudfConfig::kCudfPinnedPoolSize,
-         backendConf_->get(kCudfPinnedPoolSize, kCudfPinnedPoolSizeDefault)},
-        {velox::cudf_velox::CudfConfig::kCudfHostAsPinnedThreshold,
-         backendConf_->get(kCudfHostAsPinnedThreshold, kCudfHostAsPinnedThresholdDefault)},
-        {velox::cudf_velox::CudfConfig::kCudfPackedDtoH,
-         backendConf_->get(kCudfPackedDtoH, kCudfPackedDtoHDefault)},
+        // NOTE: kCudfGpuTargetBatchRows/Bytes, kCudfPinnedPoolSize,
+        // kCudfHostAsPinnedThreshold, kCudfPackedDtoH were dropped from IBM
+        // baseline CudfConfig.h. Hard-coded fallbacks are applied in the
+        // gluten cpp call sites that previously read them (CudfVectorStream.h,
+        // GpuBufferBatchResizer.cc). The Spark-side conf keys remain so user
+        // settings still parse cleanly; we just don't forward them.
         // MPP single-node GPU exchange: route PartitionedOutput/Exchange through
         // IBM cudf's UcxPartitionedOutput/UcxExchange. With intra_node_exchange
         // on, UcxExchangeServer/Source detect same-Communicator-instance and use
@@ -247,7 +243,7 @@ void VeloxBackend::init(
     // serde, for spill
     facebook::velox::serializer::presto::PrestoVectorSerde::registerVectorSerde();
   }
-  if (!isRegisteredNamedVectorSerde(facebook::velox::VectorSerde::Kind::kPresto)) {
+  if (!isRegisteredNamedVectorSerde("Presto")) {
     // RSS shuffle serde.
     facebook::velox::serializer::presto::PrestoVectorSerde::registerNamedVectorSerde();
   }
