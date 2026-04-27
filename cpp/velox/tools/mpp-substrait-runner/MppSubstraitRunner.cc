@@ -605,9 +605,8 @@ int main(int argc, char** argv) {
 
   printSummary(results);
 
-#ifdef GLUTEN_ENABLE_GPU
-  cudf_velox::testingShutdownLocalGpuExchangeSource();
-#endif
+  // testingShutdownLocalGpuExchangeSource was removed alongside the
+  // cudf/exchange/* headers in the IBM-baseline switch.
 
   // Non-zero exit if any query failed.
   for (const auto& r : results) {

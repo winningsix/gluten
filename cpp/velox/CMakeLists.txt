@@ -553,7 +553,11 @@ if(ENABLE_GPU)
     ${VELOX_BUILD_PATH}/_deps/rmm-build/librmm.so
     ${VELOX_BUILD_PATH}/_deps/rapids_logger-build/librapids_logger.so
     ${VELOX_BUILD_PATH}/_deps/kvikio-build/libkvikio.so
-    /usr/local/cuda/lib64/libcudart.so)
+    ${VELOX_BUILD_PATH}/_deps/ucxx-build/libucxx.so
+    /usr/local/cuda/lib64/libcudart.so
+    /usr/lib64/libucp.so
+    /usr/lib64/libuct.so
+    /usr/lib64/libucs.so)
 endif()
 
 add_custom_command(
