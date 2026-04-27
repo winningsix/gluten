@@ -21,6 +21,7 @@
 #include "utils/Timer.h"
 
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 // PinnedHostMemory.h removed in IBM-baseline switch. We substitute the
 // pinned host-memory API with a minimal local std::vector<uint8_t>-backed

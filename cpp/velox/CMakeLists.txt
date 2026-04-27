@@ -265,10 +265,12 @@ target_include_directories(
   PUBLIC ${CMAKE_SYSTEM_INCLUDE_PATH}
          ${JNI_INCLUDE_DIRS}
          ${VELOX_BUILD_PATH}
-         # ucxx headers fetched into the velox build dir by
-         # FetchContent (cpp/include is the public include root). Required
-         # by velox/experimental/ucx-exchange/Communicator.h's
+         # ucxx headers fetched by velox FetchContent. The release build
+         # tree (VELOX_BUILD_PATH) does not stage them under _deps, so
+         # point at the ucx-probe build dir explicitly. Required by
+         # velox/experimental/ucx-exchange/Communicator.h's
          # `#include "ucxx/api.h"`.
+         /opt/velox/_build/ucx-probe/_deps/ucxx-src/cpp/include
          ${VELOX_BUILD_PATH}/_deps/ucxx-src/cpp/include
          ${CMAKE_CURRENT_SOURCE_DIR}
          ${VELOX_HOME}
