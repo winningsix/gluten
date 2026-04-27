@@ -352,8 +352,16 @@ case class MppNativeQueryExec(
             parallelism = parallelism
           )
 
-          // Link exchange specs: each exchange child's consumer is this fragment
+          // Link exchange specs: each exchange child's consumer is this fragment.
+          // When broadcast-fusion is enabled and the exchange is a BroadcastExchange
+          // whose build was already absorbed (producer id == -1), we skip the
+          // ExchangeSpec entirely -- the build operators were walked into this
+          // consumer fragment via walkInFragment-equivalent recursion, so there is
+          // no remote producer to wire.
           childExchangeFragIds.zip(findExchangeNodes(wst)).foreach {
+            case (producerFragId, _) if producerFragId < 0 =>
+              // Fused broadcast: no separate producer fragment, no exchange spec.
+              ()
             case (producerFragId, exchangeNode) =>
               val (exchangeType, partitionKeys) =
                 classifyPartitioning(exchangeNode.outputPartitioning)
@@ -376,10 +384,24 @@ case class MppNativeQueryExec(
             walk(unwrapTransparent(exchange.child)))
 
         case bex: BroadcastExchangeLike =>
-          // Same memoization for broadcast exchanges.
-          exchangeToProducerFragId.getOrElseUpdate(
-            bex.asInstanceOf[Exchange],
-            walk(unwrapTransparent(bex.child)))
+          // Q21-style fusion: when spark.gluten.mpp.fuseBroadcastBuilds=true and
+          // the broadcast's runtime size <= spark.gluten.mpp.broadcastFuseThreshold,
+          // do NOT allocate a producer fragment. Return -1 as a sentinel; the WST
+          // consumer suppresses the corresponding ExchangeSpec entry. The build
+          // operators are still serialized: the consumer WST's doTransform walks
+          // through ColumnarInputAdapter -> BroadcastQueryStage normally, so the
+          // local-build path inside Velox handles the data side. This saves one
+          // fragment per fused broadcast (e.g. 12 -> 9 on TPC-H Q21).
+          if (canFuseBroadcastLive(bex)) {
+            logWarning(
+              s"MppNativeQueryExec: fusing broadcast build (size <= " +
+                s"$broadcastFuseThresholdBytes bytes) into consumer fragment")
+            -1
+          } else {
+            exchangeToProducerFragId.getOrElseUpdate(
+              bex.asInstanceOf[Exchange],
+              walk(unwrapTransparent(bex.child)))
+          }
 
         case reused: ReusedExchangeExec =>
           // The ReusedExchangeExec.child is the same JVM object as the original
@@ -505,6 +527,11 @@ case class MppNativeQueryExec(
       case cia: ColumnarInputAdapter => unwrapToExchange(cia.child)
       case c2c: ColumnarToColumnarExec => unwrapToExchange(c2c.child)
       case c2r: ColumnarToRowExecBase => unwrapToExchange(c2r.child)
+      // Spark inserts RowToColumnar (and its inverse ColumnarToRow) on either
+      // side of an Exchange when the exchange operates on rows. Without this
+      // case, non-broadcast partial-agg to final-agg gather edges are silently
+      // dropped from extractedExchanges and the multi-root planner check fails.
+      case r2c: RowToColumnarExecBase => unwrapToExchange(r2c.child)
       case _ => None
     }
   }
@@ -538,8 +565,77 @@ case class MppNativeQueryExec(
   private def unwrapTransparent(plan: SparkPlan): SparkPlan = {
     plan match {
       case c2c: ColumnarToColumnarExec => unwrapTransparent(c2c.child)
+      // Q21-style fix: Spark inserts AssignUniqueId before LeftSemi/LeftAnti joins
+      // to dedupe; that op declares outputPartitioning = UnknownPartitioning, which
+      // makes EnsureRequirements add a SPURIOUS shuffle even when the input is
+      // already hash-partitioned on the join key. When opted in
+      // (spark.gluten.mpp.assignUniqueIdTransparent) and the child carries a real
+      // HashPartitioning, treat it as transparent so the surrounding fragment
+      // walk does not see an artificial fragment boundary.
+      case other
+          if isAssignUniqueIdLike(other) && assignUniqueIdTransparent &&
+            isHashPartitioned(other.children.head) =>
+        unwrapTransparent(other.children.head)
       case other => other
     }
+  }
+
+  /**
+   * Class-name match for Spark's AssignUniqueId / AssignUniqueIdExec across versions. We avoid a
+   * direct import because the operator's package has shifted between Spark releases (and Gluten
+   * supports several); a name match is stable enough for a transparency hint.
+   */
+  private def isAssignUniqueIdLike(plan: SparkPlan): Boolean = {
+    if (plan.children.size != 1) return false
+    val cn = plan.getClass.getName
+    cn.endsWith(".AssignUniqueId") ||
+    cn.endsWith(".AssignUniqueIdExec") ||
+    cn.endsWith("AssignUniqueIdExecTransformer")
+  }
+
+  private def isHashPartitioned(plan: SparkPlan): Boolean = {
+    plan.outputPartitioning match {
+      case _: HashPartitioning => true
+      case _ => false
+    }
+  }
+
+  private def assignUniqueIdTransparent: Boolean = {
+    SQLConf.get
+      .getConfString("spark.gluten.mpp.assignUniqueIdTransparent", "false")
+      .toBoolean
+  }
+
+  private def fuseBroadcastBuildsEnabled: Boolean = {
+    SQLConf.get.getConfString("spark.gluten.mpp.fuseBroadcastBuilds", "false").toBoolean
+  }
+
+  /** Threshold in bytes below which a broadcast build may be fused. Default 8 GB. */
+  private def broadcastFuseThresholdBytes: Long = {
+    SQLConf.get
+      .getConfString(
+        "spark.gluten.mpp.broadcastFuseThreshold",
+        (8L * 1024L * 1024L * 1024L).toString)
+      .toLong
+  }
+
+  /**
+   * Decide whether a [[BroadcastExchangeLike]] is small enough to fuse into the consumer fragment.
+   * We use `runtimeStatistics.sizeInBytes` when the runtime exposes it; failing that we
+   * conservatively refuse to fuse so we never silently turn a too-large broadcast into a fused
+   * replicated build (would OOM the consumer).
+   */
+  private def canFuseBroadcastLive(bc: SparkPlan): Boolean = {
+    if (!fuseBroadcastBuildsEnabled) return false
+    val sizeBytes: Option[Long] = bc match {
+      case b: BroadcastExchangeLike =>
+        try { Some(b.runtimeStatistics.sizeInBytes.toLong) }
+        catch {
+          case _: Throwable => None
+        }
+      case _ => None
+    }
+    sizeBytes.exists(_ <= broadcastFuseThresholdBytes)
   }
 
   /** Classify the partitioning into an exchange type string and extract partition keys. */
