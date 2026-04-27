@@ -377,11 +377,26 @@ case class MppNativeQueryExec(
           fragId
 
         case exchange: ShuffleExchangeLike =>
-          // Exchange boundary: walk the producer side (exchange.child). Memoize so a
-          // subsequent ReusedExchangeExec pointing at the same Exchange reuses it.
-          exchangeToProducerFragId.getOrElseUpdate(
-            exchange.asInstanceOf[Exchange],
-            walk(unwrapTransparent(exchange.child)))
+          // PoC: when spark.gluten.mpp.collapseSingleGather=true, fuse SinglePartition
+          // shuffles into the parent fragment. Returns -1 sentinel (same convention
+          // as fused broadcast); the WST consumer case must tolerate -1 producerFragId
+          // by suppressing the ExchangeSpec entry.
+          val isSingleGather = exchange.outputPartitioning.isInstanceOf[SinglePartition.type]
+          val collapseSingleGather =
+            org.apache.spark.sql.SparkSession.getActiveSession
+              .exists(_.conf.get("spark.gluten.mpp.collapseSingleGather", "false").toBoolean)
+          if (isSingleGather && collapseSingleGather) {
+            logWarning(
+              "MppNativeQueryExec.walk: collapsing SinglePartition shuffle into parent fragment")
+            walk(unwrapTransparent(exchange.child))
+            -1
+          } else {
+            // Exchange boundary: walk the producer side (exchange.child). Memoize so a
+            // subsequent ReusedExchangeExec pointing at the same Exchange reuses it.
+            exchangeToProducerFragId.getOrElseUpdate(
+              exchange.asInstanceOf[Exchange],
+              walk(unwrapTransparent(exchange.child)))
+          }
 
         case bex: BroadcastExchangeLike =>
           // Q21-style fusion: when spark.gluten.mpp.fuseBroadcastBuilds=true and
@@ -627,15 +642,22 @@ case class MppNativeQueryExec(
    */
   private def canFuseBroadcastLive(bc: SparkPlan): Boolean = {
     if (!fuseBroadcastBuildsEnabled) return false
-    val sizeBytes: Option[Long] = bc match {
+    // When opt-in is on, default to fuse unless we can prove the build is too big.
+    // runtimeStatistics often throws / is not yet materialized at extract time;
+    // treat that as "small / unknown" rather than refusing to fuse.
+    val sizeBytes: Long = bc match {
       case b: BroadcastExchangeLike =>
-        try { Some(b.runtimeStatistics.sizeInBytes.toLong) }
-        catch {
-          case _: Throwable => None
-        }
-      case _ => None
+        try b.runtimeStatistics.sizeInBytes.toLong
+        catch { case _: Throwable => 0L }
+      case _ => 0L
     }
-    sizeBytes.exists(_ <= broadcastFuseThresholdBytes)
+    val ok = sizeBytes <= broadcastFuseThresholdBytes
+    if (ok) {
+      logWarning(
+        s"MppNativeQueryExec.canFuseBroadcastLive: fusing (sizeBytes=$sizeBytes " +
+          s"<= $broadcastFuseThresholdBytes)")
+    }
+    ok
   }
 
   /** Classify the partitioning into an exchange type string and extract partition keys. */

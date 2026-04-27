@@ -132,23 +132,25 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    */
   private def canFuseBroadcast(bc: SparkPlan): Boolean = {
     if (!isBroadcastFuseEnabled) return false
-    val sizeBytes: Option[Long] = bc match {
+    // When opt-in is on, default to fusing unless we can prove the build is too big.
+    // runtimeStatistics often throws at MppCollapseRule time (broadcast not yet
+    // materialized); treat that as "small / unknown" rather than refusing to fuse.
+    val sizeBytes: Long = bc match {
       case b: BroadcastExchangeLike =>
-        try {
-          // BroadcastExchangeLike exposes Spark's standard SparkPlan.computeStats via
-          // the LogicalPlan stats; SparkPlan itself does not have stats, so we go through
-          // the runtime estimate of the data size if the BroadcastExchange has already
-          // materialized (BroadcastQueryStageExec carries `estimatedSize`).
-          Some(b.runtimeStatistics.sizeInBytes.toLong)
-        } catch {
-          case _: Throwable => None
-        }
+        try b.runtimeStatistics.sizeInBytes.toLong
+        catch { case _: Throwable => 0L }
       case stage: BroadcastQueryStageExec =>
-        try { Some(stage.computeStats().map(_.sizeInBytes.toLong).getOrElse(Long.MaxValue)) }
-        catch { case _: Throwable => None }
-      case _ => None
+        try stage.computeStats().map(_.sizeInBytes.toLong).getOrElse(0L)
+        catch { case _: Throwable => 0L }
+      case _ => 0L
     }
-    sizeBytes.exists(_ <= broadcastFuseThresholdBytes)
+    val ok = sizeBytes <= broadcastFuseThresholdBytes
+    if (ok) {
+      logWarning(
+        s"MppCollapseRule.canFuseBroadcast: fusing (sizeBytes=$sizeBytes " +
+          s"<= $broadcastFuseThresholdBytes)")
+    }
+    ok
   }
 
   override def apply(plan: SparkPlan): SparkPlan = {
@@ -493,6 +495,28 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     def walk(node: SparkPlan): Int = {
       node match {
         case shuffle: ShuffleExchangeLike =>
+          // PoC: opt-in fusion of SinglePartition gather shuffles into the parent
+          // fragment so Velox LocalPlanner can split internally via LocalExchange
+          // instead of cross-fragment Spark exchange. Tracked by
+          // spark.gluten.mpp.collapseSingleGather (default false).
+          val isSingleGather =
+            shuffle.outputPartitioning
+              .isInstanceOf[org.apache.spark.sql.catalyst.plans.physical.SinglePartition.type]
+          val collapseSingleGather =
+            org.apache.spark.sql.SparkSession.getActiveSession
+              .exists(_.conf.get("spark.gluten.mpp.collapseSingleGather", "false").toBoolean)
+          if (isSingleGather && collapseSingleGather) {
+            logWarning(
+              "MppCollapseRule.walk: collapsing SinglePartition shuffle into parent fragment " +
+                "(opt-in spark.gluten.mpp.collapseSingleGather=true)")
+            // Walk through the child as if no shuffle; the shuffle becomes a Velox
+            // LocalExchange handled by Velox LocalPlanner (or absorbed if
+            // partial-final agg are in the same WST).
+            walkInFragment(unwrapToExchange(shuffle.child))
+            // -1 sentinel: caller (WST consumer case) treats as "no separate
+            // upstream fragment"; same convention used for fused broadcast builds.
+            return -1
+          }
           // The child of the exchange belongs to the producer fragment
           val producerFragmentId = walk(unwrapToExchange(shuffle.child))
 
