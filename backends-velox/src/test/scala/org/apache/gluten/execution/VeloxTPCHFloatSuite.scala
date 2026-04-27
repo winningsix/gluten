@@ -42,5 +42,8 @@ class VeloxTPCHFloatSuite extends VeloxTPCHSuite {
       // Plan-shape parity with Presto (opt-in cross-cut rules)
       .set("spark.gluten.mpp.singlePartitionSort", "true")
       .set("spark.gluten.mpp.removeRedundantShuffle", "true")
+      // β-agent broadcast-build fusion (small builds become in-fragment, saves
+      // 1 fragment per fused broadcast — primary join optimization)
+      .set("spark.gluten.mpp.fuseBroadcastBuilds", "true")
   }
 }
