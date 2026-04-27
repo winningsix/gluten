@@ -531,16 +531,29 @@ if(ENABLE_GPU)
 
   # Static cuDF integration archives: PRIVATE + whole-archive. Like
   # facebook::velox, these need every .o pulled in so consumer-used APIs
-  # end up exported from libgluten.so.
+  # end up exported from libgluten.so. Use full paths instead of imported
+  # targets so cmake doesn't drop the --whole-archive flags.
   target_link_libraries(
     velox
     PRIVATE -Wl,--whole-archive
-            facebook::velox::velox_cudf_exec facebook::velox::velox_cudf_vector
-            facebook::velox::velox_cudf_hive_connector
-            facebook::velox::velox_cudf_expression
+            ${VELOX_BUILD_PATH}/velox/experimental/cudf/exec/libvelox_cudf_exec.a
+            ${VELOX_BUILD_PATH}/velox/experimental/cudf/vector/libvelox_cudf_vector.a
+            ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/libvelox_cudf_hive_connector.a
+            ${VELOX_BUILD_PATH}/velox/experimental/cudf/expression/libvelox_cudf_expression.a
             -Wl,--no-whole-archive)
   # Shared libs consumers need at link time (cudf::cudf, libcurl): PUBLIC.
   target_link_libraries(velox PUBLIC cudf::cudf velox_curl)
+  # IBM baseline brings in apache thrift symbols transitively (Presto serde
+  # uses thrift for handshake / buffered transport). System Arrow doesn't
+  # link them in, so add /usr/local/lib/libthrift.a here.
+  target_link_libraries(velox PUBLIC /usr/local/lib/libthrift.a)
+  # rmm cuda_stream_view + cudart_static + ucxx need explicit shared lib
+  # links since the static archives forward-declare but don't link them.
+  target_link_libraries(velox PUBLIC
+    ${VELOX_BUILD_PATH}/_deps/rmm-build/librmm.so
+    ${VELOX_BUILD_PATH}/_deps/rapids_logger-build/librapids_logger.so
+    ${VELOX_BUILD_PATH}/_deps/kvikio-build/cpp/libkvikio.so
+    /usr/local/cuda/lib64/libcudart.so)
 endif()
 
 add_custom_command(
