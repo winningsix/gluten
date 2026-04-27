@@ -499,10 +499,10 @@ if(ENABLE_GPU)
     facebook::velox::velox_cudf_hive_connector
     ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/libvelox_cudf_hive_connector.a
   )
-  import_library(
-    facebook::velox::velox_cudf_exchange
-    ${VELOX_BUILD_PATH}/velox/experimental/cudf/exchange/libvelox_cudf_exchange.a
-  )
+  # IBM-baseline velox dropped velox/experimental/cudf/exchange/. The
+  # equivalent functionality is in IBM's UcxExchange/UcxPartitionedOutput
+  # which live under velox/experimental/ucx-exchange/, linked transitively
+  # via velox_cudf_exec.
 
   target_compile_definitions(
     velox PRIVATE LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
@@ -520,7 +520,6 @@ if(ENABLE_GPU)
     PRIVATE -Wl,--whole-archive
             facebook::velox::velox_cudf_exec facebook::velox::velox_cudf_vector
             facebook::velox::velox_cudf_hive_connector
-            facebook::velox::velox_cudf_exchange
             facebook::velox::velox_cudf_expression
             -Wl,--no-whole-archive)
   # Shared libs consumers need at link time (cudf::cudf, libcurl): PUBLIC.

@@ -78,10 +78,10 @@
 // GPU exchange bits. The harness is intentionally coupled to the GPU build
 // (ENABLE_GPU=ON) since that's the path we're iterating on; we add a soft
 // fallback so a non-GPU build still links.
-#ifdef GLUTEN_ENABLE_GPU
-#include "velox/experimental/cudf/exchange/GpuInProcExchangeSource.h"
-#include "velox/experimental/cudf/exchange/LocalGpuExchangeSource.h"
-#endif
+// IBM-baseline velox dropped velox/experimental/cudf/exchange/. The
+// GPU exchange path is now provided by IBM's UcxExchange/UcxExchangeSource
+// (registered via the cudf OperatorAdapters at runtime when transportType
+// =kUcx), so this harness no longer manually registers a factory.
 
 namespace fs = std::filesystem;
 using namespace facebook::velox;
@@ -545,18 +545,13 @@ int main(int argc, char** argv) {
   }
 
 #ifdef GLUTEN_ENABLE_GPU
-  // Register the GPU exchange source factories. The coordinator picks a
-  // task-id prefix per its own USE_INPROC_CHANNEL env flag; the Source
-  // factory chain tries each factory in order. Registering both keeps
-  // backwards compat for the "gpu-local://" path while enabling the new
-  // "gpu-inproc://" path.
-  exec::ExchangeSource::registerFactory(
-      cudf_velox::createGpuInProcExchangeSource);
-  exec::ExchangeSource::registerFactory(
-      cudf_velox::createLocalGpuExchangeSource);
-  cudf_velox::testingStartLocalGpuExchangeSource();
-  LOG(WARNING) << "mpp-substrait-runner: registered "
-               << "GpuInProcExchangeSource + LocalGpuExchangeSource factories";
+  // No-op: IBM's cudf OperatorAdapters wire UcxExchange / UcxExchangeSource
+  // at runtime when the substrait plan emits transportType=kUcx. No manual
+  // factory registration needed (and the cudf/exchange/* helpers used here
+  // before are gone in the IBM baseline).
+  LOG(WARNING)
+      << "mpp-substrait-runner: GPU exchange handled by IBM cudf adapters "
+      << "(transportType=kUcx); no manual factory registration.";
 #else
   LOG(WARNING)
       << "mpp-substrait-runner: built without GLUTEN_ENABLE_GPU; "
