@@ -32,6 +32,11 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/ucx-exchange/Communicator.h"
+#endif
+
+#ifdef GLUTEN_ENABLE_GPU
+DECLARE_bool(velox_ucx_exchange);
 #endif
 
 #include "compute/VeloxRuntime.h"
@@ -192,11 +197,37 @@ void VeloxBackend::init(
         {velox::cudf_velox::CudfConfig::kCudfHostAsPinnedThreshold,
          backendConf_->get(kCudfHostAsPinnedThreshold, kCudfHostAsPinnedThresholdDefault)},
         {velox::cudf_velox::CudfConfig::kCudfPackedDtoH,
-         backendConf_->get(kCudfPackedDtoH, kCudfPackedDtoHDefault)}};
+         backendConf_->get(kCudfPackedDtoH, kCudfPackedDtoHDefault)},
+        // MPP single-node GPU exchange: route PartitionedOutput/Exchange through
+        // IBM cudf's UcxPartitionedOutput/UcxExchange. With intra_node_exchange
+        // on, UcxExchangeServer/Source detect same-Communicator-instance and use
+        // IntraNodeTransferRegistry to pass cudf::packed_columns shared_ptrs
+        // without any UCX wire transfer. Without this, the PartitionedOutput
+        // adapter declines to swap and producer falls back to CPU (Presto serde),
+        // which the consumer's GpuExchange rejects at runtime.
+        {velox::cudf_velox::CudfConfig::kUcxExchange, "true"},
+        {velox::cudf_velox::CudfConfig::kUcxIntraNodeExchange, "true"}};
     auto& cudfConfig = velox::cudf_velox::CudfConfig::getInstance();
     cudfConfig.initialize(std::move(options));
     velox::cudf_velox::registerCudf();
     velox::exec::Operator::registerOperator(std::make_unique<CudfVectorStreamOperatorTranslator>());
+
+    // Initialize the UCX Communicator once per process. Required so that
+    // UcxPartitionedOutput / UcxExchange can perform the same-process
+    // handshake that hands off cudf::packed_columns through the
+    // IntraNodeTransferRegistry. Port=0 lets UCXX bind an ephemeral
+    // localhost port; coordinatorURL="" because we have no remote
+    // coordinator. The Communicator owns a dedicated worker thread.
+    FLAGS_velox_ucx_exchange = true;
+    velox::ContinueFuture commReady;
+    auto comm = velox::ucx_exchange::Communicator::initAndGet(
+        /*port=*/0, /*coordinatorURL=*/"", &commReady);
+    if (comm) {
+      std::thread([comm]() { comm->run(); }).detach();
+      std::move(commReady).wait();
+      LOG(INFO) << "VeloxBackend: UCX Communicator running on port "
+                << comm->getListenerPort();
+    }
   }
 #endif
 

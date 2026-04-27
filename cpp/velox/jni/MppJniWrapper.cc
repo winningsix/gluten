@@ -46,9 +46,6 @@
 #include "operators/plannodes/RowVectorStream.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include "operators/plannodes/CudfVectorStream.h"
-#include "velox/experimental/cudf/exchange/GpuExchangeNode.h"
-#include "velox/experimental/cudf/exchange/GpuPartitionedOutputNode.h"
-#include "velox/experimental/cudf/exchange/LocalGpuExchangeSource.h"
 #endif
 
 using namespace gluten;
@@ -167,19 +164,19 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
               << node->id() << "' with ExchangeNode '"
               << exchangeNodeId << "' outputType="
               << node->outputType()->toString();
-#ifdef GLUTEN_ENABLE_GPU
-    // Use the GPU-aware exchange node so the generated GpuExchange
-    // operator unwraps CudfVector-carrying pages directly (zero-copy)
-    // and avoids the Presto serde checkTypeEncoding path that fails
-    // for CudfVector VARCHAR columns.
-    return std::make_shared<velox::cudf_velox::GpuExchangeNode>(
-        exchangeNodeId, node->outputType());
-#else
-    return std::make_shared<velox::core::ExchangeNode>(
-        exchangeNodeId,
-        node->outputType(),
-        velox::VectorSerde::Kind::kPresto);
-#endif
+    // Emit a plain velox ExchangeNode tagged with TransportType::kUcx.
+    // IBM cudf's ExchangeAdapter swaps this to UcxExchange at runtime,
+    // and UcxExchangeServer/Source detect the same-Communicator-instance
+    // case and pass cudf::packed_columns through IntraNodeTransferRegistry
+    // without any UCX wire transfer — so the same code path covers both
+    // CPU and GPU execution.
+    return velox::core::ExchangeNode::Builder()
+        .id(exchangeNodeId)
+        .outputType(node->outputType())
+        .serdeKind("Presto")
+        .transportType(
+            velox::core::ExchangeNode::TransportType::kUcx)
+        .build();
   }
 
   // If this is a leaf node (no children) that is NOT ValueStream, keep it.
@@ -447,20 +444,11 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       env->GetArrayLength(exchangeSpecsJsonArr));
   const auto numExchanges = exchangeSpecs.size();
 
-  // --- Register GPU ExchangeSource for intra-process exchange ---
-  // MPP uses Velox's ExchangeNode/OutputBufferManager for streaming data
-  // between fragments. The "gpu-local://" prefix is handled by
-  // LocalGpuExchangeSource from the cudf exchange module.
-#ifdef GLUTEN_ENABLE_GPU
-  static std::once_flag gpuExchangeRegistered;
-  std::call_once(gpuExchangeRegistered, []() {
-    velox::exec::ExchangeSource::registerFactory(
-        facebook::velox::cudf_velox::createLocalGpuExchangeSource);
-    LOG(INFO) << "MppJniWrapper: registered LocalGpuExchangeSource factory";
-  });
-#endif
-
   // --- Convert each Substrait plan to a Velox PlanNode ---
+  // Note: no ExchangeSource factory registration needed here. The IBM
+  // velox baseline's ExchangeAdapter swaps our plain ExchangeNodes
+  // (transportType=kUcx) to UcxExchange at runtime, and UcxExchange
+  // creates its own UcxExchangeSource — gluten doesn't register one.
 
   auto veloxPool = defaultLeafVeloxMemoryPool();
 
@@ -657,11 +645,16 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
 
     if (numOutputPartitions == 1) {
       // Single-partition gather output (root fragment or single-consumer).
+      // transportType=kUcx routes this through IBM cudf's
+      // PartitionedOutputAdapter -> UcxPartitionedOutput at runtime; for
+      // single-process/single-Communicator runs the IntraNodeTransfer fast
+      // path is taken, so no UCX wire transfer is performed.
       wrappedPlan = velox::core::PartitionedOutputNode::single(
           outputNodeId,
           veloxPlanNode->outputType(),
-          velox::VectorSerde::Kind::kPresto,
-          veloxPlanNode);
+          /*serdeKind=*/"Presto",
+          veloxPlanNode,
+          velox::core::PartitionedOutputNode::TransportType::kUcx);
     } else {
       // Multi-partition output. Construct the PartitionFunctionSpec from the
       // outbound exchange's partitionType + partitionKeys.
@@ -717,20 +710,13 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
                 << " keyIndices=" << keyIndices.size()
                 << " func=" << (funcSpec ? funcSpec->toString() : "null");
 
-#ifdef GLUTEN_ENABLE_GPU
-      // MPP GPU sink: partition CudfVector input on GPU and publish
-      // GpuSerializedPages to OutputBufferManager without D2H copy.
-      // Avoids PrestoVectorSerde, which misclassifies CudfVector VARCHAR
-      // encodings and breaks consumer deserialization.
-      wrappedPlan = std::make_shared<velox::cudf_velox::GpuPartitionedOutputNode>(
-          outputNodeId,
-          velox::cudf_velox::GpuPartitionedOutputNode::Kind::kPartitioned,
-          std::move(partitionExprs),
-          numOutputPartitions,
-          std::move(funcSpec),
-          veloxPlanNode->outputType(),
-          veloxPlanNode);
-#else
+      // Emit a plain velox PartitionedOutputNode tagged with
+      // TransportType::kUcx. IBM cudf's PartitionedOutputAdapter swaps
+      // this to UcxPartitionedOutput at runtime; UcxPartitionedOutput
+      // detects the same-Communicator-instance case via
+      // IntraNodeTransferRegistry and hands cudf::packed_columns
+      // shared_ptrs to the consumer without any UCX wire transfer or
+      // serde, so the same code path covers both CPU and GPU runs.
       wrappedPlan = std::make_shared<velox::core::PartitionedOutputNode>(
           outputNodeId,
           velox::core::PartitionedOutputNode::Kind::kPartitioned,
@@ -739,9 +725,9 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
           /*replicateNullsAndAny=*/false,
           std::move(funcSpec),
           veloxPlanNode->outputType(),
-          velox::VectorSerde::Kind::kPresto,
-          veloxPlanNode);
-#endif
+          /*serdeKind=*/"Presto",
+          veloxPlanNode,
+          velox::core::PartitionedOutputNode::TransportType::kUcx);
     }
 
     LOG(INFO) << "MppJniWrapper: fragment " << i
@@ -860,7 +846,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   // destructed and iter N+1 happens to allocate at the same address, the
   // two queries end up with identical queryIds and therefore identical
   // taskIds. Stale state keyed by taskId (ExchangeClient remoteTaskIds_,
-  // LocalGpuExchangeSource timeouts_, etc.) then bridges the two queries
+  // UcxExchangeSource registries, etc.) then bridges the two queries
   // and hangs the second one. Use a monotonically increasing counter
   // instead.
   static std::atomic<uint64_t> gMppQueryCounter{0};
