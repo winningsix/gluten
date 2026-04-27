@@ -18,7 +18,7 @@ package org.apache.gluten.execution
 
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.expression.ConverterUtils
-import org.apache.gluten.extension.{ExchangeSpec, NativeFragment}
+import org.apache.gluten.extension.{ExchangeSpec, MppRemoveRedundantShuffleRule, MppSinglePartitionSortRule, NativeFragment}
 import org.apache.gluten.extension.columnar.transition.{Convention, ConventionReq}
 import org.apache.gluten.substrait.SubstraitContext
 import org.apache.gluten.substrait.plan.PlanBuilder
@@ -492,12 +492,34 @@ case class MppNativeQueryExec(
       }
     }
 
-    walk(child)
+    // Apply cross-cut Catalyst rules (Sort/Skip-shuffle) here. Plan-C MppStrategy
+    // intercepts queries at planner time and wraps them in MppNativeQueryExec
+    // before the columnar post-rule pass runs, so rules registered via
+    // VeloxRuleApi.injectPost don't see the wrapped subtree. Re-running them on
+    // `child` ensures plan-shape parity (range->single sort, redundant-shuffle
+    // elimination) regardless of injection ordering. Each rule is gated by its
+    // own conf key, so this is a no-op when the user hasn't opted in.
+    val rewrittenChild = applyCrossCutRules(child)
+
+    walk(rewrittenChild)
 
     // Sort fragments by ID (ensures topological order: producers before consumers)
     val sortedFragments = extractedFragments.sortBy(_.id).toSeq
     val sortedExchanges = extractedExchanges.sortBy(_.id).toSeq
     (sortedFragments, sortedExchanges)
+  }
+
+  /**
+   * Re-run plan-shape parity rules on the wrapped child plan. MppStrategy intercepts before the
+   * columnar post-rule pass, so rules registered via VeloxRuleApi.injectPost otherwise miss this
+   * subtree. Each rule is conf-gated and a no-op by default.
+   */
+  private def applyCrossCutRules(plan: SparkPlan): SparkPlan = {
+    val sortRule = MppSinglePartitionSortRule()
+    val skipShuffleRule = MppRemoveRedundantShuffleRule()
+    val afterSort = sortRule(plan)
+    val afterSkipShuffle = skipShuffleRule(afterSort)
+    afterSkipShuffle
   }
 
   /**
