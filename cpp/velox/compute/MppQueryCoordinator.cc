@@ -389,7 +389,7 @@ void MppQueryCoordinator::start() {
     // single per-process Communicator, so loopback + the bare task id
     // suffices; UcxExchangeServer/Source detect same-Communicator and
     // bypass the wire via IntraNodeTransferRegistry.
-    auto comm = velox::ucx_exchange::Communicator::getInstance();
+    auto comm = facebook::velox::ucx_exchange::Communicator::getInstance();
     const int urlPort = static_cast<int>(comm->getListenerPort()) - 3;
     auto stripScheme = [](const std::string& s) -> std::string {
       auto pos = s.find("://");
