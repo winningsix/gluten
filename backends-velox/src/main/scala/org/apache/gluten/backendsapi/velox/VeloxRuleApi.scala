@@ -145,6 +145,12 @@ object VeloxRuleApi {
     // ColumnarCollapseTransformStages becomes a no-op on that subtree.
     // If not MPP-eligible, MppCollapseRule passes through unchanged and
     // ColumnarCollapseTransformStages handles BSP wrapping as usual.
+    // Two opt-in plan-shape rules run BEFORE MppCollapseRule so the
+    // collapse pass sees the rewritten exchanges:
+    //   - MppSinglePartitionSortRule: RANGE -> SINGLE for global sorts (Presto parity)
+    //   - MppRemoveRedundantShuffleRule: drop hash shuffles whose child already satisfies
+    injector.injectPost(_ => MppSinglePartitionSortRule())
+    injector.injectPost(_ => MppRemoveRedundantShuffleRule())
     injector.injectPost(c => MppCollapseRule(new GlutenConfig(c.sqlConf)))
     injector.injectPost(c => ColumnarCollapseTransformStages(new GlutenConfig(c.sqlConf)))
     injector.injectPost(_ => GenerateTransformStageId())
@@ -248,6 +254,8 @@ object VeloxRuleApi {
       .getExtendedColumnarPostRules()
       .foreach(each => injector.injectPostTransform(c => each(c.session)))
     // MPP collapse runs BEFORE BSP collapse in the RAS path as well.
+    injector.injectPostTransform(_ => MppSinglePartitionSortRule())
+    injector.injectPostTransform(_ => MppRemoveRedundantShuffleRule())
     injector.injectPostTransform(c => MppCollapseRule(new GlutenConfig(c.sqlConf)))
     injector.injectPostTransform(c => ColumnarCollapseTransformStages(new GlutenConfig(c.sqlConf)))
     injector.injectPostTransform(_ => GenerateTransformStageId())
