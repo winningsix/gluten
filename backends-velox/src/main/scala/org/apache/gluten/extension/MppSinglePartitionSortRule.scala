@@ -16,12 +16,14 @@
  */
 package org.apache.gluten.extension
 
+import org.apache.gluten.execution.SortExecTransformer
+
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.plans.physical.{RangePartitioning, SinglePartition}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{ProjectExec, SortExec, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, ShuffleQueryStageExec}
-import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
+import org.apache.spark.sql.execution.exchange.{ShuffleExchangeExec, ShuffleExchangeLike}
 
 /**
  * Rewrite `Exchange(RangePartitioning) -> Sort(global)` at the plan root into
@@ -41,39 +43,72 @@ case class MppSinglePartitionSortRule() extends Rule[SparkPlan] with Logging {
     val sess = org.apache.spark.sql.SparkSession.getActiveSession
     val enabled = sess.exists(_.conf.get(confKey, "false").toBoolean)
     logWarning(
-      s"MppSinglePartitionSortRule.apply: enabled=$enabled plan=${plan.getClass.getSimpleName}")
+      s"[MppSinglePartitionSortRule] apply: enabled=$enabled root=${plan.getClass.getSimpleName}")
+    if (enabled) {
+      logWarning(s"[MppSinglePartitionSortRule] tree:\n${plan.treeString.take(1500)}")
+    }
     if (!enabled) {
       return plan
     }
     rewriteRoot(plan)
   }
 
+  // Recognize the global-sort root: vanilla SortExec(global=true) or
+  // gluten's SortExecTransformer(global=true).
+  private object GlobalSort {
+    def unapply(p: SparkPlan): Option[SparkPlan] = p match {
+      case s: SortExec if s.global => Some(s)
+      case t: SortExecTransformer if t.global => Some(t)
+      case _ => None
+    }
+  }
+
   private def rewriteRoot(node: SparkPlan): SparkPlan = node match {
     case aqe: AdaptiveSparkPlanExec => aqe
     case p: ProjectExec => p.withNewChildren(Seq(rewriteRoot(p.child)))
-    case s: SortExec if s.global => s.withNewChildren(Seq(rewriteExchange(s.child)))
+    case GlobalSort(s) => s.withNewChildren(Seq(rewriteSubtree(s.children.head)))
     case other if other.children.size == 1 && isRootSpine(other) =>
       other.withNewChildren(Seq(rewriteRoot(other.children.head)))
     case other => other
   }
 
   private def isRootSpine(p: SparkPlan): Boolean = p match {
-    case _: SortExec | _: ProjectExec => true
-    case _ => p.getClass.getSimpleName.contains("ColumnarToRow")
+    case _: SortExec | _: SortExecTransformer | _: ProjectExec => true
+    case _ =>
+      val n = p.getClass.getSimpleName
+      n.contains("ColumnarToRow") || n.contains("InputIteratorTransformer") ||
+      n.contains("RowToVeloxColumnar") || n.contains("WholeStageTransformer")
   }
 
-  private def rewriteExchange(node: SparkPlan): SparkPlan = node match {
+  // Walk into the sort's input subtree and rewrite the first RangePartitioning shuffle
+  // we encounter. This handles: direct shuffle, AQE-wrapped shuffle, and the
+  // gluten-inserted wrapper chain (InputIteratorTransformer, RowToVeloxColumnar,
+  // ColumnarToRow, ColumnarToColumnar) between sort and shuffle.
+  private def rewriteSubtree(node: SparkPlan): SparkPlan = node match {
     case stage: ShuffleQueryStageExec =>
       stage.plan match {
-        case sh: ShuffleExchangeExec if sh.outputPartitioning.isInstanceOf[RangePartitioning] =>
-          logWarning(
-            s"MppSinglePartitionSortRule: rewriting RANGE -> SINGLE at root sort (AQE stage)")
-          ShuffleExchangeExec(SinglePartition, sh.child, sh.shuffleOrigin)
+        case sh: ShuffleExchangeLike if sh.outputPartitioning.isInstanceOf[RangePartitioning] =>
+          logWarning("MppSinglePartitionSortRule: rewriting RANGE -> SINGLE (AQE stage)")
+          rewriteShuffle(sh)
         case _ => node
       }
-    case sh: ShuffleExchangeExec if sh.outputPartitioning.isInstanceOf[RangePartitioning] =>
-      logWarning(s"MppSinglePartitionSortRule: rewriting RANGE -> SINGLE at root sort")
-      ShuffleExchangeExec(SinglePartition, sh.child, sh.shuffleOrigin)
-    case _ => node
+    case sh: ShuffleExchangeLike if sh.outputPartitioning.isInstanceOf[RangePartitioning] =>
+      logWarning(
+        s"MppSinglePartitionSortRule: rewriting RANGE -> SINGLE (${sh.getClass.getSimpleName})")
+      rewriteShuffle(sh)
+    case other if other.children.size == 1 =>
+      other.withNewChildren(Seq(rewriteSubtree(other.children.head)))
+    case other => other
+  }
+
+  // Rewrite the shuffle's partitioning from RangePartitioning to SinglePartition.
+  // For ColumnarShuffleExchangeExec (gluten variant) we still emit a vanilla
+  // ShuffleExchangeExec; gluten's columnar rule will re-wrap it on a later pass.
+  private def rewriteShuffle(sh: ShuffleExchangeLike): SparkPlan = sh match {
+    case se: ShuffleExchangeExec =>
+      ShuffleExchangeExec(SinglePartition, se.child, se.shuffleOrigin)
+    case other =>
+      // Fallback: build a vanilla ShuffleExchangeExec around the same child.
+      ShuffleExchangeExec(SinglePartition, other.children.head)
   }
 }
