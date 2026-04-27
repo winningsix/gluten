@@ -286,6 +286,9 @@ target_include_directories(
          ${VELOX_BUILD_PATH}/_deps/cuco-src/include
          ${VELOX_BUILD_PATH}/_deps/kvikio-src/cpp/include
          ${VELOX_BUILD_PATH}/_deps/rapids_logger-src/include
+         # CUDA runtime headers (cuda_runtime_api.h etc.) used transitively
+         # by rmm/cuda_stream_view.hpp.
+         /usr/local/cuda/include
          ${CMAKE_CURRENT_SOURCE_DIR}
          ${VELOX_HOME}
          ${PROTO_OUTPUT_DIR}
