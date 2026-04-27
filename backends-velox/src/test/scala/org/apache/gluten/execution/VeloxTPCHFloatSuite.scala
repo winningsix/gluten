@@ -37,5 +37,10 @@ class VeloxTPCHFloatSuite extends VeloxTPCHSuite {
       // Plan C (MppStrategy) — intercept at Strategy level
       .set("spark.gluten.mpp.enabled", "true")
       .set("spark.gluten.mpp.strategy.enabled", "true")
+      // Dump every MppNativeQueryExec plan for offline comparison with Presto
+      .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps-tpch")
+      // Plan-shape parity with Presto (opt-in cross-cut rules)
+      .set("spark.gluten.mpp.singlePartitionSort", "true")
+      .set("spark.gluten.mpp.removeRedundantShuffle", "true")
   }
 }

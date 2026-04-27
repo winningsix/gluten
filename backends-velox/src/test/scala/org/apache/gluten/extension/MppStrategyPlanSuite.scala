@@ -40,6 +40,10 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
       .set("spark.sql.adaptive.enabled", "false")
       .set("spark.gluten.mpp.enabled", "true")
       .set("spark.gluten.mpp.strategy.enabled", "true")
+      .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps")
+      .set("spark.gluten.sql.columnar.cudf", "true")
+      .set("spark.gluten.sql.columnar.backend.velox.cudf.enabled", "true")
+      .set("spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan", "true")
   }
 
   override def beforeAll(): Unit = {
