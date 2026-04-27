@@ -1459,8 +1459,13 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
 #endif
   }
   common::SubfieldFilters subfieldFilters;
+  // IBM-baseline HiveTableHandle dropped the standalone bool
+  // filterPushdownEnabled argument; subfieldFilters being non-empty
+  // implicitly enables pushdown. Legacy 5-arg ctor (subfieldFilters,
+  // remainingFilter, dataColumns + defaulted tail) is still supported.
+  (void)filterPushdownEnabled;
   tableHandle = std::make_shared<connector::hive::HiveTableHandle>(
-      connectorId, "hive_table", filterPushdownEnabled, std::move(subfieldFilters), remainingFilter, tableSchema);
+      connectorId, "hive_table", std::move(subfieldFilters), remainingFilter, tableSchema);
 
   // Get assignments and out names.
   std::vector<std::string> outNames;

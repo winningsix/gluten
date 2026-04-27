@@ -239,44 +239,20 @@ WholeStageResultIterator::WholeStageResultIterator(
     // which the cuDF Parquet reader would treat as a complete file, failing
     // the header/footer magic check.
     if (!cudfFileInfos.empty()) {
-      // CudfConfig.gpuTargetBatchBytes was removed in the IBM-baseline
-      // switch. Hard-coded to 2GB pending a long-term port to QueryConfig.
-      const int64_t targetBytes = int64_t{2L * 1024 * 1024 * 1024};
-      size_t i = 0;
-      while (i < cudfFileInfos.size()) {
-        const auto& primary = cudfFileInfos[i];
-        std::vector<velox::cudf_velox::connector::hive::CoalescedFileRange>
-            coalescedFiles;
-        int64_t accumulatedLength = static_cast<int64_t>(primary.length);
-        ++i;
-        // Only coalesce whole-file ranges (start == 0). Split-file ranges
-        // must go through the full-file datasource + skip_bytes/num_bytes path.
-        const bool primaryIsWholeFile = (primary.start == 0);
-        while (primaryIsWholeFile && targetBytes > 0 &&
-               i < cudfFileInfos.size() &&
-               accumulatedLength < targetBytes) {
-          const auto& f = cudfFileInfos[i];
-          if (f.start != 0) {
-            break;
-          }
-          coalescedFiles.push_back(
-              {f.path, f.start, f.length, f.infoColumns});
-          accumulatedLength += static_cast<int64_t>(f.length);
-          ++i;
-        }
+      // IBM baseline drops CoalescedFileRange + the 7-arg ctor. Per ferd:
+      // IO coalescing optimization not needed; one split per file is fine.
+      for (const auto& f : cudfFileInfos) {
         auto cudfSplit = std::make_shared<
             velox::cudf_velox::connector::hive::CudfHiveConnectorSplit>(
             kCudfHiveConnectorId,
-            primary.path,
-            primary.start,
-            primary.length,
-            0,
-            primary.infoColumns,
-            std::move(coalescedFiles));
+            f.path,
+            f.start,
+            f.length,
+            /*splitWeight=*/0,
+            f.infoColumns);
         connectorSplits.emplace_back(std::move(cudfSplit));
       }
-      VLOG(1) << "Coalesced " << cudfFileInfos.size() << " CUDF files into "
-              << connectorSplits.size() << " splits";
+      VLOG(1) << "Built " << connectorSplits.size() << " CUDF splits (one per file)";
     }
 #endif
 
@@ -839,10 +815,8 @@ std::unordered_map<std::string, std::string> WholeStageResultIterator::getQueryC
 #ifdef GLUTEN_ENABLE_GPU
     configs[velox::cudf_velox::CudfConfig::kCudfEnabled] =
         std::to_string(veloxCfg_->get<bool>(kCudfEnabled, false));
-    configs[velox::cudf_velox::CudfConfig::kCudfSkipOutputToVelox] =
-        std::to_string(veloxCfg_->get<bool>(
-            kCudfSkipOutputToVelox,
-            kCudfSkipOutputToVeloxDefault));
+    // IBM baseline removed kCudfSkipOutputToVelox. Output-to-Velox is
+    // unconditional now; gluten consumers always materialize to RowVector.
 #endif
 
     const auto setIfExists = [&](const std::string& glutenKey, const std::string& veloxKey) {
