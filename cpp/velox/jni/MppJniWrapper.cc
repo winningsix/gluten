@@ -644,17 +644,25 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     velox::core::PlanNodePtr wrappedPlan;
 
     if (numOutputPartitions == 1) {
-      // Single-partition gather output (root fragment or single-consumer).
-      // transportType=kUcx routes this through IBM cudf's
-      // PartitionedOutputAdapter -> UcxPartitionedOutput at runtime; for
-      // single-process/single-Communicator runs the IntraNodeTransfer fast
-      // path is taken, so no UCX wire transfer is performed.
+      // Single-partition gather output. Two cases:
+      //   1. Producer fragment with a SINGLE-gather outbound exchange
+      //      (outboundExchange != nullptr) -> route through IBM cudf's
+      //      PartitionedOutputAdapter -> UcxPartitionedOutput so the
+      //      consumer fragment's UcxExchange can pull GPU pages via the
+      //      IntraNodeTransferRegistry fast path.
+      //   2. Root fragment (outboundExchange == nullptr, output goes to
+      //      the coordinator) -> keep the default kHttp transport so
+      //      OutputBufferManager receives pages; MppQueryCoordinator
+      //      polls OBM for the final result.
+      const auto transportType = (outboundExchange != nullptr)
+          ? velox::core::PartitionedOutputNode::TransportType::kUcx
+          : velox::core::PartitionedOutputNode::TransportType::kHttp;
       wrappedPlan = velox::core::PartitionedOutputNode::single(
           outputNodeId,
           veloxPlanNode->outputType(),
           /*serdeKind=*/"Presto",
           veloxPlanNode,
-          velox::core::PartitionedOutputNode::TransportType::kUcx);
+          transportType);
     } else {
       // Multi-partition output. Construct the PartitionFunctionSpec from the
       // outbound exchange's partitionType + partitionKeys.
