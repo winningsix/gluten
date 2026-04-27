@@ -28,7 +28,7 @@ import java.io.File
  *
  * Dataset directory is taken from the system property `gluten.tpch.externalDataDir` (default
  * `/data/tpch/sf1k_v2_float`). Each TPC-H table is expected at
- * `${externalDataDir}/<table>/*.parquet`.
+ * `${externalDataDir}/[table]/`.
  *
  * This suite extends [[VeloxTPCHTableSupport]] directly (NOT [[VeloxTPCHSuite]]) so it does not
  * inherit the 22 TPC-H tests; we only register the five matching queries here.
