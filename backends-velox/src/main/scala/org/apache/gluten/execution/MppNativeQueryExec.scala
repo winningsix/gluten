@@ -18,7 +18,7 @@ package org.apache.gluten.execution
 
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.expression.ConverterUtils
-import org.apache.gluten.extension.{ExchangeSpec, MppRemoveRedundantShuffleRule, MppSinglePartitionSortRule, NativeFragment}
+import org.apache.gluten.extension.{ExchangeSpec, MppParallelSortSplitRule, MppRemoveRedundantShuffleRule, MppSinglePartitionSortRule, NativeFragment}
 import org.apache.gluten.extension.columnar.transition.{Convention, ConventionReq}
 import org.apache.gluten.substrait.SubstraitContext
 import org.apache.gluten.substrait.plan.PlanBuilder
@@ -517,9 +517,13 @@ case class MppNativeQueryExec(
   private def applyCrossCutRules(plan: SparkPlan): SparkPlan = {
     val sortRule = MppSinglePartitionSortRule()
     val skipShuffleRule = MppRemoveRedundantShuffleRule()
+    val parallelSortSplitRule = MppParallelSortSplitRule()
     val afterSort = sortRule(plan)
     val afterSkipShuffle = skipShuffleRule(afterSort)
-    afterSkipShuffle
+    // parallelSortSplit must run AFTER MppSinglePartitionSortRule so the
+    // RangePartitioning -> SinglePartition rewrite has already happened.
+    val afterParallelSortSplit = parallelSortSplitRule(afterSkipShuffle)
+    afterParallelSortSplit
   }
 
   /**

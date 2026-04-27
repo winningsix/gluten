@@ -63,6 +63,7 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport {
       // Cross-cut plan-shape parity (re-applied inside MppNativeQueryExec).
       .set("spark.gluten.mpp.singlePartitionSort", "true")
       .set("spark.gluten.mpp.removeRedundantShuffle", "true")
+      .set("spark.gluten.mpp.parallelSortSplit", "true")
       .set("spark.gluten.mpp.fuseBroadcastBuilds", "true")
       // Run on cudf (GPU) where supported.
       .set("spark.gluten.sql.columnar.cudf", "true")

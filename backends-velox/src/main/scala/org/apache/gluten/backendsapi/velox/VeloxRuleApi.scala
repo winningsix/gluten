@@ -149,8 +149,10 @@ object VeloxRuleApi {
     // collapse pass sees the rewritten exchanges:
     //   - MppSinglePartitionSortRule: RANGE -> SINGLE for global sorts (Presto parity)
     //   - MppRemoveRedundantShuffleRule: drop hash shuffles whose child already satisfies
+    //   - MppParallelSortSplitRule: insert RR-merge between SINGLE gather and producer
     injector.injectPost(_ => MppSinglePartitionSortRule())
     injector.injectPost(_ => MppRemoveRedundantShuffleRule())
+    injector.injectPost(_ => MppParallelSortSplitRule())
     injector.injectPost(c => MppCollapseRule(new GlutenConfig(c.sqlConf)))
     injector.injectPost(c => ColumnarCollapseTransformStages(new GlutenConfig(c.sqlConf)))
     injector.injectPost(_ => GenerateTransformStageId())
@@ -256,6 +258,7 @@ object VeloxRuleApi {
     // MPP collapse runs BEFORE BSP collapse in the RAS path as well.
     injector.injectPostTransform(_ => MppSinglePartitionSortRule())
     injector.injectPostTransform(_ => MppRemoveRedundantShuffleRule())
+    injector.injectPostTransform(_ => MppParallelSortSplitRule())
     injector.injectPostTransform(c => MppCollapseRule(new GlutenConfig(c.sqlConf)))
     injector.injectPostTransform(c => ColumnarCollapseTransformStages(new GlutenConfig(c.sqlConf)))
     injector.injectPostTransform(_ => GenerateTransformStageId())
