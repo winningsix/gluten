@@ -164,11 +164,9 @@ class MppQueryCoordinator {
   /// Fetch the next page of serialized data from the root task's output buffer.
   /// Returns true if data was fetched, false if at end-of-stream.
   /// Populates `pages` with the received SerializedPageBase objects. Uses
-  /// OutputBufferManager::getPages (SerializedPageBase-callback) rather than
-  /// getData (IOBuf-callback) so that GpuSerializedPage (which has no CPU
-  /// IOBuf representation) can flow through zero-copy. next() unwraps each
-  /// page: GpuSerializedPage -> CudfVector (zero-copy GPU); PrestoSerializedPage
-  /// -> RowVector via VectorStreamGroup::read (CPU deserialize fallback).
+  /// OutputBufferManager::getPages (SerializedPageBase-callback) for symmetry
+  /// with the producer side. next() deserializes each PrestoSerializedPage
+  /// into a RowVector via VectorStreamGroup::read.
   bool fetchNextOutputPage(
       std::vector<std::unique_ptr<facebook::velox::exec::SerializedPageBase>>&
           pages);

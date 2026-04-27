@@ -38,8 +38,6 @@
 #include "velox/exec/OutputBufferManager.h"
 #include "velox/exec/SerializedPage.h"
 #include "velox/exec/Task.h"
-#include "velox/experimental/cudf/exchange/GpuSerializedPage.h"
-#include "velox/experimental/cudf/exchange/InProcessChannel.h"
 #include "velox/vector/VectorStream.h"
 
 using namespace facebook::velox;
@@ -49,23 +47,12 @@ namespace gluten {
 
 namespace {
 
-/// Pick the task-id prefix once. USE_INPROC_CHANNEL=1 selects the new
-/// single-machine single-GPU InProcessChannel path (bypasses
-/// OutputBufferManager entirely). Otherwise fall back to "gpu-local://"
-/// which goes through OutputBufferManager via LocalGpuExchangeSource.
-std::string pickTaskIdPrefix() {
-  const char* v = std::getenv("USE_INPROC_CHANNEL");
-  if (v != nullptr) {
-    std::string s(v);
-    if (!s.empty() && s != "0" && s != "false" && s != "no" && s != "off") {
-      return "gpu-inproc://";
-    }
-  }
-  return "gpu-local://";
-}
-
-/// Task ID prefix for GPU exchange. Chosen once at process startup.
-const std::string kTaskIdPrefix = pickTaskIdPrefix();
+/// Task ID prefix for all fragments. Root-fragment output is consumed by
+/// the coordinator via OutputBufferManager (kHttp PartitionedOutput); other
+/// fragment-to-fragment edges go through IBM's UCX / IntraNodeTransfer path
+/// (wired in MppJniWrapper.cc). The "gpu-local://" prefix is retained for
+/// continuity with existing logging.
+constexpr const char* kTaskIdPrefix = "gpu-local://";
 
 } // namespace
 
@@ -192,13 +179,6 @@ MppQueryCoordinator::~MppQueryCoordinator() {
           bufferManager_->removeTask(tid);
         } catch (...) {
         }
-        // Also drop any in-process channels registered for this task. This
-        // path is a no-op when taskId prefix is "gpu-local://" (registry has
-        // no entries).
-        try {
-          cudf_velox::InProcessChannelRegistry::get().removeTask(tid);
-        } catch (...) {
-        }
       }
     }
   }
@@ -212,21 +192,13 @@ MppQueryCoordinator::~MppQueryCoordinator() {
 std::string MppQueryCoordinator::makeTaskId(
     int32_t fragmentId,
     int32_t replicaIdx) const {
-  // Root fragment's output is consumed directly by this coordinator via
-  // OutputBufferManager::getPages(), so its taskId must keep the
-  // "gpu-local://" prefix even when USE_INPROC_CHANNEL=1 (otherwise
-  // GpuPartitionedOutput would route the root's output to
-  // InProcessChannel and the coordinator's read would hang).
-  //
-  // Non-root fragments are consumed by another Task via an ExchangeNode;
-  // for those, the configured kTaskIdPrefix applies (gpu-inproc:// when
-  // the env flag is on, gpu-local:// otherwise).
-  constexpr const char* kRootPrefix = "gpu-local://";
-  const char* prefix = (fragmentId == rootFragmentId_)
-      ? kRootPrefix
-      : kTaskIdPrefix.c_str();
+  // Root-fragment output is consumed by this coordinator via
+  // OutputBufferManager::getPages() (kHttp PartitionedOutput).
+  // Non-root fragment edges flow through IBM's UCX / IntraNodeTransfer
+  // path; they share the same task-id prefix because routing is decided
+  // by adapters, not by the prefix.
   return fmt::format(
-      "{}{}-{}-p{}", prefix, queryId_, fragmentId, replicaIdx);
+      "{}{}-{}-p{}", kTaskIdPrefix, queryId_, fragmentId, replicaIdx);
 }
 
 bool MppQueryCoordinator::isTerminalState(TaskState state) {
@@ -726,11 +698,11 @@ RowVectorPtr MppQueryCoordinator::next() {
       return nullptr;
     }
 
-    // Unwrap and return the first non-null page. Two shapes are possible:
-    //   1. GpuSerializedPage wrapped in SharedSerializedPage (zero-copy GPU):
-    //      pull out the CudfVector (RowVector subclass) -- no D2H copy.
-    //   2. PrestoSerializedPage or raw IOBuf-backed page (CPU path): deserialize
-    //      via VectorStreamGroup::read into a fresh RowVector.
+    // Unwrap and return the first non-null page. The root fragment's output
+    // is a kHttp PartitionedOutput, which produces CPU-serialized pages
+    // (PrestoVectorSerde / IOBuf-backed). Inter-fragment GPU edges flow
+    // through IBM's UCX / IntraNodeTransfer path and never reach this
+    // coordinator, so there is no GpuSerializedPage shape to handle here.
     // Remaining pages in the batch are discarded here; they will be re-fetched
     // on subsequent next() calls. Sequence ack already advanced inside
     // fetchNextOutputPage() so this is safe.
@@ -739,24 +711,7 @@ RowVectorPtr MppQueryCoordinator::next() {
         continue;
       }
 
-      // Case 1: GPU page. OutputBufferManager wraps outgoing pages in
-      // SharedSerializedPage; peek through to find the GpuSerializedPage.
-      cudf_velox::GpuSerializedPage* gpuPage = nullptr;
-      if (auto* shared = dynamic_cast<SharedSerializedPage*>(page.get())) {
-        gpuPage = dynamic_cast<cudf_velox::GpuSerializedPage*>(
-            shared->innerShared().get());
-      } else {
-        gpuPage = dynamic_cast<cudf_velox::GpuSerializedPage*>(page.get());
-      }
-      if (gpuPage != nullptr) {
-        // cudfVector() is CudfVector (RowVector subclass). Returning it as
-        // RowVectorPtr keeps data on GPU; downstream consumers (runner main
-        // loop) see it as an opaque RowVector.
-        return gpuPage->cudfVector();
-      }
-
-      // Case 2: CPU page. Deserialize via Presto serde. Preserves backward
-      // compatibility with the old CPU-only gather path.
+      // Deserialize the CPU page via Presto serde into a RowVector.
       auto inputStream = page->prepareStreamForDeserialize();
       auto outputType = std::dynamic_pointer_cast<const RowType>(
           fragmentSpecs_[rootFragmentId_].planFragment.planNode->outputType());
@@ -864,12 +819,10 @@ void MppQueryCoordinator::waitForCompletion() {
     }
   }
 
-  // Clean up output buffer entries and in-process channels for all tasks.
+  // Clean up output buffer entries for all tasks.
   for (auto& replicas : fragmentTasks_) {
     for (auto& task : replicas) {
       bufferManager_->removeTask(task->taskId());
-      cudf_velox::InProcessChannelRegistry::get().removeTask(
-          task->taskId());
     }
   }
 
