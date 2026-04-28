@@ -266,6 +266,12 @@
           <tagsToExclude>${tagsToExclude}</tagsToExclude>
           <systemProperties>
             <velox.udf.lib.path>${cpp.build.dir}/velox/udf/examples/libmyudf.so,${cpp.build.dir}/velox/udf/examples/libmyudaf.so</velox.udf.lib.path>
+            <!-- Forward TPC-H SF1K external-data-dir + per-query filter so
+                 the SF1K suite (VeloxTPCHFloatSF1KSuite) sees them as JVM
+                 sys.props. Without these explicit forwards, mvn -D... does
+                 not reach the surefire-forked test JVM. -->
+            <gluten.tpch.externalDataDir>${gluten.tpch.externalDataDir}</gluten.tpch.externalDataDir>
+            <gluten.tpch.onlyQuery>${gluten.tpch.onlyQuery}</gluten.tpch.onlyQuery>
           </systemProperties>
         </configuration>
       </plugin>
