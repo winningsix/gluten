@@ -117,7 +117,17 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
   // Run all 22 TPC-H queries. noFallBack=false so non-MPP-eligible queries
   // surface as their actual failure mode (not as a generic fallback test
   // failure). The 60s per-query failAfter contains hangs.
-  (1 to 22).foreach {
+  // Optional sys-prop filter: -Dgluten.tpch.onlyQuery=6 registers only Q6.
+  // Used by per-query JVM-isolation runs to bypass cuDF abort-path memory
+  // leaks that survive across tests in a single JVM (RC: failed task leaves
+  // ~128MB stuck in MemoryPool, JVM teardown asserts on reservedBytes != 0).
+  // Defaults to all 22 when unset.
+  private val onlyQuery: Option[Int] =
+    sys.props.get("gluten.tpch.onlyQuery").flatMap(s => scala.util.Try(s.toInt).toOption)
+
+  private val queriesToRun: Seq[Int] = onlyQuery.map(Seq(_)).getOrElse(1 to 22)
+
+  queriesToRun.foreach {
     qid =>
       test(s"TPC-H q$qid") {
         failAfter(perQueryTimeout) {
