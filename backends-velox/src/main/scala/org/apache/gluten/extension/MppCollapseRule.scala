@@ -498,6 +498,23 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       }
     }
 
+    /**
+     * Peel off the synthetic hash-prefix ProjectExecTransformer that
+     * VeloxSparkPlanExecApi.genColumnarShuffleExchange injects above the shuffle child for HASH
+     * partitioning. The injected project's first column is always aliased "hash_partition_key" and
+     * computes Murmur3Hash. In MPP, we recompute that hash inside Velox PartitionedOutputNode's
+     * HashPartitionFunctionSpec, so the prefix column is unnecessary and actively harmful: (a) it
+     * makes producer/consumer wire schemas drift (producer ships N+1 cols, consumer expects N), (b)
+     * it materializes hash_with_seed which cuDF can't replace and falls back to CPU, (c) it wraps
+     * the IntraNodeTransferRegistry fast path with an extra ProjectNode.
+     */
+    def stripSyntheticHashProject(node: SparkPlan): SparkPlan = node match {
+      case p: org.apache.gluten.execution.ProjectExecTransformer
+          if p.projectList.nonEmpty && p.projectList.head.name == "hash_partition_key" =>
+        p.child
+      case other => other
+    }
+
     // Walk the plan, building fragments. Returns the fragment ID of the current subtree's root.
     def walk(node: SparkPlan): Int = {
       node match {
@@ -524,8 +541,13 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
             // upstream fragment"; same convention used for fused broadcast builds.
             return -1
           }
-          // The child of the exchange belongs to the producer fragment
-          val producerFragmentId = walk(unwrapToExchange(shuffle.child))
+          // The child of the exchange belongs to the producer fragment.
+          // Strip the synthetic hash_partition_key ProjectExecTransformer that
+          // VeloxSparkPlanExecApi injects: in MPP we recompute the hash on-the-fly
+          // inside HashPartitionFunctionSpec, so the prefix column shouldn't exist
+          // on the wire (otherwise producer ships N+1 cols, consumer expects N).
+          val producerFragmentId =
+            walk(stripSyntheticHashProject(unwrapToExchange(shuffle.child)))
 
           // Create the consumer fragment (the exchange source side)
           val consumerFragmentId = fragmentCounter.getAndIncrement()
