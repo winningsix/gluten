@@ -221,8 +221,16 @@ void VeloxBackend::init(
     if (comm) {
       std::thread([comm]() { comm->run(); }).detach();
       std::move(commReady).wait();
-      LOG(INFO) << "VeloxBackend: UCX Communicator running on port "
-                << comm->getListenerPort();
+      // WARNING (not INFO) so it survives the default kGlogSeverityLevel=1
+      // filter; this single line is the canonical proof that the per-process
+      // Communicator started, and we want it in every run log.
+      LOG(WARNING) << "VeloxBackend: UCX Communicator running on port "
+                   << comm->getListenerPort()
+                   << " (intra-node-bypass enabled)";
+    } else {
+      LOG(WARNING) << "VeloxBackend: UCX Communicator init returned null "
+                      "(FLAGS_velox_ucx_exchange="
+                   << FLAGS_velox_ucx_exchange << ")";
     }
   }
 #endif
