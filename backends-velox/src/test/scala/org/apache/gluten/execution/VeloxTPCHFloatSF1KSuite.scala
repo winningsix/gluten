@@ -78,33 +78,47 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport {
       .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps-tpch-sf1k")
   }
 
+  // Print actual rows for offline diff vs Presto-GPU SF1K reference (post-ANALYZE).
+  // compareResult=false because we don't ship a q*.out reference in this suite's
+  // resources; the [MPP-RESULT] tag lets us grep run logs deterministically.
+  private def dumpRows(qid: Int, df: org.apache.spark.sql.DataFrame): Unit = {
+    val rows = df.collect()
+    // scalastyle:off println
+    println(s"[MPP-RESULT] Q${qid} count=${rows.length} schema=${df.schema.simpleString}")
+    rows.take(10).foreach(r => println(s"[MPP-RESULT] Q${qid} row: ${r.mkString("|")}"))
+    if (rows.length > 10) {
+      rows.takeRight(2).foreach(r => println(s"[MPP-RESULT] Q${qid} tail: ${r.mkString("|")}"))
+    }
+    // scalastyle:on println
+  }
+
   test("TPC-H q6") {
     runTPCHQuery(6, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-      _ => ()
+      df => dumpRows(6, df)
     }
   }
 
   test("TPC-H q12") {
     runTPCHQuery(12, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-      _ => ()
+      df => dumpRows(12, df)
     }
   }
 
   test("TPC-H q16") {
     runTPCHQuery(16, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-      _ => ()
+      df => dumpRows(16, df)
     }
   }
 
   test("TPC-H q17") {
     runTPCHQuery(17, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-      _ => ()
+      df => dumpRows(17, df)
     }
   }
 
   test("TPC-H q18") {
     runTPCHQuery(18, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-      _ => ()
+      df => dumpRows(18, df)
     }
   }
 }
