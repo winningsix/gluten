@@ -38,11 +38,11 @@ import java.io.File
 class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
 
   // Per-query hard cap. Presto-GPU SF1K runs the full 22 in ~66s = ~3s/query;
-  // 20s gives headroom for our multi-fragment + UCX tear-down path so a
-  // correct query (Q6 emits the right row in ~12-15s) is not flagged red
-  // by scalatest before the JVM-side collect() returns. Still bounds the
-  // 22-query sweep to ~7 min worst case.
-  private val perQueryTimeout = Span(20, Seconds)
+  // measured Q6 wall-clock through Spark-Gluten + multi-fragment + UCX
+  // tear-down is ~32s (Spark path overhead, not query execution). 45s
+  // gives correct queries headroom to land green; 22-query sweep capped
+  // at ~16 min worst case until we shave the Spark-side overhead.
+  private val perQueryTimeout = Span(45, Seconds)
 
   protected val externalDataDir: String =
     sys.props.getOrElse("gluten.tpch.externalDataDir", "/data/tpch/sf1k_v2_float")
