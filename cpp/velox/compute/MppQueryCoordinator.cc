@@ -235,26 +235,28 @@ void MppQueryCoordinator::start() {
   // output buffers are already registered in OutputBufferManager when
   // consumers try to fetch data.
   //
-  // --- Derive per-fragment replica count from inbound exchanges ---
-  // A fragment with no inbound exchange (leaf) runs as one replica.
-  // A fragment that consumes exchange(s) runs as N replicas where N is driven
-  // by the HASH / RANGE / ROUND_ROBIN inbound exchanges (consumer parallelism).
-  // BROADCAST inbound exchanges carry numPartitions=1 by design (one producer
-  // payload replicated to every consumer replica) and must NOT be used to
-  // derive consumer parallelism. All non-broadcast inbound exchanges at a
-  // given consumer must still agree on N.
-  // NOTE: broadcast fan-out correctness (every replica actually receives the
-  // one producer payload) is tracked separately as open issue #5 in
-  // plan/mpp-22q-status.md -- this block only sets the replica count.
+  // --- Derive per-fragment driver count from inbound exchanges (Presto-style) ---
+  // Presto-aligned task model: 1 task per fragment per worker (here single-node
+  // = 1 task per fragment). Within that task, drivers handle the per-partition
+  // parallelism: for a HASH/RANGE/ROUND_ROBIN inbound exchange with N partitions,
+  // the consumer task has N drivers each pulling one producer-destination split.
+  // This replaces the old N-replica model where each replica pinned destination=i.
+  //
+  // Memory benefit: 1 task with shared memory pool across drivers, not N tasks
+  // each with their own pool. Q1 SF1K's 16 replicas × 512MB FilterProject was
+  // 16x the budget; now drivers share.
+  // BROADCAST inbound exchanges carry numPartitions=1 (one payload replicated
+  // to all consumers) and don't drive driver count.
   fragmentReplicaCount_.assign(fragmentSpecs_.size(), 1);
+  std::vector<int32_t> consumerInboundPartitions(fragmentSpecs_.size(), 0);
   for (auto& exchange : exchangeSpecs_) {
     if (exchange.partitionType == "BROADCAST") {
       continue;
     }
     const auto consumer = exchange.consumerFragmentId;
     const auto n = std::max(1, exchange.numPartitions);
-    auto& slot = fragmentReplicaCount_[consumer];
-    if (slot == 1) {
+    auto& slot = consumerInboundPartitions[consumer];
+    if (slot == 0) {
       slot = n;
     } else {
       VELOX_CHECK_EQ(
@@ -320,22 +322,27 @@ void MppQueryCoordinator::start() {
     // noMoreData() call (stock Velox end-marker only fires when ALL drivers
     // have called noMoreData; multi-driver broadcast hangs when any driver
     // receives zero splits or blocks for any other reason).
+    // Presto-style: 1 task per fragment, drivers = max(spec.numDrivers,
+    // inbound numPartitions). Broadcast producers stay at 1 driver because
+    // the kBroadcast OutputBuffer end-marker requires a deterministic single
+    // noMoreData() call.
     const auto bcastN = broadcastFanout[spec.id];
+    const auto inboundN = consumerInboundPartitions[spec.id];
     const auto perReplicaDrivers = (bcastN > 0) ? 1
-        : (replicas == 1 ? std::max(1, spec.numDrivers) : 1);
+        : std::max({1, spec.numDrivers, inboundN});
     for (int32_t i = 0; i < replicas; ++i) {
       auto taskId = makeTaskId(spec.id, i);
       auto task = Task::create(
           taskId,
           spec.planFragment,
-          /*destination=*/i,
+          /*destination=*/0,
           queryCtx_,
           Task::ExecutionMode::kParallel);
       LOG(WARNING) << "MppQueryCoordinator[" << queryId_
                    << "]: starting fragment " << spec.id << " replica " << i
                    << "/" << replicas << " taskId=" << taskId
                    << " drivers=" << perReplicaDrivers
-                   << " destination=" << i
+                   << " inboundN=" << inboundN
                    << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN)
                                   : std::string{});
       task->start(perReplicaDrivers);
@@ -395,24 +402,36 @@ void MppQueryCoordinator::start() {
     // same per-process Communicator, so loopback + the taskId suffices;
     // UcxExchangeServer/Source detect same-Communicator and bypass the
     // wire via IntraNodeTransferRegistry.
+    // Presto-style: 1 consumer task, add ALL N producer-destination splits to
+    // it. Drivers within the consumer task pick up splits dynamically (one
+    // driver per producer destination is the typical pattern with
+    // perReplicaDrivers = numPartitions).
     auto comm = facebook::velox::ucx_exchange::Communicator::getInstance();
     const int urlPort = static_cast<int>(comm->getListenerPort()) - 3;
-    for (size_t i = 0; i < consumerReplicas.size(); ++i) {
-      auto& consumerTask = consumerReplicas[i];
+    VELOX_CHECK_EQ(
+        consumerReplicas.size(),
+        1u,
+        "Presto-style task model: consumer fragment must have exactly 1 task; "
+        "got {}",
+        consumerReplicas.size());
+    auto& consumerTask = consumerReplicas[0];
+    const auto numDestinations =
+        exchange.partitionType == "BROADCAST" ? 1 : std::max(1, exchange.numPartitions);
+    int32_t splitCount = 0;
+    for (int dest = 0; dest < numDestinations; ++dest) {
       for (const auto& prodId : producerTaskIds) {
         const auto url = fmt::format(
-            "http://127.0.0.1:{}/v1/task/{}/results/{}",
-            urlPort, prodId, i);
+            "http://127.0.0.1:{}/v1/task/{}/results/{}", urlPort, prodId, dest);
         consumerTask->addSplit(
             exchange.exchangeNodeId,
             Split(std::make_shared<RemoteConnectorSplit>(url)));
+        ++splitCount;
       }
-      consumerTask->noMoreSplits(exchange.exchangeNodeId);
     }
+    consumerTask->noMoreSplits(exchange.exchangeNodeId);
     LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: exchange "
-                 << exchange.id << " wired ("
-                 << (producerReplicas.size() * consumerReplicas.size())
-                 << " splits total)";
+                 << exchange.id << " wired (" << splitCount
+                 << " splits total, " << numDestinations << " destinations)";
   }
 
   // Phase 2.5: broadcast producer output buffer fan-out already set in
