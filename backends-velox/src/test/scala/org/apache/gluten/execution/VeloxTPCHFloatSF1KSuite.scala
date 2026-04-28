@@ -37,9 +37,12 @@ import java.io.File
  */
 class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
 
-  // Per-query hard cap. SF1K Q6 normally finishes < 30s; if any query goes
-  // past this, treat it as a hang (Q18 historically deadlocks under JIT off).
-  private val perQueryTimeout = Span(30, Seconds)
+  // Per-query hard cap. The test path runs df.collect() twice (once inside
+  // runTPCHQuery for the compareResult=false branch, once inside dumpRows),
+  // so each query effectively pays double the single-collect wall clock.
+  // SF1K Q6 single-collect ~15s, so double = ~30s; 60s gives headroom for
+  // the heavier queries (Q12/Q17/Q18). Anything past 60s is genuinely hung.
+  private val perQueryTimeout = Span(60, Seconds)
 
   protected val externalDataDir: String =
     sys.props.getOrElse("gluten.tpch.externalDataDir", "/data/tpch/sf1k_v2_float")
