@@ -124,16 +124,18 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
     LOG(INFO) << "MppDumpLoader: replacing ValueStream node '" << node->id()
               << "' with ExchangeNode '" << exchangeNodeId
               << "' outputType=" << node->outputType()->toString();
-    // CPU ExchangeNode. Pair with CPU PartitionedOutputNode::single on the
-    // producer side below -- both ends speak Presto, ToCudf inserts D2H /
-    // H2D adapters around the boundary. End-to-end GPU exchange needs a
-    // Velox-side fix (ToCudf doesn't recognize pre-constructed
-    // GpuPartitionedOutputNode; inserts unwanted CudfToVelox adapter that
-    // FATALs "must be CudfVector" inside GpuPartitionedOutput::addInput).
+    // Tag the consumer-side ExchangeNode with TransportType::kUcx so IBM
+    // cudf's ExchangeAdapter swaps it to UcxExchange at runtime. Without
+    // this tag the adapter declines (canRunOnGPU requires kUcx) and the
+    // node stays as plain CPU Exchange[Presto]; meanwhile MppQueryCoordinator
+    // injects UCX-formatted URLs as splits, and Velox's stock
+    // ExchangeSource::create finds no factory matching them — every
+    // consumer fragment fails on first getSplits() with INVALID_STATE.
     return std::make_shared<velox::core::ExchangeNode>(
         exchangeNodeId,
         node->outputType(),
-        std::string{"Presto"});
+        std::string{"Presto"},
+        velox::core::ExchangeNode::TransportType::kUcx);
   }
 
   const auto& sources = node->sources();
@@ -478,6 +480,9 @@ MppDumpLoadResult loadMppQueryFromDump(
       // after Phase-2 wiring. The `fanout` value here is kept just for
       // bookkeeping / future reference; it is not passed to the plan node.
       (void)fanout;
+      // Broadcast producer is always non-root (it feeds a consumer
+      // fragment). Tag with kUcx so IBM cudf's PartitionedOutputAdapter
+      // swaps to UcxPartitionedOutput.
       wrappedPlan = std::make_shared<velox::core::PartitionedOutputNode>(
           outputNodeId,
           velox::core::PartitionedOutputNode::Kind::kBroadcast,
@@ -487,14 +492,24 @@ MppDumpLoadResult loadMppQueryFromDump(
           std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>(),
           veloxPlanNode->outputType(),
           std::string{"Presto"},
-          veloxPlanNode);
+          veloxPlanNode,
+          velox::core::PartitionedOutputNode::TransportType::kUcx);
     } else if (numOutputPartitions == 1) {
-      // CPU PartitionedOutput, see consumer-side comment above.
+      // Single-partition gather. Two cases (mirrors MppJniWrapper.cc:646-665):
+      //   - producer with SINGLE-gather outbound exchange (outboundExchange!=nullptr)
+      //     → kUcx so the consumer's UcxExchange picks it up via
+      //     IntraNodeTransferRegistry.
+      //   - root fragment (outboundExchange==nullptr, output goes to the
+      //     coordinator) → kHttp so OutputBufferManager receives pages.
+      const auto transportType = (outboundExchange != nullptr)
+          ? velox::core::PartitionedOutputNode::TransportType::kUcx
+          : velox::core::PartitionedOutputNode::TransportType::kHttp;
       wrappedPlan = velox::core::PartitionedOutputNode::single(
           outputNodeId,
           veloxPlanNode->outputType(),
           std::string{"Presto"},
-          veloxPlanNode);
+          veloxPlanNode,
+          transportType);
     } else {
       const std::string& partitionType = outboundExchange
           ? outboundExchange->partitionType
@@ -534,14 +549,10 @@ MppDumpLoadResult loadMppQueryFromDump(
             std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>();
       }
 
-      // Use the stock core::PartitionedOutputNode regardless of ENABLE_GPU.
-      // The cuDF LocalGpuPartitionedOutputAdapter catches `exec::PartitionedOutput`
-      // at driver-compile time and swaps in `GpuPartitionedOutput` with the
-      // acceptsGpuInput/producesGpuOutput flags that stop ToCudf from wedging
-      // a CudfToVelox D2H adapter above it. Using GpuPartitionedOutputNode
-      // directly in the plan bypasses the adapter -- ToCudf sees an unknown
-      // GPU sink and inserts the D2H wedge, which then FATALs with
-      // "cudfVec == nullptr". See tmp/agent-reports/s3-timeout-pattern.md.
+      // Multi-partition output is always producer-side; tag with kUcx so
+      // IBM cudf's PartitionedOutputAdapter swaps to UcxPartitionedOutput.
+      // Without the tag the node stays as plain CPU PartitionedOutput[Presto]
+      // which doesn't speak the UCX URL format MppQueryCoordinator wires.
       wrappedPlan = std::make_shared<velox::core::PartitionedOutputNode>(
           outputNodeId,
           velox::core::PartitionedOutputNode::Kind::kPartitioned,
@@ -551,7 +562,8 @@ MppDumpLoadResult loadMppQueryFromDump(
           std::move(funcSpec),
           veloxPlanNode->outputType(),
           std::string{"Presto"},
-          veloxPlanNode);
+          veloxPlanNode,
+          velox::core::PartitionedOutputNode::TransportType::kUcx);
     }
 
     // 3g. Package into MppFragmentSpec.

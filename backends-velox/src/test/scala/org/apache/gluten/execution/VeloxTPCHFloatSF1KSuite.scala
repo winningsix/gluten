@@ -84,10 +84,10 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport {
   private def dumpRows(qid: Int, df: org.apache.spark.sql.DataFrame): Unit = {
     val rows = df.collect()
     // scalastyle:off println
-    println(s"[MPP-RESULT] Q${qid} count=${rows.length} schema=${df.schema.simpleString}")
-    rows.take(10).foreach(r => println(s"[MPP-RESULT] Q${qid} row: ${r.mkString("|")}"))
+    println(s"[MPP-RESULT] Q$qid count=${rows.length} schema=${df.schema.simpleString}")
+    rows.take(10).foreach(r => println(s"[MPP-RESULT] Q$qid row: ${r.mkString("|")}"))
     if (rows.length > 10) {
-      rows.takeRight(2).foreach(r => println(s"[MPP-RESULT] Q${qid} tail: ${r.mkString("|")}"))
+      rows.takeRight(2).foreach(r => println(s"[MPP-RESULT] Q$qid tail: ${r.mkString("|")}"))
     }
     // scalastyle:on println
   }

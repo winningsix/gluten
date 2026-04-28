@@ -130,7 +130,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    * Only fuse when the Spark-computed Statistics.sizeInBytes is both available AND below threshold.
    * If stats throw (broadcast not yet materialized) or report 0, refuse to fuse: with stats unknown
    * we have no way to confirm the build is small, and aggressive fusion in that case has bitten us
-   * on Q16 — the consumer fragment's WST was already frozen with an InputIteratorTransformer that
+   * on Q16 - the consumer fragment's WST was already frozen with an InputIteratorTransformer that
    * emits ReadRel(iterator:0) for the build, but with fusion-decided-true no BROADCAST exchange
    * spec is emitted, so the C++ side has zero placeholder iterators and conversion crashes at
    * SubstraitToVeloxPlan.cc:1357 (streamIdx 0 < inputIters_.size() 0).
