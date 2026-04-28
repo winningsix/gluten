@@ -1044,6 +1044,60 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeGetMppOutput( // NOLI
 }
 
 // ---------------------------------------------------------------------------
+// nativeAbortMppQuery
+// ---------------------------------------------------------------------------
+
+/// Explicit pre-close abort hook. The JVM-side caller (e.g.
+/// MppNativeQueryExec.close, an iterator close-listener, or a
+/// failAfter-driven cleanup path) invokes this BEFORE
+/// nativeCloseMppQuery so that the C++ coordinator gets a chance to call
+/// Task::requestAbort() on every native Velox Task and wait (bounded) for
+/// it to reach a terminal state. This is the only path that reliably
+/// releases per-task MemoryPool reservations before JVM shutdown — without
+/// it, a `failAfter`-style timeout returns from the test method while the
+/// native Tasks keep running, and process exit later trips
+/// MemoryManager::removePool()'s reservedBytes==0 VELOX_CHECK and
+/// terminate()s the JVM.
+///
+/// Idempotent and safe to call without a matching close: the underlying
+/// coordinator->abort() guards against re-entry. Does NOT release the
+/// handle; the caller must still invoke nativeCloseMppQuery to free the
+/// ObjectStore slot and the native resources.
+JNIEXPORT void JNICALL
+Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeAbortMppQuery( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jlong handle) {
+  JNI_METHOD_START
+
+  LOG(INFO) << "MppJniWrapper: aborting MPP query, handle=" << handle;
+
+  auto mppHandle = ObjectStore::retrieve<MppQueryHandle>(handle);
+  if (mppHandle == nullptr) {
+    LOG(WARNING) << "MppJniWrapper: nativeAbortMppQuery on unknown handle="
+                 << handle << " (already released?)";
+    return;
+  }
+  if (mppHandle->coordinator == nullptr) {
+    LOG(WARNING) << "MppJniWrapper: nativeAbortMppQuery handle=" << handle
+                 << " has null coordinator";
+    return;
+  }
+
+  try {
+    mppHandle->coordinator->abort();
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "MppJniWrapper: nativeAbortMppQuery handle=" << handle
+               << " coordinator->abort() threw: " << e.what();
+  } catch (...) {
+    LOG(ERROR) << "MppJniWrapper: nativeAbortMppQuery handle=" << handle
+               << " coordinator->abort() threw unknown exception";
+  }
+
+  JNI_METHOD_END()
+}
+
+// ---------------------------------------------------------------------------
 // nativeCloseMppQuery
 // ---------------------------------------------------------------------------
 
@@ -1056,8 +1110,30 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCloseMppQuery( // NOL
 
   LOG(INFO) << "MppJniWrapper: closing MPP query, handle=" << handle;
 
+  // Drive the bounded abort+wait BEFORE dropping the shared_ptr. ~Mpp-
+  // QueryHandle's destructor would also reach this via coordinator.reset()
+  // -> ~MppQueryCoordinator, but doing it here makes the cleanup point
+  // explicit and gives us a clearly-attributed log line if an abort hangs
+  // at JVM-exit. abort() is idempotent so callers that have already issued
+  // nativeAbortMppQuery just see the aborted_ short-circuit.
+  auto mppHandle = ObjectStore::retrieve<MppQueryHandle>(handle);
+  if (mppHandle != nullptr && mppHandle->coordinator != nullptr) {
+    try {
+      mppHandle->coordinator->abort();
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "MppJniWrapper: nativeCloseMppQuery handle=" << handle
+                 << " coordinator->abort() threw: " << e.what();
+    } catch (...) {
+      LOG(ERROR) << "MppJniWrapper: nativeCloseMppQuery handle=" << handle
+                 << " coordinator->abort() threw unknown exception";
+    }
+  }
+  // Drop the local retrieve() reference before release() so the only
+  // remaining strong ref is the one inside the ObjectStore.
+  mppHandle.reset();
+
   // Release from the ObjectStore. This drops the shared_ptr<MppQueryHandle>,
-  // which triggers ~MppQueryHandle -> coordinator->abort() -> cleanup.
+  // which triggers ~MppQueryHandle -> coordinator->abort() (no-op now) -> cleanup.
   ObjectStore::release(handle);
 
   JNI_METHOD_END()
