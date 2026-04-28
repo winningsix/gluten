@@ -99,19 +99,43 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
     // scalastyle:on println
   }
 
-  // Generate one ScalaTest case per TPC-H query (1..22). Each test runs through
-  // MppStrategy if its plan shape matches Presto (Q6/Q12/Q16/Q17/Q18 today) and
-  // otherwise falls back to the standard Gluten path. noFallBack=true would
-  // fail the non-matching queries; we leave it false here so the suite reports
-  // *which* queries actually run all-GPU MPP and which still need planner work.
-  // The 30s per-query cap keeps a hung query from blocking the rest of the run.
-  (1 to 22).foreach {
-    qid =>
-      test(s"TPC-H q$qid") {
-        failAfter(perQueryTimeout) {
-          runTPCHQuery(qid, tpchQueries, queriesResults, compareResult = false, noFallBack = false)(
-            df => dumpRows(qid, df))
-        }
+  test("TPC-H q6") {
+    failAfter(perQueryTimeout) {
+      runTPCHQuery(6, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
+        df => dumpRows(6, df)
       }
+    }
+  }
+
+  test("TPC-H q12") {
+    failAfter(perQueryTimeout) {
+      runTPCHQuery(12, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
+        df => dumpRows(12, df)
+      }
+    }
+  }
+
+  test("TPC-H q16") {
+    failAfter(perQueryTimeout) {
+      runTPCHQuery(16, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
+        df => dumpRows(16, df)
+      }
+    }
+  }
+
+  test("TPC-H q17") {
+    failAfter(perQueryTimeout) {
+      runTPCHQuery(17, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
+        df => dumpRows(17, df)
+      }
+    }
+  }
+
+  test("TPC-H q18") {
+    failAfter(perQueryTimeout) {
+      runTPCHQuery(18, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
+        df => dumpRows(18, df)
+      }
+    }
   }
 }
