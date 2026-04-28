@@ -19,6 +19,7 @@ package org.apache.gluten.extension
 import org.apache.gluten.execution.SortExecTransformer
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.plans.physical.{RoundRobinPartitioning, SinglePartition}
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -26,20 +27,19 @@ import org.apache.spark.sql.execution.{ProjectExec, SortExec, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.exchange.{ShuffleExchangeExec, ShuffleExchangeLike}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.SparkSession
 
 /**
  * Mimic Presto's parallel-sort split for global ORDER BY queries.
  *
- * Presto's distributed planner inserts an extra fragment between the last hashed
- * FinalAggregate fragment and the SINGLE-gather output fragment:
+ * Presto's distributed planner inserts an extra fragment between the last hashed FinalAggregate
+ * fragment and the SINGLE-gather output fragment:
  * {{{
  *   Frag N+1 [HASH]        : FinalAgg + PartialSort, output ROUND_ROBIN
  *   Frag N   [ROUND_ROBIN] : LocalMerge + PartialSort over RemoteSource, output SINGLE
  *   Frag N-1 [SINGLE]      : Output / RemoteMerge
  * }}}
- * Gluten currently goes straight from FinalAgg+Sort to SINGLE gather, missing the
- * parallel pre-sort merge step. This rule re-introduces it.
+ * Gluten currently goes straight from FinalAgg+Sort to SINGLE gather, missing the parallel pre-sort
+ * merge step. This rule re-introduces it.
  *
  * Pattern recognized at the plan root (after [[MppSinglePartitionSortRule]] has converted
  * `Exchange(RangePartitioning) -> Sort(global)` into `Exchange(SinglePartition) -> Sort`):
@@ -57,8 +57,8 @@ import org.apache.spark.sql.SparkSession
  * }}}
  *
  * The two new sorts are local; gluten's columnar transform will rewrite them to
- * [[SortExecTransformer]] on a later pass. `N` defaults to
- * `spark.sql.shuffle.partitions` (falling back to 4).
+ * [[SortExecTransformer]] on a later pass. `N` defaults to `spark.sql.shuffle.partitions` (falling
+ * back to 4).
  *
  * Gated by spark.gluten.mpp.parallelSortSplit (default: false).
  */
@@ -128,8 +128,7 @@ case class MppParallelSortSplitRule() extends Rule[SparkPlan] with Logging {
     case stage: ShuffleQueryStageExec =>
       stage.plan match {
         case sh: ShuffleExchangeLike if sh.outputPartitioning == SinglePartition =>
-          logWarning(
-            "MppParallelSortSplitRule: splicing parallel-sort + RR merge (AQE stage)")
+          logWarning("MppParallelSortSplitRule: splicing parallel-sort + RR merge (AQE stage)")
           spliceParallelSortMerge(sh, sortOrder)
         case _ => node
       }
@@ -144,14 +143,13 @@ case class MppParallelSortSplitRule() extends Rule[SparkPlan] with Logging {
   }
 
   /**
-   * Build the new spine over the SinglePartition shuffle's producer:
-   * SinglePartition( LocalMerge( RoundRobin( PartialSort( producer ) ) ) ).
+   * Build the new spine over the SinglePartition shuffle's producer: SinglePartition( LocalMerge(
+   * RoundRobin( PartialSort( producer ) ) ) ).
    *
    * For a [[ColumnarShuffleExchangeExec]] (gluten variant) we still emit a vanilla
-   * [[ShuffleExchangeExec]] for both the SinglePartition gather and the new RoundRobin
-   * exchange; gluten's columnar pass will re-wrap them later. The two new
-   * [[SortExec]]s are local (`global=false`); columnar transform will lift them
-   * to [[SortExecTransformer]] on a later pass.
+   * [[ShuffleExchangeExec]] for both the SinglePartition gather and the new RoundRobin exchange;
+   * gluten's columnar pass will re-wrap them later. The two new [[SortExec]]s are local
+   * (`global=false`); columnar transform will lift them to [[SortExecTransformer]] on a later pass.
    */
   private def spliceParallelSortMerge(
       gather: ShuffleExchangeLike,
@@ -184,8 +182,9 @@ case class MppParallelSortSplitRule() extends Rule[SparkPlan] with Logging {
       } catch {
         case _: Throwable => "4"
       }
-    val parsed = try raw.toInt
-    catch { case _: Throwable => 4 }
+    val parsed =
+      try raw.toInt
+      catch { case _: Throwable => 4 }
     math.max(parsed, 1)
   }
 }
