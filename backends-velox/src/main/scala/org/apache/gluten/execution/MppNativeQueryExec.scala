@@ -31,6 +31,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
 import org.apache.spark.sql.execution.{ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, InputIteratorTransformer, SparkPlan, SQLExecution, UnaryExecNode}
+import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
@@ -565,6 +566,17 @@ case class MppNativeQueryExec(
       case ex: ShuffleExchangeLike => Some(ex.asInstanceOf[Exchange])
       case ex: BroadcastExchangeLike => Some(ex.asInstanceOf[Exchange])
       case reused: ReusedExchangeExec => unwrapToExchange(reused.child)
+      // AQE wraps each finalized exchange in a query-stage node. By the time
+      // applyCrossCutRules runs at exec time, every still-AQE-wrapped exchange
+      // (e.g. the partial-agg -> final-agg HASH shuffle that the cross-cut
+      // rules don't rewrite) is reachable only through ShuffleQueryStageExec /
+      // BroadcastQueryStageExec. Without these two cases, unwrapToExchange
+      // returns None and the surrounding ExchangeSpec is silently dropped --
+      // which strips the HASH redistribution between Partial and Final
+      // aggregates on TPC-H Q1 and turns Final into a per-driver pass-through
+      // (4 producer drivers x 4 groups = 16 rows instead of 4).
+      case stage: ShuffleQueryStageExec => unwrapToExchange(stage.plan)
+      case stage: BroadcastQueryStageExec => unwrapToExchange(stage.plan)
       case cia: ColumnarInputAdapter => unwrapToExchange(cia.child)
       case c2c: ColumnarToColumnarExec => unwrapToExchange(c2c.child)
       case c2r: ColumnarToRowExecBase => unwrapToExchange(c2r.child)
