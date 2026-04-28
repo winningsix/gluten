@@ -84,6 +84,11 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       // burns ~25s/query. AST/standalone-cudf path handles the same expressions
       // without the JIT compile step. Re-enable per-query if a workload needs it.
       .set("spark.gluten.sql.columnar.backend.velox.cudf.jit_expression_enabled", "false")
+      // Disable cudf AST expression evaluator: hits "AST expression was provided
+      // non-matching operand types" on Q17 and "like expects 2 inputs (3 vs. 2)"
+      // on Q18. Standalone cudf-function path runs the same filters/projects
+      // without going through the AST builder.
+      .set("spark.gluten.sql.columnar.backend.velox.cudf.ast_expression_enabled", "false")
       // Dump every MppNativeQueryExec plan for offline diagnosis if the run fails.
       .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps-tpch-sf1k")
   }

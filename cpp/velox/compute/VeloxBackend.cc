@@ -207,7 +207,12 @@ void VeloxBackend::init(
         // NVRTC AST JIT when it hits compile bugs (e.g. EQUAL operator_functor
         // ambiguity on Q12 SF1K). Default true to preserve current behaviour.
         {velox::cudf_velox::CudfConfig::kCudfJitExpressionEnabled,
-         backendConf_->get(kCudfJitExpressionEnabled, kCudfJitExpressionEnabledDefault)}};
+         backendConf_->get(kCudfJitExpressionEnabled, kCudfJitExpressionEnabledDefault)},
+        // Forward ast_expression_enabled toggle. With AST off, filters/projects
+        // run via standalone cudf::ast / cudf functions, avoiding "non-matching
+        // operand types" / "like expects 2 inputs" errors (Q17/Q18 SF1K).
+        {velox::cudf_velox::CudfConfig::kCudfAstExpressionEnabled,
+         backendConf_->get(kCudfAstExpressionEnabled, kCudfAstExpressionEnabledDefault)}};
     auto& cudfConfig = velox::cudf_velox::CudfConfig::getInstance();
     cudfConfig.initialize(std::move(options));
     velox::cudf_velox::registerCudf();

@@ -209,6 +209,15 @@ const std::string kCudfJitExpressionEnabled =
     "spark.gluten.sql.columnar.backend.velox.cudf.jit_expression_enabled";
 const std::string kCudfJitExpressionEnabledDefault = "true";
 
+// Forward to IBM CudfConfig::kCudfAstExpressionEnabled. When false, the cudf
+// AST expression evaluator is bypassed; filters/projects run via standalone
+// cudf::ast / cudf functions instead. Avoids "AST expression was provided
+// non-matching operand types" (Q17 SF1K) and "like expects 2 inputs (3 vs. 2)"
+// (Q18 SF1K).
+const std::string kCudfAstExpressionEnabled =
+    "spark.gluten.sql.columnar.backend.velox.cudf.ast_expression_enabled";
+const std::string kCudfAstExpressionEnabledDefault = "true";
+
 const std::string kCudfGpuTargetBatchRows = "spark.gluten.sql.columnar.backend.velox.cudf.gpuTargetBatchRows";
 const std::string kCudfGpuTargetBatchRowsDefault = "1000000";
 
