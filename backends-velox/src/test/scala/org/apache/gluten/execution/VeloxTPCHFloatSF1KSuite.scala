@@ -87,11 +87,15 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       // burns ~25s/query. AST/standalone-cudf path handles the same expressions
       // without the JIT compile step. Re-enable per-query if a workload needs it.
       .set("spark.gluten.sql.columnar.backend.velox.cudf.jit_expression_enabled", "false")
-      // Disable cudf AST expression evaluator: hits "AST expression was provided
-      // non-matching operand types" on Q17 and "like expects 2 inputs (3 vs. 2)"
-      // on Q18. Standalone cudf-function path runs the same filters/projects
-      // without going through the AST builder.
-      .set("spark.gluten.sql.columnar.backend.velox.cudf.ast_expression_enabled", "false")
+      // Keep AST expression evaluator ENABLED. Earlier we disabled it to dodge
+      // Q17/Q18 cuDF-AST builder errors ("like expects 2 inputs", "startswith
+      // unsupported"), but disabling it also unregisters the AST evaluator
+      // entirely (registerAstEvaluator is gated on this config in ToCudf.cpp:344),
+      // which means basic arithmetic like multiply(a, subtract(1, b)) -- TPC-H
+      // Q1's classic l_extendedprice * (1 - l_discount) -- has no evaluator at
+      // all and falls back to CPU. The Q17/Q18 issues are separate and need
+      // narrower handling (per-expression check, not whole-AST disable).
+      .set("spark.gluten.sql.columnar.backend.velox.cudf.ast_expression_enabled", "true")
       // Dump every MppNativeQueryExec plan for offline diagnosis if the run fails.
       .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps-tpch-sf1k")
   }
