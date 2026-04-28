@@ -18,7 +18,9 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -134,9 +136,20 @@ class MppQueryCoordinator {
   /// (finished, failed, aborted, or canceled).
   bool isFinished() const;
 
-  /// Abort all running fragments. Non-blocking; use waitForCompletion()
-  /// to block until all tasks have actually stopped.
-  void abort();
+  /// Abort all running fragments and wait (bounded) for each one to reach
+  /// a terminal state. Calls Task::requestAbort() on every tracked Task that
+  /// is not already terminal, then blocks on each Task's
+  /// taskCompletionFuture() up to `perTaskTimeout`. If a task fails to reach
+  /// terminal within the timeout we log loudly and continue — abort() never
+  /// blocks the caller indefinitely. This is the path that releases all
+  /// per-task MemoryPool reservations; without it, JVM shutdown can hit
+  /// MemoryManager::removePool() VELOX_CHECK(reservedBytes==0) and abort.
+  ///
+  /// Idempotent: safe to call multiple times. Safe to call before start()
+  /// (no-op).
+  void abort(
+      std::chrono::milliseconds perTaskTimeout =
+          std::chrono::milliseconds(10000));
 
   /// Block until all fragments have reached a terminal state.
   /// Throws if any fragment ended with an error.
@@ -196,6 +209,14 @@ class MppQueryCoordinator {
 
   bool started_{false};
   bool noMoreData_{false};
+
+  /// Guards the abort path so concurrent abort() callers (e.g. JNI explicit
+  /// close racing with destructor) don't double-issue requestAbort or stomp
+  /// on each other's wait loops. fragmentTasks_ itself is only mutated in
+  /// start() (single-threaded, before any abort path can fire) so it does not
+  /// need the mutex on the read side.
+  mutable std::mutex abortMutex_;
+  bool aborted_{false};
 
   /// Output buffer reading state for the root fragment. When root is
   /// replicated we track per-replica sequence + atEnd. Drain strategy is

@@ -153,12 +153,13 @@ MppQueryCoordinator::~MppQueryCoordinator() {
                << " totalTasks=" << totalTasks
                << " rootFragmentId=" << rootFragmentId_;
   if (started_) {
-    // Abort any still-running tasks and wait for all tasks to reach a
-    // terminal state, then remove their OutputBuffer entries from the
-    // global OutputBufferManager. Failing to call removeTask() leaks the
-    // producer-side buffer (and its pages) into the process-wide manager,
-    // which causes subsequent MPP queries in the same JVM to hang because
-    // ExchangeClient state there is not cleanly reset.
+    // Abort any still-running tasks (with bounded wait) and then remove
+    // their OutputBuffer entries from the global OutputBufferManager.
+    // Failing to call removeTask() leaks the producer-side buffer (and its
+    // pages) into the process-wide manager, which causes subsequent MPP
+    // queries in the same JVM to hang because ExchangeClient state there
+    // is not cleanly reset. abort() is idempotent: if the JVM-side close
+    // already drove abort, the inner aborted_ guard short-circuits.
     try {
       abort();
     } catch (...) {
@@ -167,15 +168,6 @@ MppQueryCoordinator::~MppQueryCoordinator() {
       for (auto& task : replicas) {
         if (task == nullptr) {
           continue;
-        }
-        // Best-effort wait for terminal state. Cap to avoid blocking shutdown
-        // indefinitely on a stuck task — if we time out, we still proceed
-        // with removeTask, accepting that the task may log warnings.
-        if (!isTerminalState(task->state())) {
-          try {
-            task->taskCompletionFuture().wait(std::chrono::seconds(5));
-          } catch (...) {
-          }
         }
         const auto& tid = task->taskId();
         LOG(WARNING) << "MppQueryCoordinator[" << queryId_
@@ -804,32 +796,116 @@ bool MppQueryCoordinator::isFinished() const {
 // abort()
 // ---------------------------------------------------------------------------
 
-void MppQueryCoordinator::abort() {
+void MppQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
+  // Serialize abort callers. The same coordinator can be aborted by two
+  // paths (an explicit JNI nativeAbortMppQuery from the JVM-side close, and
+  // the destructor when ~MppQueryHandle drops the shared_ptr); without this
+  // gate they would race on requestAbort() + parallel taskCompletionFuture()
+  // waits.
+  std::lock_guard<std::mutex> lk(abortMutex_);
   if (!started_) {
     LOG(WARNING) << "MppQueryCoordinator[" << queryId_
                  << "]: abort() called before start(), skipping";
     return;
   }
-  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: abort() begin";
+  if (aborted_) {
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                 << "]: abort() already completed, skipping";
+    return;
+  }
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+               << "]: abort() begin perTaskTimeoutMs="
+               << perTaskTimeout.count();
+
+  // Phase 1: fire requestAbort() on every non-terminal task. This is
+  // non-blocking; each call returns a future. We don't need those futures
+  // because we'll wait on taskCompletionFuture() in Phase 2 — that's
+  // realized whenever the task is no longer running, regardless of which
+  // call drove it to terminal.
+  size_t firedCount = 0;
+  size_t alreadyTerminalCount = 0;
   for (auto& replicas : fragmentTasks_) {
     for (auto& task : replicas) {
       if (task == nullptr) {
         continue;
       }
-      auto state = task->state();
+      const auto state = task->state();
       if (!isTerminalState(state)) {
         LOG(WARNING) << "MppQueryCoordinator[" << queryId_
                      << "]: requestAbort(" << task->taskId()
                      << ") state=" << static_cast<int>(state);
-        task->requestAbort();
+        try {
+          task->requestAbort();
+        } catch (const std::exception& e) {
+          LOG(ERROR) << "MppQueryCoordinator[" << queryId_
+                     << "]: requestAbort threw for " << task->taskId()
+                     << ": " << e.what();
+        } catch (...) {
+          LOG(ERROR) << "MppQueryCoordinator[" << queryId_
+                     << "]: requestAbort threw unknown exception for "
+                     << task->taskId();
+        }
+        ++firedCount;
       } else {
-        LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                     << "]: already-terminal " << task->taskId()
-                     << " state=" << static_cast<int>(state);
+        ++alreadyTerminalCount;
       }
     }
   }
-  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: abort() end";
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+               << "]: abort() requested " << firedCount
+               << " task(s), " << alreadyTerminalCount << " already terminal";
+
+  // Phase 2: bounded wait for each task to reach a terminal state. We use
+  // taskCompletionFuture() which is realized when the task is no longer
+  // running. Cap each wait so a stuck task can't hold up shutdown forever —
+  // a leak warning at process exit is strictly better than an infinite hang
+  // or a removePool() VELOX_CHECK abort.
+  size_t terminalAfterWait = 0;
+  size_t timedOut = 0;
+  for (auto& replicas : fragmentTasks_) {
+    for (auto& task : replicas) {
+      if (task == nullptr) {
+        continue;
+      }
+      if (isTerminalState(task->state())) {
+        ++terminalAfterWait;
+        continue;
+      }
+      try {
+        // folly SemiFuture::wait(timeout) blocks up to the timeout and
+        // returns the (rvalue-reference) future itself; check .isReady()
+        // afterwards to see whether the timeout fired or the task became
+        // terminal.
+        auto waited = task->taskCompletionFuture().wait(perTaskTimeout);
+        if (waited.isReady() || isTerminalState(task->state())) {
+          ++terminalAfterWait;
+        } else {
+          ++timedOut;
+          LOG(ERROR) << "MppQueryCoordinator[" << queryId_
+                     << "]: abort() TIMEOUT waiting for taskId="
+                     << task->taskId()
+                     << " state=" << static_cast<int>(task->state())
+                     << " numDrivers=" << task->numTotalDrivers()
+                     << " numFinishedDrivers="
+                     << task->numFinishedDrivers()
+                     << " — task may still hold MemoryPool reservations";
+        }
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "MppQueryCoordinator[" << queryId_
+                   << "]: taskCompletionFuture wait threw for "
+                   << task->taskId() << ": " << e.what();
+      } catch (...) {
+        LOG(ERROR) << "MppQueryCoordinator[" << queryId_
+                   << "]: taskCompletionFuture wait threw unknown for "
+                   << task->taskId();
+      }
+    }
+  }
+
+  aborted_ = true;
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: abort() end"
+               << " terminal=" << terminalAfterWait
+               << " timedOut=" << timedOut;
 }
 
 // ---------------------------------------------------------------------------
