@@ -127,28 +127,35 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
   /**
    * Decide whether a [[BroadcastExchangeLike]] is small enough to fuse into the consumer fragment.
-   * We use the Spark-computed Statistics.sizeInBytes when available; if not we conservatively
-   * refuse to fuse (i.e. behave exactly as today).
+   * Only fuse when the Spark-computed Statistics.sizeInBytes is both available AND below threshold.
+   * If stats throw (broadcast not yet materialized) or report 0, refuse to fuse: with stats unknown
+   * we have no way to confirm the build is small, and aggressive fusion in that case has bitten us
+   * on Q16 — the consumer fragment's WST was already frozen with an InputIteratorTransformer that
+   * emits ReadRel(iterator:0) for the build, but with fusion-decided-true no BROADCAST exchange
+   * spec is emitted, so the C++ side has zero placeholder iterators and conversion crashes at
+   * SubstraitToVeloxPlan.cc:1357 (streamIdx 0 < inputIters_.size() 0).
    */
   private def canFuseBroadcast(bc: SparkPlan): Boolean = {
     if (!isBroadcastFuseEnabled) return false
-    // When opt-in is on, default to fusing unless we can prove the build is too big.
-    // runtimeStatistics often throws at MppCollapseRule time (broadcast not yet
-    // materialized); treat that as "small / unknown" rather than refusing to fuse.
     val sizeBytes: Long = bc match {
       case b: BroadcastExchangeLike =>
         try b.runtimeStatistics.sizeInBytes.toLong
-        catch { case _: Throwable => 0L }
+        catch { case _: Throwable => -1L }
       case stage: BroadcastQueryStageExec =>
-        try stage.computeStats().map(_.sizeInBytes.toLong).getOrElse(0L)
-        catch { case _: Throwable => 0L }
-      case _ => 0L
+        try stage.computeStats().map(_.sizeInBytes.toLong).getOrElse(-1L)
+        catch { case _: Throwable => -1L }
+      case _ => -1L
     }
-    val ok = sizeBytes <= broadcastFuseThresholdBytes
+    // sizeBytes <= 0 means "unknown" or "stats-not-yet-populated". Don't fuse in that case.
+    val ok = sizeBytes > 0 && sizeBytes <= broadcastFuseThresholdBytes
     if (ok) {
       logWarning(
         s"MppCollapseRule.canFuseBroadcast: fusing (sizeBytes=$sizeBytes " +
           s"<= $broadcastFuseThresholdBytes)")
+    } else {
+      logWarning(
+        s"MppCollapseRule.canFuseBroadcast: NOT fusing (sizeBytes=$sizeBytes " +
+          s"unknown or above threshold $broadcastFuseThresholdBytes)")
     }
     ok
   }
