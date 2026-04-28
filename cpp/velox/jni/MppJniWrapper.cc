@@ -157,26 +157,68 @@ void collectValueStreamNodes(
 velox::core::PlanNodePtr replaceValueStreamWithExchange(
     const velox::core::PlanNodePtr& node,
     const std::string& targetNodeId,
-    const std::string& exchangeNodeId) {
-  // Base case: this IS the target ValueStream leaf — replace it.
+    const std::string& exchangeNodeId,
+    const velox::RowTypePtr& producerOutputType) {
+  // Base case: this IS the target ValueStream leaf - replace it.
   if (isValueStreamNode(node) && node->id() == targetNodeId) {
-    LOG(INFO) << "MppJniWrapper: replacing ValueStream node '"
-              << node->id() << "' with ExchangeNode '"
-              << exchangeNodeId << "' outputType="
-              << node->outputType()->toString();
-    // Emit a plain velox ExchangeNode tagged with TransportType::kUcx.
-    // IBM cudf's ExchangeAdapter swaps this to UcxExchange at runtime,
-    // and UcxExchangeServer/Source detect the same-Communicator-instance
-    // case and pass cudf::packed_columns through IntraNodeTransferRegistry
-    // without any UCX wire transfer — so the same code path covers both
-    // CPU and GPU execution.
-    return velox::core::ExchangeNode::Builder()
-        .id(exchangeNodeId)
-        .outputType(node->outputType())
-        .serdeKind("Presto")
-        .transportType(
-            velox::core::ExchangeNode::TransportType::kUcx)
-        .build();
+    const auto& consumerType = node->outputType();
+    const auto& wireType =
+        producerOutputType != nullptr ? producerOutputType : consumerType;
+    LOG(INFO) << "MppJniWrapper: replacing ValueStream node '" << node->id()
+              << "' with ExchangeNode '" << exchangeNodeId
+              << "' wireType=" << wireType->toString()
+              << " consumerType=" << consumerType->toString();
+    // ExchangeNode advertises the WIRE schema (producer's outputType, which
+    // includes any synthetic hash_partition_key prefix the Spark-side
+    // MppNativeQueryExec injects for HASH partitioning). IBM cudf's
+    // ExchangeAdapter swaps this to UcxExchange at runtime; UcxExchange
+    // detects same-Communicator-instance and hands cudf::packed_columns via
+    // IntraNodeTransferRegistry.
+    auto exchange = velox::core::ExchangeNode::Builder()
+                        .id(exchangeNodeId)
+                        .outputType(wireType)
+                        .serdeKind("Presto")
+                        .transportType(
+                            velox::core::ExchangeNode::TransportType::kUcx)
+                        .build();
+
+    // If the producer's wire schema is wider than what the consumer expects
+    // (typical: producer ships hash_partition_key:int as col 0; consumer was
+    // generated to start at col 1), inject a ProjectNode to strip the prefix
+    // columns and rename remaining fields to the consumer's expected names.
+    // Without this projection cudf's CudfToVelox::setType trips its
+    // physical-type kindEquals check at the fragment boundary (manifests as
+    // "Cannot change vector type from ROW<...> to ROW<...>").
+    if (wireType->size() == consumerType->size()) {
+      return exchange;
+    }
+    VELOX_CHECK_GT(
+        wireType->size(),
+        consumerType->size(),
+        "Producer wire type {} narrower than consumer type {}",
+        wireType->toString(),
+        consumerType->toString());
+    const auto skip =
+        wireType->size() - consumerType->size(); // typically 1 (the key)
+    std::vector<velox::core::TypedExprPtr> projections;
+    std::vector<std::string> projectionNames;
+    projections.reserve(consumerType->size());
+    projectionNames.reserve(consumerType->size());
+    for (size_t i = 0; i < consumerType->size(); ++i) {
+      const auto wireIdx = i + skip;
+      projections.push_back(
+          std::make_shared<velox::core::FieldAccessTypedExpr>(
+              wireType->childAt(wireIdx), wireType->nameOf(wireIdx)));
+      projectionNames.push_back(consumerType->nameOf(i));
+    }
+    auto projectId = exchangeNodeId + "_strip_key";
+    LOG(INFO) << "MppJniWrapper: inserting ProjectNode '" << projectId
+              << "' to strip " << skip << " leading column(s) from wire schema";
+    return std::make_shared<velox::core::ProjectNode>(
+        projectId,
+        std::move(projectionNames),
+        std::move(projections),
+        std::move(exchange));
   }
 
   // If this is a leaf node (no children) that is NOT ValueStream, keep it.
@@ -190,8 +232,8 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
   newSources.reserve(sources.size());
   bool anyChanged = false;
   for (const auto& source : sources) {
-    auto newSource =
-        replaceValueStreamWithExchange(source, targetNodeId, exchangeNodeId);
+    auto newSource = replaceValueStreamWithExchange(
+        source, targetNodeId, exchangeNodeId, producerOutputType);
     if (newSource.get() != source.get()) {
       anyChanged = true;
     }
@@ -448,7 +490,13 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   // Note: no ExchangeSource factory registration needed here. The IBM
   // velox baseline's ExchangeAdapter swaps our plain ExchangeNodes
   // (transportType=kUcx) to UcxExchange at runtime, and UcxExchange
-  // creates its own UcxExchangeSource — gluten doesn't register one.
+  // creates its own UcxExchangeSource - gluten doesn't register one.
+  //
+  // We also build up `producerOutputTypes` as we process each fragment
+  // so that consumer fragments can use the producer's actual wire schema
+  // (which may include a synthetic hash_partition_key prefix) when
+  // creating their inbound ExchangeNode + strip-prefix ProjectNode.
+  std::unordered_map<int, velox::RowTypePtr> producerOutputTypes;
 
   auto veloxPool = defaultLeafVeloxMemoryPool();
 
@@ -545,6 +593,12 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     }
 
     auto veloxPlanNode = converter.toVeloxPlan(substraitPlan, localFiles);
+    // Capture this fragment's wire schema BEFORE any plan rewriting (the
+    // ValueStream replacement / PartitionedOutput wrap below). Consumer
+    // fragments processed in later iterations will look this up via
+    // producerOutputTypes[exchange.producerFragmentId] to build their
+    // ExchangeNode + strip-prefix ProjectNode against the correct schema.
+    producerOutputTypes[static_cast<int>(i)] = veloxPlanNode->outputType();
 
     // Extract scan split info from the converter BEFORE tree rewriting.
     // For scan-containing fragments, this captures file scan node IDs and
@@ -608,11 +662,28 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
 
       // Replace each ValueStream node with the corresponding ExchangeNode.
       // Match by position: first ValueStream (stream 0) -> first exchange, etc.
+      // Pass the producer's actual outputType (may include hash_partition_key
+      // prefix) so the new ExchangeNode advertises the wire schema; a
+      // ProjectNode is auto-injected to strip leading prefix columns when
+      // wireType is wider than the consumer's expected outputType.
       for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+        velox::RowTypePtr producerType;
+        auto it = producerOutputTypes.find(
+            inboundExchanges[j]->producerFragmentId);
+        if (it != producerOutputTypes.end()) {
+          producerType = it->second;
+        } else {
+          LOG(WARNING) << "MppJniWrapper: fragment " << i << " inbound exchange "
+                       << inboundExchanges[j]->exchangeNodeId
+                       << " producer fragment "
+                       << inboundExchanges[j]->producerFragmentId
+                       << " not yet seen; using consumer outputType as-is";
+        }
         veloxPlanNode = replaceValueStreamWithExchange(
             veloxPlanNode,
             valueStreamNodes[j]->id(),
-            inboundExchanges[j]->exchangeNodeId);
+            inboundExchanges[j]->exchangeNodeId,
+            producerType);
       }
 
       LOG(INFO) << "MppJniWrapper: fragment " << i
