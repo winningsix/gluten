@@ -18,6 +18,9 @@ package org.apache.gluten.execution
 
 import org.apache.spark.SparkConf
 
+import org.scalatest.concurrent.TimeLimits
+import org.scalatest.time.{Seconds, Span}
+
 import java.io.File
 
 /**
@@ -32,7 +35,11 @@ import java.io.File
  * This suite extends [[VeloxTPCHTableSupport]] directly (NOT [[VeloxTPCHSuite]]) so it does not
  * inherit the 22 TPC-H tests; we only register the five matching queries here.
  */
-class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport {
+class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
+
+  // Per-query hard cap. SF1K Q6 normally finishes < 30s; if any query goes
+  // past this, treat it as a hang (Q18 historically deadlocks under JIT off).
+  private val perQueryTimeout = Span(30, Seconds)
 
   protected val externalDataDir: String =
     sys.props.getOrElse("gluten.tpch.externalDataDir", "/data/tpch/sf1k_v2_float")
@@ -93,32 +100,42 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport {
   }
 
   test("TPC-H q6") {
-    runTPCHQuery(6, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-      df => dumpRows(6, df)
+    failAfter(perQueryTimeout) {
+      runTPCHQuery(6, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
+        df => dumpRows(6, df)
+      }
     }
   }
 
   test("TPC-H q12") {
-    runTPCHQuery(12, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-      df => dumpRows(12, df)
+    failAfter(perQueryTimeout) {
+      runTPCHQuery(12, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
+        df => dumpRows(12, df)
+      }
     }
   }
 
   test("TPC-H q16") {
-    runTPCHQuery(16, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-      df => dumpRows(16, df)
+    failAfter(perQueryTimeout) {
+      runTPCHQuery(16, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
+        df => dumpRows(16, df)
+      }
     }
   }
 
   test("TPC-H q17") {
-    runTPCHQuery(17, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-      df => dumpRows(17, df)
+    failAfter(perQueryTimeout) {
+      runTPCHQuery(17, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
+        df => dumpRows(17, df)
+      }
     }
   }
 
   test("TPC-H q18") {
-    runTPCHQuery(18, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-      df => dumpRows(18, df)
+    failAfter(perQueryTimeout) {
+      runTPCHQuery(18, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
+        df => dumpRows(18, df)
+      }
     }
   }
 }
