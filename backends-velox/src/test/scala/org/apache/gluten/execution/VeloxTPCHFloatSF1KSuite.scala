@@ -37,11 +37,12 @@ import java.io.File
  */
 class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
 
-  // Per-query hard cap. Presto-GPU SF1K runs the full 22 in ~66s -> ~3s/query.
-  // 30s gives 10x headroom for our doubled-collect path (runTPCHQuery + dumpRows
-  // both call df.collect()); anything past 30s is wall-clock pathological and
-  // we'd rather fast-fail to keep the gap analysis tight.
-  private val perQueryTimeout = Span(30, Seconds)
+  // Per-query hard cap. Presto-GPU SF1K runs the full 22 in ~66s = ~3s/query;
+  // 10s gives ~3x headroom for our doubled-collect path. Anything past 10s
+  // is wall-clock pathological -- fast-fail keeps the 22-query sweep under
+  // 3 minutes total (matching Presto's order of magnitude) so iteration is
+  // tight enough for fix-test cycles.
+  private val perQueryTimeout = Span(10, Seconds)
 
   protected val externalDataDir: String =
     sys.props.getOrElse("gluten.tpch.externalDataDir", "/data/tpch/sf1k_v2_float")
