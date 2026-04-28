@@ -192,19 +192,12 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
     if (wireType->size() == consumerType->size()) {
       return exchange;
     }
-    if (wireType->size() < consumerType->size()) {
-      // Producer ships fewer columns than the consumer expects. We can't
-      // synthesize missing columns at the JNI layer; this is an upstream
-      // planner inconsistency between the producer and consumer fragment
-      // substrait. Log loudly and let the failure surface downstream
-      // (typically as CudfToVelox::setType / kindEquals) rather than
-      // fail-fast here.
-      LOG(WARNING) << "MppJniWrapper: producer wire " << wireType->toString()
-                   << " narrower than consumer " << consumerType->toString()
-                   << " for exchange " << exchangeNodeId
-                   << "; emitting bare ExchangeNode (downstream may fail)";
-      return exchange;
-    }
+    VELOX_CHECK_GT(
+        wireType->size(),
+        consumerType->size(),
+        "Producer wire type {} narrower than consumer type {}",
+        wireType->toString(),
+        consumerType->toString());
     const auto skip =
         wireType->size() - consumerType->size(); // typically 1 (the key)
     std::vector<velox::core::TypedExprPtr> projections;
