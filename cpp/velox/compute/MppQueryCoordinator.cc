@@ -49,12 +49,16 @@ namespace gluten {
 
 namespace {
 
-/// Task ID prefix for all fragments. Root-fragment output is consumed by
-/// the coordinator via OutputBufferManager (kHttp PartitionedOutput); other
-/// fragment-to-fragment edges go through IBM's UCX / IntraNodeTransfer path
-/// (wired in MppJniWrapper.cc). The "gpu-local://" prefix is retained for
-/// continuity with existing logging.
-constexpr const char* kTaskIdPrefix = "gpu-local://";
+/// Task ID prefix for all fragments. Must NOT contain "://" or any other
+/// character that breaks URL-path parsing: the producer task's taskId is
+/// embedded as a single path component in the inter-fragment exchange URL
+/// (`/v1/task/<taskId>/results/<dest>`), and UcxExchangeSource extracts the
+/// component via folly::split('/', ...). With "gpu-local://" the slashes
+/// shift the components and the producer's queue-manager key
+/// (UcxPartitionedOutput uses `this->taskId()` directly) no longer matches
+/// what the Acceptor parses out of the URL, so the consumer hangs waiting
+/// for data that's already enqueued under a different key.
+constexpr const char* kTaskIdPrefix = "gpu-local-";
 
 } // namespace
 
@@ -383,25 +387,22 @@ void MppQueryCoordinator::start() {
 
     // Build the IBM ucx-exchange URL format expected by
     // UcxExchangeSource::extractTaskAndDestinationId:
-    //   http://127.0.0.1:<port-3>/v1/task/<bareTaskId>/results/<dest>
+    //   http://127.0.0.1:<port-3>/v1/task/<taskId>/results/<dest>
     // The "+3" port hack is documented in UcxExchangeSource::create
-    // (host port = uri.port() + 3). The producer publishes via the same
-    // single per-process Communicator, so loopback + the bare task id
-    // suffices; UcxExchangeServer/Source detect same-Communicator and
-    // bypass the wire via IntraNodeTransferRegistry.
+    // (host port = uri.port() + 3). The taskId is embedded verbatim as a
+    // single path component, so kTaskIdPrefix MUST NOT contain "://" or
+    // "/" (see kTaskIdPrefix definition). The producer publishes via the
+    // same per-process Communicator, so loopback + the taskId suffices;
+    // UcxExchangeServer/Source detect same-Communicator and bypass the
+    // wire via IntraNodeTransferRegistry.
     auto comm = facebook::velox::ucx_exchange::Communicator::getInstance();
     const int urlPort = static_cast<int>(comm->getListenerPort()) - 3;
-    auto stripScheme = [](const std::string& s) -> std::string {
-      auto pos = s.find("://");
-      return pos == std::string::npos ? s : s.substr(pos + 3);
-    };
     for (size_t i = 0; i < consumerReplicas.size(); ++i) {
       auto& consumerTask = consumerReplicas[i];
       for (const auto& prodId : producerTaskIds) {
-        const auto bare = stripScheme(prodId);
         const auto url = fmt::format(
             "http://127.0.0.1:{}/v1/task/{}/results/{}",
-            urlPort, bare, i);
+            urlPort, prodId, i);
         consumerTask->addSplit(
             exchange.exchangeNodeId,
             Split(std::make_shared<RemoteConnectorSplit>(url)));
