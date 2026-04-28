@@ -68,6 +68,12 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport {
       .set("spark.gluten.sql.columnar.cudf", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enabled", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan", "true")
+      // Disable cudf JIT-fused expressions: NVRTC fails to compile EQUAL on Q12's
+      // filter (`cudf::ast::operator_functor<EQUAL, true>::operator() no instance
+      // matches`), which produces a Spark task retry that masks as success but
+      // burns ~25s/query. AST/standalone-cudf path handles the same expressions
+      // without the JIT compile step. Re-enable per-query if a workload needs it.
+      .set("spark.gluten.sql.columnar.backend.velox.cudf.jit_expression_enabled", "false")
       // Dump every MppNativeQueryExec plan for offline diagnosis if the run fails.
       .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps-tpch-sf1k")
   }
