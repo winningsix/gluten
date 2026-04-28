@@ -61,9 +61,12 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
 
   override protected def sparkConf: SparkConf = {
     super.sparkConf
-      // 1TB-scale resources; parent default is too small.
+      // 1TB-scale resources; parent default is too small. 32g (was 16g) so the
+      // 22-query sweep doesn't OOM on heavy joins like Q1 where 16-replica
+      // PartitionedOutput each holds ~512MB. Long-term fix: switch to
+      // 1-task-per-worker model so memory is shared across drivers.
       .set("spark.sql.shuffle.partitions", "16")
-      .set("spark.memory.offHeap.size", "16g")
+      .set("spark.memory.offHeap.size", "32g")
       .set("spark.sql.adaptive.enabled", "false")
       // Plan-C MppStrategy: intercept queries at planner level and route through MPP.
       .set("spark.gluten.mpp.enabled", "true")
