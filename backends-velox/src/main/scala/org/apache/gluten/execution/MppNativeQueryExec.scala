@@ -668,20 +668,29 @@ case class MppNativeQueryExec(
    */
   private def canFuseBroadcastLive(bc: SparkPlan): Boolean = {
     if (!fuseBroadcastBuildsEnabled) return false
-    // When opt-in is on, default to fuse unless we can prove the build is too big.
-    // runtimeStatistics often throws / is not yet materialized at extract time;
-    // treat that as "small / unknown" rather than refusing to fuse.
+    // Only fuse when sizeBytes is positively known AND below threshold. This
+    // mirrors the conservative path in MppCollapseRule.canFuseBroadcast: with
+    // stats unknown/zero we have no proof the build is small, and aggressive
+    // fusion has bitten Q16 SF1K (broadcast antijoin folded in-fragment but
+    // the consumer's WST still emits ReadRel(iterator:0) -> SubstraitToVeloxPlan
+    // line 1357 streamIdx OOB). Two gates need to be conservative; this is the
+    // execution-time one (the rule-time gate is canFuseBroadcast in
+    // MppCollapseRule).
     val sizeBytes: Long = bc match {
       case b: BroadcastExchangeLike =>
         try b.runtimeStatistics.sizeInBytes.toLong
-        catch { case _: Throwable => 0L }
-      case _ => 0L
+        catch { case _: Throwable => -1L }
+      case _ => -1L
     }
-    val ok = sizeBytes <= broadcastFuseThresholdBytes
+    val ok = sizeBytes > 0 && sizeBytes <= broadcastFuseThresholdBytes
     if (ok) {
       logWarning(
         s"MppNativeQueryExec.canFuseBroadcastLive: fusing (sizeBytes=$sizeBytes " +
           s"<= $broadcastFuseThresholdBytes)")
+    } else {
+      logWarning(
+        s"MppNativeQueryExec.canFuseBroadcastLive: NOT fusing (sizeBytes=$sizeBytes " +
+          s"unknown or above threshold $broadcastFuseThresholdBytes)")
     }
     ok
   }
