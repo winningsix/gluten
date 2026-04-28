@@ -107,43 +107,16 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
     // scalastyle:on println
   }
 
-  test("TPC-H q6") {
-    failAfter(perQueryTimeout) {
-      runTPCHQuery(6, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-        df => dumpRows(6, df)
+  // Run all 22 TPC-H queries. noFallBack=false so non-MPP-eligible queries
+  // surface as their actual failure mode (not as a generic fallback test
+  // failure). The 60s per-query failAfter contains hangs.
+  (1 to 22).foreach {
+    qid =>
+      test(s"TPC-H q$qid") {
+        failAfter(perQueryTimeout) {
+          runTPCHQuery(qid, tpchQueries, queriesResults, compareResult = false, noFallBack = false)(
+            df => dumpRows(qid, df))
+        }
       }
-    }
-  }
-
-  test("TPC-H q12") {
-    failAfter(perQueryTimeout) {
-      runTPCHQuery(12, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-        df => dumpRows(12, df)
-      }
-    }
-  }
-
-  test("TPC-H q16") {
-    failAfter(perQueryTimeout) {
-      runTPCHQuery(16, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-        df => dumpRows(16, df)
-      }
-    }
-  }
-
-  test("TPC-H q17") {
-    failAfter(perQueryTimeout) {
-      runTPCHQuery(17, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-        df => dumpRows(17, df)
-      }
-    }
-  }
-
-  test("TPC-H q18") {
-    failAfter(perQueryTimeout) {
-      runTPCHQuery(18, tpchQueries, queriesResults, compareResult = false, noFallBack = true) {
-        df => dumpRows(18, df)
-      }
-    }
   }
 }
