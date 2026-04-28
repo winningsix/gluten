@@ -201,6 +201,14 @@ const std::string kCudfEnableTableScan = "spark.gluten.sql.columnar.backend.velo
 const bool kCudfEnableTableScanDefault = false;
 const std::string kCudfHiveConnectorId = "cudf-hive";
 
+// Forward to IBM CudfConfig::kCudfJitExpressionEnabled. When false, NVRTC JIT
+// compilation of cudf::ast expressions is skipped and the AST/standalone-cudf
+// path runs filters/projects directly, avoiding NVRTC compile failures (e.g.
+// `operator_functor<EQUAL,true>::operator() no instance` reported on Q12 SF1K).
+const std::string kCudfJitExpressionEnabled =
+    "spark.gluten.sql.columnar.backend.velox.cudf.jit_expression_enabled";
+const std::string kCudfJitExpressionEnabledDefault = "true";
+
 const std::string kCudfGpuTargetBatchRows = "spark.gluten.sql.columnar.backend.velox.cudf.gpuTargetBatchRows";
 const std::string kCudfGpuTargetBatchRowsDefault = "1000000";
 

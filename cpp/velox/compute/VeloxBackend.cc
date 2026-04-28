@@ -202,7 +202,12 @@ void VeloxBackend::init(
         // adapter declines to swap and producer falls back to CPU (Presto serde),
         // which the consumer's GpuExchange rejects at runtime.
         {velox::cudf_velox::CudfConfig::kUcxExchange, "true"},
-        {velox::cudf_velox::CudfConfig::kUcxIntraNodeExchange, "true"}};
+        {velox::cudf_velox::CudfConfig::kUcxIntraNodeExchange, "true"},
+        // Forward gluten-side jit_expression_enabled toggle so user can disable
+        // NVRTC AST JIT when it hits compile bugs (e.g. EQUAL operator_functor
+        // ambiguity on Q12 SF1K). Default true to preserve current behaviour.
+        {velox::cudf_velox::CudfConfig::kCudfJitExpressionEnabled,
+         backendConf_->get(kCudfJitExpressionEnabled, kCudfJitExpressionEnabledDefault)}};
     auto& cudfConfig = velox::cudf_velox::CudfConfig::getInstance();
     cudfConfig.initialize(std::move(options));
     velox::cudf_velox::registerCudf();
