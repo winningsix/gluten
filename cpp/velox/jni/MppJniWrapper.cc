@@ -817,10 +817,21 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
             std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>();
       }
 
-      LOG(INFO) << "MppJniWrapper: fragment " << i
-                << " outbound exchange type=" << partitionType
-                << " keyIndices=" << keyIndices.size()
-                << " func=" << (funcSpec ? funcSpec->toString() : "null");
+      LOG(WARNING) << "MppJniWrapper: fragment " << i
+                   << " outbound exchange type=" << partitionType
+                   << " keyIndices.size=" << keyIndices.size()
+                   << " keyChannels=["
+                   << [&] {
+                        std::string s;
+                        for (size_t k = 0; k < keyIndices.size(); ++k) {
+                          if (k) s += ",";
+                          s += std::to_string(keyIndices[k]);
+                        }
+                        return s;
+                      }()
+                   << "] func=" << (funcSpec ? funcSpec->toString() : "null")
+                   << " usingRoundRobinFallback="
+                   << (partitionType == "HASH" && keyIndices.empty() ? "YES" : "no");
 
       // Emit a plain velox PartitionedOutputNode tagged with
       // TransportType::kUcx. IBM cudf's PartitionedOutputAdapter swaps
