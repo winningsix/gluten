@@ -762,10 +762,68 @@ bool MppQueryCoordinator::fetchNextOutputPage(
   return false;
 }
 
+void MppQueryCoordinator::rethrowFirstTaskError() const {
+  // Scan every tracked Task. If any has FAILED/ABORTED, rethrow the first
+  // captured exception so the JNI translates it to a Java RuntimeException
+  // instead of returning nullptr (= end-of-stream = false PASS in tests).
+  // A clean kFinished task with task->error()==nullptr is left alone, so
+  // legitimate count=0 results (Q11 empty bloom filter, restrictive
+  // predicates) keep flowing through as nullptr.
+  std::exception_ptr firstError;
+  std::string firstFailedTaskId;
+  TaskState firstFailedState = TaskState::kRunning;
+  for (auto& replicas : fragmentTasks_) {
+    for (auto& task : replicas) {
+      if (task == nullptr) {
+        continue;
+      }
+      const auto state = task->state();
+      const bool nonOkTerminal =
+          state == TaskState::kFailed || state == TaskState::kAborted;
+      auto err = task->error();
+      if (nonOkTerminal || err) {
+        if (!firstError) {
+          firstError = err;
+          firstFailedTaskId = task->taskId();
+          firstFailedState = state;
+        }
+      }
+    }
+  }
+  if (firstError) {
+    LOG(ERROR) << "MppQueryCoordinator[" << queryId_
+               << "]: rethrowFirstTaskError taskId=" << firstFailedTaskId
+               << " state=" << static_cast<int>(firstFailedState);
+    std::rethrow_exception(firstError);
+  }
+  // No captured std::exception_ptr but some task is in kFailed/kAborted
+  // (Velox can transition without a stored exception in odd cases, e.g.
+  // requestAbort() from outside). Still surface the failure rather than
+  // pretending the query succeeded.
+  for (auto& replicas : fragmentTasks_) {
+    for (auto& task : replicas) {
+      if (task == nullptr) {
+        continue;
+      }
+      const auto state = task->state();
+      if (state == TaskState::kFailed || state == TaskState::kAborted) {
+        VELOX_FAIL(
+            "MppQueryCoordinator[{}]: task {} ended in non-OK terminal "
+            "state {} with no captured error; failing the query rather "
+            "than returning empty result",
+            queryId_,
+            task->taskId(),
+            static_cast<int>(state));
+      }
+    }
+  }
+}
+
 RowVectorPtr MppQueryCoordinator::next() {
   VELOX_CHECK(started_, "Must call start() before next()");
 
   if (noMoreData_) {
+    rethrowFirstTaskError();
     return nullptr;
   }
 
@@ -775,6 +833,9 @@ RowVectorPtr MppQueryCoordinator::next() {
     bool gotData = fetchNextOutputPage(pages);
 
     if (!gotData) {
+      // EOS: distinguish real "all tasks finished cleanly" from
+      // "some task failed and produced no pages" before returning nullptr.
+      rethrowFirstTaskError();
       return nullptr;
     }
 
@@ -813,6 +874,9 @@ RowVectorPtr MppQueryCoordinator::next() {
     }
   }
 
+  // Loop fell through without producing data: same EOS surface as the
+  // !gotData path above; consult task error state before reporting empty.
+  rethrowFirstTaskError();
   return nullptr;
 }
 

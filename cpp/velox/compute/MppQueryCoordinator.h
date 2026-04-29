@@ -174,6 +174,15 @@ class MppQueryCoordinator {
   /// Check if a task state is terminal.
   static bool isTerminalState(facebook::velox::exec::TaskState state);
 
+  /// Walk every (fragId, replicaIdx) Task; if any has reached
+  /// TaskState::kFailed / kAborted or carries a non-null `task->error()`,
+  /// rethrow the first captured exception. A legitimately-empty result
+  /// (Q11-style empty bloom filter, predicate that filters all rows) has
+  /// every task in kFinished with error()==nullptr and is left alone.
+  /// Called from next() at EOS so the JNI gets a real exception instead
+  /// of nullptr-as-end-of-stream.
+  void rethrowFirstTaskError() const;
+
   /// Fetch the next page of serialized data from the root task's output buffer.
   /// Returns true if data was fetched, false if at end-of-stream.
   /// Populates `pages` with the received SerializedPageBase objects. Wraps
