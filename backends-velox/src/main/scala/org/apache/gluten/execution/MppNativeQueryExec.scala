@@ -607,13 +607,64 @@ case class MppNativeQueryExec(
    * mechanism ensures identical subqueries share a single execution.
    */
   private def materializeScalarSubqueries(plan: SparkPlan): Unit = {
-    // Pass 1: declared subqueries. SparkPlan.subqueries lists the
-    // ExecSubqueryExpression-bearing children of a node; calling prepare()
-    // on them kicks off any underlying broadcast/exchange. This is the
-    // path Spark itself uses in SparkPlan.prepareSubqueries.
+    // Spark's SparkPlan.prepare() recursively drives prepareSubqueries on every
+    // node in the subtree. prepareSubqueries iterates node.subqueries and calls
+    // prepare() on each BaseSubqueryExec, which is exactly what handles
+    // ExecSubqueryExpression *and* the runtime-DPP BloomFilter subqueries
+    // (BloomFilterMightContain wraps a PlanExpression whose plan is a
+    // SubqueryBroadcastExec / SubqueryExec). MppNativeQueryExec normally
+    // bypasses child.executeColumnar() so this never runs; call it explicitly
+    // before driver-side Substrait generation.
+    //
+    // prepare() only kicks off broadcast/scalar futures; it does not block.
+    // Below we additionally walk every expression and drive each subquery to
+    // completion so the result is materialized into a literal before
+    // WholeStageTransformer.doWholeStageTransform serializes it.
+    try {
+      plan.prepare()
+    } catch {
+      case t: Throwable =>
+        logWarning(
+          s"materializeScalarSubqueries: plan.prepare() threw " +
+            s"${t.getClass.getSimpleName}: ${t.getMessage}; falling back to " +
+            s"per-node walk",
+          t)
+    }
+
     plan.foreach {
       node =>
-        node.subqueries.foreach(subPlan => subPlan.prepare())
+        // Drive every declared subquery to completion. SparkPlan.subqueries
+        // returns the Seq[BaseSubqueryExec] reachable from this node, which
+        // covers BOTH classic ExecSubqueryExpression (Q11/Q22 scalar) AND the
+        // SubqueryBroadcastExec wrapper that Spark's InjectRuntimeFilter rule
+        // emits for VeloxBloomFilterAggregate build sides (Q16/Q20).
+        node.subqueries.foreach {
+          subPlan =>
+            try {
+              subPlan.prepare()
+              // Force the underlying future to finish. For ScalarSubqueryExec
+              // this caches the row; for SubqueryBroadcastExec this awaits
+              // the broadcast and caches the relation. Either way, by return
+              // any PlanExpression that references subPlan can resolve to a
+              // concrete value during Substrait conversion.
+              try {
+                val m = subPlan.getClass.getMethod("relationFuture")
+                val fut = m.invoke(subPlan)
+                fut.getClass
+                  .getMethod("get")
+                  .invoke(fut)
+              } catch {
+                case _: NoSuchMethodException => // not a broadcast subquery
+                case _: Throwable => // best-effort
+              }
+            } catch {
+              case t: Throwable =>
+                logWarning(
+                  s"materializeScalarSubqueries: subPlan.prepare() failed for " +
+                    s"${subPlan.getClass.getSimpleName}: ${t.getMessage}",
+                  t)
+            }
+        }
         node.expressions.foreach {
           expr =>
             expr.foreach {
@@ -622,18 +673,29 @@ case class MppNativeQueryExec(
                 // Idempotent: updateResult blocks on the underlying future and
                 // stores the row.
                 sub.updateResult()
-              case other if other.getClass.getSimpleName.contains("BloomFilter") =>
-                // Spark's runtime-DPP BloomFilterMightContain is a PlanExpression
-                // whose embedded plan is materialized via Spark's broadcast/AQE
-                // path, NOT through ExecSubqueryExpression. Without the WARN log
-                // we silently see hasFilter_=false in MightContainFunction and
-                // every row gets filtered out (Q11/Q16/Q20/Q22 -> count=0).
-                logWarning(
-                  s"materializeScalarSubqueries: SAW non-ExecSubquery bloom expr " +
-                    s"${other.getClass.getName} on ${node.getClass.getSimpleName} " +
-                    s"-- not materialized via this path; MightContainFunction " +
-                    s"may see NULL literal and filter all rows.")
-              case _ =>
+              case other =>
+                // Runtime-DPP bloom filters extend PlanExpression but NOT
+                // ExecSubqueryExpression. Spark exposes the embedded plan via
+                // a `plan` field; if the expression has a `updateResult`
+                // method, drive it too (mirrors ExecSubqueryExpression).
+                // Reflection keeps us insulated from the concrete class name
+                // (BloomFilterSubqueryExpression vs DynamicPruningSubquery
+                // shifted between Spark releases).
+                val cls = other.getClass
+                if (
+                  cls.getName.contains("BloomFilter") ||
+                  cls.getName.contains("DynamicPruning") ||
+                  cls.getName.contains("PlanExpression")
+                ) {
+                  try {
+                    val planField = cls.getMethod("plan")
+                    val embedded = planField.invoke(other).asInstanceOf[SparkPlan]
+                    if (embedded != null) embedded.prepare()
+                  } catch { case _: Throwable => () }
+                  try {
+                    cls.getMethod("updateResult").invoke(other)
+                  } catch { case _: Throwable => () }
+                }
             }
         }
     }
