@@ -69,16 +69,6 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       .set("spark.sql.shuffle.partitions", "16")
       .set("spark.memory.offHeap.size", "32g")
       .set("spark.sql.adaptive.enabled", "false")
-      // Bump broadcast threshold so Spark picks BroadcastHashJoin for the
-      // small-side (filtered lineitem ~880MB, customer ~30M, etc.) joins that
-      // Presto-GPU SF1K runs as REPLICATED. MppCollapseRule absorbs the
-      // resulting BroadcastExchange (treats BROADCAST as a distinct exchange
-      // type, see MppCollapseRule.scala:295). Eliminates the isomorphic-HASH
-      // shape collision that drives Q12's column-binding swap (INV-19) and
-      // the 1.6GB CudfHashJoinBuild OOM on Q3 (16 replicas each holding the
-      // shuffled build side instead of one broadcast copy). Default 10MB
-      // forced ShuffledHashJoin everywhere, ~10-14× slower than Presto.
-      .set("spark.sql.autoBroadcastJoinThreshold", "2147483648")
       // Plan-C MppStrategy: intercept queries at planner level and route through MPP.
       .set("spark.gluten.mpp.enabled", "true")
       .set("spark.gluten.mpp.strategy.enabled", "true")
