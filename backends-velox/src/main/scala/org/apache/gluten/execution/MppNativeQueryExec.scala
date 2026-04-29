@@ -394,9 +394,17 @@ case class MppNativeQueryExec(
           } else {
             // Exchange boundary: walk the producer side (exchange.child). Memoize so a
             // subsequent ReusedExchangeExec pointing at the same Exchange reuses it.
+            // Strip the synthetic hash_partition_key prefix project before descending
+            // (mirrors MppCollapseRule.stripSyntheticHashProject) so the producer
+            // fragment's WST output excludes the prefix column. Without this, the
+            // partition-key indices computed by serializeExchangeSpecs land at [1,2]
+            // of an N+1-wide schema while the C++ side strips the prefix on receive
+            // (MppJniWrapper.cc), and Velox's PartitionedOutputNode partitions BEFORE
+            // the strip -- misrouting Q1's partial-agg states to all 4 F1 drivers and
+            // producing 4 keys * 4 drivers = 16 rows instead of 4.
             exchangeToProducerFragId.getOrElseUpdate(
               exchange.asInstanceOf[Exchange],
-              walk(unwrapTransparent(exchange.child)))
+              walk(stripSyntheticHashProject(unwrapTransparent(exchange.child))))
           }
 
         case bex: BroadcastExchangeLike =>
@@ -612,6 +620,25 @@ case class MppNativeQueryExec(
             }
         }
     }
+  }
+
+  /**
+   * Peel off the synthetic hash-prefix ProjectExecTransformer that
+   * VeloxSparkPlanExecApi.genColumnarShuffleExchange may inject above the shuffle child for HASH
+   * partitioning. The injected project's first column is always aliased "hash_partition_key" and
+   * computes Murmur3Hash. In MPP we recompute the hash inside Velox's HashPartitionFunctionSpec, so
+   * the prefix column is dead weight and -- worse -- shifts every real partition-key column right
+   * by one. The C++ side strips the prefix on receive (MppJniWrapper.cc) but the producer's
+   * PartitionedOutputNode partitions BEFORE the strip, so partition-key indices computed against
+   * the prefix-shifted schema misroute every record. On TPC-H Q1 SF1K this surfaces as 4 keys * 4
+   * active F1 drivers = 16 rows instead of 4. Mirrors MppCollapseRule.stripSyntheticHashProject
+   * (Plan D).
+   */
+  private def stripSyntheticHashProject(plan: SparkPlan): SparkPlan = plan match {
+    case p: ProjectExecTransformer
+        if p.projectList.nonEmpty && p.projectList.head.name == "hash_partition_key" =>
+      p.child
+    case other => other
   }
 
   /** Unwrap transparent wrapper nodes (ColumnarToColumnar, resize batches, etc.). */
