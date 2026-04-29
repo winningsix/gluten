@@ -203,6 +203,13 @@ void VeloxBackend::init(
         // which the consumer's GpuExchange rejects at runtime.
         {velox::cudf_velox::CudfConfig::kUcxExchange, "true"},
         {velox::cudf_velox::CudfConfig::kUcxIntraNodeExchange, "true"},
+        // Tell cuDF expression evaluator to register the Spark function set
+        // (might_contain, hash_with_seed, xxhash64_with_seed, ...) instead of
+        // the Presto default. Without this, registerSparkFunctions() never
+        // runs and any nested might_contain / xxhash64_with_seed fails with
+        // "createCudfFunction returned null" at recursive eval. Spark-Gluten
+        // never wants the Presto function set for cuDF.
+        {velox::cudf_velox::CudfConfig::kCudfFunctionEngine, "spark"},
         // Forward gluten-side jit_expression_enabled toggle so user can disable
         // NVRTC AST JIT when it hits compile bugs (e.g. EQUAL operator_functor
         // ambiguity on Q12 SF1K). Default true to preserve current behaviour.
