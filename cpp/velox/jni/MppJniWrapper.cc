@@ -16,6 +16,7 @@
  */
 
 #include <jni.h>
+#include <limits>
 
 #include <fmt/format.h>
 #include <glog/logging.h>
@@ -698,24 +699,101 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
           valueStreamNodes.size(),
           inboundExchanges.size());
 
-      // Replace each ValueStream node with the corresponding ExchangeNode.
-      // Match by position: first ValueStream (stream 0) -> first exchange, etc.
-      // Pass the producer's wire outputType so the helper can build the
-      // ExchangeNode against the actual wire format and synthesize a
-      // ProjectNode to strip any synthetic prefix columns / rename to
-      // consumer-expected names. Without this Q17 silently returns null
-      // and Q18 hangs on cuDF kindEquals at the fragment boundary.
+      // Match each ValueStream to its inbound exchange by structural
+      // schema equivalence, NOT by DFS position. Spark enumerates
+      // ExchangeSpecs in BSP plan walk order (left child first); the
+      // Velox plan's ValueStream order depends on how Gluten emitted
+      // the substrait join -- Gluten's HashJoin transformer can put the
+      // build side on Velox's left, opposite Spark's streamed-first BSP
+      // layout. On Q2 SF1K this surfaces as fragment 2 (part join partsupp):
+      // inboundExchanges[0] is F0->F2 (part, 2 cols) but the leftmost
+      // Velox ValueStream expects partsupp's 3 cols, so HashJoinNode::
+      // validate fails with "left side join key not found: n0_0".
+      auto schemaMatches = [](const velox::RowTypePtr& a,
+                              const velox::RowTypePtr& b) {
+        if (a == nullptr || b == nullptr || a->size() != b->size()) {
+          return false;
+        }
+        for (size_t k = 0; k < a->size(); ++k) {
+          if (!a->childAt(k)->equivalent(*b->childAt(k))) {
+            return false;
+          }
+        }
+        return true;
+      };
+      std::vector<size_t> exchangeForStream(
+          valueStreamNodes.size(), std::numeric_limits<size_t>::max());
+      std::vector<bool> exchangeUsed(inboundExchanges.size(), false);
+      // Pass 1: greedy structural schema match. The producer wire may
+      // carry a leading synthetic hash_partition_key column the consumer
+      // doesn't see, so also try the prefix-stripped form.
       for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+        auto streamType = std::dynamic_pointer_cast<const velox::RowType>(
+            valueStreamNodes[j]->outputType());
+        for (size_t k = 0; k < inboundExchanges.size(); ++k) {
+          if (exchangeUsed[k]) continue;
+          velox::RowTypePtr producerWire;
+          auto it = producerWireTypes.find(
+              inboundExchanges[k]->producerFragmentId);
+          if (it != producerWireTypes.end()) {
+            producerWire = it->second;
+          }
+          bool matched = schemaMatches(streamType, producerWire);
+          if (!matched && producerWire != nullptr && streamType != nullptr &&
+              producerWire->size() == streamType->size() + 1) {
+            std::vector<std::string> n;
+            std::vector<velox::TypePtr> t;
+            for (size_t kk = 1; kk < producerWire->size(); ++kk) {
+              n.push_back(producerWire->nameOf(kk));
+              t.push_back(producerWire->childAt(kk));
+            }
+            auto stripped = std::make_shared<const velox::RowType>(
+                std::move(n), std::move(t));
+            matched = schemaMatches(streamType, stripped);
+          }
+          if (matched) {
+            exchangeForStream[j] = k;
+            exchangeUsed[k] = true;
+            break;
+          }
+        }
+      }
+      // Pass 2: positional fallback for any leftover (e.g. self-join
+      // where two producers share an identical schema).
+      for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+        if (exchangeForStream[j] != std::numeric_limits<size_t>::max()) {
+          continue;
+        }
+        for (size_t k = 0; k < inboundExchanges.size(); ++k) {
+          if (!exchangeUsed[k]) {
+            exchangeForStream[j] = k;
+            exchangeUsed[k] = true;
+            break;
+          }
+        }
+      }
+      for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+        const auto k = exchangeForStream[j];
+        LOG(WARNING) << "MppJniWrapper: fragment " << i << " stream[" << j
+                     << "] id=" << valueStreamNodes[j]->id()
+                     << " type=" << valueStreamNodes[j]->outputType()->toString()
+                     << " -> exchange[" << k << "] producerF="
+                     << inboundExchanges[k]->producerFragmentId
+                     << " nodeId=" << inboundExchanges[k]->exchangeNodeId;
+      }
+      // Replace each ValueStream node with the matched ExchangeNode.
+      for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+        const auto k = exchangeForStream[j];
         velox::RowTypePtr producerWire;
         auto it = producerWireTypes.find(
-            inboundExchanges[j]->producerFragmentId);
+            inboundExchanges[k]->producerFragmentId);
         if (it != producerWireTypes.end()) {
           producerWire = it->second;
         }
         veloxPlanNode = replaceValueStreamWithExchange(
             veloxPlanNode,
             valueStreamNodes[j]->id(),
-            inboundExchanges[j]->exchangeNodeId,
+            inboundExchanges[k]->exchangeNodeId,
             producerWire);
       }
 
