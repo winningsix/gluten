@@ -872,12 +872,11 @@ void MppQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
         continue;
       }
       try {
-        // folly SemiFuture::wait(timeout) blocks up to the timeout and
-        // returns the (rvalue-reference) future itself; check .isReady()
-        // afterwards to see whether the timeout fired or the task became
-        // terminal.
-        auto waited = task->taskCompletionFuture().wait(perTaskTimeout);
-        if (waited.isReady() || isTerminalState(task->state())) {
+        // Wait blocks up to perTaskTimeout. After the wait, just check the
+        // Task's own state; we don't depend on wait()'s return value to
+        // sidestep folly Future API drift between Velox versions.
+        task->taskCompletionFuture().wait(perTaskTimeout);
+        if (isTerminalState(task->state())) {
           ++terminalAfterWait;
         } else {
           ++timedOut;
