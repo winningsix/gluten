@@ -241,6 +241,13 @@ void MppQueryCoordinator::start() {
   // to all consumers) and don't drive driver count.
   fragmentReplicaCount_.assign(fragmentSpecs_.size(), 1);
   std::vector<int32_t> consumerInboundPartitions(fragmentSpecs_.size(), 0);
+  // Per-fragment flag: is this fragment the consumer side of a HASH or RANGE
+  // inbound exchange? If so, partition routing requires destination pinning
+  // (each consumer task pulls only its own bucket from the producer's
+  // PartitionedOutputBuffer); we'll spawn N tasks each with destination=i,
+  // not 1 task with N drivers. ROUND_ROBIN/SINGLE consumers don't need this
+  // since any consumer can process any chunk -- they keep the 1-task model.
+  std::vector<bool> isHashConsumer(fragmentSpecs_.size(), false);
   for (auto& exchange : exchangeSpecs_) {
     if (exchange.partitionType == "BROADCAST") {
       continue;
@@ -260,6 +267,21 @@ void MppQueryCoordinator::start() {
           consumer,
           slot,
           n);
+    }
+    if (exchange.partitionType == "HASH" || exchange.partitionType == "RANGE") {
+      isHashConsumer[consumer] = true;
+    }
+  }
+  // Apply HASH/RANGE consumer fan-out: N tasks per such fragment, one per
+  // partition bucket. Mirrors Presto-on-GPU: stage with FIXED HASH input
+  // partitioning has numTasks == numConsumerTasks, each task at its own
+  // destination index. With 1 task and N drivers (the previous model)
+  // drivers contended for splits in a shared queue, breaking partition
+  // routing -- TPC-H Q1 SF1K observed 16 rows (4 keys * 4 active drivers)
+  // instead of 4 because 4 random drivers each merged all 4 keys' partials.
+  for (size_t i = 0; i < fragmentSpecs_.size(); ++i) {
+    if (isHashConsumer[i]) {
+      fragmentReplicaCount_[i] = std::max(1, consumerInboundPartitions[i]);
     }
   }
 
@@ -320,14 +342,23 @@ void MppQueryCoordinator::start() {
     // noMoreData() call.
     const auto bcastN = broadcastFanout[spec.id];
     const auto inboundN = consumerInboundPartitions[spec.id];
+    // HASH consumer: each replica is one bucket, so 1 driver per task
+    // suffices (drivers within a task can't be partition-routed, and the
+    // task already has only its own partition's data). For non-HASH (incl.
+    // ROUND_ROBIN), drivers split the work locally so we keep N drivers.
     const auto perReplicaDrivers = (bcastN > 0) ? 1
+        : isHashConsumer[spec.id] ? 1
         : std::max({1, spec.numDrivers, inboundN});
     for (int32_t i = 0; i < replicas; ++i) {
       auto taskId = makeTaskId(spec.id, i);
       auto task = Task::create(
           taskId,
           spec.planFragment,
-          /*destination=*/0,
+          // For HASH consumer fragments we pin each task to its bucket so
+          // the producer's PartitionedOutputBuffer routes the correct
+          // partition's data here. For non-HASH single-task fragments
+          // destination is moot; 0 is fine.
+          /*destination=*/i,
           queryCtx_,
           Task::ExecutionMode::kParallel);
       LOG(WARNING) << "MppQueryCoordinator[" << queryId_
@@ -394,36 +425,47 @@ void MppQueryCoordinator::start() {
     // same per-process Communicator, so loopback + the taskId suffices;
     // UcxExchangeServer/Source detect same-Communicator and bypass the
     // wire via IntraNodeTransferRegistry.
-    // Presto-style: 1 consumer task, add ALL N producer-destination splits to
-    // it. Drivers within the consumer task pick up splits dynamically (one
-    // driver per producer destination is the typical pattern with
-    // perReplicaDrivers = numPartitions).
+    // Split wiring rules:
+    //   * SINGLE/ROUND_ROBIN/BROADCAST consumer (1 replica): the single
+    //     consumer task receives ALL producer destinations; its drivers
+    //     fan out work locally.
+    //   * HASH/RANGE consumer (N replicas, one per bucket): consumer task i
+    //     receives ONLY destination=i from each producer. Each task is
+    //     pinned to that bucket via Task::create(destination=i), and its
+    //     1 driver runs the final-step aggregate over its bucket's data.
     auto comm = facebook::velox::ucx_exchange::Communicator::getInstance();
     const int urlPort = static_cast<int>(comm->getListenerPort()) - 3;
-    VELOX_CHECK_EQ(
-        consumerReplicas.size(),
-        1u,
-        "Presto-style task model: consumer fragment must have exactly 1 task; "
-        "got {}",
-        consumerReplicas.size());
-    auto& consumerTask = consumerReplicas[0];
-    const auto numDestinations =
+    const bool isHashFanout = consumerReplicas.size() > 1;
+    const auto totalDestinations =
         exchange.partitionType == "BROADCAST" ? 1 : std::max(1, exchange.numPartitions);
     int32_t splitCount = 0;
-    for (int dest = 0; dest < numDestinations; ++dest) {
-      for (const auto& prodId : producerTaskIds) {
-        const auto url = fmt::format(
-            "http://127.0.0.1:{}/v1/task/{}/results/{}", urlPort, prodId, dest);
-        consumerTask->addSplit(
-            exchange.exchangeNodeId,
-            Split(std::make_shared<RemoteConnectorSplit>(url)));
-        ++splitCount;
+    for (size_t cIdx = 0; cIdx < consumerReplicas.size(); ++cIdx) {
+      auto& consumerTask = consumerReplicas[cIdx];
+      // Range of destinations this consumer task pulls. HASH fan-out: only
+      // its own bucket. Otherwise: all destinations.
+      const int destBegin = isHashFanout ? static_cast<int>(cIdx) : 0;
+      const int destEnd =
+          isHashFanout ? static_cast<int>(cIdx) + 1 : totalDestinations;
+      for (int dest = destBegin; dest < destEnd; ++dest) {
+        for (const auto& prodId : producerTaskIds) {
+          const auto url = fmt::format(
+              "http://127.0.0.1:{}/v1/task/{}/results/{}",
+              urlPort,
+              prodId,
+              dest);
+          consumerTask->addSplit(
+              exchange.exchangeNodeId,
+              Split(std::make_shared<RemoteConnectorSplit>(url)));
+          ++splitCount;
+        }
       }
+      consumerTask->noMoreSplits(exchange.exchangeNodeId);
     }
-    consumerTask->noMoreSplits(exchange.exchangeNodeId);
     LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: exchange "
-                 << exchange.id << " wired (" << splitCount
-                 << " splits total, " << numDestinations << " destinations)";
+                 << exchange.id << " wired (" << splitCount << " splits across "
+                 << consumerReplicas.size() << " consumer task(s), "
+                 << totalDestinations << " producer destinations, "
+                 << (isHashFanout ? "HASH-fanout" : "single-consumer") << ")";
   }
 
   // Phase 2.5: broadcast producer output buffer fan-out already set in
