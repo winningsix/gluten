@@ -344,27 +344,12 @@ case class MppNativeQueryExec(
           // we want: each fragment's Substrait covers operators between exchanges.
           val childExchangeFragIds = findExchangeChildren(wst).map(walk)
 
-          // Plan-D parity: peel the synthetic "hash_partition_key" prefix project
-          // that VeloxSparkPlanExecApi.genColumnarShuffleExchange injects on top of
-          // a HASH-shuffle producer. In MPP we recompute the partition hash inside
-          // Velox's HashPartitionFunctionSpec from the named partition keys, so the
-          // Murmur3Hash prefix column is dead weight on the wire. Worse, leaving it
-          // in the producer's WST shifts every column right by one: when
-          // serializeExchangeSpecs resolves partition-key indices against the WST
-          // outputAttributes, l_returnflag/l_linestatus map to indices [1, 2]
-          // instead of [0, 1], and the C++-side PartitionedOutput reads the wrong
-          // columns. On TPC-H Q1 SF1K this manifested as 16 rows: hash routing
-          // effectively random, each F1 driver received its own slice of all 4
-          // groups, and merge_extract emitted 4 rows per active driver. Plan D
-          // strips this in MppCollapseRule.stripSyntheticHashProject; do the same
-          // here so Plan C / Plan D produce identical fragment graphs.
-          val frag = stripHashPrefixWst(wst)
           val fragId = fragmentCounter.getAndIncrement()
-          val parallelism = inferParallelism(frag)
+          val parallelism = inferParallelism(wst)
           extractedFragments += NativeFragment(
             id = fragId,
-            rootOperator = frag,
-            outputAttributes = frag.output,
+            rootOperator = wst,
+            outputAttributes = wst.output,
             parallelism = parallelism
           )
 
@@ -540,36 +525,6 @@ case class MppNativeQueryExec(
     // RangePartitioning -> SinglePartition rewrite has already happened.
     val afterParallelSortSplit = parallelSortSplitRule(afterSkipShuffle)
     afterParallelSortSplit
-  }
-
-  /**
-   * If the WST's outermost operator is the synthetic "hash_partition_key" prefix project that
-   * VeloxSparkPlanExecApi.genColumnarShuffleExchange inserts above HASH-shuffle producers, return a
-   * new WST whose top operator is the project's child (i.e. with the prefix column peeled off).
-   * Otherwise return the original WST unchanged. This mirrors the strip in
-   * MppCollapseRule.stripSyntheticHashProject so Plan C produces the same fragment shape as Plan D.
-   *
-   * Why this matters at fragment-extraction time: the synthetic Project is normally absorbed by
-   * ColumnarCollapseTransformStages into the producer WST before MppCollapseRule runs. Plan D
-   * strips it during its own walk (the Project node is still visible at that point). Plan C goes
-   * through MppStrategy + planLater + ColumnarCollapseTransformStages, so by the time
-   * extractFragmentsFromChildPlan walks the tree, the Project is already buried inside the WST. We
-   * rebuild the WST to peel that one layer.
-   */
-  private def stripHashPrefixWst(wst: WholeStageTransformer): WholeStageTransformer = {
-    wst.child match {
-      case p: ProjectExecTransformer
-          if p.projectList.nonEmpty && p.projectList.head.name == "hash_partition_key" =>
-        // Reuse the same stage-id and materializeInput flag so dump/log lines stay
-        // aligned with the original WST and downstream metrics still attribute correctly.
-        val rebuilt = WholeStageTransformer(p.child, wst.materializeInput)(wst.transformStageId)
-        logWarning(
-          s"MppNativeQueryExec.stripHashPrefixWst: peeled synthetic hash_partition_key " +
-            s"project from producer WST (stage=${wst.transformStageId}); " +
-            s"output went from ${wst.output.size} to ${rebuilt.output.size} columns")
-        rebuilt
-      case _ => wst
-    }
   }
 
   /**
