@@ -64,6 +64,16 @@ public class MppQueryJniWrapper implements RuntimeAware {
    *     {@code substraitPlans.length}.
    * @param exchangeSpecsJson UTF-8 JSON array describing exchanges, e.g.: {@code
    *     [{"producerFragmentId":1,"consumerFragmentId":0,"exchangeNodeId":"n3"}]}
+   * @param splitInfosPerFragment serialized scan split info per fragment.
+   * @param broadcastSlotIndicesPerFragment for each consumer fragment, the iterator slot indices
+   *     occupied by fused broadcasts (sorted ascending). {@code null} or empty when no broadcasts
+   *     are fused into that fragment. Outer length equals {@code substraitPlans.length}.
+   * @param broadcastIteratorsPerFragment parallel to {@code broadcastSlotIndicesPerFragment};
+   *     each entry is a {@code java.util.Iterator} of {@code ColumnarBatch} over the broadcasted
+   *     batches that the C++ side wraps via {@code makeJniColumnarBatchIterator} and pushes into
+   *     {@code placeholderIters[slotIdx]}. Without this the substrait plan's
+   *     {@code ReadRel(iterator:N)} for fused broadcasts has no backing iterator and triggers
+   *     {@code streamIdx N vs size N} OOB at {@code constructCudfValueStreamNode}.
    * @return native handle (opaque jlong) for use with the other methods.
    * @throws RuntimeException on Substrait parse failure or invalid specs.
    */
@@ -71,7 +81,9 @@ public class MppQueryJniWrapper implements RuntimeAware {
       byte[][] substraitPlans,
       int[] numDriversPerFragment,
       byte[] exchangeSpecsJson,
-      byte[][][] splitInfosPerFragment);
+      byte[][][] splitInfosPerFragment,
+      int[][] broadcastSlotIndicesPerFragment,
+      Object[][] broadcastIteratorsPerFragment);
 
   /**
    * Start all fragments concurrently (all-stages-up scheduling). Must be called exactly once after

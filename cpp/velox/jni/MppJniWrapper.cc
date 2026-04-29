@@ -17,6 +17,7 @@
 
 #include <jni.h>
 #include <limits>
+#include <unordered_set>
 
 #include <fmt/format.h>
 #include <glog/logging.h>
@@ -503,7 +504,9 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     jobjectArray substraitPlansArr,
     jintArray numDriversArr,
     jbyteArray exchangeSpecsJsonArr,
-    jobjectArray splitInfosPerFragArr) {
+    jobjectArray splitInfosPerFragArr,
+    jobjectArray broadcastSlotIndicesPerFragArr,
+    jobjectArray broadcastIteratorsPerFragArr) {
   JNI_METHOD_START
 
   auto ctx = getRuntime(env, wrapper);
@@ -526,6 +529,21 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       reinterpret_cast<const uint8_t*>(safeExchangeJson.elems()),
       env->GetArrayLength(exchangeSpecsJsonArr));
   const auto numExchanges = exchangeSpecs.size();
+
+  // Validate fused-broadcast arrays. They are parallel int[][] / Object[][] of
+  // length numFragments. Each entry is null OR an array (slotIndices and
+  // iterators must agree in length per fragment). When null/empty: that
+  // consumer fragment has no fused broadcasts (the common case).
+  if (broadcastSlotIndicesPerFragArr != nullptr) {
+    GLUTEN_CHECK(
+        env->GetArrayLength(broadcastSlotIndicesPerFragArr) == numFragments,
+        "broadcastSlotIndicesPerFrag length must match substraitPlans length");
+  }
+  if (broadcastIteratorsPerFragArr != nullptr) {
+    GLUTEN_CHECK(
+        env->GetArrayLength(broadcastIteratorsPerFragArr) == numFragments,
+        "broadcastIteratorsPerFrag length must match substraitPlans length");
+  }
 
   // --- Convert each Substrait plan to a Velox PlanNode ---
   // Note: no ExchangeSource factory registration needed here. The IBM
@@ -583,18 +601,95 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
                        "spark.gluten.sql.columnar.backend.velox.cudf.enabled",
                        "NOT_SET")
                 << " confMap.size=" << runtime->getConfMap().size();
-    // Count inbound exchanges for this fragment (= number of stream inputs).
-    // Consumer fragments have ValueStream nodes that need input iterators
-    // during plan conversion. We provide nullptr placeholders since these
-    // nodes get replaced with ExchangeNode after conversion.
-    int32_t numStreamInputs = 0;
+    // Count inbound exchanges + fused broadcasts for this fragment. Each
+    // ReadRel(iterator:N) in the substrait plan needs a corresponding entry
+    // in placeholderIters. Exchange slots stay nullptr (replaced with
+    // ExchangeNode below). Broadcast slots get a real ResultIterator built
+    // from the JVM-side Iterator[ColumnarBatch] supplied by
+    // MppNativeQueryRDD.materializeFusedBroadcastIteratorImpl. Without this,
+    // SubstraitToVeloxPlan.cc:constructCudfValueStreamNode hits
+    // `streamIdx N vs size N` OOB the moment the consumer plan's substrait
+    // mentions a fused broadcast input.
+    int32_t numExchangeInputs = 0;
     for (const auto& exchange : exchangeSpecs) {
       if (exchange.consumerFragmentId == static_cast<int32_t>(i)) {
-        numStreamInputs++;
+        numExchangeInputs++;
       }
     }
+
+    // Look up this fragment's broadcast slot indices.
+    std::vector<int32_t> broadcastSlotIndicesForFrag;
+    jobjectArray broadcastIterForFragArr = nullptr;
+    if (broadcastSlotIndicesPerFragArr != nullptr) {
+      auto slotsArrObj = static_cast<jintArray>(
+          env->GetObjectArrayElement(broadcastSlotIndicesPerFragArr, i));
+      if (slotsArrObj != nullptr) {
+        auto safeSlots = getIntArrayElementsSafe(env, slotsArrObj);
+        jsize n = env->GetArrayLength(slotsArrObj);
+        broadcastSlotIndicesForFrag.reserve(n);
+        for (jsize s = 0; s < n; ++s) {
+          broadcastSlotIndicesForFrag.push_back(safeSlots.elems()[s]);
+        }
+        env->DeleteLocalRef(slotsArrObj);
+      }
+    }
+    if (broadcastIteratorsPerFragArr != nullptr) {
+      broadcastIterForFragArr = static_cast<jobjectArray>(
+          env->GetObjectArrayElement(broadcastIteratorsPerFragArr, i));
+    }
+
+    const int32_t numBroadcastInputs =
+        static_cast<int32_t>(broadcastSlotIndicesForFrag.size());
+    if (broadcastIterForFragArr != nullptr) {
+      jsize iterLen = env->GetArrayLength(broadcastIterForFragArr);
+      GLUTEN_CHECK(
+          iterLen == numBroadcastInputs,
+          fmt::format(
+              "Fragment {} broadcastSlotIndices length {} != "
+              "broadcastIterators length {}",
+              i,
+              numBroadcastInputs,
+              iterLen));
+    }
+
+    const int32_t numStreamInputs = numExchangeInputs + numBroadcastInputs;
     std::vector<std::shared_ptr<ResultIterator>> placeholderIters(
         numStreamInputs, nullptr);
+
+    // Materialize broadcast slot iterators via the standard Gluten JNI bridge.
+    // Each Iterator[ColumnarBatch] becomes a ResultIterator that, when Velox's
+    // ValueStream operator pulls next(), call back into the JVM via JNIEnv to
+    // fetch the next ColumnarBatch from the broadcasted BuildSideRelation.
+    std::unordered_set<int32_t> broadcastSlotSet;
+    for (int32_t b = 0; b < numBroadcastInputs; ++b) {
+      const int32_t slotIdx = broadcastSlotIndicesForFrag[b];
+      GLUTEN_CHECK(
+          slotIdx >= 0 && slotIdx < numStreamInputs,
+          fmt::format(
+              "Fragment {} broadcast slot {} out of range "
+              "(numStreamInputs={})",
+              i,
+              slotIdx,
+              numStreamInputs));
+      auto jIter = env->GetObjectArrayElement(broadcastIterForFragArr, b);
+      GLUTEN_CHECK(
+          jIter != nullptr,
+          fmt::format(
+              "Fragment {} broadcast iterator at index {} is null",
+              i,
+              b));
+      auto wrapped = makeJniColumnarBatchIterator(env, jIter, ctx);
+      placeholderIters[slotIdx] =
+          std::make_shared<ResultIterator>(std::move(wrapped));
+      broadcastSlotSet.insert(slotIdx);
+      LOG(WARNING) << "MppJniWrapper: fragment " << i
+                   << " fused broadcast wired at slot " << slotIdx
+                   << " (" << b + 1 << "/" << numBroadcastInputs << ")";
+      env->DeleteLocalRef(jIter);
+    }
+    if (broadcastIterForFragArr != nullptr) {
+      env->DeleteLocalRef(broadcastIterForFragArr);
+    }
 
     VeloxPlanConverter converter(
         veloxPool.get(),
@@ -683,21 +778,28 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       }
     }
 
-    if (!inboundExchanges.empty()) {
+    if (!inboundExchanges.empty() || !broadcastSlotSet.empty()) {
       // Collect ValueStream leaf nodes in depth-first order.
       // The order matches SubstraitToVeloxPlanConverter's stream index
-      // assignment (iterator:0, iterator:1, ...).
+      // assignment (iterator:0, iterator:1, ...). With fused broadcasts in
+      // play, valueStreamNodes contains BOTH exchange-backed slots (which
+      // we must replace with ExchangeNode below) AND broadcast-backed slots
+      // (which we must leave alone -- their placeholderIters[slot] entry is
+      // a live JNI-backed iterator that Velox's ValueStream operator pulls
+      // from at runtime). broadcastSlotSet identifies the latter.
       std::vector<velox::core::PlanNodePtr> valueStreamNodes;
       collectValueStreamNodes(veloxPlanNode, valueStreamNodes);
 
       VELOX_CHECK_EQ(
           valueStreamNodes.size(),
-          inboundExchanges.size(),
-          "Fragment {} has {} ValueStream nodes but {} inbound exchanges. "
-          "These must match 1:1.",
+          static_cast<size_t>(numExchangeInputs + numBroadcastInputs),
+          "Fragment {} has {} ValueStream nodes but {} inbound exchanges + "
+          "{} fused broadcasts. These must match 1:1 (broadcast slots are "
+          "kept as ValueStream, exchange slots are rewritten to ExchangeNode).",
           i,
           valueStreamNodes.size(),
-          inboundExchanges.size());
+          inboundExchanges.size(),
+          numBroadcastInputs);
 
       // Match each ValueStream to its inbound exchange by structural
       // schema equivalence, NOT by DFS position. Spark enumerates
@@ -724,10 +826,16 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       std::vector<size_t> exchangeForStream(
           valueStreamNodes.size(), std::numeric_limits<size_t>::max());
       std::vector<bool> exchangeUsed(inboundExchanges.size(), false);
-      // Pass 1: greedy structural schema match. The producer wire may
-      // carry a leading synthetic hash_partition_key column the consumer
-      // doesn't see, so also try the prefix-stripped form.
+      // Pass 1: greedy structural schema match against inbound exchanges.
+      // Skip ValueStream slots that correspond to fused broadcasts -- those
+      // stay as ValueStream and consume placeholderIters[slot] at runtime.
+      // The producer wire may carry a leading synthetic hash_partition_key
+      // column the consumer doesn't see, so also try the prefix-stripped
+      // form.
       for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+        if (broadcastSlotSet.count(static_cast<int32_t>(j)) > 0) {
+          continue; // broadcast slot, leave alone
+        }
         auto streamType = std::dynamic_pointer_cast<const velox::RowType>(
             valueStreamNodes[j]->outputType());
         for (size_t k = 0; k < inboundExchanges.size(); ++k) {
@@ -758,9 +866,11 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
           }
         }
       }
-      // Pass 2: positional fallback for any leftover (e.g. self-join
-      // where two producers share an identical schema).
+      // Pass 2: positional fallback for any leftover non-broadcast slot.
       for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+        if (broadcastSlotSet.count(static_cast<int32_t>(j)) > 0) {
+          continue;
+        }
         if (exchangeForStream[j] != std::numeric_limits<size_t>::max()) {
           continue;
         }
@@ -773,6 +883,13 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
         }
       }
       for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+        if (broadcastSlotSet.count(static_cast<int32_t>(j)) > 0) {
+          LOG(WARNING) << "MppJniWrapper: fragment " << i << " stream[" << j
+                       << "] id=" << valueStreamNodes[j]->id()
+                       << " type=" << valueStreamNodes[j]->outputType()->toString()
+                       << " -> KEEP as ValueStream (fused broadcast slot)";
+          continue;
+        }
         const auto k = exchangeForStream[j];
         LOG(WARNING) << "MppJniWrapper: fragment " << i << " stream[" << j
                      << "] id=" << valueStreamNodes[j]->id()
@@ -781,8 +898,13 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
                      << inboundExchanges[k]->producerFragmentId
                      << " nodeId=" << inboundExchanges[k]->exchangeNodeId;
       }
-      // Replace each ValueStream node with the matched ExchangeNode.
+      // Replace each non-broadcast ValueStream node with the matched
+      // ExchangeNode. Broadcast slots remain as ValueStream and Velox reads
+      // the broadcasted batches via placeholderIters[slot] at runtime.
       for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+        if (broadcastSlotSet.count(static_cast<int32_t>(j)) > 0) {
+          continue;
+        }
         const auto k = exchangeForStream[j];
         velox::RowTypePtr producerWire;
         auto it = producerWireTypes.find(

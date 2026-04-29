@@ -27,6 +27,8 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
+import java.util.{Iterator => JIterator}
+
 /**
  * RDD that executes an MPP query plan via JNI.
  *
@@ -61,6 +63,7 @@ class MppNativeQueryRDD(
     numDriversPerFragment: Array[Int],
     exchangeSpecsJson: String,
     fragmentSplitInfos: Array[Array[Array[Byte]]],
+    fusedBroadcastsByConsumer: Map[Int, Seq[FusedBroadcast]],
     pipelineTime: SQLMetric,
     outputRows: SQLMetric,
     outputBatches: SQLMetric
@@ -89,11 +92,38 @@ class MppNativeQueryRDD(
     // and wires them together via OutputBufferManager streaming exchange.
     val runtime = Runtimes.contextInstance(BackendsApiManager.getBackendName, "MppQuery")
     val jniWrapper = MppQueryJniWrapper.create(runtime)
+
+    // For each consumer fragment that has fused broadcasts, materialize the
+    // build side as Iterator[ColumnarBatch] (one iterator per fused broadcast)
+    // and pack into parallel int[] / Object[] arrays the JNI side can iterate.
+    // numFragments is implied by fragmentPlans.length; we emit ragged arrays
+    // (entries are null for fragments with no fused broadcasts).
+    val numFragments = fragmentPlans.length
+    val broadcastSlotIndicesPerFrag = new Array[Array[Int]](numFragments)
+    val broadcastIteratorsPerFrag = new Array[Array[JIterator[ColumnarBatch]]](numFragments)
+    fusedBroadcastsByConsumer.foreach {
+      case (consumerId, fusedList) =>
+        if (consumerId >= 0 && consumerId < numFragments) {
+          val sortedBySlot = fusedList.sortBy(_.slotIdx)
+          broadcastSlotIndicesPerFrag(consumerId) = sortedBySlot.map(_.slotIdx).toArray
+          broadcastIteratorsPerFrag(consumerId) = sortedBySlot
+            .map(MppNativeQueryRDD.materializeFusedBroadcastIteratorImpl)
+            .toArray
+          logInfo(
+            s"MppNativeQueryRDD: fragment $consumerId has " +
+              s"${sortedBySlot.size} fused broadcast(s) at slots " +
+              sortedBySlot.map(_.slotIdx).mkString("[", ",", "]"))
+        }
+    }
+
     val mppHandle = jniWrapper.nativeCreateMppQuery(
       fragmentPlans,
       numDriversPerFragment,
       exchangeSpecsJson.getBytes("UTF-8"),
-      fragmentSplitInfos)
+      fragmentSplitInfos,
+      broadcastSlotIndicesPerFrag,
+      broadcastIteratorsPerFrag.asInstanceOf[Array[Array[Object]]]
+    )
     jniWrapper.nativeStartMppQuery(mppHandle)
 
     logInfo("MppNativeQueryRDD: all MPP fragments started, streaming exchange active")
@@ -146,3 +176,25 @@ class MppNativeQueryRDD(
 
 /** Simple partition for the single-partition MppNativeQueryRDD. */
 private[execution] case class MppPartition(override val index: Int) extends Partition
+
+private[execution] object MppNativeQueryRDD {
+
+  /**
+   * Materialize the broadcasted BuildSideRelation into a Java Iterator[ColumnarBatch] suitable for
+   * hand-off to the C++ side via `makeJniColumnarBatchIterator`. Mirrors
+   * [[VeloxBroadcastBuildSideRDD.genBroadcastBuildSideIterator]] but lives here to keep the MPP RDD
+   * self-contained.
+   */
+  def materializeFusedBroadcastIteratorImpl(fb: FusedBroadcast): JIterator[ColumnarBatch] = {
+    val start = System.nanoTime()
+    val relation = fb.broadcast.value.asReadOnlyCopy()
+    val scalaIter = relation.deserialized
+    val tracker =
+      org.apache.gluten.metrics.TaskWallTimeTracker.get()
+    tracker.broadcastBuildNanos += (System.nanoTime() - start)
+    new JIterator[ColumnarBatch] {
+      override def hasNext: Boolean = scalaIter.hasNext
+      override def next(): ColumnarBatch = scalaIter.next()
+    }
+  }
+}

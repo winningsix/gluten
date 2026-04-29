@@ -25,6 +25,7 @@ import org.apache.gluten.substrait.plan.PlanBuilder
 import org.apache.gluten.substrait.rel.SplitInfo
 import org.apache.gluten.utils.SubstraitPlanPrinterUtil
 
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
@@ -33,6 +34,7 @@ import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, Hash
 import org.apache.spark.sql.execution.{ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, InputIteratorTransformer, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeLike}
+import org.apache.spark.sql.execution.joins.BuildSideRelation
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -80,6 +82,18 @@ import scala.collection.mutable
  * the child plan only to extract Substrait fragments, then executes via JNI -> MppQueryCoordinator
  * (streaming exchange).
  */
+/**
+ * Identifies a fused broadcast: one whose build subtree was inlined into the consumer fragment's
+ * substrait (no separate producer fragment), but which still occupies an `iterator:N` ReadRel slot
+ * in that consumer's plan. The runtime side must pre-populate `placeholderIters[slotIdx]` with a
+ * BatchIterator over the broadcasted ColumnarBatches before plan conversion, otherwise
+ * `SubstraitToVeloxPlan.cc:constructCudfValueStreamNode` hits `streamIdx N vs size N` OOB.
+ *
+ * Slot index is the position in `findExchangeChildren(wst)` walk order -- the same DFS order Gluten
+ * uses to assign `iterator:0, iterator:1, ...` in substrait.
+ */
+case class FusedBroadcast(slotIdx: Int, broadcast: Broadcast[BuildSideRelation])
+
 case class MppNativeQueryExec(
     child: SparkPlan,
     fragments: Seq[NativeFragment],
@@ -153,10 +167,13 @@ case class MppNativeQueryExec(
       // Phase 2: Extract fragments from child BSP plan and generate Substrait plans.
       logWarning(s"MppNativeQueryExec: child plan tree:\n${child.treeString.take(2000)}")
 
-      val (extractedFragments, extractedExchanges) = extractFragmentsFromChildPlan()
+      val (extractedFragments, extractedExchanges, fusedBroadcastsByConsumer) =
+        extractFragmentsFromChildPlan()
       logWarning(
         s"MppNativeQueryExec: Phase 2 extracted ${extractedFragments.size} fragments " +
-          s"and ${extractedExchanges.size} exchanges from child plan")
+          s"and ${extractedExchanges.size} exchanges " +
+          s"and ${fusedBroadcastsByConsumer.values.map(_.size).sum} fused " +
+          s"broadcasts from child plan")
 
       // Log each fragment for debugging
       extractedFragments.foreach {
@@ -221,6 +238,7 @@ case class MppNativeQueryExec(
           numDriversPerFragment,
           exchangeSpecsJson,
           fragmentSplitInfos,
+          fusedBroadcastsByConsumer,
           longMetric("totalQueryTimeMs"),
           longMetric("outputRows"),
           longMetric("outputBatches")
@@ -267,12 +285,15 @@ case class MppNativeQueryExec(
       fragmentSplitInfos)
 
     // RDD only receives serialized bytes - no SparkPlan references.
+    // Pre-built fragments path doesn't fuse broadcasts (legacy MppCollapseRule
+    // path materializes them as separate fragments via BROADCAST exchange).
     new MppNativeQueryRDD(
       sparkContext,
       fragmentPlans,
       numDriversPerFragment,
       exchangeSpecsJson,
       fragmentSplitInfos,
+      Map.empty[Int, Seq[FusedBroadcast]],
       longMetric("totalQueryTimeMs"),
       longMetric("outputRows"),
       longMetric("outputBatches")
@@ -320,7 +341,8 @@ case class MppNativeQueryExec(
    *
    * We do NOT modify the child plan tree -- only read it.
    */
-  private def extractFragmentsFromChildPlan(): (Seq[NativeFragment], Seq[ExchangeSpec]) = {
+  private def extractFragmentsFromChildPlan()
+      : (Seq[NativeFragment], Seq[ExchangeSpec], Map[Int, Seq[FusedBroadcast]]) = {
     val extractedFragments = mutable.ArrayBuffer[NativeFragment]()
     val extractedExchanges = mutable.ArrayBuffer[ExchangeSpec]()
     // Memoize producer fragment ids by Exchange so ReusedExchangeExec (which shares the
@@ -328,6 +350,12 @@ case class MppNativeQueryExec(
     val exchangeToProducerFragId = mutable.HashMap[Exchange, Int]()
     val fragmentCounter = new AtomicInteger(0)
     val exchangeCounter = new AtomicInteger(0)
+    // Track fused broadcasts per consumer fragment so we can pre-populate
+    // their iterator slot at JNI hand-off time. Slot index is the position
+    // in WST.findExchangeChildren walk order, which matches the substrait
+    // iterator:N indexing emitted by InputIteratorTransformer.
+    val broadcastsByConsumer =
+      mutable.HashMap[Int, mutable.ArrayBuffer[FusedBroadcast]]()
 
     /**
      * Walk the plan tree depth-first. Returns the fragment ID of the subtree rooted at `plan`. At
@@ -356,14 +384,37 @@ case class MppNativeQueryExec(
           // Link exchange specs: each exchange child's consumer is this fragment.
           // When broadcast-fusion is enabled and the exchange is a BroadcastExchange
           // whose build was already absorbed (producer id == -1), we skip the
-          // ExchangeSpec entirely -- the build operators were walked into this
-          // consumer fragment via walkInFragment-equivalent recursion, so there is
-          // no remote producer to wire.
-          childExchangeFragIds.zip(findExchangeNodes(wst)).foreach {
-            case (producerFragId, _) if producerFragId < 0 =>
-              // Fused broadcast: no separate producer fragment, no exchange spec.
+          // ExchangeSpec but capture the broadcast variable with its iterator slot
+          // index so the JNI layer can pre-populate inputIters_[slotIdx] with a
+          // BatchIterator over the broadcasted ColumnarBatches. Without this the
+          // C++ side would short by one (substrait still emits ReadRel for the
+          // fused build) -> streamIdx OOB at SubstraitToVeloxPlan.cc:1357.
+          val exchangeNodes = findExchangeNodes(wst)
+          childExchangeFragIds.zipWithIndex.zip(exchangeNodes).foreach {
+            case ((producerFragId, slotIdx), bex: BroadcastExchangeLike) if producerFragId < 0 =>
+              // Fused broadcast: capture for executor-side iterator hand-off.
+              try {
+                val bcast = bex.executeBroadcast[BuildSideRelation]()
+                broadcastsByConsumer.getOrElseUpdate(fragId, mutable.ArrayBuffer.empty) +=
+                  FusedBroadcast(slotIdx, bcast)
+                logWarning(
+                  s"MppNativeQueryExec: captured fused broadcast at " +
+                    s"consumerF=$fragId slot=$slotIdx " +
+                    s"(${bex.getClass.getSimpleName})")
+              } catch {
+                case t: Throwable =>
+                  logWarning(
+                    s"MppNativeQueryExec: failed to capture broadcast " +
+                      s"variable at consumerF=$fragId slot=$slotIdx " +
+                      s"(${bex.getClass.getSimpleName}); will likely hit " +
+                      s"streamIdx OOB at native side: ${t.getMessage}",
+                    t
+                  )
+              }
+            case ((producerFragId, _), _) if producerFragId < 0 =>
+              // Non-broadcast collapse (e.g. collapseSingleGather sentinel).
               ()
-            case (producerFragId, exchangeNode) =>
+            case ((producerFragId, _), exchangeNode) =>
               val (exchangeType, partitionKeys) =
                 classifyPartitioning(exchangeNode.outputPartitioning)
               extractedExchanges += ExchangeSpec(
@@ -515,7 +566,10 @@ case class MppNativeQueryExec(
     // Sort fragments by ID (ensures topological order: producers before consumers)
     val sortedFragments = extractedFragments.sortBy(_.id).toSeq
     val sortedExchanges = extractedExchanges.sortBy(_.id).toSeq
-    (sortedFragments, sortedExchanges)
+    val frozenBroadcasts = broadcastsByConsumer.iterator.map {
+      case (consumerId, buf) => consumerId -> buf.toSeq
+    }.toMap
+    (sortedFragments, sortedExchanges, frozenBroadcasts)
   }
 
   /**
