@@ -98,15 +98,6 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       .set("spark.gluten.sql.columnar.backend.velox.cudf.ast_expression_enabled", "true")
       // Dump every MppNativeQueryExec plan for offline diagnosis if the run fails.
       .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps-tpch-sf1k")
-      // Disable Spark runtime bloom-filter DPP. The injected `might_contain`
-      // predicate isn't supported by cuDF's expression evaluator (it would
-      // return "Unsupported expression for recursive evaluation: might_contain"
-      // and abort the task, which then cascades into a misleading
-      // "No ExchangeSource factory matches" cleanup error). Q4/Q5 are the
-      // primary victims. cuDF native might_contain support is the proper
-      // long-term fix; until then, disabling DPP keeps the GPU path running
-      // (small selectivity regression on join-probe side).
-      .set("spark.sql.optimizer.runtime.bloomFilter.enabled", "false")
   }
 
   // Print actual rows for offline diff vs Presto-GPU SF1K reference (post-ANALYZE).
