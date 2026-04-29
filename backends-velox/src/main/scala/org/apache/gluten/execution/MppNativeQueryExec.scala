@@ -607,15 +607,32 @@ case class MppNativeQueryExec(
    * mechanism ensures identical subqueries share a single execution.
    */
   private def materializeScalarSubqueries(plan: SparkPlan): Unit = {
+    // Pass 1: declared subqueries. SparkPlan.subqueries lists the
+    // ExecSubqueryExpression-bearing children of a node; calling prepare()
+    // on them kicks off any underlying broadcast/exchange. This is the
+    // path Spark itself uses in SparkPlan.prepareSubqueries.
     plan.foreach {
       node =>
+        node.subqueries.foreach(subPlan => subPlan.prepare())
         node.expressions.foreach {
           expr =>
             expr.foreach {
               case sub: ExecSubqueryExpression =>
                 sub.plan.prepare()
-                // Idempotent: updateResult blocks on the underlying future and stores the row.
+                // Idempotent: updateResult blocks on the underlying future and
+                // stores the row.
                 sub.updateResult()
+              case other if other.getClass.getSimpleName.contains("BloomFilter") =>
+                // Spark's runtime-DPP BloomFilterMightContain is a PlanExpression
+                // whose embedded plan is materialized via Spark's broadcast/AQE
+                // path, NOT through ExecSubqueryExpression. Without the WARN log
+                // we silently see hasFilter_=false in MightContainFunction and
+                // every row gets filtered out (Q11/Q16/Q20/Q22 -> count=0).
+                logWarning(
+                  s"materializeScalarSubqueries: SAW non-ExecSubquery bloom expr " +
+                    s"${other.getClass.getName} on ${node.getClass.getSimpleName} " +
+                    s"-- not materialized via this path; MightContainFunction " +
+                    s"may see NULL literal and filter all rows.")
               case _ =>
             }
         }
