@@ -42,7 +42,12 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
   // tear-down is ~32s (Spark path overhead, not query execution). 45s
   // gives correct queries headroom to land green; 22-query sweep capped
   // at ~16 min worst case until we shave the Spark-side overhead.
-  private val perQueryTimeout = Span(45, Seconds)
+  private val perQueryTimeout = Span(
+    sys.props
+      .get("gluten.tpch.perQueryTimeoutSeconds")
+      .flatMap(s => scala.util.Try(s.toInt).toOption)
+      .getOrElse(45),
+    Seconds)
 
   protected val externalDataDir: String =
     sys.props.getOrElse("gluten.tpch.externalDataDir", "/data/tpch/sf1k_v2_float")
@@ -69,6 +74,14 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       .set("spark.sql.shuffle.partitions", "16")
       .set("spark.memory.offHeap.size", "32g")
       .set("spark.sql.adaptive.enabled", "false")
+      // BHJ via explicit BROADCAST(t) hints (see tpchSQL override). CBO is
+      // unreachable here because parquet temp views report defaultSizeInBytes
+      // = Long.MaxValue and full ANALYZE FOR ALL COLUMNS on SF1K lineitem
+      // takes >30 min in surefire local mode. Hints sidestep CBO entirely.
+      // Bump autoBroadcastJoinThreshold past Spark's default 10MB so the
+      // hinted broadcast tables (part ~30MB, supplier ~1.4MB, customer
+      // ~300MB) clear the threshold even without stats.
+      .set("spark.sql.autoBroadcastJoinThreshold", (2L * 1024 * 1024 * 1024).toString)
       // Plan-C MppStrategy: intercept queries at planner level and route through MPP.
       .set("spark.gluten.mpp.enabled", "true")
       .set("spark.gluten.mpp.strategy.enabled", "true")
@@ -100,6 +113,37 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps-tpch-sf1k")
   }
 
+  // Per-query BROADCAST hint mapping for Track 1 (Phase 3): force Spark to
+  // pick BroadcastHashJoin so Phase 1+2 fused-broadcast iterator transport
+  // (commit f95dec3b3) actually gets exercised. Mirrors the REPLICATED side
+  // Presto's CBO picks; sized so the build relation fits under
+  // autoBroadcastJoinThreshold=2GB for the SF1K_v2_float dataset:
+  //   part      ~30MB    (Q14, Q16, Q17)
+  //   supplier  ~1.4MB   (Q16)
+  //   customer  ~300MB   (Q18)
+  // Q12's outer join sides (orders ~150GB, lineitem ~720GB) are too large
+  // for any broadcast at SF1K; left without a hint until we reshape that
+  // query separately.
+  private val broadcastHintByQuery: Map[Int, String] = Map(
+    14 -> "/*+ BROADCAST(part) */",
+    16 -> "/*+ BROADCAST(part, supplier) */",
+    17 -> "/*+ BROADCAST(part) */",
+    18 -> "/*+ BROADCAST(customer) */"
+  )
+
+  override protected def tpchSQL(queryNum: Int, tpchQueries: String): String = {
+    val raw = super.tpchSQL(queryNum, tpchQueries)
+    broadcastHintByQuery.get(queryNum) match {
+      case Some(hint) =>
+        // Inject hint after the OUTER `select` keyword (case-insensitive,
+        // first match only). Spark requires hints between SELECT and the
+        // first projection; replaceFirst with a word-boundary regex keeps
+        // subqueries' inner SELECTs untouched.
+        raw.replaceFirst("(?i)\\bselect\\b", s"select $hint")
+      case None => raw
+    }
+  }
+
   // Print actual rows for offline diff vs Presto-GPU SF1K reference (post-ANALYZE).
   // compareResult=false because we don't ship a q*.out reference in this suite's
   // resources; the [MPP-RESULT] tag lets us grep run logs deterministically.
@@ -118,19 +162,33 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
   // surface as their actual failure mode (not as a generic fallback test
   // failure). The 60s per-query failAfter contains hangs.
   // Optional sys-prop filter: -Dgluten.tpch.onlyQuery=6 registers only Q6.
+  // Comma-separated values are also supported, for example:
+  // -Dgluten.tpch.onlyQuery=1,2,3,12,18.
   // Used by per-query JVM-isolation runs to bypass cuDF abort-path memory
   // leaks that survive across tests in a single JVM (RC: failed task leaves
   // ~128MB stuck in MemoryPool, JVM teardown asserts on reservedBytes != 0).
   // Defaults to all 22 when unset.
-  private val onlyQuery: Option[Int] =
-    sys.props.get("gluten.tpch.onlyQuery").flatMap(s => scala.util.Try(s.toInt).toOption)
+  private val onlyQueries: Option[Seq[Int]] =
+    sys.props
+      .get("gluten.tpch.onlyQuery")
+      .map {
+        _.split(",").toSeq
+          .flatMap(s => scala.util.Try(s.trim.toInt).toOption)
+          .distinct
+          .sorted
+      }
+      .filter(_.nonEmpty)
 
-  private val queriesToRun: Seq[Int] = onlyQuery.map(Seq(_)).getOrElse(1 to 22)
+  private val queriesToRun: Seq[Int] = onlyQueries.getOrElse(1 to 22)
 
   queriesToRun.foreach {
     qid =>
       test(s"TPC-H q$qid") {
         failAfter(perQueryTimeout) {
+          val previewDf = spark.sql(tpchSQL(qid, tpchQueries))
+          logWarning(
+            s"VeloxTPCHFloatSF1KSuite: Q$qid PRE-COLLECT optimizedPlan with stats:\n" +
+              previewDf.queryExecution.stringWithStats)
           runTPCHQuery(qid, tpchQueries, queriesResults, compareResult = false, noFallBack = false)(
             df => dumpRows(qid, df))
         }
