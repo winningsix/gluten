@@ -138,16 +138,19 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
     """
       |select
       |  o.o_orderpriority,
-      |  count(*) as order_count
+      |  sum(case when l.late_lineitem_count > 0 then 1 else 0 end) as order_count
       |from
       |  orders o
       |join (
-      |  select distinct
-      |    l_orderkey
+      |  select
+      |    l_orderkey,
+      |    count(*) as late_lineitem_count
       |  from
       |    lineitem
       |  where
       |    l_commitdate < l_receiptdate
+      |  group by
+      |    l_orderkey
       |) l
       |  on l.l_orderkey = o.o_orderkey
       |where
