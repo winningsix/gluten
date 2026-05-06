@@ -141,10 +141,7 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
     Seq(
       "spark.gluten.sql.columnar.libpath",
       "spark.gluten.loadLibFromJar",
-      q4ExistsLineitemDedupKey).foreach {
-      key =>
-        sys.props.get(key).foreach(conf.set(key, _))
-    }
+      q4ExistsLineitemDedupKey).foreach(key => sys.props.get(key).foreach(conf.set(key, _)))
     conf
   }
 

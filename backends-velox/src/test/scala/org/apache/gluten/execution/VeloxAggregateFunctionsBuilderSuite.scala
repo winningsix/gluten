@@ -28,11 +28,12 @@ import org.scalatest.funsuite.AnyFunSuite
 
 class VeloxAggregateFunctionsBuilderSuite extends AnyFunSuite {
   test("count merge modes register sum companion") {
-    Seq(PartialMerge, Final).foreach { mode =>
-      val registered = registerCount(mode)
+    Seq(PartialMerge, Final).foreach {
+      mode =>
+        val registered = registerCount(mode)
 
-      assert(registered.contains(sumMergeFunction))
-      assert(!registered.contains(countMergeFunction))
+        assert(registered.contains(sumMergeFunction))
+        assert(!registered.contains(countMergeFunction))
     }
   }
 
