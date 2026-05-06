@@ -68,12 +68,12 @@ public class MppQueryJniWrapper implements RuntimeAware {
    * @param broadcastSlotIndicesPerFragment for each consumer fragment, the iterator slot indices
    *     occupied by fused broadcasts (sorted ascending). {@code null} or empty when no broadcasts
    *     are fused into that fragment. Outer length equals {@code substraitPlans.length}.
-   * @param broadcastIteratorsPerFragment parallel to {@code broadcastSlotIndicesPerFragment};
-   *     each entry is a {@code java.util.Iterator} of {@code ColumnarBatch} over the broadcasted
-   *     batches that the C++ side wraps via {@code makeJniColumnarBatchIterator} and pushes into
-   *     {@code placeholderIters[slotIdx]}. Without this the substrait plan's
-   *     {@code ReadRel(iterator:N)} for fused broadcasts has no backing iterator and triggers
-   *     {@code streamIdx N vs size N} OOB at {@code constructCudfValueStreamNode}.
+   * @param broadcastIteratorsPerFragment parallel to {@code broadcastSlotIndicesPerFragment}; each
+   *     entry is a {@code java.util.Iterator} of {@code ColumnarBatch} over the broadcasted batches
+   *     that the C++ side wraps via {@code makeJniColumnarBatchIterator} and pushes into {@code
+   *     placeholderIters[slotIdx]}. Without this the substrait plan's {@code ReadRel(iterator:N)}
+   *     for fused broadcasts has no backing iterator and triggers {@code streamIdx N vs size N} OOB
+   *     at {@code constructCudfValueStreamNode}.
    * @return native handle (opaque jlong) for use with the other methods.
    * @throws RuntimeException on Substrait parse failure or invalid specs.
    */
