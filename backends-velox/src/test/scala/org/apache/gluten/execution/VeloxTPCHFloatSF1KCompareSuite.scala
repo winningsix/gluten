@@ -142,11 +142,12 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
       "spark.driver.maxResultSize",
       "spark.gluten.sql.columnar.libpath",
       "spark.gluten.loadLibFromJar",
-      q4ExistsLineitemDedupKey).foreach { key =>
-      sys.props
-        .get(key)
-        .filter(value => value.nonEmpty && value != "null")
-        .foreach(conf.set(key, _))
+      q4ExistsLineitemDedupKey).foreach {
+      key =>
+        sys.props
+          .get(key)
+          .filter(value => value.nonEmpty && value != "null")
+          .foreach(conf.set(key, _))
     }
     conf
   }
