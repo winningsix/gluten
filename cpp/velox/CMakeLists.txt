@@ -565,6 +565,10 @@ if(ENABLE_GPU)
     /usr/lib64/libucs.so)
 endif()
 
+# Repeat Arrow after whole-archived Velox/cuDF archives so static Arrow objects
+# referenced from pulled-in Velox objects resolve under ldd -r/dlopen.
+target_link_libraries(velox PRIVATE Arrow::arrow Arrow::arrow_bundled_dependencies)
+
 add_custom_command(
   TARGET velox
   POST_BUILD
