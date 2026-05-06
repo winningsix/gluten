@@ -339,9 +339,14 @@ import_library(facebook::velox ${VELOX_BUILD_PATH}/lib/libvelox.a)
 import_library(facebook::velox::dbgen
                ${VELOX_BUILD_PATH}/velox/tpch/gen/dbgen/libdbgen.a)
 
-if(BUILD_TESTS)
-  add_duckdb()
+# libvelox.a is whole-archive'd into libgluten.so even for non-test builds.
+# Keep DuckDB and Arrow direct on the combined shared library link line so
+# `ldd -r`/dlopen can resolve relocations from whole-archived Velox objects.
+add_duckdb()
+target_link_libraries(velox PRIVATE duckdb_static Arrow::arrow
+                                    Arrow::arrow_bundled_dependencies)
 
+if(BUILD_TESTS)
   target_link_libraries(facebook::velox INTERFACE facebook::velox::dbgen)
 
   import_library(
