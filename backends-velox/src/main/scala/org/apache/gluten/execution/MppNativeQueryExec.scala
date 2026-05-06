@@ -345,9 +345,6 @@ case class MppNativeQueryExec(
       : (Seq[NativeFragment], Seq[ExchangeSpec], Map[Int, Seq[FusedBroadcast]]) = {
     val extractedFragments = mutable.ArrayBuffer[NativeFragment]()
     val extractedExchanges = mutable.ArrayBuffer[ExchangeSpec]()
-    // Memoize producer fragment ids by Exchange so ReusedExchangeExec (which shares the
-    // same Exchange reference as the original) reuses rather than creates a duplicate.
-    val exchangeToProducerFragId = mutable.HashMap[Exchange, Int]()
     val fragmentCounter = new AtomicInteger(0)
     val exchangeCounter = new AtomicInteger(0)
     // Track fused broadcasts per consumer fragment so we can pre-populate
@@ -370,7 +367,8 @@ case class MppNativeQueryExec(
           // to discover any exchange boundaries below it. The WST's doTransform()
           // stops at InputIteratorTransformer boundaries, which is exactly what
           // we want: each fragment's Substrait covers operators between exchanges.
-          val childExchangeFragIds = findExchangeChildren(wst).map(walk)
+          val exchangeChildren = findExchangeChildren(wst)
+          val childExchangeFragIds = exchangeChildren.map(walk)
 
           val fragId = fragmentCounter.getAndIncrement()
           val parallelism = inferParallelism(wst)
@@ -389,7 +387,16 @@ case class MppNativeQueryExec(
           // BatchIterator over the broadcasted ColumnarBatches. Without this the
           // C++ side would short by one (substrait still emits ReadRel for the
           // fused build) -> streamIdx OOB at SubstraitToVeloxPlan.cc:1357.
-          val exchangeNodes = findExchangeNodes(wst)
+          val exchangeNodes = exchangeChildren.zipWithIndex.map {
+            case (child, slotIdx) =>
+              unwrapToExchange(child).getOrElse {
+                throw new IllegalStateException(
+                  s"MppNativeQueryExec: WST fragment $fragId input slot $slotIdx " +
+                    s"(${child.getClass.getSimpleName}) did not unwrap to an Exchange. " +
+                    s"Refusing to silently drop an ExchangeSpec; this would desynchronize " +
+                    s"iterator slots and native ValueStream schemas.")
+              }
+          }
           childExchangeFragIds.zipWithIndex.zip(exchangeNodes).foreach {
             case ((producerFragId, slotIdx), bex: BroadcastExchangeLike) if producerFragId < 0 =>
               // Fused broadcast: capture for executor-side iterator hand-off.
@@ -443,8 +450,14 @@ case class MppNativeQueryExec(
             walk(unwrapTransparent(exchange.child))
             -1
           } else {
-            // Exchange boundary: walk the producer side (exchange.child). Memoize so a
-            // subsequent ReusedExchangeExec pointing at the same Exchange reuses it.
+            // Exchange boundary: walk the producer side for this consumer.
+            //
+            // Native MPP emits exactly one PartitionedOutputNode for each fragment.
+            // Reusing one producer fragment for multiple Spark exchange consumers
+            // makes the native side reuse that producer's wire row type and output
+            // buffers for all consumers. Duplicate the producer occurrence instead;
+            // this recomputes the shared exchange payload but keeps producer and
+            // consumer schemas aligned positionally.
             // Strip the synthetic hash_partition_key prefix project before descending
             // (mirrors MppCollapseRule.stripSyntheticHashProject) so the producer
             // fragment's WST output excludes the prefix column. Without this, the
@@ -453,9 +466,7 @@ case class MppNativeQueryExec(
             // (MppJniWrapper.cc), and Velox's PartitionedOutputNode partitions BEFORE
             // the strip -- misrouting Q1's partial-agg states to all 4 F1 drivers and
             // producing 4 keys * 4 drivers = 16 rows instead of 4.
-            exchangeToProducerFragId.getOrElseUpdate(
-              exchange.asInstanceOf[Exchange],
-              walk(stripSyntheticHashProject(unwrapTransparent(exchange.child))))
+            walk(stripSyntheticHashProject(unwrapTransparent(exchange.child)))
           }
 
         case bex: BroadcastExchangeLike =>
@@ -473,15 +484,15 @@ case class MppNativeQueryExec(
                 s"$broadcastFuseThresholdBytes bytes) into consumer fragment")
             -1
           } else {
-            exchangeToProducerFragId.getOrElseUpdate(
-              bex.asInstanceOf[Exchange],
-              walk(unwrapTransparent(bex.child)))
+            // See ShuffleExchangeLike above: do not share one native producer
+            // fragment across multiple consumers.
+            walk(unwrapTransparent(bex.child))
           }
 
         case reused: ReusedExchangeExec =>
-          // The ReusedExchangeExec.child is the same JVM object as the original
-          // Exchange. Walk it -- memoization guarantees we return the already-
-          // assigned producer fragment id.
+          // Spark reuses the same Exchange JVM object here, but native MPP cannot
+          // share one producer output buffer across multiple consumers. Walking
+          // the child creates an independent producer fragment for this occurrence.
           walk(reused.child)
 
         case topk: TakeOrderedAndProjectExecTransformer =>
@@ -601,6 +612,12 @@ case class MppNativeQueryExec(
         case _: WholeStageTransformer =>
           // Stop: this is a nested WST (shouldn't happen in normal BSP plans)
           ()
+        case join: HashJoinLikeExecTransformer =>
+          // HashJoinLikeExecTransformer emits Substrait inputs in streamed/build order, which may
+          // differ from Spark's left/right child order when the build side is switched. Keep MPP
+          // exchange specs in the same order so native ValueStream replacement cannot swap inputs.
+          collect(join.streamedPlan)
+          collect(join.buildPlan)
         case iit: InputIteratorTransformer =>
           // InputIteratorTransformer marks a fragment boundary.
           // Its child (ColumnarInputAdapter -> Exchange) is the exchange child.
@@ -612,14 +629,6 @@ case class MppNativeQueryExec(
     // Walk the WST's internal operator tree (wst.child is the root TransformSupport)
     collect(wst.child)
     result.toSeq
-  }
-
-  /**
-   * Find the actual ShuffleExchangeLike nodes corresponding to the exchange children found by
-   * [[findExchangeChildren]]. Unwraps ColumnarInputAdapter and other wrappers.
-   */
-  private def findExchangeNodes(wst: WholeStageTransformer): Seq[Exchange] = {
-    findExchangeChildren(wst).flatMap(child => unwrapToExchange(child))
   }
 
   /** Unwrap wrapper nodes to find the Exchange (shuffle or broadcast) underneath. */
