@@ -946,8 +946,32 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
 
     auto outputNodeId = fmt::format("mpp_output_{}", i);
     velox::core::PlanNodePtr wrappedPlan;
+    const std::string partitionType = outboundExchange != nullptr
+        ? outboundExchange->partitionType
+        : std::string("ROOT");
+    const bool isBroadcastOutput =
+        outboundExchange != nullptr && partitionType == "BROADCAST";
+    const char* outputKindHelper = isBroadcastOutput
+        ? "broadcast"
+        : (numOutputPartitions == 1 ? "single" : "partitioned");
 
-    if (numOutputPartitions == 1) {
+    LOG(INFO) << "MppJniWrapper: fragment " << i
+              << " outbound partitionType=" << partitionType
+              << " outputKindHelper=" << outputKindHelper
+              << " numOutputPartitions=" << numOutputPartitions;
+
+    if (isBroadcastOutput) {
+      // Broadcast output must be tagged as kBroadcast even when the exchange
+      // spec carries one producer partition; coordinator fanout is applied via
+      // updateOutputBuffers(N, true) after wiring.
+      wrappedPlan = velox::core::PartitionedOutputNode::broadcast(
+          outputNodeId,
+          numOutputPartitions,
+          veloxPlanNode->outputType(),
+          /*serdeKind=*/"Presto",
+          veloxPlanNode,
+          velox::core::PartitionedOutputNode::TransportType::kUcx);
+    } else if (numOutputPartitions == 1) {
       // Single-partition gather output. Two cases:
       //   1. Producer fragment with a SINGLE-gather outbound exchange
       //      (outboundExchange != nullptr) -> route through IBM cudf's
@@ -975,9 +999,6 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       //                 Correctness is preserved — equal keys land in the same
       //                 partition — only intra-partition ordering is lost.)
       //   ROUND_ROBIN/other -> RoundRobinPartitionFunctionSpec()
-      const std::string& partitionType =
-          outboundExchange != nullptr ? outboundExchange->partitionType
-                                      : std::string("ROUND_ROBIN");
       const auto& keyIndices = outboundExchange != nullptr
           ? outboundExchange->partitionKeyIndices
           : std::vector<int32_t>{};
