@@ -37,6 +37,8 @@ import java.io.File
  */
 class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
 
+  private val q4ExistsLineitemDedupKey = "spark.gluten.mpp.q4ExistsLineitemDedup"
+
   // Per-query hard cap. Presto-GPU SF1K runs the full 22 in ~66s = ~3s/query;
   // measured Q6 wall-clock through Spark-Gluten + multi-fragment + UCX
   // tear-down is ~32s (Spark path overhead, not query execution). 45s
@@ -132,8 +134,43 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
     19 -> "/*+ BROADCAST(part) */"
   )
 
+  private val q4ExistsLineitemDedupSQL: String =
+    """
+      |select
+      |  o.o_orderpriority,
+      |  count(*) as order_count
+      |from
+      |  orders o
+      |join (
+      |  select distinct
+      |    l_orderkey
+      |  from
+      |    lineitem
+      |  where
+      |    l_commitdate < l_receiptdate
+      |) l
+      |  on l.l_orderkey = o.o_orderkey
+      |where
+      |  o.o_orderdate >= date '1993-07-01'
+      |  and o.o_orderdate < date '1993-07-01' + interval '3' month
+      |group by
+      |  o.o_orderpriority
+      |order by
+      |  o.o_orderpriority
+      |""".stripMargin
+
+  private def q4ExistsLineitemDedupEnabled: Boolean =
+    sys.props
+      .get(q4ExistsLineitemDedupKey)
+      .exists(_.trim.equalsIgnoreCase("true"))
+
   override protected def tpchSQL(queryNum: Int, tpchQueries: String): String = {
-    val raw = super.tpchSQL(queryNum, tpchQueries)
+    val raw =
+      if (queryNum == 4 && q4ExistsLineitemDedupEnabled) {
+        q4ExistsLineitemDedupSQL
+      } else {
+        super.tpchSQL(queryNum, tpchQueries)
+      }
     broadcastHintByQuery.get(queryNum) match {
       case Some(hint) =>
         // Inject hint after the OUTER `select` keyword (case-insensitive,
