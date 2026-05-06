@@ -128,7 +128,8 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
     14 -> "/*+ BROADCAST(part) */",
     16 -> "/*+ BROADCAST(part, supplier) */",
     17 -> "/*+ BROADCAST(part) */",
-    18 -> "/*+ BROADCAST(customer) */"
+    18 -> "/*+ BROADCAST(customer) */",
+    19 -> "/*+ BROADCAST(part) */"
   )
 
   override protected def tpchSQL(queryNum: Int, tpchQueries: String): String = {
