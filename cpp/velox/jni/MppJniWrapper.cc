@@ -16,14 +16,21 @@
  */
 
 #include <jni.h>
+#include <algorithm>
+#include <cstring>
 #include <limits>
+#include <sstream>
+#include <string>
 #include <unordered_set>
+#include <vector>
 
 #include <fmt/format.h>
 #include <glog/logging.h>
 #include <folly/dynamic.h>
 #include <folly/json.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/message.h>
 
 #include <jni/JniCommon.h>
 #include <jni/JniError.h>
@@ -85,6 +92,75 @@ struct MppQueryHandle {
     executor.reset();
   }
 };
+
+bool tryGetIteratorIndex(const ::substrait::ReadRel& readRel, int32_t* index) {
+  if (!readRel.has_local_files() || readRel.local_files().items_size() == 0) {
+    return false;
+  }
+
+  const std::string& uri = readRel.local_files().items(0).uri_file();
+  constexpr const char* kIteratorPrefix = "iterator:";
+  const auto pos = uri.find(kIteratorPrefix);
+  if (pos == std::string::npos) {
+    return false;
+  }
+
+  const auto indexString = uri.substr(pos + std::strlen(kIteratorPrefix));
+  try {
+    *index = std::stoi(indexString);
+  } catch (const std::exception& e) {
+    VELOX_FAIL(
+        "Invalid MPP iterator URI '{}' in Substrait ReadRel: {}",
+        uri,
+        e.what());
+  }
+  return true;
+}
+
+void collectIteratorIndices(
+    const ::google::protobuf::Message& message,
+    std::vector<int32_t>& indices) {
+  if (message.GetDescriptor() == ::substrait::ReadRel::descriptor()) {
+    const auto& readRel = static_cast<const ::substrait::ReadRel&>(message);
+    int32_t index = -1;
+    if (tryGetIteratorIndex(readRel, &index)) {
+      indices.push_back(index);
+    }
+  }
+
+  const auto* reflection = message.GetReflection();
+  std::vector<const ::google::protobuf::FieldDescriptor*> fields;
+  reflection->ListFields(message, &fields);
+  for (const auto* field : fields) {
+    if (field->cpp_type() !=
+        ::google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
+      continue;
+    }
+    if (field->is_repeated()) {
+      const int fieldSize = reflection->FieldSize(message, field);
+      for (int i = 0; i < fieldSize; ++i) {
+        collectIteratorIndices(
+            reflection->GetRepeatedMessage(message, field, i), indices);
+      }
+    } else {
+      collectIteratorIndices(reflection->GetMessage(message, field), indices);
+    }
+  }
+}
+
+std::string formatIndices(std::vector<int32_t> indices) {
+  std::sort(indices.begin(), indices.end());
+  std::ostringstream out;
+  out << "[";
+  for (size_t i = 0; i < indices.size(); ++i) {
+    if (i != 0) {
+      out << ",";
+    }
+    out << indices[i];
+  }
+  out << "]";
+  return out.str();
+}
 
 // ---------------------------------------------------------------------------
 // Plan tree rewriting helpers
@@ -653,6 +729,24 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     }
 
     const int32_t numStreamInputs = numExchangeInputs + numBroadcastInputs;
+    std::vector<int32_t> iteratorIndices;
+    collectIteratorIndices(substraitPlan, iteratorIndices);
+    int32_t maxIteratorIndex = -1;
+    for (const auto index : iteratorIndices) {
+      maxIteratorIndex = std::max(maxIteratorIndex, index);
+    }
+    VELOX_CHECK_LT(
+        maxIteratorIndex,
+        numStreamInputs,
+        "Fragment {} Substrait has ReadRel iterator slot(s) {} but JNI "
+        "prepared only {} MPP stream input(s): {} inbound exchange(s) + {} "
+        "fused broadcast(s). This indicates the fragment extractor dropped "
+        "an InputIteratorTransformer boundary before native plan conversion.",
+        i,
+        formatIndices(iteratorIndices),
+        numStreamInputs,
+        numExchangeInputs,
+        numBroadcastInputs);
     std::vector<std::shared_ptr<ResultIterator>> placeholderIters(
         numStreamInputs, nullptr);
 
