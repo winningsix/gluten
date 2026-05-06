@@ -54,6 +54,10 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
   protected val externalDataDir: String =
     sys.props.getOrElse("gluten.tpch.externalDataDir", "/data/tpch/sf1k_v2_float")
 
+  private def nonNullProperty(key: String): Option[String] = {
+    sys.props.get(key).filter(value => value.nonEmpty && value != "null")
+  }
+
   override protected def createTPCHNotNullTables(): Unit = {
     TPCHTableDataFrames = TPCHTables
       .map(_.name)
@@ -68,7 +72,7 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
   }
 
   override protected def sparkConf: SparkConf = {
-    super.sparkConf
+    val conf = super.sparkConf
       // 1TB-scale resources; parent default is too small. 32g (was 16g) so the
       // 22-query sweep doesn't OOM on heavy joins like Q1 where 16-replica
       // PartitionedOutput each holds ~512MB. Long-term fix: switch to
@@ -113,6 +117,13 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       .set("spark.gluten.sql.columnar.backend.velox.cudf.ast_expression_enabled", "true")
       // Dump every MppNativeQueryExec plan for offline diagnosis if the run fails.
       .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps-tpch-sf1k")
+
+    Seq(
+      "spark.driver.maxResultSize",
+      "spark.gluten.sql.columnar.libpath",
+      "spark.gluten.loadLibFromJar",
+      q4ExistsLineitemDedupKey).foreach(key => nonNullProperty(key).foreach(conf.set(key, _)))
+    conf
   }
 
   // Per-query BROADCAST hint mapping for Track 1 (Phase 3): force Spark to

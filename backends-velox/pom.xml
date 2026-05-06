@@ -284,6 +284,7 @@
             <gluten.tpch.q13DiagnosticCustomerStart>${gluten.tpch.q13DiagnosticCustomerStart}</gluten.tpch.q13DiagnosticCustomerStart>
             <gluten.tpch.q13DiagnosticCustomerEnd>${gluten.tpch.q13DiagnosticCustomerEnd}</gluten.tpch.q13DiagnosticCustomerEnd>
             <gluten.tpch.q13DiagnosticBucketCount>${gluten.tpch.q13DiagnosticBucketCount}</gluten.tpch.q13DiagnosticBucketCount>
+            <spark.driver.maxResultSize>${spark.driver.maxResultSize}</spark.driver.maxResultSize>
             <spark.gluten.loadLibFromJar>${spark.gluten.loadLibFromJar}</spark.gluten.loadLibFromJar>
             <spark.gluten.sql.columnar.libpath>${spark.gluten.sql.columnar.libpath}</spark.gluten.sql.columnar.libpath>
             <spark.gluten.mpp.q4ExistsLineitemDedup>${spark.gluten.mpp.q4ExistsLineitemDedup}</spark.gluten.mpp.q4ExistsLineitemDedup>
