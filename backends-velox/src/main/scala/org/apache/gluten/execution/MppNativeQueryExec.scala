@@ -670,29 +670,13 @@ case class MppNativeQueryExec(
    * mechanism ensures identical subqueries share a single execution.
    */
   private def materializeScalarSubqueries(plan: SparkPlan): Unit = {
-    // Spark's SparkPlan.prepare() recursively drives prepareSubqueries on every
-    // node in the subtree. prepareSubqueries iterates node.subqueries and calls
-    // prepare() on each BaseSubqueryExec, which is exactly what handles
-    // ExecSubqueryExpression *and* the runtime-DPP BloomFilter subqueries
-    // (BloomFilterMightContain wraps a PlanExpression whose plan is a
-    // SubqueryBroadcastExec / SubqueryExec). MppNativeQueryExec normally
-    // bypasses child.executeColumnar() so this never runs; call it explicitly
-    // before driver-side Substrait generation.
-    //
-    // prepare() only kicks off broadcast/scalar futures; it does not block.
-    // Below we additionally walk every expression and drive each subquery to
-    // completion so the result is materialized into a literal before
-    // WholeStageTransformer.doWholeStageTransform serializes it.
-    try {
-      plan.prepare()
-    } catch {
-      case t: Throwable =>
-        logWarning(
-          s"materializeScalarSubqueries: plan.prepare() threw " +
-            s"${t.getClass.getSimpleName}: ${t.getMessage}; falling back to " +
-            s"per-node walk",
-          t)
-    }
+    // Do not call plan.prepare() on the whole child tree here. SparkPlan.prepare()
+    // eagerly starts regular BroadcastExchange jobs, but MPP consumes those joins
+    // through native BROADCAST exchanges. Preparing the whole plan can therefore
+    // driver-collect a large build side before MPP starts, tripping
+    // spark.driver.maxResultSize on Q16/Q18. Only materialize real subquery
+    // expressions below; fused broadcast builds are captured explicitly by
+    // canFuseBroadcastLive/executeBroadcast.
 
     plan.foreach {
       node =>
