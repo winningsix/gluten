@@ -21,6 +21,7 @@
 #include <arrow/ipc/writer.h>
 #include <execinfo.h>
 #include <jni.h>
+#include <mutex>
 
 #include "compute/ProtobufUtils.h"
 #include "compute/Runtime.h"
@@ -424,6 +425,10 @@ class SparkAllocationListener final : public gluten::AllocationListener {
     if (size == 0) {
       return;
     }
+    // MPP fanout can allocate from many native Velox driver threads at once.
+    // Keep the Java ReservationListener callback single-threaded; Spark's
+    // task/global memory targets are the shared state behind this JNI edge.
+    std::lock_guard<std::recursive_mutex> guard(allocationMutex_);
     JNIEnv* env;
     attachCurrentThreadAsDaemonOrThrow(vm_, &env);
     if (size < 0) {
@@ -458,6 +463,7 @@ class SparkAllocationListener final : public gluten::AllocationListener {
  private:
   JavaVM* vm_;
   jobject jListenerGlobalRef_;
+  std::recursive_mutex allocationMutex_;
   std::atomic_int64_t usedBytes_{0L};
   std::atomic_int64_t peakBytes_{0L};
 };
