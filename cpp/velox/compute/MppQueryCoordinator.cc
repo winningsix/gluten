@@ -383,7 +383,75 @@ void MppQueryCoordinator::start() {
     }
   }
 
-  // Phase 2: Wire exchanges via RemoteConnectorSplits (cartesian product).
+  // Phase 2: Add file scan splits to scan-containing fragments.
+  //
+  // Native UCX exchange opens producer connections as soon as a consumer gets
+  // its RemoteConnectorSplit. Release scan inputs first so producer-side
+  // UcxPartitionedOutput queues are constructed before consumers handshake.
+  for (auto& spec : fragmentSpecs_) {
+    if (spec.scanNodeIds.empty()) {
+      continue;
+    }
+    VELOX_CHECK_EQ(
+        fragmentTasks_[spec.id].size(),
+        1u,
+        "Scan-bearing fragment {} has {} replicas; scans are only wired to "
+        "single-replica tasks.",
+        spec.id,
+        fragmentTasks_[spec.id].size());
+    auto& task = fragmentTasks_[spec.id][0];
+    VELOX_CHECK_EQ(
+        spec.scanNodeIds.size(),
+        spec.scanInfos.size(),
+        "Fragment {} has {} scan node IDs but {} scan infos",
+        spec.id,
+        spec.scanNodeIds.size(),
+        spec.scanInfos.size());
+
+    for (size_t i = 0; i < spec.scanNodeIds.size(); i++) {
+      const auto& scanInfo = spec.scanInfos[i];
+      const auto& scanNodeId = spec.scanNodeIds[i];
+      // Use the connector ID from the plan's TableScanNode.
+      // This is critical: "test-hive" → Velox Hive connector,
+      // "cudf-hive" → cuDF GPU connector (handles type casting).
+      const auto& connectorId = (i < spec.scanConnectorIds.size() &&
+                                  !spec.scanConnectorIds[i].empty())
+          ? spec.scanConnectorIds[i]
+          : kHiveConnectorId;
+
+      for (size_t j = 0; j < scanInfo->paths.size(); j++) {
+        std::unordered_map<std::string, std::optional<std::string>> partitionKeys;
+        if (!scanInfo->partitionColumns.empty() &&
+            j < scanInfo->partitionColumns.size()) {
+          for (const auto& [key, value] : scanInfo->partitionColumns[j]) {
+            partitionKeys[key] = value;
+          }
+        }
+
+        // Use HiveConnectorSplit with the appropriate connector ID.
+        // When connectorId is "cudf-hive", Velox routes to the cuDF connector
+        // which handles type coercion (BIGINT→DOUBLE) via libcudf.
+        auto connectorSplit =
+            std::make_shared<connector::hive::HiveConnectorSplit>(
+                connectorId,
+                scanInfo->paths[j],
+                scanInfo->format,
+                scanInfo->starts[j],
+                scanInfo->lengths[j],
+                partitionKeys);
+
+        task->addSplit(scanNodeId, Split(std::move(connectorSplit)));
+      }
+      task->noMoreSplits(scanNodeId);
+
+      LOG(WARNING) << "MppQueryCoordinator: added " << scanInfo->paths.size()
+                   << " scan splits (connector='" << connectorId
+                   << "') to fragment " << spec.id
+                   << " scan node " << scanNodeId;
+    }
+  }
+
+  // Phase 3: Wire exchanges via RemoteConnectorSplits (cartesian product).
   //
   // For each exchange E(producer P, consumer C) with M producer replicas and
   // N consumer replicas: each of the N consumer replicas adds M splits (one
@@ -468,79 +536,9 @@ void MppQueryCoordinator::start() {
                  << (isHashFanout ? "HASH-fanout" : "single-consumer") << ")";
   }
 
-  // Phase 2.5: broadcast producer output buffer fan-out already set in
+  // Phase 3.5: broadcast producer output buffer fan-out already set in
   // Phase 1 (before task->start()); nothing to do here. See the
   // broadcastFanout precompute above for the ordering rationale.
-
-  // Phase 3: Add file scan splits to scan-containing fragments.
-  //
-  // Leaf fragments that read from files (e.g., Parquet scans) need their
-  // file paths injected as HiveConnectorSplits. This mirrors the pattern
-  // in WholeStageResultIterator::noMoreSplits().
-  for (auto& spec : fragmentSpecs_) {
-    if (spec.scanNodeIds.empty()) {
-      continue;
-    }
-    // Scan-bearing fragments are always leaves (no inbound exchange) and
-    // therefore have exactly one replica.
-    VELOX_CHECK_EQ(
-        fragmentTasks_[spec.id].size(),
-        1u,
-        "Scan-bearing fragment {} has {} replicas; scans are only wired to "
-        "leaf fragments which must be single-replica.",
-        spec.id,
-        fragmentTasks_[spec.id].size());
-    auto& task = fragmentTasks_[spec.id][0];
-    VELOX_CHECK_EQ(
-        spec.scanNodeIds.size(),
-        spec.scanInfos.size(),
-        "Fragment {} has {} scan node IDs but {} scan infos",
-        spec.id,
-        spec.scanNodeIds.size(),
-        spec.scanInfos.size());
-
-    for (size_t i = 0; i < spec.scanNodeIds.size(); i++) {
-      const auto& scanInfo = spec.scanInfos[i];
-      const auto& scanNodeId = spec.scanNodeIds[i];
-      // Use the connector ID from the plan's TableScanNode.
-      // This is critical: "test-hive" → Velox Hive connector,
-      // "cudf-hive" → cuDF GPU connector (handles type casting).
-      const auto& connectorId = (i < spec.scanConnectorIds.size() &&
-                                  !spec.scanConnectorIds[i].empty())
-          ? spec.scanConnectorIds[i]
-          : kHiveConnectorId;
-
-      for (size_t j = 0; j < scanInfo->paths.size(); j++) {
-        std::unordered_map<std::string, std::optional<std::string>> partitionKeys;
-        if (!scanInfo->partitionColumns.empty() &&
-            j < scanInfo->partitionColumns.size()) {
-          for (const auto& [key, value] : scanInfo->partitionColumns[j]) {
-            partitionKeys[key] = value;
-          }
-        }
-
-        // Use HiveConnectorSplit with the appropriate connector ID.
-        // When connectorId is "cudf-hive", Velox routes to the cuDF connector
-        // which handles type coercion (BIGINT→DOUBLE) via libcudf.
-        auto connectorSplit =
-            std::make_shared<connector::hive::HiveConnectorSplit>(
-                connectorId,
-                scanInfo->paths[j],
-                scanInfo->format,
-                scanInfo->starts[j],
-                scanInfo->lengths[j],
-                partitionKeys);
-
-        task->addSplit(scanNodeId, Split(std::move(connectorSplit)));
-      }
-      task->noMoreSplits(scanNodeId);
-
-      LOG(WARNING) << "MppQueryCoordinator: added " << scanInfo->paths.size()
-                   << " scan splits (connector='" << connectorId
-                   << "') to fragment " << spec.id
-                   << " scan node " << scanNodeId;
-    }
-  }
 
   // Diagnostic watchdog: every 5s dump the state of every (fragId, replicaIdx)
   // Task so we can see where a hang is happening. Cheap: N_tasks log lines
