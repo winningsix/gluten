@@ -569,7 +569,11 @@ object VeloxAggregateFunctionsBuilder {
       mode: AggregateMode): Long = {
     val (sigName, aggFunc) =
       try {
-        (AggregateFunctionsBuilder.getSubstraitFunctionName(aggregateFunc), aggregateFunc)
+        val name = aggregateFunc match {
+          case _: Count if mode == PartialMerge || mode == Final => ExpressionNames.SUM
+          case _ => AggregateFunctionsBuilder.getSubstraitFunctionName(aggregateFunc)
+        }
+        (name, aggregateFunc)
       } catch {
         case e: GlutenNotSupportException =>
           HiveUDAFInspector.getUDAFClassName(aggregateFunc) match {
