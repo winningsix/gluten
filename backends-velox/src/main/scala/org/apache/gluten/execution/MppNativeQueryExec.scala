@@ -470,24 +470,10 @@ case class MppNativeQueryExec(
           }
 
         case bex: BroadcastExchangeLike =>
-          // Q21-style fusion: when spark.gluten.mpp.fuseBroadcastBuilds=true and
-          // the broadcast's runtime size <= spark.gluten.mpp.broadcastFuseThreshold,
-          // do NOT allocate a producer fragment. Return -1 as a sentinel; the WST
-          // consumer suppresses the corresponding ExchangeSpec entry. The build
-          // operators are still serialized: the consumer WST's doTransform walks
-          // through ColumnarInputAdapter -> BroadcastQueryStage normally, so the
-          // local-build path inside Velox handles the data side. This saves one
-          // fragment per fused broadcast (e.g. 12 -> 9 on TPC-H Q21).
-          if (canFuseBroadcastLive(bex)) {
-            logWarning(
-              s"MppNativeQueryExec: fusing broadcast build (size <= " +
-                s"$broadcastFuseThresholdBytes bytes) into consumer fragment")
-            -1
-          } else {
-            // See ShuffleExchangeLike above: do not share one native producer
-            // fragment across multiple consumers.
-            walk(unwrapTransparent(bex.child))
-          }
+          // Keep broadcast builds behind a native producer fragment. The old fused path
+          // shared one JNI iterator across fanout drivers and is not safe for MPP.
+          rejectUnsafeBroadcastFusionIfRequested("MppNativeQueryExec")
+          walk(unwrapTransparent(bex.child))
 
         case reused: ReusedExchangeExec =>
           // Spark reuses the same Exchange JVM object here, but native MPP cannot
@@ -675,8 +661,8 @@ case class MppNativeQueryExec(
     // through native BROADCAST exchanges. Preparing the whole plan can therefore
     // driver-collect a large build side before MPP starts, tripping
     // spark.driver.maxResultSize on Q16/Q18. Only materialize real subquery
-    // expressions below; fused broadcast builds are captured explicitly by
-    // canFuseBroadcastLive/executeBroadcast.
+    // expressions below; regular broadcast builds stay behind native BROADCAST
+    // exchange fragments.
 
     plan.foreach {
       node =>
@@ -816,61 +802,11 @@ case class MppNativeQueryExec(
     SQLConf.get.getConfString("spark.gluten.mpp.fuseBroadcastBuilds", "false").toBoolean
   }
 
-  private def unsafeFusedBroadcastBuildsEnabled: Boolean = {
-    SQLConf.get
-      .getConfString("spark.gluten.mpp.allowUnsafeFusedBroadcastBuilds", "false")
-      .toBoolean
-  }
-
-  /** Threshold in bytes below which a broadcast build may be fused. Default 8 GB. */
-  private def broadcastFuseThresholdBytes: Long = {
-    SQLConf.get
-      .getConfString(
-        "spark.gluten.mpp.broadcastFuseThreshold",
-        (8L * 1024L * 1024L * 1024L).toString)
-      .toLong
-  }
-
-  /**
-   * Decide whether a [[BroadcastExchangeLike]] is small enough to fuse into the consumer fragment.
-   * We use `runtimeStatistics.sizeInBytes` when the runtime exposes it; failing that we
-   * conservatively refuse to fuse so we never silently turn a too-large broadcast into a fused
-   * replicated build (would OOM the consumer).
-   */
-  private def canFuseBroadcastLive(bc: SparkPlan): Boolean = {
-    if (!fuseBroadcastBuildsEnabled) return false
-    if (!unsafeFusedBroadcastBuildsEnabled) {
-      logWarning(
-        "MppNativeQueryExec.canFuseBroadcastLive: NOT fusing broadcast because " +
-          "spark.gluten.mpp.allowUnsafeFusedBroadcastBuilds is false; using native " +
-          "BROADCAST exchange to avoid sharing one JNI broadcast iterator across fanout drivers")
-      return false
-    }
-    // Only fuse when sizeBytes is positively known AND below threshold. This
-    // mirrors the conservative path in MppCollapseRule.canFuseBroadcast: with
-    // stats unknown/zero we have no proof the build is small, and aggressive
-    // fusion has bitten Q16 SF1K (broadcast antijoin folded in-fragment but
-    // the consumer's WST still emits ReadRel(iterator:0) -> SubstraitToVeloxPlan
-    // line 1357 streamIdx OOB). Two gates need to be conservative; this is the
-    // execution-time one (the rule-time gate is canFuseBroadcast in
-    // MppCollapseRule).
-    val sizeBytes: Long = bc match {
-      case b: BroadcastExchangeLike =>
-        try b.runtimeStatistics.sizeInBytes.toLong
-        catch { case _: Throwable => -1L }
-      case _ => -1L
-    }
-    val ok = sizeBytes > 0 && sizeBytes <= broadcastFuseThresholdBytes
-    if (ok) {
-      logWarning(
-        s"MppNativeQueryExec.canFuseBroadcastLive: fusing (sizeBytes=$sizeBytes " +
-          s"<= $broadcastFuseThresholdBytes)")
-    } else {
-      logWarning(
-        s"MppNativeQueryExec.canFuseBroadcastLive: NOT fusing (sizeBytes=$sizeBytes " +
-          s"unknown or above threshold $broadcastFuseThresholdBytes)")
-    }
-    ok
+  private def rejectUnsafeBroadcastFusionIfRequested(context: String): Unit = {
+    if (!fuseBroadcastBuildsEnabled) return
+    logWarning(
+      s"$context: ignoring spark.gluten.mpp.fuseBroadcastBuilds=true; using native " +
+        "BROADCAST exchange to avoid sharing one JNI broadcast iterator across fanout drivers")
   }
 
   /** Classify the partitioning into an exchange type string and extract partition keys. */

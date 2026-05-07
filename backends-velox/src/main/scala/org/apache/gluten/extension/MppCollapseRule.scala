@@ -99,19 +99,13 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   private val MPP_ENABLED_KEY = "spark.gluten.mpp.enabled"
   private val MPP_ENABLED_DEFAULT = "true"
 
-  // --- Q21-style broadcast fusion (Presto parity) ---
+  // --- Broadcast fusion guard ---
   //
-  // Spark/Gluten emit a broadcast build subtree as its OWN fragment fed by a
-  // BROADCAST exchange into the consumer. Presto co-locates a small REPLICATED
-  // build with its consumer fragment, saving 2-3 fragments per join-heavy query
-  // (TPC-H Q21 in particular: 12 fragments -> 9). This is enabled only when
-  // spark.gluten.mpp.fuseBroadcastBuilds is true and the broadcast's estimated
-  // size is below spark.gluten.mpp.broadcastFuseThreshold (default 8 GB).
+  // The old fused path inlined broadcast builds into the consumer fragment, but
+  // that path shares one JNI iterator across native fanout drivers. Keep broadcast
+  // builds behind native BROADCAST exchange fragments instead.
   private val BROADCAST_FUSE_ENABLED_KEY = "spark.gluten.mpp.fuseBroadcastBuilds"
   private val BROADCAST_FUSE_ENABLED_DEFAULT = "false"
-  private val BROADCAST_FUSE_THRESHOLD_KEY = "spark.gluten.mpp.broadcastFuseThreshold"
-  // 8 GB (bytes). String form so SQLConf parses it deterministically across Spark versions.
-  private val BROADCAST_FUSE_THRESHOLD_DEFAULT = (8L * 1024L * 1024L * 1024L).toString
 
   private def isBroadcastFuseEnabled: Boolean = {
     SQLConf.get
@@ -119,58 +113,11 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       .toBoolean
   }
 
-  private def isUnsafeBroadcastFuseEnabled: Boolean = {
-    SQLConf.get
-      .getConfString("spark.gluten.mpp.allowUnsafeFusedBroadcastBuilds", "false")
-      .toBoolean
-  }
-
-  private def broadcastFuseThresholdBytes: Long = {
-    SQLConf.get
-      .getConfString(BROADCAST_FUSE_THRESHOLD_KEY, BROADCAST_FUSE_THRESHOLD_DEFAULT)
-      .toLong
-  }
-
-  /**
-   * Decide whether a [[BroadcastExchangeLike]] is small enough to fuse into the consumer fragment.
-   * Only fuse when the Spark-computed Statistics.sizeInBytes is both available AND below threshold.
-   * If stats throw (broadcast not yet materialized) or report 0, refuse to fuse: with stats unknown
-   * we have no way to confirm the build is small, and aggressive fusion in that case has bitten us
-   * on Q16 - the consumer fragment's WST was already frozen with an InputIteratorTransformer that
-   * emits ReadRel(iterator:0) for the build, but with fusion-decided-true no BROADCAST exchange
-   * spec is emitted, so the C++ side has zero placeholder iterators and conversion crashes at
-   * SubstraitToVeloxPlan.cc:1357 (streamIdx 0 < inputIters_.size() 0).
-   */
-  private def canFuseBroadcast(bc: SparkPlan): Boolean = {
-    if (!isBroadcastFuseEnabled) return false
-    if (!isUnsafeBroadcastFuseEnabled) {
-      logWarning(
-        "MppCollapseRule.canFuseBroadcast: NOT fusing broadcast because " +
-          "spark.gluten.mpp.allowUnsafeFusedBroadcastBuilds is false; using native " +
-          "BROADCAST exchange to avoid sharing one JNI broadcast iterator across fanout drivers")
-      return false
-    }
-    val sizeBytes: Long = bc match {
-      case b: BroadcastExchangeLike =>
-        try b.runtimeStatistics.sizeInBytes.toLong
-        catch { case _: Throwable => -1L }
-      case stage: BroadcastQueryStageExec =>
-        try stage.computeStats().map(_.sizeInBytes.toLong).getOrElse(-1L)
-        catch { case _: Throwable => -1L }
-      case _ => -1L
-    }
-    // sizeBytes <= 0 means "unknown" or "stats-not-yet-populated". Don't fuse in that case.
-    val ok = sizeBytes > 0 && sizeBytes <= broadcastFuseThresholdBytes
-    if (ok) {
-      logWarning(
-        s"MppCollapseRule.canFuseBroadcast: fusing (sizeBytes=$sizeBytes " +
-          s"<= $broadcastFuseThresholdBytes)")
-    } else {
-      logWarning(
-        s"MppCollapseRule.canFuseBroadcast: NOT fusing (sizeBytes=$sizeBytes " +
-          s"unknown or above threshold $broadcastFuseThresholdBytes)")
-    }
-    ok
+  private def rejectUnsafeBroadcastFusionIfRequested(context: String): Unit = {
+    if (!isBroadcastFuseEnabled) return
+    logWarning(
+      s"$context: ignoring spark.gluten.mpp.fuseBroadcastBuilds=true; using native " +
+        "BROADCAST exchange to avoid sharing one JNI broadcast iterator across fanout drivers")
   }
 
   override def apply(plan: SparkPlan): SparkPlan = {
@@ -589,56 +536,37 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
           consumerFragmentId
 
         case broadcast: BroadcastExchangeLike =>
-          // Q21-style fusion: when the broadcast build is small enough and the user
-          // opted in via spark.gluten.mpp.fuseBroadcastBuilds, fold the build subtree
-          // INTO the consumer fragment (no separate fragment, no BROADCAST exchange
-          // spec). This matches Presto's REPLICATED distribution and removes 1
-          // fragment per fused broadcast (e.g. 12 -> 9 on TPC-H Q21).
-          if (canFuseBroadcast(broadcast)) {
-            logWarning(
-              s"MppCollapseRule: fusing broadcast build (size <= " +
-                s"$broadcastFuseThresholdBytes bytes) into consumer fragment")
-            val childPlan = broadcast.children.headOption
-              .map(unwrapToExchange)
-              .getOrElse(broadcast)
-            // Walk the build subtree as part of the surrounding fragment by calling
-            // walkInFragment directly. We do not allocate a fragment id for the build:
-            // the caller already created the consumer fragment and will absorb us.
-            walkInFragment(childPlan)
-            // Sentinel: -1 means "no separate fragment" -- caller treats this child
-            // exactly like an in-fragment TransformSupport child.
-            -1
-          } else {
-            // Default (existing) behavior: build side becomes its own fragment fed
-            // into the consumer via a BROADCAST exchange.
-            val childPlan = broadcast.children.headOption
-              .map(unwrapToExchange)
-              .getOrElse(broadcast)
-            val producerFragmentId = walk(childPlan)
+          // Build side becomes its own fragment fed into the consumer via a
+          // native BROADCAST exchange. Do not inline the build into the consumer:
+          // the fused path is unsafe under native fanout.
+          rejectUnsafeBroadcastFusionIfRequested("MppCollapseRule")
+          val childPlan = broadcast.children.headOption
+            .map(unwrapToExchange)
+            .getOrElse(broadcast)
+          val producerFragmentId = walk(childPlan)
 
-            val consumerFragmentId = fragmentCounter.getAndIncrement()
-            val exchangeSource = MppExchangeSourceTransformer(
-              exchangeCounter.get(),
-              broadcast.output
-            )
-            fragments += NativeFragment(
-              id = consumerFragmentId,
-              rootOperator = exchangeSource,
-              outputAttributes = broadcast.output,
-              parallelism = 1
-            )
+          val consumerFragmentId = fragmentCounter.getAndIncrement()
+          val exchangeSource = MppExchangeSourceTransformer(
+            exchangeCounter.get(),
+            broadcast.output
+          )
+          fragments += NativeFragment(
+            id = consumerFragmentId,
+            rootOperator = exchangeSource,
+            outputAttributes = broadcast.output,
+            parallelism = 1
+          )
 
-            exchanges += ExchangeSpec(
-              id = exchangeCounter.getAndIncrement(),
-              producerFragmentId = producerFragmentId,
-              consumerFragmentId = consumerFragmentId,
-              exchangeType = "BROADCAST",
-              numPartitions = 1,
-              partitionKeys = Seq.empty
-            )
+          exchanges += ExchangeSpec(
+            id = exchangeCounter.getAndIncrement(),
+            producerFragmentId = producerFragmentId,
+            consumerFragmentId = consumerFragmentId,
+            exchangeType = "BROADCAST",
+            numPartitions = 1,
+            partitionKeys = Seq.empty
+          )
 
-            consumerFragmentId
-          }
+          consumerFragmentId
 
         case stage: ShuffleQueryStageExec =>
           walk(stage.plan)
