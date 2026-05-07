@@ -816,6 +816,12 @@ case class MppNativeQueryExec(
     SQLConf.get.getConfString("spark.gluten.mpp.fuseBroadcastBuilds", "false").toBoolean
   }
 
+  private def unsafeFusedBroadcastBuildsEnabled: Boolean = {
+    SQLConf.get
+      .getConfString("spark.gluten.mpp.allowUnsafeFusedBroadcastBuilds", "false")
+      .toBoolean
+  }
+
   /** Threshold in bytes below which a broadcast build may be fused. Default 8 GB. */
   private def broadcastFuseThresholdBytes: Long = {
     SQLConf.get
@@ -833,6 +839,13 @@ case class MppNativeQueryExec(
    */
   private def canFuseBroadcastLive(bc: SparkPlan): Boolean = {
     if (!fuseBroadcastBuildsEnabled) return false
+    if (!unsafeFusedBroadcastBuildsEnabled) {
+      logWarning(
+        "MppNativeQueryExec.canFuseBroadcastLive: NOT fusing broadcast because " +
+          "spark.gluten.mpp.allowUnsafeFusedBroadcastBuilds is false; using native " +
+          "BROADCAST exchange to avoid sharing one JNI broadcast iterator across fanout drivers")
+      return false
+    }
     // Only fuse when sizeBytes is positively known AND below threshold. This
     // mirrors the conservative path in MppCollapseRule.canFuseBroadcast: with
     // stats unknown/zero we have no proof the build is small, and aggressive

@@ -119,6 +119,12 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       .toBoolean
   }
 
+  private def isUnsafeBroadcastFuseEnabled: Boolean = {
+    SQLConf.get
+      .getConfString("spark.gluten.mpp.allowUnsafeFusedBroadcastBuilds", "false")
+      .toBoolean
+  }
+
   private def broadcastFuseThresholdBytes: Long = {
     SQLConf.get
       .getConfString(BROADCAST_FUSE_THRESHOLD_KEY, BROADCAST_FUSE_THRESHOLD_DEFAULT)
@@ -137,6 +143,13 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    */
   private def canFuseBroadcast(bc: SparkPlan): Boolean = {
     if (!isBroadcastFuseEnabled) return false
+    if (!isUnsafeBroadcastFuseEnabled) {
+      logWarning(
+        "MppCollapseRule.canFuseBroadcast: NOT fusing broadcast because " +
+          "spark.gluten.mpp.allowUnsafeFusedBroadcastBuilds is false; using native " +
+          "BROADCAST exchange to avoid sharing one JNI broadcast iterator across fanout drivers")
+      return false
+    }
     val sizeBytes: Long = bc match {
       case b: BroadcastExchangeLike =>
         try b.runtimeStatistics.sizeInBytes.toLong
