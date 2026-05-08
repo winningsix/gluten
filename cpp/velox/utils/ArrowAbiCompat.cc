@@ -8,6 +8,7 @@
  */
 
 #include <arrow/array/array_binary.h>
+#include <arrow/type.h>
 #include <arrow/type_fwd.h>
 #include <arrow/util/key_value_metadata.h>
 
@@ -43,9 +44,7 @@ extern "C" std::shared_ptr<arrow::DataType> arrowListField(
 
 extern "C" std::shared_ptr<arrow::DataType> arrowListField(
     const std::shared_ptr<arrow::Field>& valueType) {
-  auto fn = static_cast<std::shared_ptr<arrow::DataType> (*)(
-      const std::shared_ptr<arrow::Field>&)>(&arrow::list);
-  return fn(valueType);
+  return std::make_shared<arrow::ListType>(valueType);
 }
 
 extern "C" std::shared_ptr<arrow::DataType> arrowLargeListField(
@@ -54,9 +53,7 @@ extern "C" std::shared_ptr<arrow::DataType> arrowLargeListField(
 
 extern "C" std::shared_ptr<arrow::DataType> arrowLargeListField(
     const std::shared_ptr<arrow::Field>& valueType) {
-  auto fn = static_cast<std::shared_ptr<arrow::DataType> (*)(
-      const std::shared_ptr<arrow::Field>&)>(&arrow::large_list);
-  return fn(valueType);
+  return std::make_shared<arrow::LargeListType>(valueType);
 }
 
 extern "C" std::shared_ptr<arrow::DataType> arrowFixedSizeListField(
@@ -66,7 +63,5 @@ extern "C" std::shared_ptr<arrow::DataType> arrowFixedSizeListField(
 extern "C" std::shared_ptr<arrow::DataType> arrowFixedSizeListField(
     const std::shared_ptr<arrow::Field>& valueType,
     int listSize) {
-  auto fn = static_cast<std::shared_ptr<arrow::DataType> (*)(
-      const std::shared_ptr<arrow::Field>&, int)>(&arrow::fixed_size_list);
-  return fn(valueType, listSize);
+  return std::make_shared<arrow::FixedSizeListType>(valueType, listSize);
 }
