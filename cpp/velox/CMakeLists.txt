@@ -191,6 +191,7 @@ set(VELOX_SRCS
     substrait/VeloxToSubstraitPlan.cc
     substrait/VeloxToSubstraitType.cc
     udf/UdfLoader.cc
+    utils/ArrowAbiCompat.cc
     utils/Common.cc
     utils/ConfigExtractor.cc
     utils/VeloxArrowUtils.cc
@@ -338,13 +339,7 @@ import_library(facebook::velox ${VELOX_BUILD_PATH}/lib/libvelox.a)
 # tpch code is pulled in and needs these symbols regardless of BUILD_TESTS.
 import_library(facebook::velox::dbgen
                ${VELOX_BUILD_PATH}/velox/tpch/gen/dbgen/libdbgen.a)
-
-# libvelox.a is whole-archive'd into libgluten.so even for non-test builds.
-# Keep DuckDB and Arrow direct on the combined shared library link line so
-# `ldd -r`/dlopen can resolve relocations from whole-archived Velox objects.
 add_duckdb()
-target_link_libraries(velox PRIVATE duckdb_static Arrow::arrow
-                                    Arrow::arrow_bundled_dependencies)
 
 if(BUILD_TESTS)
   target_link_libraries(facebook::velox INTERFACE facebook::velox::dbgen)
@@ -389,6 +384,15 @@ target_link_libraries(velox PRIVATE
 # (folly::Init, etc.) are present in libgluten.so for symbol lookup.
 target_link_libraries(velox PRIVATE
   -Wl,--whole-archive Folly::folly -Wl,--no-whole-archive)
+
+# The velox target embeds the static gluten core archive manually with
+# --whole-archive, so close gluten's public static dependencies on the final
+# shared library instead of relying on transitive propagation through that
+# linker-flag hunk.
+find_arrow_lib(${ARROW_LIB_NAME})
+find_arrow_lib(${ARROW_BUNDLED_DEPS})
+target_link_libraries(velox PRIVATE Arrow::arrow
+                                    Arrow::arrow_bundled_dependencies)
 
 # glog is SHARED (libglog.so); consumers whose code calls google::LOG /
 # google::SetLogDestination need it on their link line. Propagate PUBLIC so
@@ -565,9 +569,12 @@ if(ENABLE_GPU)
     /usr/lib64/libucs.so)
 endif()
 
-# Repeat Arrow after whole-archived Velox/cuDF archives so static Arrow objects
-# referenced from pulled-in Velox objects resolve under ldd -r/dlopen.
-target_link_libraries(velox PRIVATE Arrow::arrow Arrow::arrow_bundled_dependencies)
+# Keep these at the end of libgluten.so's link line. `facebook::velox` and the
+# cuDF integration archives are pulled in with whole-archive above, and static
+# dependencies must appear after the archives that reference them.
+target_link_libraries(velox PRIVATE
+  duckdb_static
+  -Wl,--start-group Arrow::arrow Arrow::arrow_bundled_dependencies -Wl,--end-group)
 
 add_custom_command(
   TARGET velox

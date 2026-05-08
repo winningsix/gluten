@@ -34,6 +34,19 @@ target_include_directories(
 # the cuDF exchange / hive-connector static archives.
 target_link_libraries(mpp-substrait-runner PRIVATE velox)
 
+# `velox` keeps the core Gluten archive private to avoid double-registering
+# protobuf descriptors in Java consumers. As a result, standalone executables
+# that link libgluten.so directly must also link a few static dependencies
+# needed to resolve libgluten.so's non-exported references at executable link
+# time.
+find_library(ARROW_SHARED_LIBRARY NAMES arrow REQUIRED)
+target_link_libraries(mpp-substrait-runner PRIVATE ${ARROW_SHARED_LIBRARY})
+
+find_package(DuckDB QUIET)
+if(TARGET duckdb_static)
+  target_link_libraries(mpp-substrait-runner PRIVATE duckdb_static)
+endif()
+
 # fmt is a pure template/helper library with no global registration state.
 # Some of its internals (e.g. fmt::v11::detail::is_printable) are compiled
 # with LOCAL visibility inside libfmt.a and therefore cannot be exported

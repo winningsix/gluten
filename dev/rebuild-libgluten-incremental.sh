@@ -113,7 +113,7 @@ for sym in \
   Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery \
   Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeStartMppQuery \
   ; do
-  if ! nm -D "$OUT_LIB" 2>/dev/null | grep -q " T $sym$"; then
+  if ! nm -D "$OUT_LIB" 2>/dev/null | awk -v sym="$sym" '$2 == "T" && $3 == sym { found = 1 } END { exit !found }'; then
     echo "fatal: expected JNI symbol absent: $sym" >&2
     exit 6
   fi

@@ -386,15 +386,41 @@ QueryResult runQueryFromDump(
     }
 
     // --- 2. Thread pool + QueryCtx ---
-    // Physical driver count: replica-count logic from MppJniWrapper.
+    // Physical driver count: mirror MppQueryCoordinator's replica-count
+    // logic. Only HASH/RANGE inbound exchanges create one consumer task per
+    // destination; BROADCAST and ROUND_ROBIN do not drive task replication.
     const auto& fragments = loaded.fragments;
     const auto& exchanges = loaded.exchanges;
     std::vector<int32_t> replicaCount(fragments.size(), 1);
+    std::vector<int32_t> consumerInboundPartitions(fragments.size(), 0);
+    std::vector<bool> isHashConsumer(fragments.size(), false);
     for (const auto& ex : exchanges) {
+      if (ex.partitionType == "BROADCAST") {
+        continue;
+      }
       const auto consumer = ex.consumerFragmentId;
       const auto n = std::max(1, ex.numPartitions);
-      if (replicaCount[consumer] == 1) {
-        replicaCount[consumer] = n;
+      auto& slot = consumerInboundPartitions[consumer];
+      if (slot == 0) {
+        slot = n;
+      } else {
+        VELOX_CHECK_EQ(
+            slot,
+            n,
+            "Fragment {} has inbound non-broadcast exchanges with inconsistent "
+            "numPartitions ({} vs {}). All HASH/RANGE/ROUND_ROBIN inbound "
+            "exchanges must agree.",
+            consumer,
+            slot,
+            n);
+      }
+      if (ex.partitionType == "HASH" || ex.partitionType == "RANGE") {
+        isHashConsumer[consumer] = true;
+      }
+    }
+    for (size_t i = 0; i < fragments.size(); ++i) {
+      if (isHashConsumer[i]) {
+        replicaCount[i] = std::max(1, consumerInboundPartitions[i]);
       }
     }
     int32_t totalPhysicalDrivers = 0;
