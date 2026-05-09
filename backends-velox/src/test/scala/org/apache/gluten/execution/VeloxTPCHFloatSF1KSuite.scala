@@ -88,6 +88,13 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       // hinted broadcast tables (part ~30MB, supplier ~1.4MB, customer
       // ~300MB) clear the threshold even without stats.
       .set("spark.sql.autoBroadcastJoinThreshold", (2L * 1024 * 1024 * 1024).toString)
+      // Full-result collection and diagnostics can exceed Spark's 1024m default.
+      .set(
+        "spark.driver.maxResultSize",
+        sys.props
+          .get("spark.driver.maxResultSize")
+          .filter(v => v.nonEmpty && v != "null")
+          .getOrElse("8g"))
       // Plan-C MppStrategy: intercept queries at planner level and route through MPP.
       .set("spark.gluten.mpp.enabled", "true")
       .set("spark.gluten.mpp.strategy.enabled", "true")

@@ -44,6 +44,7 @@
 #include "memory/VeloxColumnarBatch.h"
 #include "memory/VeloxMemoryManager.h"
 #include "substrait/plan.pb.h"
+#include "utils/ConfigExtractor.h"
 #include "utils/ObjectStore.h"
 
 // Plan node types for tree rewriting.
@@ -78,6 +79,9 @@ struct MppQueryHandle {
   /// Query context (memory pool, config, cache).
   std::shared_ptr<velox::core::QueryCtx> queryCtx;
 
+  /// Optional spill executor. QueryCtx stores a raw pointer to this.
+  std::shared_ptr<folly::CPUThreadPoolExecutor> spillExecutor;
+
   /// The coordinator itself.
   std::shared_ptr<MppQueryCoordinator> coordinator;
 
@@ -86,9 +90,10 @@ struct MppQueryHandle {
 
   ~MppQueryHandle() {
     // Ensure coordinator is destroyed first (aborts any running tasks),
-    // then queryCtx, then the executor.
+    // then queryCtx, then spill/execution pools.
     coordinator.reset();
     queryCtx.reset();
+    spillExecutor.reset();
     executor.reset();
   }
 };
@@ -160,6 +165,157 @@ std::string formatIndices(std::vector<int32_t> indices) {
   }
   out << "]";
   return out.str();
+}
+
+std::shared_ptr<velox::config::ConfigBase> createMppSessionConfig(
+    VeloxRuntime* runtime) {
+  auto backendConf = VeloxBackend::get()->getBackendConf();
+  auto mergedMap = backendConf->rawConfigsCopy();
+  for (const auto& [key, val] : runtime->getConfMap()) {
+    mergedMap[key] = val;
+  }
+  return std::make_shared<velox::config::ConfigBase>(std::move(mergedMap));
+}
+
+std::unordered_map<std::string, std::string> buildMppQueryConfig(
+    const std::shared_ptr<velox::config::ConfigBase>& veloxCfg) {
+  std::unordered_map<std::string, std::string> configs;
+
+  configs[velox::core::QueryConfig::kPreferredOutputBatchRows] =
+      std::to_string(veloxCfg->get<uint32_t>(kSparkBatchSize, 4096));
+  configs[velox::core::QueryConfig::kMaxOutputBatchRows] =
+      std::to_string(veloxCfg->get<uint32_t>(kSparkBatchSize, 4096));
+  configs[velox::core::QueryConfig::kPreferredOutputBatchBytes] =
+      std::to_string(veloxCfg->get<uint64_t>(kVeloxPreferredBatchBytes, 10L << 20));
+
+  try {
+    configs[velox::core::QueryConfig::kSparkAnsiEnabled] =
+        veloxCfg->get<std::string>(kAnsiEnabled, "false");
+    configs[velox::core::QueryConfig::kSessionTimezone] =
+        veloxCfg->get<std::string>(kSessionTimezone, "");
+    configs[velox::core::QueryConfig::kAdjustTimestampToTimezone] = "true";
+
+    auto offHeapMemory =
+        veloxCfg->get<int64_t>(kSparkTaskOffHeapMemory, facebook::velox::memory::kMaxMemory);
+    auto maxPartialAggregationMemory = std::max<int64_t>(
+        1 << 24,
+        veloxCfg->get<int64_t>(kMaxPartialAggregationMemory).has_value()
+            ? veloxCfg->get<int64_t>(kMaxPartialAggregationMemory).value()
+            : static_cast<int64_t>(
+                  veloxCfg->get<double>(kMaxPartialAggregationMemoryRatio, 0.1) * offHeapMemory));
+    auto maxExtendedPartialAggregationMemory = std::max<int64_t>(
+        1 << 26,
+        veloxCfg->get<int64_t>(kMaxExtendedPartialAggregationMemory).has_value()
+            ? veloxCfg->get<int64_t>(kMaxExtendedPartialAggregationMemory).value()
+            : static_cast<int64_t>(
+                  veloxCfg->get<double>(kMaxExtendedPartialAggregationMemoryRatio, 0.15) * offHeapMemory));
+    configs[velox::core::QueryConfig::kMaxPartialAggregationMemory] =
+        std::to_string(maxPartialAggregationMemory);
+    configs[velox::core::QueryConfig::kMaxExtendedPartialAggregationMemory] =
+        std::to_string(maxExtendedPartialAggregationMemory);
+    configs[velox::core::QueryConfig::kAbandonPartialAggregationMinPct] =
+        std::to_string(veloxCfg->get<int32_t>(kAbandonPartialAggregationMinPct, 90));
+    configs[velox::core::QueryConfig::kAbandonPartialAggregationMinRows] =
+        std::to_string(veloxCfg->get<int32_t>(kAbandonPartialAggregationMinRows, 100000));
+
+    const auto spillStrategy =
+        veloxCfg->get<std::string>(kSpillStrategy, kSpillStrategyDefaultValue);
+    configs[velox::core::QueryConfig::kSpillEnabled] =
+        spillStrategy == "none" ? "false" : "true";
+    configs[velox::core::QueryConfig::kAggregationSpillEnabled] =
+        std::to_string(veloxCfg->get<bool>(kAggregationSpillEnabled, true));
+    configs[velox::core::QueryConfig::kJoinSpillEnabled] =
+        std::to_string(veloxCfg->get<bool>(kJoinSpillEnabled, true));
+    configs[velox::core::QueryConfig::kOrderBySpillEnabled] =
+        std::to_string(veloxCfg->get<bool>(kOrderBySpillEnabled, true));
+    configs[velox::core::QueryConfig::kWindowSpillEnabled] =
+        std::to_string(veloxCfg->get<bool>(kWindowSpillEnabled, true));
+    configs[velox::core::QueryConfig::kMaxSpillLevel] =
+        std::to_string(veloxCfg->get<int32_t>(kMaxSpillLevel, 4));
+    configs[velox::core::QueryConfig::kMaxSpillFileSize] =
+        std::to_string(veloxCfg->get<uint64_t>(kMaxSpillFileSize, 1L * 1024 * 1024 * 1024));
+    configs[velox::core::QueryConfig::kMaxSpillRunRows] =
+        std::to_string(veloxCfg->get<uint64_t>(kMaxSpillRunRows, 3L * 1024 * 1024));
+    configs[velox::core::QueryConfig::kMaxSpillBytes] =
+        std::to_string(veloxCfg->get<uint64_t>(kMaxSpillBytes, 107374182400LL));
+    configs[velox::core::QueryConfig::kSpillWriteBufferSize] =
+        std::to_string(veloxCfg->get<uint64_t>(kShuffleSpillDiskWriteBufferSize, 1L * 1024 * 1024));
+    configs[velox::core::QueryConfig::kSpillReadBufferSize] =
+        std::to_string(veloxCfg->get<int32_t>(kSpillReadBufferSize, 1L * 1024 * 1024));
+    configs[velox::core::QueryConfig::kSpillStartPartitionBit] =
+        std::to_string(veloxCfg->get<uint8_t>(kSpillStartPartitionBit, 48));
+    configs[velox::core::QueryConfig::kSpillNumPartitionBits] =
+        std::to_string(veloxCfg->get<uint8_t>(kSpillPartitionBits, 3));
+    configs[velox::core::QueryConfig::kSpillableReservationGrowthPct] =
+        std::to_string(veloxCfg->get<uint8_t>(kSpillableReservationGrowthPct, 25));
+    configs[velox::core::QueryConfig::kSpillPrefixSortEnabled] =
+        veloxCfg->get<std::string>(kSpillPrefixSortEnabled, "false");
+    if (veloxCfg->get<bool>(kSparkShuffleSpillCompress, true)) {
+      configs[velox::core::QueryConfig::kSpillCompressionKind] =
+          veloxCfg->get<std::string>(
+              kSpillCompressionKind,
+              veloxCfg->get<std::string>(kCompressionKind, "lz4"));
+    } else {
+      configs[velox::core::QueryConfig::kSpillCompressionKind] = "none";
+    }
+
+    configs[velox::core::QueryConfig::kSparkBloomFilterExpectedNumItems] =
+        std::to_string(veloxCfg->get<int64_t>(kBloomFilterExpectedNumItems, 1000000));
+    configs[velox::core::QueryConfig::kSparkBloomFilterNumBits] =
+        std::to_string(veloxCfg->get<int64_t>(kBloomFilterNumBits, 8388608));
+    configs[velox::core::QueryConfig::kSparkBloomFilterMaxNumBits] =
+        std::to_string(veloxCfg->get<int64_t>(kBloomFilterMaxNumBits, 4194304));
+    configs[velox::core::QueryConfig::kHashProbeDynamicFilterPushdownEnabled] =
+        std::to_string(veloxCfg->get<bool>(kHashProbeDynamicFilterPushdownEnabled, true));
+    configs[velox::core::QueryConfig::kHashProbeBloomFilterPushdownMaxSize] =
+        std::to_string(veloxCfg->get<uint64_t>(kHashProbeBloomFilterPushdownMaxSize, 0));
+    configs[velox::core::QueryConfig::kMaxSplitPreloadPerDriver] =
+        std::to_string(veloxCfg->get<int32_t>(kVeloxSplitPreloadPerDriver, 2));
+
+    configs[velox::core::QueryConfig::kAbandonDedupHashMapMinRows] =
+        std::to_string(veloxCfg->get<int32_t>(kAbandonDedupHashMapMinRows, 100000));
+    configs[velox::core::QueryConfig::kAbandonDedupHashMapMinPct] =
+        std::to_string(veloxCfg->get<int32_t>(kAbandonDedupHashMapMinPct, 0));
+    configs[velox::core::QueryConfig::kDriverCpuTimeSliceLimitMs] = "0";
+
+    configs[velox::core::QueryConfig::kSparkLegacyDateFormatter] =
+        veloxCfg->get<std::string>(kSparkLegacyTimeParserPolicy, "") == "LEGACY" ? "true" : "false";
+    configs[velox::core::QueryConfig::kThrowExceptionOnDuplicateMapKeys] =
+        veloxCfg->get<std::string>(kSparkMapKeyDedupPolicy, "") == "EXCEPTION" ? "true" : "false";
+    configs[velox::core::QueryConfig::kSparkLegacyStatisticalAggregate] =
+        std::to_string(veloxCfg->get<bool>(kSparkLegacyStatisticalAggregate, false));
+    configs[velox::core::QueryConfig::kSparkJsonIgnoreNullFields] =
+        std::to_string(veloxCfg->get<bool>(kSparkJsonIgnoreNullFields, true));
+    configs[velox::core::QueryConfig::kExprMaxCompiledRegexes] =
+        std::to_string(veloxCfg->get<int32_t>(kExprMaxCompiledRegexes, 100));
+
+#ifdef GLUTEN_ENABLE_GPU
+    configs[velox::cudf_velox::CudfConfig::kCudfEnabled] =
+        std::to_string(veloxCfg->get<bool>(kCudfEnabled, false));
+#endif
+
+    const auto setIfExists = [&](const std::string& glutenKey, const std::string& veloxKey) {
+      const auto valueOptional = veloxCfg->get<std::string>(glutenKey);
+      if (valueOptional.has_value()) {
+        configs[veloxKey] = valueOptional.value();
+      }
+    };
+    setIfExists(kQueryTraceEnabled, velox::core::QueryConfig::kQueryTraceEnabled);
+    setIfExists(kQueryTraceDir, velox::core::QueryConfig::kQueryTraceDir);
+    setIfExists(kQueryTraceMaxBytes, velox::core::QueryConfig::kQueryTraceMaxBytes);
+    setIfExists(kQueryTraceTaskRegExp, velox::core::QueryConfig::kQueryTraceTaskRegExp);
+    setIfExists(kOpTraceDirectoryCreateConfig, velox::core::QueryConfig::kOpTraceDirectoryCreateConfig);
+
+    overwriteVeloxConf(veloxCfg.get(), configs, kDynamicBackendConfPrefix);
+  } catch (const std::invalid_argument& err) {
+    std::string errDetails = err.what();
+    throw std::runtime_error("Invalid MPP query conf arg: " + errDetails);
+  }
+
+  // Keep the MPP-specific exchange buffer override after dynamic config copy.
+  configs[velox::core::QueryConfig::kMaxOutputBufferSize] = "1073741824";
+  configs[velox::core::QueryConfig::kMaxPartitionedOutputBufferSize] = "1073741824";
+  return configs;
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +784,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   // creates its own UcxExchangeSource — gluten doesn't register one.
 
   auto veloxPool = defaultLeafVeloxMemoryPool();
+  auto sessionCfg = createMppSessionConfig(runtime);
 
   std::vector<MppFragmentSpec> fragmentSpecs;
   fragmentSpecs.reserve(numFragments);
@@ -654,16 +811,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
             &substraitPlan),
         fmt::format("Failed to parse Substrait plan for fragment {}", i));
 
-    // Convert Substrait -> Velox PlanNode.
-    // Merge backend config + runtime session config. Backend config has static
-    // settings; session config has per-query overrides (e.g., cudf=true).
-    auto backendConf = VeloxBackend::get()->getBackendConf();
-    auto mergedMap = backendConf->rawConfigsCopy();
-    for (const auto& [key, val] : runtime->getConfMap()) {
-      mergedMap[key] = val;
-    }
-    auto sessionCfg = std::make_shared<velox::config::ConfigBase>(
-        std::move(mergedMap));
+    // Convert Substrait -> Velox PlanNode with backend defaults plus runtime
+    // session overrides (e.g., cudf=true).
     LOG(WARNING) << "MppJniWrapper: fragment " << i
                 << " cudf.enabled="
                 << sessionCfg->get<std::string>(
@@ -1265,17 +1414,24 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   // backpressure on the first few pages, stalling the producer pipeline and
   // never firing noMoreData to downstream. Raise to 1 GB to give chained
   // exchanges breathing room at N up to ~200.
-  std::unordered_map<std::string, std::string> queryConfigMap = {
-      {velox::core::QueryConfig::kMaxOutputBufferSize, "1073741824"},
-      {velox::core::QueryConfig::kMaxPartitionedOutputBufferSize, "1073741824"},
-  };
+  auto queryConfigMap = buildMppQueryConfig(sessionCfg);
+  std::shared_ptr<folly::CPUThreadPoolExecutor> spillExecutor;
+  const auto spillThreadNum =
+      sessionCfg->get<uint32_t>(kSpillThreadNum, kSpillThreadNumDefaultValue);
+  if (spillThreadNum > 0) {
+    spillExecutor = std::make_shared<folly::CPUThreadPoolExecutor>(spillThreadNum);
+  }
+  LOG(WARNING) << "MppJniWrapper: QueryCtx configs=" << queryConfigMap.size()
+               << " spillStrategy="
+               << sessionCfg->get<std::string>(kSpillStrategy, kSpillStrategyDefaultValue)
+               << " spillThreads=" << spillThreadNum;
   auto queryCtx = velox::core::QueryCtx::create(
       executor.get(),
       velox::core::QueryConfig{std::move(queryConfigMap)},
       connectorConfigs,
       VeloxBackend::get()->getAsyncDataCache(),
       mppPool,
-      /*spillExecutor=*/nullptr,
+      spillExecutor.get(),
       "MppQuery");
 
   // Generate a process-unique query ID. Previously we used the queryCtx
@@ -1303,6 +1459,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   auto handle = std::make_shared<MppQueryHandle>();
   handle->executor = std::move(executor);
   handle->queryCtx = std::move(queryCtx);
+  handle->spillExecutor = std::move(spillExecutor);
   handle->coordinator = std::move(coordinator);
   handle->memoryPool = std::move(veloxPool);
 
