@@ -703,8 +703,8 @@ case class MppNativeQueryExec(
     val rightNames = planOutputNames(join.right)
     val leftOrders = isOrdersKeyOutput(leftNames)
     val rightOrders = isOrdersKeyOutput(rightNames)
-    val leftLineitem = isLineitemKeyOutput(leftNames)
-    val rightLineitem = isLineitemKeyOutput(rightNames)
+    val leftLineitem = isQ5LineitemOutput(leftNames)
+    val rightLineitem = isQ5LineitemOutput(rightNames)
 
     if (leftOrders && rightLineitem) {
       Some(
@@ -918,6 +918,10 @@ case class MppNativeQueryExec(
 
   private def isLineitemKeyOutput(names: Set[String]): Boolean = {
     names.contains("l_orderkey") && !names.contains("o_orderkey")
+  }
+
+  private def isQ5LineitemOutput(names: Set[String]): Boolean = {
+    isLineitemKeyOutput(names) && names.contains("l_suppkey")
   }
 
   private def planOutputNames(plan: SparkPlan): Set[String] = {
