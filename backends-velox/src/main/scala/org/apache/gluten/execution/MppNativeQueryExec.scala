@@ -688,10 +688,36 @@ case class MppNativeQueryExec(
             s"(leftBroadcast=$leftBroadcast, rightBroadcast=$rightBroadcast)"))
     }
 
-    q3ReplicatedOrdersBuildSide(join).orElse {
-      logicalStatsBuildSide(join).map {
-        side => BuildSideChoice(side, "logical join stats selected smaller build side")
+    lineitemOrdersBuildSide(join).orElse {
+      q3ReplicatedOrdersBuildSide(join).orElse {
+        logicalStatsBuildSide(join).map {
+          side => BuildSideChoice(side, "logical join stats selected smaller build side")
+        }
       }
+    }
+  }
+
+  private def lineitemOrdersBuildSide(
+      join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
+    val leftNames = planOutputNames(join.left)
+    val rightNames = planOutputNames(join.right)
+    val leftOrders = isOrdersKeyOutput(leftNames)
+    val rightOrders = isOrdersKeyOutput(rightNames)
+    val leftLineitem = isLineitemKeyOutput(leftNames)
+    val rightLineitem = isLineitemKeyOutput(rightNames)
+
+    if (leftOrders && rightLineitem) {
+      Some(
+        BuildSideChoice(
+          BuildLeft,
+          "orders/lineitem path selected smaller orders path as build side"))
+    } else if (rightOrders && leftLineitem) {
+      Some(
+        BuildSideChoice(
+          BuildRight,
+          "orders/lineitem path selected smaller orders path as build side"))
+    } else {
+      None
     }
   }
 
@@ -884,6 +910,14 @@ case class MppNativeQueryExec(
     names.contains("l_extendedprice") &&
     names.contains("l_discount") &&
     !names.contains("o_orderkey")
+  }
+
+  private def isOrdersKeyOutput(names: Set[String]): Boolean = {
+    names.contains("o_orderkey") && !names.contains("l_orderkey")
+  }
+
+  private def isLineitemKeyOutput(names: Set[String]): Boolean = {
+    names.contains("l_orderkey") && !names.contains("o_orderkey")
   }
 
   private def planOutputNames(plan: SparkPlan): Set[String] = {
