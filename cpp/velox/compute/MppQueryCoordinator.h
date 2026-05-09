@@ -233,6 +233,8 @@ class MppQueryCoordinator {
   std::shared_ptr<facebook::velox::exec::OutputBufferManager> bufferManager_;
   std::vector<int64_t> rootOutputSequence_;
   std::vector<bool> rootReplicaAtEnd_;
+  std::vector<std::unique_ptr<facebook::velox::exec::SerializedPageBase>>
+      pendingRootPages_;
   int32_t rootFetchCursor_{0};
   /// True for RANGE (order-preserving) drain; false for round-robin.
   bool rootDrainSequential_{false};

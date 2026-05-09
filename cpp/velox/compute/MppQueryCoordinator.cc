@@ -820,6 +820,28 @@ void MppQueryCoordinator::rethrowFirstTaskError() const {
 RowVectorPtr MppQueryCoordinator::next() {
   VELOX_CHECK(started_, "Must call start() before next()");
 
+  const auto deserializePage =
+      [&](std::unique_ptr<SerializedPageBase>& page) -> RowVectorPtr {
+    // Deserialize the CPU page via Presto serde into a RowVector.
+    auto inputStream = page->prepareStreamForDeserialize();
+    auto outputType = std::dynamic_pointer_cast<const RowType>(
+        fragmentSpecs_[rootFragmentId_].planFragment.planNode->outputType());
+    VELOX_CHECK(
+        outputType != nullptr, "Root fragment must have RowType output");
+    if (deserializePool_ == nullptr) {
+      deserializePool_ = queryCtx_->pool()->addLeafChild("mpp_deserialize");
+    }
+    RowVectorPtr result;
+    VectorStreamGroup::read(
+        inputStream.get(),
+        deserializePool_.get(),
+        outputType,
+        getVectorSerde(),
+        &result,
+        /*options=*/nullptr);
+    return result;
+  };
+
   if (noMoreData_) {
     rethrowFirstTaskError();
     return nullptr;
@@ -827,6 +849,16 @@ RowVectorPtr MppQueryCoordinator::next() {
 
   // Keep fetching until we get data pages or hit end-of-stream.
   while (!noMoreData_) {
+    while (!pendingRootPages_.empty()) {
+      auto page = std::move(pendingRootPages_.front());
+      pendingRootPages_.erase(pendingRootPages_.begin());
+      if (!page) {
+        continue;
+      }
+      rethrowFirstTaskError();
+      return deserializePage(page);
+    }
+
     std::vector<std::unique_ptr<SerializedPageBase>> pages;
     bool gotData = fetchNextOutputPage(pages);
 
@@ -837,38 +869,22 @@ RowVectorPtr MppQueryCoordinator::next() {
       return nullptr;
     }
 
-    // Unwrap and return the first non-null page. The root fragment's output
-    // is a kHttp PartitionedOutput, which produces CPU-serialized pages
-    // (PrestoVectorSerde / IOBuf-backed). Inter-fragment GPU edges flow
+    // A failed producer/consumer can race with the root aggregate producing a
+    // page (for global aggregates this may be a single NULL row). Surface the
+    // native failure before handing that page to Spark, otherwise a partial
+    // result can masquerade as a successful one-row answer.
+    rethrowFirstTaskError();
+
+    // Queue all non-null pages returned by this getData call. The root
+    // fragment's kHttp PartitionedOutput produces CPU-serialized pages
+    // (PrestoVectorSerde / IOBuf-backed); inter-fragment GPU edges flow
     // through IBM's UCX / IntraNodeTransfer path and never reach this
     // coordinator, so there is no GpuSerializedPage shape to handle here.
-    // Remaining pages in the batch are discarded here; they will be re-fetched
-    // on subsequent next() calls. Sequence ack already advanced inside
-    // fetchNextOutputPage() so this is safe.
     for (auto& page : pages) {
       if (!page) {
         continue;
       }
-
-      // Deserialize the CPU page via Presto serde into a RowVector.
-      auto inputStream = page->prepareStreamForDeserialize();
-      auto outputType = std::dynamic_pointer_cast<const RowType>(
-          fragmentSpecs_[rootFragmentId_].planFragment.planNode->outputType());
-      VELOX_CHECK(
-          outputType != nullptr, "Root fragment must have RowType output");
-      if (deserializePool_ == nullptr) {
-        deserializePool_ =
-            queryCtx_->pool()->addLeafChild("mpp_deserialize");
-      }
-      RowVectorPtr result;
-      VectorStreamGroup::read(
-          inputStream.get(),
-          deserializePool_.get(),
-          outputType,
-          getVectorSerde(),
-          &result,
-          /*options=*/nullptr);
-      return result;
+      pendingRootPages_.push_back(std::move(page));
     }
   }
 
