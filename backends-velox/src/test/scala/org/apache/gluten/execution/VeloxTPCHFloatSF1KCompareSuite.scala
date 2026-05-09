@@ -18,26 +18,28 @@ package org.apache.gluten.execution
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.{DataFrame, Row}
-import org.apache.spark.sql.types.{DoubleType, FloatType, StructType}
+import org.apache.spark.sql.types._
 
+import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
 import org.scalatest.concurrent.TimeLimits
 import org.scalatest.time.{Seconds, Span}
 
 import java.io.File
 
+import scala.collection.JavaConverters._
 import scala.util.Try
 
 /**
  * Full-output correctness harness for SF1K TPC-H runs.
  *
  * This suite intentionally stays separate from [[VeloxTPCHFloatSF1KSuite]], which is still useful
- * as a broad runtime smoke test. It compares complete query output against Spark RAPIDS Parquet
- * references rather than relying on the truncated [MPP-RESULT] log preview.
+ * as a broad runtime smoke test. When `gluten.tpch.prestoReferenceDir` is set it uses Presto-GPU
+ * JSON as the primary oracle; otherwise it preserves the RAPIDS Parquet reference path.
  */
 class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimits {
 
   private val defaultReferenceRoot = "/raid/pv-cli/spark_output/rapids_sf1000_1GPU_3run_0423"
-  private val q4ExistsLineitemDedupKey = "spark.gluten.mpp.q4ExistsLineitemDedup"
+  private val objectMapper = new ObjectMapper()
 
   private def nonNullProperty(key: String, defaultValue: String): String = {
     sys.props.get(key).filter(value => value.nonEmpty && value != "null").getOrElse(defaultValue)
@@ -103,8 +105,26 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
   private val referenceRun: String =
     nonNullProperty("gluten.tpch.referenceRun", "run-1-test")
 
+  private val prestoReferenceDir: Option[File] =
+    sys.props
+      .get("gluten.tpch.prestoReferenceDir")
+      .filter(value => value.nonEmpty && value != "null")
+      .map(new File(_))
+
+  private val allowPrestoSampleOnly: Boolean =
+    sys.props
+      .get("gluten.tpch.allowPrestoSampleOnly")
+      .exists(_.equalsIgnoreCase("true"))
+
   protected val externalDataDir: String =
     nonNullProperty("gluten.tpch.externalDataDir", "/data/tpch/sf1k_v2_float")
+
+  private val mppDumpDir: String =
+    sys.props
+      .get("spark.gluten.mpp.substraitDumpDir")
+      .orElse(sys.env.get("CURSOR_MPP_DUMP_DIR"))
+      .filter(_.nonEmpty)
+      .getOrElse("/opt/gluten/mpp-dumps-tpch-sf1k")
 
   override protected def createTPCHNotNullTables(): Unit = {
     TPCHTableDataFrames = TPCHTables
@@ -137,18 +157,14 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
       .set("spark.gluten.mpp.removeRedundantShuffle", "true")
       .set("spark.gluten.mpp.parallelSortSplit", "true")
       .set("spark.gluten.mpp.fuseBroadcastBuilds", "true")
-      // Keep compact fragments from owning too many Presto-like stage inputs at once.
-      // The production default remains opt-in; this SF1K gate falls back to BSP barriers.
-      .set("spark.gluten.mpp.maxInboundExchangesPerFragment", "4")
       .set("spark.gluten.sql.columnar.cudf", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enabled", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.jit_expression_enabled", "false")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.ast_expression_enabled", "true")
-      .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps-tpch-sf1k")
+      .set("spark.gluten.mpp.substraitDumpDir", mppDumpDir)
 
     Seq(
-      "spark.driver.maxResultSize",
       "spark.gluten.sql.columnar.libpath",
       "spark.gluten.loadLibFromJar",
       "spark.gluten.mpp.substraitDumpDir",
@@ -160,7 +176,8 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
       "spark.gluten.mpp.q3.replicateOrdersPath",
       "spark.gluten.mpp.fuseBroadcastBuilds",
       "spark.gluten.mpp.normalizeJoinBuildSide",
-      q4ExistsLineitemDedupKey).foreach {
+      "spark.gluten.mpp.q4ExistsLineitemDedup"
+    ).foreach {
       key =>
         sys.props
           .get(key)
@@ -178,46 +195,8 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
     19 -> "/*+ BROADCAST(part) */"
   )
 
-  private val q4ExistsLineitemDedupSQL: String =
-    """
-      |select
-      |  o.o_orderpriority,
-      |  sum(case when l.late_lineitem_count > 0 then 1 else 0 end) as order_count
-      |from
-      |  orders o
-      |join (
-      |  select
-      |    l_orderkey,
-      |    count(*) as late_lineitem_count
-      |  from
-      |    lineitem
-      |  where
-      |    l_commitdate < l_receiptdate
-      |  group by
-      |    l_orderkey
-      |) l
-      |  on l.l_orderkey = o.o_orderkey
-      |where
-      |  o.o_orderdate >= date '1993-07-01'
-      |  and o.o_orderdate < date '1993-07-01' + interval '3' month
-      |group by
-      |  o.o_orderpriority
-      |order by
-      |  o.o_orderpriority
-      |""".stripMargin
-
-  private def q4ExistsLineitemDedupEnabled: Boolean =
-    sys.props
-      .get(q4ExistsLineitemDedupKey)
-      .exists(_.trim.equalsIgnoreCase("true"))
-
   override protected def tpchSQL(queryNum: Int, tpchQueries: String): String = {
-    val raw =
-      if (queryNum == 4 && q4ExistsLineitemDedupEnabled) {
-        q4ExistsLineitemDedupSQL
-      } else {
-        super.tpchSQL(queryNum, tpchQueries)
-      }
+    val raw = super.tpchSQL(queryNum, tpchQueries)
     broadcastHintByQuery.get(queryNum) match {
       case Some(hint) => raw.replaceFirst("(?i)\\bselect\\b", s"select $hint")
       case None => raw
@@ -249,15 +228,21 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
 
   queriesToCompare.foreach {
     qid =>
-      test(s"TPC-H q$qid matches RAPIDS SF1K reference") {
+      val referenceLabel =
+        if (prestoReferenceDir.isDefined) "Presto-GPU JSON reference" else "RAPIDS SF1K reference"
+      test(s"TPC-H q$qid matches $referenceLabel") {
         failAfter(perQueryTimeout) {
           val actualDf = spark.sql(tpchSQL(qid, tpchQueries))
           logWarning(
             s"VeloxTPCHFloatSF1KCompareSuite: Q$qid optimizedPlan with stats:\n" +
               actualDf.queryExecution.stringWithStats)
 
-          val expectedDf = spark.read.parquet(referencePath(qid).getAbsolutePath)
-          compareFullOutput(qid, actualDf, expectedDf)
+          prestoReferenceDir match {
+            case Some(_) => comparePrestoJsonOutput(qid, actualDf)
+            case None =>
+              val expectedDf = spark.read.parquet(referencePath(qid).getAbsolutePath)
+              compareFullOutput(qid, actualDf, expectedDf)
+          }
         }
       }
   }
@@ -282,6 +267,173 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
         s"Missing RAPIDS reference for Q$qid. Checked ${direct.getAbsolutePath} and " +
           s"${nested.getAbsolutePath}")
       nested
+    }
+  }
+
+  private case class PrestoReference(path: File, rows: Option[Long], sampleRows: Seq[Row])
+
+  private def prestoReferencePath(qid: Int): File = {
+    val dir = prestoReferenceDir.getOrElse(fail("Presto reference directory is not configured"))
+    val path = new File(dir, s"Q$qid.result.json")
+    assert(path.isFile, s"Missing Presto-GPU JSON reference for Q$qid: ${path.getAbsolutePath}")
+    path
+  }
+
+  private def loadPrestoReference(qid: Int, schema: StructType): PrestoReference = {
+    val path = prestoReferencePath(qid)
+    val root =
+      try {
+        objectMapper.readTree(path)
+      } catch {
+        case e: Exception =>
+          fail(
+            s"Failed to parse Presto-GPU JSON reference ${path.getAbsolutePath}: " +
+              s"${e.getMessage}")
+      }
+
+    assert(root != null && root.isObject, s"Presto-GPU JSON reference is not an object: $path")
+    val rows = Option(root.get("rows")).filterNot(_.isNull).map(jsonRowsAsLong(path, _))
+    val sampleNode = Option(root.get("sample"))
+      .getOrElse(fail(s"Presto-GPU JSON reference missing sample array: $path"))
+    assert(sampleNode.isArray, s"Presto-GPU JSON field sample is not an array: $path")
+
+    val sampleRows = sampleNode
+      .elements()
+      .asScala
+      .zipWithIndex
+      .map { case (rowNode, index) => rowFromJsonArray(path, index, rowNode, schema) }
+      .toSeq
+
+    rows.foreach {
+      rowCount =>
+        assert(
+          sampleRows.size.toLong <= rowCount,
+          s"Presto-GPU JSON sample has more rows than rows field for Q$qid: " +
+            s"sample=${sampleRows.size}, rows=$rowCount, path=${path.getAbsolutePath}"
+        )
+    }
+    PrestoReference(path, rows, sampleRows)
+  }
+
+  private def jsonRowsAsLong(path: File, node: JsonNode): Long = {
+    if (node.isIntegralNumber) {
+      node.asLong()
+    } else {
+      Try(node.asText().toLong).getOrElse(
+        fail(s"Presto-GPU JSON rows field is not an integer in ${path.getAbsolutePath}: $node"))
+    }
+  }
+
+  private def rowFromJsonArray(
+      path: File,
+      rowIndex: Int,
+      rowNode: JsonNode,
+      schema: StructType): Row = {
+    assert(
+      rowNode.isArray,
+      s"Presto-GPU JSON sample row[$rowIndex] is not an array in ${path.getAbsolutePath}")
+    assert(
+      rowNode.size() == schema.length,
+      s"Presto-GPU JSON sample row[$rowIndex] column count mismatch in ${path.getAbsolutePath}: " +
+        s"expected schema columns=${schema.length}, actual=${rowNode.size()}"
+    )
+
+    Row.fromSeq(schema.fields.zipWithIndex.map {
+      case (field, index) => jsonValueAsSparkValue(path, rowIndex, index, rowNode.get(index), field)
+    })
+  }
+
+  private def jsonValueAsSparkValue(
+      path: File,
+      rowIndex: Int,
+      columnIndex: Int,
+      node: JsonNode,
+      field: StructField): Any = {
+    if (node == null || node.isNull) {
+      null
+    } else {
+      try {
+        field.dataType match {
+          case ByteType => new java.math.BigDecimal(jsonScalarText(node)).byteValueExact()
+          case ShortType => new java.math.BigDecimal(jsonScalarText(node)).shortValueExact()
+          case IntegerType => new java.math.BigDecimal(jsonScalarText(node)).intValueExact()
+          case LongType => new java.math.BigDecimal(jsonScalarText(node)).longValueExact()
+          case FloatType => jsonScalarText(node).toFloat
+          case DoubleType => jsonScalarText(node).toDouble
+          case _: DecimalType => new java.math.BigDecimal(jsonScalarText(node))
+          case BooleanType => node.asBoolean()
+          case DateType => java.sql.Date.valueOf(jsonScalarText(node))
+          case TimestampType => java.sql.Timestamp.valueOf(jsonScalarText(node).replace('T', ' '))
+          case StringType => jsonScalarText(node)
+          case _ => jsonScalarText(node)
+        }
+      } catch {
+        case e: Exception =>
+          fail(
+            s"Cannot coerce Presto-GPU JSON value for ${path.getAbsolutePath} " +
+              s"row[$rowIndex] col[$columnIndex] (${field.name}:${field.dataType.catalogString}) " +
+              s"value=$node: ${e.getMessage}")
+      }
+    }
+  }
+
+  private def jsonScalarText(node: JsonNode): String =
+    if (node.isTextual) node.asText() else node.toString
+
+  private def comparePrestoJsonOutput(qid: Int, actualDf: DataFrame): Unit = {
+    val actualRowsInOrder = actualDf.collect().toSeq
+    val reference = loadPrestoReference(qid, actualDf.schema)
+    val prestoRowsText = reference.rows.map(_.toString).getOrElse("<missing>")
+    val fullCaptured = reference.rows.contains(reference.sampleRows.size.toLong)
+    val mode = if (fullCaptured) "FULL" else "SAMPLE_ONLY"
+
+    logWarning(
+      s"[PRESTO-JSON] Q$qid reference=${reference.path.getAbsolutePath} " +
+        s"prestoRows=$prestoRowsText sampleRows=${reference.sampleRows.size} mode=$mode " +
+        s"allowSampleOnly=$allowPrestoSampleOnly")
+
+    reference.rows.foreach {
+      expectedRows =>
+        assert(
+          actualRowsInOrder.size.toLong == expectedRows,
+          s"Q$qid row count mismatch vs Presto-GPU JSON ${reference.path.getAbsolutePath}: " +
+            s"expected=$expectedRows, actual=${actualRowsInOrder.size}"
+        )
+    }
+
+    if (fullCaptured) {
+      val mismatch = collectedOutputMismatch(
+        s"Q$qid Presto-GPU JSON full compare",
+        CollectedOutput(actualDf.schema, sortRows(actualRowsInOrder, actualDf.schema)),
+        CollectedOutput(actualDf.schema, sortRows(reference.sampleRows, actualDf.schema))
+      )
+      mismatch.foreach(message => fail(message))
+      logWarning(
+        s"[PRESTO-JSON] Q$qid FULL_PASS rows=${actualRowsInOrder.size} " +
+          s"reference=${reference.path.getAbsolutePath}")
+    } else {
+      assert(
+        reference.sampleRows.size <= actualRowsInOrder.size,
+        s"Q$qid Presto-GPU JSON sample has more rows than actual output: " +
+          s"sample=${reference.sampleRows.size}, actual=${actualRowsInOrder.size}, " +
+          s"reference=${reference.path.getAbsolutePath}"
+      )
+      val overlap = math.min(reference.sampleRows.size, actualRowsInOrder.size)
+      val mismatch = collectedOutputMismatch(
+        s"Q$qid Presto-GPU JSON sample prefix compare",
+        CollectedOutput(actualDf.schema, actualRowsInOrder.take(overlap)),
+        CollectedOutput(actualDf.schema, reference.sampleRows.take(overlap))
+      )
+      mismatch.foreach(message => fail(message))
+
+      val samplePassMessage =
+        s"Q$qid SAMPLE_PASS only: row count matched Presto-GPU rows=$prestoRowsText and " +
+          s"sample prefix rows=$overlap matched, but JSON captured " +
+          s"${reference.sampleRows.size} of $prestoRowsText rows. This is not a full " +
+          s"correctness pass. Capture full Presto rows or set " +
+          s"-Dgluten.tpch.allowPrestoSampleOnly=true for diagnostic sample-only runs."
+      logWarning(s"[PRESTO-JSON] $samplePassMessage")
+      assert(allowPrestoSampleOnly, samplePassMessage)
     }
   }
 
