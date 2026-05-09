@@ -219,7 +219,14 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
             .sorted
         }
         .filter(_.nonEmpty)
-        .getOrElse(Seq(1, 6, 12))
+        .getOrElse {
+          if (prestoReferenceDir.isDefined &&
+            sys.props.get("gluten.tpch.compareAllQueries").exists(_.equalsIgnoreCase("true"))) {
+            (1 to 22).toSeq
+          } else {
+            Seq(1, 6, 12)
+          }
+        }
     }
 
   queriesToCompare.foreach {

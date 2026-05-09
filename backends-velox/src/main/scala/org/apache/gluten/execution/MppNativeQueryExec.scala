@@ -583,7 +583,310 @@ case class MppNativeQueryExec(
     // parallelSortSplit must run AFTER MppSinglePartitionSortRule so the
     // RangePartitioning -> SinglePartition rewrite has already happened.
     val afterParallelSortSplit = parallelSortSplitRule(afterSkipShuffle)
-    afterParallelSortSplit
+    normalizeMppJoinBuildSide(afterParallelSortSplit)
+  }
+
+  /**
+   * Optional guardrail for plans where Spark has already collapsed several Presto-like stages into
+   * a single native fragment. When enabled, this avoids running one compact fragment that must
+   * drain many large HASH/BROADCAST inputs and keep all join/aggregate state live at once.
+   */
+  private def overloadedFragmentFallbackReason(
+      fragments: Seq[NativeFragment],
+      exchanges: Seq[ExchangeSpec]): Option[String] = {
+    val maxInbound = mppNonNegativeIntConf("spark.gluten.mpp.maxInboundExchangesPerFragment", 0)
+    val maxHashInbound =
+      mppNonNegativeIntConf("spark.gluten.mpp.maxHashInboundExchangesPerFragment", 0)
+    val maxBroadcastInbound =
+      mppNonNegativeIntConf("spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment", 0)
+    if (maxInbound <= 0 && maxHashInbound <= 0 && maxBroadcastInbound <= 0) {
+      return None
+    }
+    logWarning(
+      s"MppNativeQueryExec: inbound exchange guardrails enabled " +
+        s"(maxInbound=$maxInbound maxHash=$maxHashInbound maxBroadcast=$maxBroadcastInbound)")
+
+    val fragmentById = fragments.map(f => f.id -> f).toMap
+    val overloaded = exchanges
+      .groupBy(_.consumerFragmentId)
+      .toSeq
+      .sortBy(_._1)
+      .flatMap {
+        case (consumerId, inbound) =>
+          val hashCount = inbound.count(_.exchangeType == "HASH")
+          val broadcastCount = inbound.count(_.exchangeType == "BROADCAST")
+          val totalCount = inbound.size
+          val exceeded =
+            (maxInbound > 0 && totalCount > maxInbound) ||
+              (maxHashInbound > 0 && hashCount > maxHashInbound) ||
+              (maxBroadcastInbound > 0 && broadcastCount > maxBroadcastInbound)
+          if (exceeded) {
+            val output = fragmentById
+              .get(consumerId)
+              .map(_.outputAttributes.map(_.name).mkString("[", ", ", "]"))
+              .getOrElse("[]")
+            Some(
+              s"fragment $consumerId has $totalCount inbound exchanges " +
+                s"(HASH=$hashCount, BROADCAST=$broadcastCount, output=$output), exceeding " +
+                s"limits maxInbound=$maxInbound maxHash=$maxHashInbound " +
+                s"maxBroadcast=$maxBroadcastInbound")
+          } else {
+            None
+          }
+      }
+
+    overloaded.headOption
+  }
+
+  private case class BuildSideChoice(side: BuildSide, reason: String)
+
+  /**
+   * Normalize build/probe choice before Substrait generation. Native Velox/cuDF hash join builds
+   * the right input, and Gluten's HashJoin transformer already maps BuildLeft/BuildRight into
+   * streamed/build input order. This rule decides the build side in the Spark/Gluten physical plan
+   * layer rather than relying on table-name special cases or native operators to reinterpret it.
+   */
+  private def normalizeMppJoinBuildSide(plan: SparkPlan): SparkPlan = {
+    if (!normalizeMppJoinBuildSideEnabled) {
+      return plan
+    }
+    plan.transformUp {
+      case join: ShuffledHashJoinExecTransformer if join.joinType.isInstanceOf[InnerLike] =>
+        preferredMppBuildSide(join)
+          .filter(_.side != join.buildSide)
+          .map {
+            choice =>
+              logWarning(
+                s"MppNativeQueryExec: normalizing MPP hash join build side " +
+                  s"from ${join.buildSide} to ${choice.side}; ${choice.reason}")
+              join.copy(buildSide = choice.side)
+          }
+          .getOrElse(join)
+    }
+  }
+
+  private def preferredMppBuildSide(
+      join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
+    val leftBroadcast =
+      boundaryExchange(join.left).exists(_.isInstanceOf[BroadcastExchangeLike])
+    val rightBroadcast =
+      boundaryExchange(join.right).exists(_.isInstanceOf[BroadcastExchangeLike])
+
+    if (leftBroadcast != rightBroadcast) {
+      val side = if (leftBroadcast) BuildLeft else BuildRight
+      return Some(
+        BuildSideChoice(
+          side,
+          s"broadcast child selected as build side " +
+            s"(leftBroadcast=$leftBroadcast, rightBroadcast=$rightBroadcast)"))
+    }
+
+    q3ReplicatedOrdersBuildSide(join).orElse {
+      logicalStatsBuildSide(join).map {
+        side => BuildSideChoice(side, "logical join stats selected smaller build side")
+      }
+    }
+  }
+
+  private def q3ReplicatedOrdersBuildSide(
+      join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
+    if (!q3ReplicateOrdersPathEnabled) {
+      return None
+    }
+
+    val leftNames = planOutputNames(join.left)
+    val rightNames = planOutputNames(join.right)
+    val leftOrders = isQ3OrdersOutput(leftNames)
+    val rightOrders = isQ3OrdersOutput(rightNames)
+    val leftLineitem = isQ3LineitemOutput(leftNames)
+    val rightLineitem = isQ3LineitemOutput(rightNames)
+
+    if (leftOrders && rightLineitem) {
+      Some(
+        BuildSideChoice(
+          BuildLeft,
+          "Q3 replicated-orders bridge selected filtered orders path as build side"))
+    } else if (rightOrders && leftLineitem) {
+      Some(
+        BuildSideChoice(
+          BuildRight,
+          "Q3 replicated-orders bridge selected filtered orders path as build side"))
+    } else {
+      None
+    }
+  }
+
+  private def boundaryExchange(plan: SparkPlan): Option[Exchange] = {
+    unwrapToExchange(plan).orElse {
+      plan.children match {
+        case Seq(child) => boundaryExchange(child)
+        case _ => None
+      }
+    }
+  }
+
+  private def logicalStatsBuildSide(join: ShuffledHashJoinExecTransformer): Option[BuildSide] = {
+    join.logicalLink.flatMap {
+      case logicalJoin: Join =>
+        val leftStats = logicalJoin.left.stats
+        val rightStats = logicalJoin.right.stats
+        val leftSize = leftStats.sizeInBytes
+        val rightSize = rightStats.sizeInBytes
+
+        if (leftSize < rightSize) {
+          Some(BuildLeft)
+        } else if (rightSize < leftSize) {
+          Some(BuildRight)
+        } else {
+          (leftStats.rowCount, rightStats.rowCount) match {
+            case (Some(leftRows), Some(rightRows)) if leftRows < rightRows => Some(BuildLeft)
+            case (Some(leftRows), Some(rightRows)) if rightRows < leftRows => Some(BuildRight)
+            case _ => None
+          }
+        }
+      case _ => None
+    }
+  }
+
+  /**
+   * Q3-specific opt-in plan-shape bridge toward Presto-GPU's replicated orders path.
+   *
+   * Spark/Gluten emits dual HASH exchanges into the lineitem/orders join: orders/customer ->
+   * HASH(o_orderkey), lineitem -> HASH(l_orderkey). Rewriting only the orders path to BROADCAST is
+   * not enough: the join consumer still has 16 replicas, so the broadcast build is replicated 16
+   * times and can OOM in CudfHashJoinBuild. When the exact Q3 shape is visible, keep lineitem as
+   * the probe/source path, broadcast the filtered orders path, and force the join consumer to one
+   * native replica until the runtime can share a broadcast build across parallel probe replicas.
+   */
+  private def rewriteQ3ReplicateOrdersPath(
+      fragments: Seq[NativeFragment],
+      exchanges: Seq[ExchangeSpec]): (Seq[NativeFragment], Seq[ExchangeSpec]) = {
+    if (!q3ReplicateOrdersPathEnabled) {
+      return (fragments, exchanges)
+    }
+
+    val byId = fragments.map(f => f.id -> f).toMap
+    val rewrites = mutable.HashMap[Int, ExchangeSpec]()
+    val singleReplicaConsumers = mutable.HashSet[Int]()
+
+    exchanges.groupBy(_.consumerFragmentId).foreach {
+      case (consumerId, inbound) =>
+        val consumerNames = fragmentOutputNames(byId.get(consumerId))
+        val orders = inbound.filter(spec => isQ3OrdersPath(spec, byId.get(spec.producerFragmentId)))
+        val lineitem =
+          inbound.filter(spec => isQ3LineitemPath(spec, byId.get(spec.producerFragmentId)))
+
+        if (
+          consumerNames.contains("l_orderkey") &&
+          consumerNames.contains("o_orderdate") &&
+          consumerNames.contains("o_shippriority") &&
+          orders.size == 1 &&
+          lineitem.size == 1
+        ) {
+          val ordersSpec = orders.head
+          val lineitemSpec = lineitem.head
+          rewrites += ordersSpec.id -> ordersSpec
+            .copy(exchangeType = "BROADCAST", numPartitions = 1, partitionKeys = Seq.empty)
+          rewrites += lineitemSpec.id -> lineitemSpec
+            .copy(exchangeType = "ROUND_ROBIN", numPartitions = 1, partitionKeys = Seq.empty)
+          singleReplicaConsumers += consumerId
+          logWarning(
+            s"MppNativeQueryExec: Q3 replicated-orders path enabled; " +
+              s"rewrote orders exchange ${ordersSpec.id} " +
+              s"F${ordersSpec.producerFragmentId}->F$consumerId from HASH to BROADCAST, " +
+              s"lineitem exchange ${lineitemSpec.id} " +
+              s"F${lineitemSpec.producerFragmentId}->F$consumerId from HASH to ROUND_ROBIN, " +
+              s"and forced F$consumerId to one replica")
+        }
+    }
+
+    if (singleReplicaConsumers.isEmpty) {
+      logWarning(
+        "MppNativeQueryExec: spark.gluten.mpp.q3.replicateOrdersPath=true but no exact " +
+          "Q3 lineitem/orders join exchange shape was found; leaving exchanges unchanged")
+      return (fragments, exchanges)
+    }
+
+    val rewrittenFragments = fragments.map {
+      case fragment if singleReplicaConsumers.contains(fragment.id) =>
+        fragment.copy(parallelism = 1)
+      case fragment => fragment
+    }
+    val rewrittenExchanges = exchanges.map(spec => rewrites.getOrElse(spec.id, spec))
+    (rewrittenFragments, rewrittenExchanges)
+  }
+
+  private def q3ReplicateOrdersPathEnabled: Boolean = {
+    booleanConf("spark.gluten.mpp.q3.replicateOrdersPath", defaultValue = false)
+  }
+
+  private def normalizeMppJoinBuildSideEnabled: Boolean = {
+    booleanConf("spark.gluten.mpp.normalizeJoinBuildSide", defaultValue = true)
+  }
+
+  private def capLocalHashExchangeTasks(exchanges: Seq[ExchangeSpec]): Seq[ExchangeSpec] = {
+    localHashExchangeTasks match {
+      case Some(cap) =>
+        exchanges.map {
+          spec =>
+            if (
+              (spec.exchangeType == "HASH" || spec.exchangeType == "RANGE") &&
+              spec.numPartitions > cap
+            ) {
+              logWarning(
+                s"MppNativeQueryExec: capping local ${spec.exchangeType} exchange ${spec.id} " +
+                  s"F${spec.producerFragmentId}->F${spec.consumerFragmentId} native partitions " +
+                  s"from ${spec.numPartitions} to $cap via " +
+                  s"spark.gluten.mpp.localHashExchangeTasks")
+              spec.copy(numPartitions = cap)
+            } else {
+              spec
+            }
+        }
+      case None => exchanges
+    }
+  }
+
+  private def localHashExchangeTasks: Option[Int] = {
+    positiveIntConf("spark.gluten.mpp.localHashExchangeTasks")
+  }
+
+  private def isQ3OrdersPath(spec: ExchangeSpec, producer: Option[NativeFragment]): Boolean = {
+    val names = fragmentOutputNames(producer)
+    spec.exchangeType == "HASH" &&
+    spec.partitionKeys.exists(_.name.equalsIgnoreCase("o_orderkey")) &&
+    isQ3OrdersOutput(names)
+  }
+
+  private def isQ3LineitemPath(spec: ExchangeSpec, producer: Option[NativeFragment]): Boolean = {
+    val names = fragmentOutputNames(producer)
+    spec.exchangeType == "HASH" &&
+    spec.partitionKeys.exists(_.name.equalsIgnoreCase("l_orderkey")) &&
+    isQ3LineitemOutput(names)
+  }
+
+  private def isQ3OrdersOutput(names: Set[String]): Boolean = {
+    names.contains("o_orderkey") &&
+    names.contains("o_orderdate") &&
+    names.contains("o_shippriority") &&
+    !names.contains("l_orderkey")
+  }
+
+  private def isQ3LineitemOutput(names: Set[String]): Boolean = {
+    names.contains("l_orderkey") &&
+    names.contains("l_extendedprice") &&
+    names.contains("l_discount") &&
+    !names.contains("o_orderkey")
+  }
+
+  private def planOutputNames(plan: SparkPlan): Set[String] = {
+    plan.output.map(_.name.toLowerCase(java.util.Locale.ROOT)).toSet
+  }
+
+  private def fragmentOutputNames(fragment: Option[NativeFragment]): Set[String] = {
+    fragment
+      .map(_.outputAttributes.map(_.name.toLowerCase(java.util.Locale.ROOT)).toSet)
+      .getOrElse(Set.empty)
   }
 
   /**
@@ -857,7 +1160,90 @@ case class MppNativeQueryExec(
         SQLConf.get.getConfString("spark.sql.shuffle.partitions", "200").toInt
     }
     val cores = SQLConf.get.getConfString("spark.executor.cores", "16").toInt
-    math.min(raw, math.max(cores, 1))
+    val coreCapped = math.min(raw, math.max(cores, 1))
+    positiveIntConf("spark.gluten.mpp.maxDriversPerFragment") match {
+      case Some(maxDrivers) =>
+        val capped = math.min(coreCapped, maxDrivers)
+        if (capped != coreCapped) {
+          logWarning(
+            s"MppNativeQueryExec: capping fragment drivers from $coreCapped to $capped " +
+              s"(raw=$raw, executorCores=$cores) via " +
+              s"spark.gluten.mpp.maxDriversPerFragment")
+        }
+        capped
+      case None => coreCapped
+    }
+  }
+
+  private def positiveIntConf(key: String): Option[Int] = {
+    val value = SQLConf.get.getConfString(key, "").trim match {
+      case "" =>
+        Option(SparkEnv.get)
+          .flatMap(env => Option(env.conf.get(key, null)))
+          .orElse(sys.props.get(key))
+          .getOrElse("")
+          .trim
+      case fromSqlConf if fromSqlConf.equalsIgnoreCase("null") => ""
+      case fromSqlConf => fromSqlConf
+    }
+    if (value.isEmpty || value.equalsIgnoreCase("null")) {
+      None
+    } else {
+      val parsed = value.toInt
+      if (parsed <= 0) {
+        throw new IllegalArgumentException(s"$key must be a positive integer, got $value")
+      }
+      Some(parsed)
+    }
+  }
+
+  private def booleanConf(key: String, defaultValue: Boolean): Boolean = {
+    SQLConf.get.getConfString(key, "").trim match {
+      case "" =>
+        Option(SparkEnv.get)
+          .flatMap(env => Option(env.conf.get(key, null)))
+          .orElse(sys.props.get(key))
+          .map(_.trim)
+          .filter(_.nonEmpty)
+          .filterNot(_.equalsIgnoreCase("null"))
+          .map(_.toBoolean)
+          .getOrElse(defaultValue)
+      case fromSqlConf if fromSqlConf.equalsIgnoreCase("null") => defaultValue
+      case fromSqlConf => fromSqlConf.toBoolean
+    }
+  }
+
+  private def mppNonNegativeIntConf(key: String, defaultValue: Int): Int = {
+    // Prefer SparkContext conf: SF1K suites set these on SparkConf; executor-side SQLConf
+    // lookups have historically missed them while SQLConf.getConfString stayed empty, which
+    // silently disabled inbound-exchange guardrails (see Q18 fragment fan-in).
+    def trimConf(value: Option[String]): Option[String] =
+      value
+        .map(_.trim)
+        .filter(_.nonEmpty)
+        .filter(!_.equalsIgnoreCase("null"))
+
+    val sqlRaw = SQLConf.get.getConfString(key, "").trim
+    val raw = Seq(
+      trimConf(Option(sparkContext.getConf.get(key, null))),
+      trimConf(Some(sqlRaw)),
+      trimConf(Option(SparkEnv.get).flatMap(env => Option(env.conf.get(key, null)))),
+      trimConf(sys.props.get(key))
+    ).flatten.headOption.getOrElse(defaultValue.toString)
+    try {
+      val parsed = raw.toInt
+      if (parsed < 0) {
+        logWarning(
+          s"MppNativeQueryExec: invalid negative integer for $key=$raw; using $defaultValue")
+        defaultValue
+      } else {
+        parsed
+      }
+    } catch {
+      case _: NumberFormatException =>
+        logWarning(s"MppNativeQueryExec: invalid integer for $key=$raw; using $defaultValue")
+        defaultValue
+    }
   }
 
   /**
