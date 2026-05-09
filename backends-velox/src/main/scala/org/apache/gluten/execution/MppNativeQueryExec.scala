@@ -562,11 +562,14 @@ case class MppNativeQueryExec(
 
     // Sort fragments by ID (ensures topological order: producers before consumers)
     val sortedFragments = extractedFragments.sortBy(_.id).toSeq
-    val sortedExchanges = extractedExchanges.sortBy(_.id).toSeq
+    val (rewrittenFragments, rewrittenExchanges) =
+      rewriteQ3ReplicateOrdersPath(sortedFragments, extractedExchanges.toSeq)
+    val cappedExchanges = capLocalHashExchangeTasks(rewrittenExchanges)
+    val sortedExchanges = cappedExchanges.sortBy(_.id).toSeq
     val frozenBroadcasts = broadcastsByConsumer.iterator.map {
       case (consumerId, buf) => consumerId -> buf.toSeq
     }.toMap
-    (sortedFragments, sortedExchanges, frozenBroadcasts)
+    (rewrittenFragments, sortedExchanges, frozenBroadcasts)
   }
 
   /**

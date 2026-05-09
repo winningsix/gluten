@@ -86,3 +86,8 @@ metastore_db/
 
 # Maven extensions (local config)
 .mvn/
+
+# Local Presto/MPP artifacts (canonical captures live under q2/runs outside this clone)
+/presto-full-capture-*/
+/presto-gpu-ucx-*/
+/mpp-dumps-tpch-sf1k/

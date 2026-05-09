@@ -292,6 +292,14 @@
             <spark.driver.maxResultSize>${spark.driver.maxResultSize}</spark.driver.maxResultSize>
             <spark.gluten.loadLibFromJar>${spark.gluten.loadLibFromJar}</spark.gluten.loadLibFromJar>
             <spark.gluten.sql.columnar.libpath>${spark.gluten.sql.columnar.libpath}</spark.gluten.sql.columnar.libpath>
+            <spark.gluten.mpp.localHashExchangeTasks>${spark.gluten.mpp.localHashExchangeTasks}</spark.gluten.mpp.localHashExchangeTasks>
+            <spark.gluten.mpp.maxDriversPerFragment>${spark.gluten.mpp.maxDriversPerFragment}</spark.gluten.mpp.maxDriversPerFragment>
+            <spark.gluten.mpp.maxInboundExchangesPerFragment>${spark.gluten.mpp.maxInboundExchangesPerFragment}</spark.gluten.mpp.maxInboundExchangesPerFragment>
+            <spark.gluten.mpp.maxHashInboundExchangesPerFragment>${spark.gluten.mpp.maxHashInboundExchangesPerFragment}</spark.gluten.mpp.maxHashInboundExchangesPerFragment>
+            <spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment>${spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment}</spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment>
+            <spark.gluten.mpp.q3.replicateOrdersPath>${spark.gluten.mpp.q3.replicateOrdersPath}</spark.gluten.mpp.q3.replicateOrdersPath>
+            <spark.gluten.mpp.fuseBroadcastBuilds>${spark.gluten.mpp.fuseBroadcastBuilds}</spark.gluten.mpp.fuseBroadcastBuilds>
+            <spark.gluten.mpp.normalizeJoinBuildSide>${spark.gluten.mpp.normalizeJoinBuildSide}</spark.gluten.mpp.normalizeJoinBuildSide>
             <spark.gluten.mpp.q4ExistsLineitemDedup>${spark.gluten.mpp.q4ExistsLineitemDedup}</spark.gluten.mpp.q4ExistsLineitemDedup>
           </systemProperties>
         </configuration>

@@ -137,6 +137,9 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
       .set("spark.gluten.mpp.removeRedundantShuffle", "true")
       .set("spark.gluten.mpp.parallelSortSplit", "true")
       .set("spark.gluten.mpp.fuseBroadcastBuilds", "true")
+      // Keep compact fragments from owning too many Presto-like stage inputs at once.
+      // The production default remains opt-in; this SF1K gate falls back to BSP barriers.
+      .set("spark.gluten.mpp.maxInboundExchangesPerFragment", "4")
       .set("spark.gluten.sql.columnar.cudf", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enabled", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan", "true")
@@ -148,6 +151,15 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
       "spark.driver.maxResultSize",
       "spark.gluten.sql.columnar.libpath",
       "spark.gluten.loadLibFromJar",
+      "spark.gluten.mpp.substraitDumpDir",
+      "spark.gluten.mpp.localHashExchangeTasks",
+      "spark.gluten.mpp.maxDriversPerFragment",
+      "spark.gluten.mpp.maxInboundExchangesPerFragment",
+      "spark.gluten.mpp.maxHashInboundExchangesPerFragment",
+      "spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment",
+      "spark.gluten.mpp.q3.replicateOrdersPath",
+      "spark.gluten.mpp.fuseBroadcastBuilds",
+      "spark.gluten.mpp.normalizeJoinBuildSide",
       q4ExistsLineitemDedupKey).foreach {
       key =>
         sys.props
