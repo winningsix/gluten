@@ -31,6 +31,11 @@
     <cpp.build.dir>../cpp/build/</cpp.build.dir>
     <cpp.releases.dir>${cpp.build.dir}/releases/</cpp.releases.dir>
     <byte-buddy.version>1.9.3</byte-buddy.version>
+    <!-- Defaults for scalatest systemProperties forwards: without these, unresolved ${...}
+         becomes the literal string "null" in the forked test JVM and overrides SparkConf. -->
+    <spark.gluten.mpp.maxInboundExchangesPerFragment></spark.gluten.mpp.maxInboundExchangesPerFragment>
+    <spark.gluten.mpp.maxHashInboundExchangesPerFragment></spark.gluten.mpp.maxHashInboundExchangesPerFragment>
+    <spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment></spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment>
   </properties>
 
   <dependencies>

@@ -1224,12 +1224,19 @@ case class MppNativeQueryExec(
         .filter(!_.equalsIgnoreCase("null"))
 
     val sqlRaw = SQLConf.get.getConfString(key, "").trim
-    val raw = Seq(
+    val rawJoined = Seq(
       trimConf(Option(sparkContext.getConf.get(key, null))),
       trimConf(Some(sqlRaw)),
       trimConf(Option(SparkEnv.get).flatMap(env => Option(env.conf.get(key, null)))),
       trimConf(sys.props.get(key))
     ).flatten.headOption.getOrElse(defaultValue.toString)
+    // Maven scalatest forwards sometimes inject the literal "null" when a POM property is unset.
+    val raw =
+      Option(rawJoined)
+        .map(_.trim)
+        .filter(_.nonEmpty)
+        .filter(!_.equalsIgnoreCase("null"))
+        .getOrElse(defaultValue.toString)
     try {
       val parsed = raw.toInt
       if (parsed < 0) {

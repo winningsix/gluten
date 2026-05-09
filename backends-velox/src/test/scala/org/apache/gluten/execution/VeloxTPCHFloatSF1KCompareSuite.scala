@@ -125,6 +125,12 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
       .set("spark.memory.offHeap.size", "32g")
       .set("spark.sql.adaptive.enabled", "false")
       .set("spark.sql.autoBroadcastJoinThreshold", (2L * 1024 * 1024 * 1024).toString)
+      .set(
+        "spark.driver.maxResultSize",
+        sys.props
+          .get("spark.driver.maxResultSize")
+          .filter(v => v.nonEmpty && v != "null")
+          .getOrElse("8g"))
       .set("spark.gluten.mpp.enabled", "true")
       .set("spark.gluten.mpp.strategy.enabled", "true")
       .set("spark.gluten.mpp.singlePartitionSort", "true")
