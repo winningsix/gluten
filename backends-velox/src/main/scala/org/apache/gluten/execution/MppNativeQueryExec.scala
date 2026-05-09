@@ -31,9 +31,9 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
-import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
+import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide, JoinSelectionHelper}
 import org.apache.spark.sql.catalyst.plans.InnerLike
-import org.apache.spark.sql.catalyst.plans.logical.Join
+import org.apache.spark.sql.catalyst.plans.logical.{Join, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
 import org.apache.spark.sql.execution.{ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, InputIteratorTransformer, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
@@ -566,14 +566,12 @@ case class MppNativeQueryExec(
 
     // Sort fragments by ID (ensures topological order: producers before consumers)
     val sortedFragments = extractedFragments.sortBy(_.id).toSeq
-    val (rewrittenFragments, rewrittenExchanges) =
-      rewriteQ3ReplicateOrdersPath(sortedFragments, extractedExchanges.toSeq)
-    val cappedExchanges = capLocalHashExchangeTasks(rewrittenExchanges)
+    val cappedExchanges = capLocalHashExchangeTasks(extractedExchanges.toSeq)
     val sortedExchanges = cappedExchanges.sortBy(_.id).toSeq
     val frozenBroadcasts = broadcastsByConsumer.iterator.map {
       case (consumerId, buf) => consumerId -> buf.toSeq
     }.toMap
-    (rewrittenFragments, sortedExchanges, frozenBroadcasts)
+    (sortedFragments, sortedExchanges, frozenBroadcasts)
   }
 
   /**
@@ -647,6 +645,13 @@ case class MppNativeQueryExec(
 
   private case class BuildSideChoice(side: BuildSide, reason: String)
 
+  private case class JoinSideStats(
+      sizeInBytes: BigInt,
+      rowCount: Option[BigInt],
+      source: String)
+
+  private object MppJoinSelectionHelper extends JoinSelectionHelper
+
   /**
    * Normalize build/probe choice before Substrait generation. Native Velox/cuDF hash join builds
    * the right input, and Gluten's HashJoin transformer already maps BuildLeft/BuildRight into
@@ -674,6 +679,14 @@ case class MppNativeQueryExec(
 
   private def preferredMppBuildSide(
       join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
+    broadcastBuildSide(join).orElse {
+      sparkJoinSelectionBuildSide(join).orElse {
+        statsBuildSide(join)
+      }
+    }
+  }
+
+  private def broadcastBuildSide(join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
     val leftBroadcast =
       boundaryExchange(join.left).exists(_.isInstanceOf[BroadcastExchangeLike])
     val rightBroadcast =
@@ -687,66 +700,7 @@ case class MppNativeQueryExec(
           s"broadcast child selected as build side " +
             s"(leftBroadcast=$leftBroadcast, rightBroadcast=$rightBroadcast)"))
     }
-
-    lineitemOrdersBuildSide(join).orElse {
-      q3ReplicatedOrdersBuildSide(join).orElse {
-        logicalStatsBuildSide(join).map {
-          side => BuildSideChoice(side, "logical join stats selected smaller build side")
-        }
-      }
-    }
-  }
-
-  private def lineitemOrdersBuildSide(
-      join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
-    val leftNames = planOutputNames(join.left)
-    val rightNames = planOutputNames(join.right)
-    val leftOrders = isOrdersKeyOutput(leftNames)
-    val rightOrders = isOrdersKeyOutput(rightNames)
-    val leftLineitem = isQ5LineitemOutput(leftNames)
-    val rightLineitem = isQ5LineitemOutput(rightNames)
-
-    if (leftOrders && rightLineitem) {
-      Some(
-        BuildSideChoice(
-          BuildLeft,
-          "orders/lineitem path selected smaller orders path as build side"))
-    } else if (rightOrders && leftLineitem) {
-      Some(
-        BuildSideChoice(
-          BuildRight,
-          "orders/lineitem path selected smaller orders path as build side"))
-    } else {
-      None
-    }
-  }
-
-  private def q3ReplicatedOrdersBuildSide(
-      join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
-    if (!q3ReplicateOrdersPathEnabled) {
-      return None
-    }
-
-    val leftNames = planOutputNames(join.left)
-    val rightNames = planOutputNames(join.right)
-    val leftOrders = isQ3OrdersOutput(leftNames)
-    val rightOrders = isQ3OrdersOutput(rightNames)
-    val leftLineitem = isQ3LineitemOutput(leftNames)
-    val rightLineitem = isQ3LineitemOutput(rightNames)
-
-    if (leftOrders && rightLineitem) {
-      Some(
-        BuildSideChoice(
-          BuildLeft,
-          "Q3 replicated-orders bridge selected filtered orders path as build side"))
-    } else if (rightOrders && leftLineitem) {
-      Some(
-        BuildSideChoice(
-          BuildRight,
-          "Q3 replicated-orders bridge selected filtered orders path as build side"))
-    } else {
-      None
-    }
+    None
   }
 
   private def boundaryExchange(plan: SparkPlan): Option[Exchange] = {
@@ -758,99 +712,134 @@ case class MppNativeQueryExec(
     }
   }
 
-  private def logicalStatsBuildSide(join: ShuffledHashJoinExecTransformer): Option[BuildSide] = {
+  private def sparkJoinSelectionBuildSide(
+      join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
     join.logicalLink.flatMap {
       case logicalJoin: Join =>
-        val leftStats = logicalJoin.left.stats
-        val rightStats = logicalJoin.right.stats
-        val leftSize = leftStats.sizeInBytes
-        val rightSize = rightStats.sizeInBytes
-
-        if (leftSize < rightSize) {
-          Some(BuildLeft)
-        } else if (rightSize < leftSize) {
-          Some(BuildRight)
-        } else {
-          (leftStats.rowCount, rightStats.rowCount) match {
-            case (Some(leftRows), Some(rightRows)) if leftRows < rightRows => Some(BuildLeft)
-            case (Some(leftRows), Some(rightRows)) if rightRows < leftRows => Some(BuildRight)
-            case _ => None
+        MppJoinSelectionHelper
+          .getBroadcastBuildSide(
+            logicalJoin.left,
+            logicalJoin.right,
+            logicalJoin.joinType,
+            logicalJoin.hint,
+            hintOnly = false,
+            SQLConf.get)
+          .orElse {
+            MppJoinSelectionHelper.getShuffleHashJoinBuildSide(
+              logicalJoin.left,
+              logicalJoin.right,
+              logicalJoin.joinType,
+              logicalJoin.hint,
+              hintOnly = false,
+              SQLConf.get)
           }
-        }
+          .map {
+            side =>
+              BuildSideChoice(
+                side,
+                s"Spark JoinSelection selected build side " +
+                  s"(leftSize=${logicalJoin.left.stats.sizeInBytes}, " +
+                  s"rightSize=${logicalJoin.right.stats.sizeInBytes})")
+          }
       case _ => None
     }
   }
 
-  /**
-   * Q3-specific opt-in plan-shape bridge toward Presto-GPU's replicated orders path.
-   *
-   * Spark/Gluten emits dual HASH exchanges into the lineitem/orders join: orders/customer ->
-   * HASH(o_orderkey), lineitem -> HASH(l_orderkey). Rewriting only the orders path to BROADCAST is
-   * not enough: the join consumer still has 16 replicas, so the broadcast build is replicated 16
-   * times and can OOM in CudfHashJoinBuild. When the exact Q3 shape is visible, keep lineitem as
-   * the probe/source path, broadcast the filtered orders path, and force the join consumer to one
-   * native replica until the runtime can share a broadcast build across parallel probe replicas.
-   */
-  private def rewriteQ3ReplicateOrdersPath(
-      fragments: Seq[NativeFragment],
-      exchanges: Seq[ExchangeSpec]): (Seq[NativeFragment], Seq[ExchangeSpec]) = {
-    if (!q3ReplicateOrdersPathEnabled) {
-      return (fragments, exchanges)
-    }
-
-    val byId = fragments.map(f => f.id -> f).toMap
-    val rewrites = mutable.HashMap[Int, ExchangeSpec]()
-    val singleReplicaConsumers = mutable.HashSet[Int]()
-
-    exchanges.groupBy(_.consumerFragmentId).foreach {
-      case (consumerId, inbound) =>
-        val consumerNames = fragmentOutputNames(byId.get(consumerId))
-        val orders = inbound.filter(spec => isQ3OrdersPath(spec, byId.get(spec.producerFragmentId)))
-        val lineitem =
-          inbound.filter(spec => isQ3LineitemPath(spec, byId.get(spec.producerFragmentId)))
-
-        if (
-          consumerNames.contains("l_orderkey") &&
-          consumerNames.contains("o_orderdate") &&
-          consumerNames.contains("o_shippriority") &&
-          orders.size == 1 &&
-          lineitem.size == 1
-        ) {
-          val ordersSpec = orders.head
-          val lineitemSpec = lineitem.head
-          rewrites += ordersSpec.id -> ordersSpec
-            .copy(exchangeType = "BROADCAST", numPartitions = 1, partitionKeys = Seq.empty)
-          rewrites += lineitemSpec.id -> lineitemSpec
-            .copy(exchangeType = "ROUND_ROBIN", numPartitions = 1, partitionKeys = Seq.empty)
-          singleReplicaConsumers += consumerId
-          logWarning(
-            s"MppNativeQueryExec: Q3 replicated-orders path enabled; " +
-              s"rewrote orders exchange ${ordersSpec.id} " +
-              s"F${ordersSpec.producerFragmentId}->F$consumerId from HASH to BROADCAST, " +
-              s"lineitem exchange ${lineitemSpec.id} " +
-              s"F${lineitemSpec.producerFragmentId}->F$consumerId from HASH to ROUND_ROBIN, " +
-              s"and forced F$consumerId to one replica")
-        }
-    }
-
-    if (singleReplicaConsumers.isEmpty) {
-      logWarning(
-        "MppNativeQueryExec: spark.gluten.mpp.q3.replicateOrdersPath=true but no exact " +
-          "Q3 lineitem/orders join exchange shape was found; leaving exchanges unchanged")
-      return (fragments, exchanges)
-    }
-
-    val rewrittenFragments = fragments.map {
-      case fragment if singleReplicaConsumers.contains(fragment.id) =>
-        fragment.copy(parallelism = 1)
-      case fragment => fragment
-    }
-    val rewrittenExchanges = exchanges.map(spec => rewrites.getOrElse(spec.id, spec))
-    (rewrittenFragments, rewrittenExchanges)
+  private def statsBuildSide(join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
+    Seq(logicalJoinStats(join), childLogicalStats(join)).flatten
+      .flatMap {
+        case (leftStats, rightStats) =>
+          chooseSmallerBuildSide(leftStats, rightStats).map {
+            side =>
+              BuildSideChoice(
+                side,
+                s"${leftStats.source} selected smaller build side " +
+                  s"(leftSize=${leftStats.sizeInBytes}, rightSize=${rightStats.sizeInBytes}, " +
+                  s"leftRows=${leftStats.rowCount.getOrElse("unknown")}, " +
+                  s"rightRows=${rightStats.rowCount.getOrElse("unknown")})")
+          }
+      }
+      .headOption
   }
 
-  private def q3ReplicateOrdersPathEnabled: Boolean = {
-    booleanConf("spark.gluten.mpp.q3.replicateOrdersPath", defaultValue = false)
+  private def logicalJoinStats(
+      join: ShuffledHashJoinExecTransformer): Option[(JoinSideStats, JoinSideStats)] = {
+    join.logicalLink.flatMap {
+      case logicalJoin: Join =>
+        val leftStats = logicalJoin.left.stats
+        val rightStats = logicalJoin.right.stats
+        Some(
+          (
+            JoinSideStats(leftStats.sizeInBytes, leftStats.rowCount, "logical join stats"),
+            JoinSideStats(rightStats.sizeInBytes, rightStats.rowCount, "logical join stats")))
+      case _ => None
+    }
+  }
+
+  private def childLogicalStats(
+      join: ShuffledHashJoinExecTransformer): Option[(JoinSideStats, JoinSideStats)] = {
+    for {
+      left <- planLogicalStats(join.left)
+      right <- planLogicalStats(join.right)
+    } yield {
+      (
+        JoinSideStats(left.sizeInBytes, left.rowCount, "physical subtree stats"),
+        JoinSideStats(right.sizeInBytes, right.rowCount, "physical subtree stats"))
+    }
+  }
+
+  private def planLogicalStats(plan: SparkPlan): Option[Statistics] = {
+    plan.logicalLink.map(_.stats).filter(hasUsableStats).orElse {
+      val childStats = plan.children.flatMap(planLogicalStats)
+      if (childStats.isEmpty) {
+        None
+      } else if (childStats.size == 1) {
+        Some(childStats.head)
+      } else {
+        val rowCount =
+          if (childStats.forall(_.rowCount.isDefined)) {
+            Some(childStats.flatMap(_.rowCount).sum)
+          } else {
+            None
+          }
+        Some(Statistics(childStats.map(_.sizeInBytes).sum, rowCount))
+      }
+    }
+  }
+
+  private def hasUsableStats(stats: Statistics): Boolean = {
+    isConfidentSize(stats.sizeInBytes) || stats.rowCount.exists(_ > 0)
+  }
+
+  private def chooseSmallerBuildSide(
+      leftStats: JoinSideStats,
+      rightStats: JoinSideStats): Option[BuildSide] = {
+    if (isConfidentSize(leftStats.sizeInBytes) && isConfidentSize(rightStats.sizeInBytes)) {
+      if (isSignificantlySmaller(leftStats.sizeInBytes, rightStats.sizeInBytes)) {
+        return Some(BuildLeft)
+      }
+      if (isSignificantlySmaller(rightStats.sizeInBytes, leftStats.sizeInBytes)) {
+        return Some(BuildRight)
+      }
+    }
+
+    (leftStats.rowCount, rightStats.rowCount) match {
+      case (Some(leftRows), Some(rightRows))
+          if isSignificantlySmaller(leftRows, rightRows) =>
+        Some(BuildLeft)
+      case (Some(leftRows), Some(rightRows))
+          if isSignificantlySmaller(rightRows, leftRows) =>
+        Some(BuildRight)
+      case _ => None
+    }
+  }
+
+  private def isConfidentSize(size: BigInt): Boolean = {
+    size > 0 && size < BigInt(Long.MaxValue)
+  }
+
+  private def isSignificantlySmaller(candidate: BigInt, other: BigInt): Boolean = {
+    candidate > 0 && candidate * 2 <= other
   }
 
   private def normalizeMppJoinBuildSideEnabled: Boolean = {
@@ -882,56 +871,6 @@ case class MppNativeQueryExec(
 
   private def localHashExchangeTasks: Option[Int] = {
     positiveIntConf("spark.gluten.mpp.localHashExchangeTasks")
-  }
-
-  private def isQ3OrdersPath(spec: ExchangeSpec, producer: Option[NativeFragment]): Boolean = {
-    val names = fragmentOutputNames(producer)
-    spec.exchangeType == "HASH" &&
-    spec.partitionKeys.exists(_.name.equalsIgnoreCase("o_orderkey")) &&
-    isQ3OrdersOutput(names)
-  }
-
-  private def isQ3LineitemPath(spec: ExchangeSpec, producer: Option[NativeFragment]): Boolean = {
-    val names = fragmentOutputNames(producer)
-    spec.exchangeType == "HASH" &&
-    spec.partitionKeys.exists(_.name.equalsIgnoreCase("l_orderkey")) &&
-    isQ3LineitemOutput(names)
-  }
-
-  private def isQ3OrdersOutput(names: Set[String]): Boolean = {
-    names.contains("o_orderkey") &&
-    names.contains("o_orderdate") &&
-    names.contains("o_shippriority") &&
-    !names.contains("l_orderkey")
-  }
-
-  private def isQ3LineitemOutput(names: Set[String]): Boolean = {
-    names.contains("l_orderkey") &&
-    names.contains("l_extendedprice") &&
-    names.contains("l_discount") &&
-    !names.contains("o_orderkey")
-  }
-
-  private def isOrdersKeyOutput(names: Set[String]): Boolean = {
-    names.contains("o_orderkey") && !names.contains("l_orderkey")
-  }
-
-  private def isLineitemKeyOutput(names: Set[String]): Boolean = {
-    names.contains("l_orderkey") && !names.contains("o_orderkey")
-  }
-
-  private def isQ5LineitemOutput(names: Set[String]): Boolean = {
-    isLineitemKeyOutput(names) && names.contains("l_suppkey")
-  }
-
-  private def planOutputNames(plan: SparkPlan): Set[String] = {
-    plan.output.map(_.name.toLowerCase(java.util.Locale.ROOT)).toSet
-  }
-
-  private def fragmentOutputNames(fragment: Option[NativeFragment]): Set[String] = {
-    fragment
-      .map(_.outputAttributes.map(_.name.toLowerCase(java.util.Locale.ROOT)).toSet)
-      .getOrElse(Set.empty)
   }
 
   /**
