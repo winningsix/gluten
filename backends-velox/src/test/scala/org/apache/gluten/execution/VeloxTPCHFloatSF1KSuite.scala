@@ -141,7 +141,8 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       "spark.gluten.mpp.q3.replicateOrdersPath",
       "spark.gluten.mpp.fuseBroadcastBuilds",
       "spark.gluten.mpp.normalizeJoinBuildSide",
-      q4ExistsLineitemDedupKey).foreach(key => nonNullProperty(key).foreach(conf.set(key, _)))
+      q4ExistsLineitemDedupKey
+    ).foreach(key => nonNullProperty(key).foreach(conf.set(key, _)))
     conf
   }
 

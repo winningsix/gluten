@@ -131,6 +131,29 @@ const std::string kVeloxSsdCheckSumReadVerificationEnabled =
 // async
 const std::string kVeloxIOThreads = "spark.gluten.sql.columnar.backend.velox.IOThreads";
 const uint32_t kVeloxIOThreadsDefault = 0;
+
+// MPP single-task mode: collapse all fragments into one Velox Task connected
+// via LocalPartitionNode (intra-task), bypassing UcxExchange entirely. Only
+// activates when every exchange in the plan is SINGLE/BROADCAST (1 partition).
+// HASH/RANGE/ROUND_ROBIN exchanges fall back to the regular multi-task UCX
+// path. Mirrors Presto's 1-worker behavior (cudf.exchange=false collapses
+// stages into a single task with LocalExchange between pipelines).
+const std::string kMppSingleTaskMode =
+    "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode";
+const bool kMppSingleTaskModeDefault = false;
+
+// Cap on per-task driver count (= local-partition lane count) when single-
+// task mode is active. Mirrors IBM's pbench GPU deployment choice
+// (velox-testing/.../generate_presto_config.sh sets VCPU_PER_WORKER=2 for
+// GPU variant, which becomes task.max-drivers-per-task=2 in
+// config_native.properties). The reason: cuDF GPU operators saturate one
+// stream pretty effectively, so adding more drivers per task adds
+// contention (RMM mutex, cuda runtime) more than parallelism. Same number
+// also caps how many partitions a HASH/RANGE LocalPartitionNode emits in
+// single-task mode (= consumer pipeline driver count).
+const std::string kMppSingleTaskMaxDrivers =
+    "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMaxDrivers";
+const int32_t kMppSingleTaskMaxDriversDefault = 2;
 const std::string kVeloxAsyncTimeoutOnTaskStopping =
     "spark.gluten.sql.columnar.backend.velox.asyncTimeoutOnTaskStopping";
 const int32_t kVeloxAsyncTimeoutOnTaskStoppingDefault = 30000; // 30s

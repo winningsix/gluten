@@ -92,6 +92,7 @@ class MppNativeQueryRDD(
     // and wires them together via OutputBufferManager streaming exchange.
     val runtime = Runtimes.contextInstance(BackendsApiManager.getBackendName, "MppQuery")
     val jniWrapper = MppQueryJniWrapper.create(runtime)
+    val tCreateStart = System.nanoTime()
 
     // For each consumer fragment that has fused broadcasts, materialize the
     // build side as Iterator[ColumnarBatch] (one iterator per fused broadcast)
@@ -124,7 +125,13 @@ class MppNativeQueryRDD(
       broadcastSlotIndicesPerFrag,
       broadcastIteratorsPerFrag.asInstanceOf[Array[Array[Object]]]
     )
+    val tCreateDoneStartBegin = System.nanoTime()
     jniWrapper.nativeStartMppQuery(mppHandle)
+    val tStartDone = System.nanoTime()
+    logWarning(
+      f"MppNativeQueryRDD: TIMING " +
+        f"nativeCreateMppQuery=${(tCreateDoneStartBegin - tCreateStart) / 1e6}%.1fms " +
+        f"nativeStartMppQuery=${(tStartDone - tCreateDoneStartBegin) / 1e6}%.1fms")
 
     logInfo("MppNativeQueryRDD: all MPP fragments started, streaming exchange active")
 
@@ -135,14 +142,44 @@ class MppNativeQueryRDD(
     val mppIter = new Iterator[ColumnarBatch] {
       private var nextHandle: Long = -1L
       private var finished = false
+      // Per-batch timing accumulators. We dump aggregate at end-of-stream so
+      // the per-batch logWarning doesn't drown the log file (240 batches!).
+      private var totalGetOutputNanos: Long = 0L
+      private var totalGetOutputCalls: Long = 0L
+      private var maxGetOutputNanos: Long = 0L
+      private var minGetOutputNanos: Long = Long.MaxValue
+      private val firstBatchStart: Long = System.nanoTime()
+      private var firstBatchNanos: Long = -1L
 
       override def hasNext: Boolean = {
         if (finished) return false
         if (nextHandle != -1L) return true
+        val tStart = System.nanoTime()
         nextHandle = jniWrapper.nativeGetMppOutput(mppHandle)
+        val elapsed = System.nanoTime() - tStart
+        totalGetOutputNanos += elapsed
+        totalGetOutputCalls += 1
+        if (elapsed > maxGetOutputNanos) maxGetOutputNanos = elapsed
+        if (elapsed < minGetOutputNanos) minGetOutputNanos = elapsed
+        if (firstBatchNanos < 0 && nextHandle != 0L) {
+          firstBatchNanos = System.nanoTime() - firstBatchStart
+        }
         if (nextHandle == 0L) {
           finished = true
+          val tCloseStart = System.nanoTime()
           jniWrapper.nativeCloseMppQuery(mppHandle)
+          val closeNanos = System.nanoTime() - tCloseStart
+          val avgMs =
+            totalGetOutputNanos.toDouble / math.max(1L, totalGetOutputCalls) / 1e6
+          logWarning(
+            f"MppNativeQueryRDD: TIMING " +
+              f"nativeGetMppOutput totalCalls=$totalGetOutputCalls " +
+              f"sum=${totalGetOutputNanos / 1e6}%.1fms " +
+              f"avg=$avgMs%.2fms " +
+              f"min=${minGetOutputNanos / 1e6}%.2fms " +
+              f"max=${maxGetOutputNanos / 1e6}%.2fms " +
+              f"timeToFirstBatch=${firstBatchNanos / 1e6}%.1fms " +
+              f"nativeCloseMppQuery=${closeNanos / 1e6}%.1fms")
           logInfo("MppNativeQueryRDD: MPP execution complete, all fragments finished")
           false
         } else {

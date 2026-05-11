@@ -29,6 +29,7 @@
 #include <folly/dynamic.h>
 #include <folly/json.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <nvtx3/nvtx3.hpp>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
 
@@ -61,6 +62,14 @@
 using namespace gluten;
 using namespace facebook;
 
+// NVTX domain for gluten MPP. Keeps our ranges visually distinct from
+// the velox / cudf NVTX ranges in nsys timeline.
+namespace {
+struct GlutenMppDomain {
+  static constexpr char const* name{"gluten-mpp"};
+};
+} // namespace
+
 // ---------------------------------------------------------------------------
 // Helper: container for an MppQueryCoordinator plus the resources it needs
 // that must outlive the coordinator (thread pool, memory pool, QueryCtx).
@@ -89,12 +98,30 @@ struct MppQueryHandle {
   std::shared_ptr<velox::memory::MemoryPool> memoryPool;
 
   ~MppQueryHandle() {
+    nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{
+        "jni::~MppQueryHandle"};
     // Ensure coordinator is destroyed first (aborts any running tasks),
-    // then queryCtx, then spill/execution pools.
-    coordinator.reset();
-    queryCtx.reset();
-    spillExecutor.reset();
-    executor.reset();
+    // then queryCtx, then spillExecutor, then executor.
+    {
+      nvtx3::scoped_range_in<GlutenMppDomain> r{
+          "jni::~MppQueryHandle:coordinator.reset"};
+      coordinator.reset();
+    }
+    {
+      nvtx3::scoped_range_in<GlutenMppDomain> r{
+          "jni::~MppQueryHandle:queryCtx.reset"};
+      queryCtx.reset();
+    }
+    {
+      nvtx3::scoped_range_in<GlutenMppDomain> r{
+          "jni::~MppQueryHandle:spillExecutor.reset"};
+      spillExecutor.reset();
+    }
+    {
+      nvtx3::scoped_range_in<GlutenMppDomain> r{
+          "jni::~MppQueryHandle:executor.reset"};
+      executor.reset();
+    }
   }
 };
 
@@ -380,6 +407,64 @@ void collectValueStreamNodes(
   }
 }
 
+/// Build a PartitionFunctionSpec from an exchange's partitionType + key
+/// indices. Reused by both the multi-task UCX path (PartitionedOutputNode)
+/// and the single-task merge path (LocalPartitionNode kRepartition).
+///
+/// Returns {nullptr, {}} when no key columns are usable (caller should
+/// fall back to RoundRobin or treat as no-op).
+struct PartitionSpecAndExprs {
+  velox::core::PartitionFunctionSpecPtr funcSpec;
+  std::vector<velox::core::TypedExprPtr> partitionExprs;
+};
+
+PartitionSpecAndExprs buildPartitionFunctionSpec(
+    const std::string& partitionType,
+    const std::vector<int32_t>& keyIndices,
+    const velox::RowTypePtr& outputType,
+    int32_t fragmentIdForLogging) {
+  PartitionSpecAndExprs result;
+  const auto numFields = static_cast<int32_t>(outputType->size());
+
+  // HASH and RANGE both use HashPartitionFunctionSpec for now (RANGE is
+  // degraded to hash partitioning since GPU range partitioning isn't
+  // wired — equal keys still land in the same partition, only intra-
+  // partition ordering is lost; matches the existing UCX path's choice).
+  if ((partitionType == "HASH" || partitionType == "RANGE") &&
+      !keyIndices.empty()) {
+    std::vector<velox::column_index_t> keyChannels;
+    keyChannels.reserve(keyIndices.size());
+    for (auto idx : keyIndices) {
+      if (idx < 0 || idx >= numFields) {
+        LOG(WARNING) << "MppJniWrapper: fragment " << fragmentIdForLogging
+                     << " partition key index " << idx
+                     << " out of range (output has " << numFields
+                     << " fields); falling back to round-robin";
+        keyChannels.clear();
+        result.partitionExprs.clear();
+        break;
+      }
+      keyChannels.push_back(static_cast<velox::column_index_t>(idx));
+      result.partitionExprs.push_back(
+          std::make_shared<velox::core::FieldAccessTypedExpr>(
+              outputType->childAt(idx), outputType->nameOf(idx)));
+    }
+    if (!keyChannels.empty()) {
+      result.funcSpec =
+          std::make_shared<velox::exec::HashPartitionFunctionSpec>(
+              outputType, std::move(keyChannels));
+    }
+  }
+
+  if (result.funcSpec == nullptr) {
+    result.partitionExprs.clear();
+    result.funcSpec =
+        std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>();
+  }
+
+  return result;
+}
+
 /// Recursively walk a Velox plan tree, replacing a SPECIFIC ValueStream leaf
 /// node (identified by plan node ID) with an ExchangeNode. Velox PlanNodes
 /// are immutable, so when a child changes we must reconstruct the parent.
@@ -392,29 +477,85 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
     const velox::core::PlanNodePtr& node,
     const std::string& targetNodeId,
     const std::string& exchangeNodeId,
-    const velox::RowTypePtr& producerWireType) {
+    const velox::RowTypePtr& producerWireType,
+    const velox::core::PlanNodePtr& producerPlanForMerge = nullptr,
+    const std::string& mergePartitionType = "SINGLE",
+    const std::vector<int32_t>& mergeKeyIndices = {}) {
   // Base case: this IS the target ValueStream leaf - replace it.
   if (isValueStreamNode(node) && node->id() == targetNodeId) {
     const auto& consumerType = node->outputType();
     const auto& wireType =
         producerWireType != nullptr ? producerWireType : consumerType;
-    LOG(WARNING) << "MppJniWrapper: replacing ValueStream node '" << node->id()
-                 << "' -> Exchange '" << exchangeNodeId
-                 << "' wireType=" << wireType->toString()
-                 << " consumerType=" << consumerType->toString();
-    // ExchangeNode advertises the WIRE schema (producer's outputType, may
-    // include a synthetic hash_partition_key:int prefix or other Spark-
-    // injected partitioning columns). cuDF serdes the wire as-is; if we
-    // declared the consumer's narrower type here, cuDF would silently
-    // truncate columns and we'd see "Cannot change vector type" /
-    // null-row corruption downstream (Q17 v9s, Q18 hang).
-    auto exchange = velox::core::ExchangeNode::Builder()
-                        .id(exchangeNodeId)
-                        .outputType(wireType)
-                        .serdeKind("Presto")
-                        .transportType(
-                            velox::core::ExchangeNode::TransportType::kUcx)
-                        .build();
+    velox::core::PlanNodePtr exchange;
+    if (producerPlanForMerge != nullptr) {
+      // Single-task merge mode: replace ValueStream with a LocalPartitionNode
+      // that splices the producer fragment's plan tree directly into this
+      // pipeline. Bypasses UcxExchange entirely.
+      //
+      // Per partition type:
+      //   SINGLE       -> LocalPartitionNode::Type::kGather (N-to-1)
+      //   HASH/RANGE   -> kRepartition + HashPartitionFunctionSpec
+      //   ROUND_ROBIN  -> kRepartition + RoundRobinPartitionFunctionSpec
+      //   BROADCAST    -> caller short-circuits and inlines producer plan
+      //                   directly (no LocalPartitionNode); HashJoinBridge
+      //                   handles cross-pipeline access. So we shouldn't
+      //                   actually reach here for BROADCAST.
+      const std::string localId = exchangeNodeId + "_local";
+      if (mergePartitionType == "SINGLE") {
+        LOG(WARNING) << "MppJniWrapper: replacing ValueStream node '"
+                     << node->id() << "' -> LocalPartition::gather "
+                     << "(single-task merge SINGLE) consumerType="
+                     << consumerType->toString();
+        exchange = velox::core::LocalPartitionNode::gather(
+            localId, {producerPlanForMerge});
+      } else if (
+          mergePartitionType == "BROADCAST") {
+        // BROADCAST in single-task mode: just inline the producer plan tree
+        // as-is. Velox HashJoinBridge will cross-link build and probe sides
+        // of the consumer's HashJoinNode without needing a LocalPartition.
+        LOG(WARNING) << "MppJniWrapper: replacing ValueStream node '"
+                     << node->id()
+                     << "' -> producer plan (single-task merge BROADCAST, "
+                        "no LocalPartition wrap)";
+        exchange = producerPlanForMerge;
+      } else {
+        // HASH / RANGE / ROUND_ROBIN -> kRepartition + appropriate spec.
+        auto specPair = buildPartitionFunctionSpec(
+            mergePartitionType, mergeKeyIndices, wireType,
+            /*fragmentIdForLogging=*/-1);
+        LOG(WARNING) << "MppJniWrapper: replacing ValueStream node '"
+                     << node->id() << "' -> LocalPartition::kRepartition "
+                     << "(single-task merge " << mergePartitionType
+                     << ") spec="
+                     << (specPair.funcSpec ? specPair.funcSpec->toString()
+                                           : "null");
+        exchange = velox::core::LocalPartitionNode::Builder()
+                       .id(localId)
+                       .type(velox::core::LocalPartitionNode::Type::kRepartition)
+                       .scaleWriter(false)
+                       .partitionFunctionSpec(specPair.funcSpec)
+                       .sources({producerPlanForMerge})
+                       .build();
+      }
+    } else {
+      LOG(WARNING) << "MppJniWrapper: replacing ValueStream node '"
+                   << node->id() << "' -> Exchange '" << exchangeNodeId
+                   << "' wireType=" << wireType->toString()
+                   << " consumerType=" << consumerType->toString();
+      // ExchangeNode advertises the WIRE schema (producer's outputType, may
+      // include a synthetic hash_partition_key:int prefix or other Spark-
+      // injected partitioning columns). cuDF serdes the wire as-is; if we
+      // declared the consumer's narrower type here, cuDF would silently
+      // truncate columns and we'd see "Cannot change vector type" /
+      // null-row corruption downstream (Q17 v9s, Q18 hang).
+      exchange = velox::core::ExchangeNode::Builder()
+                     .id(exchangeNodeId)
+                     .outputType(wireType)
+                     .serdeKind("Presto")
+                     .transportType(
+                         velox::core::ExchangeNode::TransportType::kUcx)
+                     .build();
+    }
 
     // Fast path: wire schema structurally equals consumer's expected. No
     // reshape needed - return ExchangeNode directly so Q6's single-driver
@@ -507,7 +648,11 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
   bool anyChanged = false;
   for (const auto& source : sources) {
     auto newSource = replaceValueStreamWithExchange(
-        source, targetNodeId, exchangeNodeId, producerWireType);
+        source,
+        targetNodeId,
+        exchangeNodeId,
+        producerWireType,
+        producerPlanForMerge);
     if (newSource.get() != source.get()) {
       anyChanged = true;
     }
@@ -740,6 +885,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     jobjectArray broadcastSlotIndicesPerFragArr,
     jobjectArray broadcastIteratorsPerFragArr) {
   JNI_METHOD_START
+  nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"jni::nativeCreateMppQuery"};
 
   auto ctx = getRuntime(env, wrapper);
   auto runtime = dynamic_cast<VeloxRuntime*>(ctx);
@@ -795,6 +941,78 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   // Fragments are emitted in topological order (producers before consumers)
   // so the producer's entry is always populated before the consumer reads it.
   std::unordered_map<int, velox::RowTypePtr> producerWireTypes;
+
+  // Single-task mode: collapse all fragments into one Velox Task, replacing
+  // every UcxExchange boundary with a LocalPartitionNode (intra-task pipeline
+  // boundary). Activates only when every exchange is SINGLE/BROADCAST
+  // (numPartitions == 1) — HASH/RANGE fall back to the multi-task path.
+  // When active, "merged producer" fragments don't get a PartitionedOutput
+  // wrapper and don't appear in fragmentSpecs; their plan tree is inlined
+  // into the consumer fragment via LocalPartitionNode::gather.
+  // Read from the merged session+backend conf to honor per-query overrides.
+  auto preLoopBackendConf = VeloxBackend::get()->getBackendConf();
+  auto preLoopMergedMap = preLoopBackendConf->rawConfigsCopy();
+  for (const auto& [key, val] : runtime->getConfMap()) {
+    preLoopMergedMap[key] = val;
+  }
+  auto preLoopSessionCfg =
+      std::make_shared<velox::config::ConfigBase>(std::move(preLoopMergedMap));
+  const bool singleTaskModeRequested = preLoopSessionCfg->get<bool>(
+      kMppSingleTaskMode, kMppSingleTaskModeDefault);
+  bool singleTaskMode = singleTaskModeRequested;
+  if (singleTaskMode) {
+    // All known partition types are supported in single-task mode:
+    //   SINGLE       -> LocalPartitionNode::Type::kGather
+    //   HASH/RANGE   -> kRepartition + HashPartitionFunctionSpec
+    //   ROUND_ROBIN  -> kRepartition + RoundRobinPartitionFunctionSpec
+    //   BROADCAST    -> producer plan inlined as-is (HashJoinBridge handles
+    //                   the cross-pipeline access)
+    // Any unknown partition type falls back to multi-task UCX path.
+    static const std::set<std::string> kSupportedPartitionTypes{
+        "SINGLE", "HASH", "RANGE", "ROUND_ROBIN", "BROADCAST"};
+    for (const auto& exch : exchangeSpecs) {
+      if (kSupportedPartitionTypes.count(exch.partitionType) == 0) {
+        LOG(WARNING) << "MppJniWrapper: singleTaskMode requested but exchange "
+                     << exch.id << " partitionType='" << exch.partitionType
+                     << "' not in supported set; falling back to multi-task";
+        singleTaskMode = false;
+        break;
+      }
+    }
+  }
+  // Fragment IDs that are "merged producers" — their plan tree gets inlined
+  // into the consumer via LocalPartitionNode and they don't get their own
+  // Velox Task.
+  std::set<int32_t> mergedProducerIds;
+  // Per-fragment unwrapped Velox plan, captured before PartitionedOutput
+  // wrapping (and before ValueStream replacement for fragments that have no
+  // inbound exchanges, i.e., leaf producers). Used by consumer fragments in
+  // single-task mode.
+  std::unordered_map<int, velox::core::PlanNodePtr> unwrappedFragmentPlans;
+  // Per-fragment scan info accumulated for merged producers — these flow
+  // into the surviving root fragment's scanInfos so MppQueryCoordinator
+  // injects their splits into the merged plan.
+  std::unordered_map<int, std::vector<std::shared_ptr<SplitInfo>>>
+      mergedProducerScanInfos;
+  std::unordered_map<int, std::vector<velox::core::PlanNodeId>>
+      mergedProducerScanNodeIds;
+  if (singleTaskMode) {
+    for (const auto& exch : exchangeSpecs) {
+      mergedProducerIds.insert(exch.producerFragmentId);
+    }
+    LOG(WARNING) << "MppJniWrapper: singleTaskMode active, "
+                 << mergedProducerIds.size()
+                 << " producer fragment(s) will be merged into consumers";
+  }
+
+  // Global plan-node-id allocator for single-task merge: each fragment's
+  // VeloxPlanConverter starts allocating ids from this value, then bumps
+  // the allocator to its high water mark. Ensures unique ids across the
+  // spliced plan tree (Velox Task::buildSplitStates VELOX_USER_CHECK
+  // requires unique node ids, otherwise: "Plan node IDs must be unique").
+  // Default starts at 100 to leave headroom and make the merged ids
+  // visually distinguishable from raw substrait conversion ids.
+  uint64_t globalPlanNodeIdAllocator = 100;
 
   for (jsize i = 0; i < numFragments; ++i) {
     auto planByteArray =
@@ -941,6 +1159,14 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
         /*writeFilesTempPath=*/std::nullopt,
         /*writeFileName=*/std::nullopt,
         /*validationMode=*/false);
+    // In single-task mode, fragments will be spliced into a single Velox plan
+    // tree, so plan node ids must be globally unique across fragments. Advance
+    // each fragment's converter id allocator so it starts above the previous
+    // fragment's high-water mark. See nextPlanNodeIdValue/setNextPlanNodeId.
+    if (singleTaskMode) {
+      converter.setNextPlanNodeId(
+          static_cast<int>(globalPlanNodeIdAllocator));
+    }
 
     // Parse split infos for this fragment from byte[][][] parameter.
     std::vector<::substrait::ReadRel_LocalFiles> localFiles;
@@ -973,6 +1199,12 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     }
 
     auto veloxPlanNode = converter.toVeloxPlan(substraitPlan, localFiles);
+    if (singleTaskMode) {
+      // Bump the global id allocator above this fragment's high-water mark
+      // so the next fragment's converter doesn't reuse ids.
+      globalPlanNodeIdAllocator =
+          static_cast<uint64_t>(converter.nextPlanNodeIdValue());
+    }
     // Capture this fragment's wire schema BEFORE plan rewriting. Consumer
     // fragments processed later look this up by exchange.producerFragmentId.
     producerWireTypes[static_cast<int>(i)] = veloxPlanNode->outputType();
@@ -1054,6 +1286,16 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       // inboundExchanges[0] is F0->F2 (part, 2 cols) but the leftmost
       // Velox ValueStream expects partsupp's 3 cols, so HashJoinNode::
       // validate fails with "left side join key not found: n0_0".
+      //
+      // Pass the producer's wire outputType to replaceValueStreamWithExchange
+      // so it can build the ExchangeNode against the actual wire format and
+      // synthesize a ProjectNode to strip any synthetic prefix columns /
+      // rename to consumer-expected names. Without this Q17 silently returns
+      // null and Q18 hangs on cuDF kindEquals at the fragment boundary.
+      //
+      // Single-task merge mode: instead of an ExchangeNode, pass the
+      // producer fragment's already-converted unwrapped plan to splice it
+      // in via LocalPartitionNode.
       auto schemaMatches = [](const velox::RowTypePtr& a,
                               const velox::RowTypePtr& b) {
         if (a == nullptr || b == nullptr || a->size() != b->size()) {
@@ -1155,17 +1397,74 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
         if (it != producerWireTypes.end()) {
           producerWire = it->second;
         }
+        velox::core::PlanNodePtr producerPlanForMerge;
+        if (singleTaskMode) {
+          auto pit = unwrappedFragmentPlans.find(
+              inboundExchanges[k]->producerFragmentId);
+          VELOX_CHECK(
+              pit != unwrappedFragmentPlans.end(),
+              "single-task mode: producer fragment {} plan missing for exchange {}",
+              inboundExchanges[k]->producerFragmentId,
+              inboundExchanges[k]->id);
+          producerPlanForMerge = pit->second;
+          // Roll the producer fragment's scanInfos / scanNodeIds /
+          // scanConnectorIds into this consumer's accumulator so when this
+          // (root) fragment becomes the single Velox Task, MppQueryCoordinator
+          // injects the merged-in scan splits onto the right plan node.
+          auto& mInfos = mergedProducerScanInfos[
+              inboundExchanges[k]->producerFragmentId];
+          auto& mIds = mergedProducerScanNodeIds[
+              inboundExchanges[k]->producerFragmentId];
+          if (!mInfos.empty()) {
+            for (size_t mi = 0; mi < mInfos.size(); ++mi) {
+              fragScanInfos.push_back(mInfos[mi]);
+              fragScanNodeIds.push_back(mIds[mi]);
+            }
+            LOG(WARNING)
+                << "MppJniWrapper: single-task merge folded "
+                << mInfos.size() << " scan(s) from fragment "
+                << inboundExchanges[k]->producerFragmentId
+                << " into fragment " << i;
+          }
+        }
         veloxPlanNode = replaceValueStreamWithExchange(
             veloxPlanNode,
             valueStreamNodes[j]->id(),
             inboundExchanges[k]->exchangeNodeId,
-            producerWire);
+            producerWire,
+            producerPlanForMerge,
+            inboundExchanges[k]->partitionType,
+            inboundExchanges[k]->partitionKeyIndices);
       }
 
       LOG(INFO) << "MppJniWrapper: fragment " << i
                 << " after ValueStream->Exchange replacement: "
                 << veloxPlanNode->toString(
                        /*detailed=*/true, /*recursive=*/true);
+    }
+
+    // Capture the post-rewrite, pre-wrap plan for use by downstream consumer
+    // fragments in single-task merge mode. This is what gets inlined via
+    // LocalPartitionNode when a consumer's ValueStream is replaced.
+    if (singleTaskMode) {
+      unwrappedFragmentPlans[static_cast<int>(i)] = veloxPlanNode;
+      // Also track scan info so we can fold it into the consumer's
+      // scanInfos when the consumer is being merged into the root.
+      mergedProducerScanInfos[static_cast<int>(i)] = fragScanInfos;
+      mergedProducerScanNodeIds[static_cast<int>(i)] = fragScanNodeIds;
+    }
+
+    // Skip the PartitionedOutput wrap and fragmentSpecs push for fragments
+    // that are getting merged into a downstream consumer. The consumer will
+    // own the merged plan as a single Velox Task.
+    if (singleTaskMode &&
+        mergedProducerIds.find(static_cast<int32_t>(i)) !=
+            mergedProducerIds.end()) {
+      LOG(WARNING) << "MppJniWrapper: fragment " << i
+                   << " is a merged producer in single-task mode, "
+                   << "skipping PartitionedOutput wrap and spec push";
+      env->DeleteLocalRef(planByteArray);
+      continue;
     }
 
     // --- Problem 1: Wrap with PartitionedOutputNode ---
@@ -1330,9 +1629,46 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
         emptyGroupedIds};
 
     MppFragmentSpec fragSpec;
-    fragSpec.id = static_cast<int32_t>(i);
+    // In single-task mode, merged producers are skipped (continue) above, so
+    // fragment IDs in the surviving fragmentSpecs would be non-contiguous
+    // (e.g. just {1}). MppQueryCoordinator requires contiguous IDs starting
+    // at 0, so renumber here based on the position in fragmentSpecs.
+    fragSpec.id = singleTaskMode
+        ? static_cast<int32_t>(fragmentSpecs.size())
+        : static_cast<int32_t>(i);
     fragSpec.planFragment = std::move(planFragment);
-    fragSpec.numDrivers = safeNumDrivers.elems()[i];
+    // numDrivers is the max-drivers parameter passed to Task::start. Velox
+    // splits the plan into pipelines at LocalPartitionNode boundaries; each
+    // pipeline gets up to numDrivers driver instances. For single-task merge,
+    // we pick the max parallelism across all merged-in fragments so the
+    // scan pipeline (e.g. parallelism=4) gets enough drivers, even though
+    // the consumer pipeline (parallelism=1, e.g. SINGLE final agg) only uses
+    // 1. Velox's pipeline-aware driver assignment handles the per-pipeline
+    // narrowing internally.
+    int32_t mergedNumDrivers = safeNumDrivers.elems()[i];
+    if (singleTaskMode) {
+      for (auto producerId : mergedProducerIds) {
+        if (producerId >= 0 && producerId < numFragments) {
+          mergedNumDrivers = std::max(
+              mergedNumDrivers, safeNumDrivers.elems()[producerId]);
+        }
+      }
+      // Cap to IBM's GPU-friendly default (2). Without this, queries that
+      // inherit Spark default `spark.sql.shuffle.partitions=200` would set
+      // mergedNumDrivers=200 and Velox would create 200 driver lanes per
+      // pipeline — way more than a single GPU can usefully drive (cuDF
+      // SM saturation + RMM mutex contention). Configurable via
+      // kMppSingleTaskMaxDrivers conf if user wants to override.
+      const int32_t driverCap = preLoopSessionCfg->get<int32_t>(
+          kMppSingleTaskMaxDrivers, kMppSingleTaskMaxDriversDefault);
+      if (mergedNumDrivers > driverCap) {
+        LOG(WARNING) << "MppJniWrapper: capping mergedNumDrivers from "
+                     << mergedNumDrivers << " to " << driverCap
+                     << " (singleTaskMaxDrivers)";
+        mergedNumDrivers = driverCap;
+      }
+    }
+    fragSpec.numDrivers = mergedNumDrivers;
     fragSpec.scanInfos = std::move(fragScanInfos);
     fragSpec.scanNodeIds = std::move(fragScanNodeIds);
     // Determine connector IDs for scan nodes.
@@ -1447,6 +1783,16 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   auto queryId =
       fmt::format("mpp-{}", gMppQueryCounter.fetch_add(1, std::memory_order_relaxed));
 
+  // In single-task mode every exchange has been inlined as a LocalPartition,
+  // and the producer fragments have been folded into the surviving root.
+  // Clear exchangeSpecs so MppQueryCoordinator's wiring loop skips and the
+  // assertion that consumer/producer fragment ids be valid passes.
+  if (singleTaskMode) {
+    LOG(WARNING) << "MppJniWrapper: clearing " << exchangeSpecs.size()
+                 << " exchangeSpec(s) for single-task mode";
+    exchangeSpecs.clear();
+  }
+
   // Create the coordinator.
   auto coordinator = MppQueryCoordinator::create(
       queryId,
@@ -1484,6 +1830,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeStartMppQuery( // NOL
     jobject wrapper,
     jlong handle) {
   JNI_METHOD_START
+  nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"jni::nativeStartMppQuery"};
 
   auto mppHandle = ObjectStore::retrieve<MppQueryHandle>(handle);
   GLUTEN_CHECK(mppHandle != nullptr, "Invalid MPP query handle");
@@ -1506,6 +1853,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeGetMppOutput( // NOLI
     jobject wrapper,
     jlong handle) {
   JNI_METHOD_START
+  nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"jni::nativeGetMppOutput"};
 
   auto ctx = getRuntime(env, wrapper);
   auto mppHandle = ObjectStore::retrieve<MppQueryHandle>(handle);
@@ -1552,6 +1900,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeAbortMppQuery( // NOL
     jobject wrapper,
     jlong handle) {
   JNI_METHOD_START
+  nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"jni::nativeAbortMppQuery"};
 
   LOG(INFO) << "MppJniWrapper: aborting MPP query, handle=" << handle;
 
@@ -1590,6 +1939,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCloseMppQuery( // NOL
     jobject wrapper,
     jlong handle) {
   JNI_METHOD_START
+  nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"jni::nativeCloseMppQuery"};
 
   LOG(INFO) << "MppJniWrapper: closing MPP query, handle=" << handle;
 

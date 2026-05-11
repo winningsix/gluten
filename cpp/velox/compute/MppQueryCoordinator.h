@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -244,6 +245,12 @@ class MppQueryCoordinator {
   /// is stalling. Runs until destructor.
   std::thread watchdogThread_;
   std::atomic<bool> watchdogStop_{false};
+  /// Used to wake the watchdog thread immediately on shutdown instead of
+  /// blocking until the current 5-second sleep_for finishes. Without this
+  /// the destructor's join() routinely waits 1-3s on average just for the
+  /// watchdog to wake from its tick interval.
+  std::mutex watchdogMutex_;
+  std::condition_variable watchdogCv_;
 
   /// Leaf memory pool for deserializing pages in next(). Velox requires
   /// allocations to happen on leaf pools, not the aggregate root returned

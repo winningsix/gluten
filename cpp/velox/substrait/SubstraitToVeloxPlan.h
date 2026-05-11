@@ -191,6 +191,19 @@ class SubstraitToVeloxPlanConverter {
     planNodeId_ = planNodeId;
   }
 
+  /// Advance the next plan node id allocator without inserting any input.
+  /// Used by single-task MPP merge to avoid colliding plan node ids when
+  /// splicing multiple fragments' Velox plans into one task tree.
+  void setNextPlanNodeId(int planNodeId) {
+    planNodeId_ = planNodeId;
+  }
+
+  /// Inspect the next plan node id (= one past the last allocated id, so
+  /// callers can compute the current high-water mark with maxId = nextId - 1).
+  int nextPlanNodeIdValue() const {
+    return planNodeId_;
+  }
+
   void setSplitInfos(std::vector<std::shared_ptr<SplitInfo>> splitInfos) {
     splitInfos_ = splitInfos;
   }

@@ -645,10 +645,7 @@ case class MppNativeQueryExec(
 
   private case class BuildSideChoice(side: BuildSide, reason: String)
 
-  private case class JoinSideStats(
-      sizeInBytes: BigInt,
-      rowCount: Option[BigInt],
-      source: String)
+  private case class JoinSideStats(sizeInBytes: BigInt, rowCount: Option[BigInt], source: String)
 
   private object MppJoinSelectionHelper extends JoinSelectionHelper
 
@@ -739,27 +736,27 @@ case class MppNativeQueryExec(
                 side,
                 s"Spark JoinSelection selected build side " +
                   s"(leftSize=${logicalJoin.left.stats.sizeInBytes}, " +
-                  s"rightSize=${logicalJoin.right.stats.sizeInBytes})")
+                  s"rightSize=${logicalJoin.right.stats.sizeInBytes})"
+              )
           }
       case _ => None
     }
   }
 
   private def statsBuildSide(join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
-    Seq(logicalJoinStats(join), childLogicalStats(join)).flatten
-      .flatMap {
-        case (leftStats, rightStats) =>
-          chooseSmallerBuildSide(leftStats, rightStats).map {
-            side =>
-              BuildSideChoice(
-                side,
-                s"${leftStats.source} selected smaller build side " +
-                  s"(leftSize=${leftStats.sizeInBytes}, rightSize=${rightStats.sizeInBytes}, " +
-                  s"leftRows=${leftStats.rowCount.getOrElse("unknown")}, " +
-                  s"rightRows=${rightStats.rowCount.getOrElse("unknown")})")
-          }
-      }
-      .headOption
+    Seq(logicalJoinStats(join), childLogicalStats(join)).flatten.flatMap {
+      case (leftStats, rightStats) =>
+        chooseSmallerBuildSide(leftStats, rightStats).map {
+          side =>
+            BuildSideChoice(
+              side,
+              s"${leftStats.source} selected smaller build side " +
+                s"(leftSize=${leftStats.sizeInBytes}, rightSize=${rightStats.sizeInBytes}, " +
+                s"leftRows=${leftStats.rowCount.getOrElse("unknown")}, " +
+                s"rightRows=${rightStats.rowCount.getOrElse("unknown")})"
+            )
+        }
+    }.headOption
   }
 
   private def logicalJoinStats(
@@ -824,11 +821,9 @@ case class MppNativeQueryExec(
     }
 
     (leftStats.rowCount, rightStats.rowCount) match {
-      case (Some(leftRows), Some(rightRows))
-          if isSignificantlySmaller(leftRows, rightRows) =>
+      case (Some(leftRows), Some(rightRows)) if isSignificantlySmaller(leftRows, rightRows) =>
         Some(BuildLeft)
-      case (Some(leftRows), Some(rightRows))
-          if isSignificantlySmaller(rightRows, leftRows) =>
+      case (Some(leftRows), Some(rightRows)) if isSignificantlySmaller(rightRows, leftRows) =>
         Some(BuildRight)
       case _ => None
     }

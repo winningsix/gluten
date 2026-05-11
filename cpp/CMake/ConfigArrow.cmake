@@ -28,7 +28,10 @@ function(FIND_ARROW_LIB LIB_NAME)
   if(NOT TARGET Arrow::${LIB_NAME})
     set(ARROW_LIB_FULL_NAME
         ${CMAKE_SHARED_LIBRARY_PREFIX}${LIB_NAME}${ARROW_STATIC_LIBRARY_SUFFIX})
-    add_library(Arrow::${LIB_NAME} STATIC IMPORTED)
+    # GLOBAL so that subdirectories outside core/ (e.g. velox/) can also link
+    # against Arrow::${LIB_NAME}. Required after d7410aee9d / e50eb1eafe moved
+    # target_link_libraries(velox ... Arrow::arrow ...) outside BUILD_TESTS.
+    add_library(Arrow::${LIB_NAME} STATIC IMPORTED GLOBAL)
     # Firstly find the lib from bundled path in Velox. If not found, try to find
     # it from system.
     find_library(

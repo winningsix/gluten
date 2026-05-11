@@ -20,6 +20,7 @@
 #include <fmt/format.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/io/IOBuf.h>
+#include <nvtx3/nvtx3.hpp>
 #include <unordered_set>
 
 // Must be included before any header that (transitively) pulls in
@@ -59,6 +60,12 @@ namespace {
 /// what the Acceptor parses out of the URL, so the consumer hangs waiting
 /// for data that's already enqueued under a different key.
 constexpr const char* kTaskIdPrefix = "gpu-local-";
+
+// NVTX domain for gluten MPP. Same name as the one in MppJniWrapper.cc so
+// both files emit ranges into the same nsys lane.
+struct GlutenMppDomain {
+  static constexpr char const* name{"gluten-mpp"};
+};
 
 } // namespace
 
@@ -138,10 +145,21 @@ std::shared_ptr<MppQueryCoordinator> MppQueryCoordinator::create(
 }
 
 MppQueryCoordinator::~MppQueryCoordinator() {
+  nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"coordinator::~destructor"};
   // Stop the watchdog first so it doesn't touch half-destructed state.
-  watchdogStop_ = true;
-  if (watchdogThread_.joinable()) {
-    watchdogThread_.join();
+  // notify_all wakes the watchdog from its cv.wait_for so join() returns
+  // promptly instead of blocking up to 5s for the next tick.
+  {
+    std::lock_guard<std::mutex> lock(watchdogMutex_);
+    watchdogStop_ = true;
+  }
+  watchdogCv_.notify_all();
+  {
+    nvtx3::scoped_range_in<GlutenMppDomain> r{
+        "coordinator::~destructor:watchdog.join"};
+    if (watchdogThread_.joinable()) {
+      watchdogThread_.join();
+    }
   }
   size_t totalTasks = 0;
   for (auto& replicas : fragmentTasks_) {
@@ -160,25 +178,60 @@ MppQueryCoordinator::~MppQueryCoordinator() {
     // queries in the same JVM to hang because ExchangeClient state there
     // is not cleanly reset. abort() is idempotent: if the JVM-side close
     // already drove abort, the inner aborted_ guard short-circuits.
-    try {
-      abort();
-    } catch (...) {
+    {
+      nvtx3::scoped_range_in<GlutenMppDomain> r{
+          "coordinator::~destructor:abort_call"};
+      try {
+        abort();
+      } catch (...) {
+      }
     }
-    for (auto& replicas : fragmentTasks_) {
-      for (auto& task : replicas) {
-        if (task == nullptr) {
-          continue;
-        }
-        const auto& tid = task->taskId();
-        LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                     << "]: removeTask(" << tid
-                     << ") state=" << static_cast<int>(task->state());
-        try {
-          bufferManager_->removeTask(tid);
-        } catch (...) {
+    {
+      nvtx3::scoped_range_in<GlutenMppDomain> removeTaskRange{
+          "coordinator::~destructor:removeTaskFromOutputBuffer"};
+      for (auto& replicas : fragmentTasks_) {
+        for (auto& task : replicas) {
+          if (task == nullptr) {
+            continue;
+          }
+          const auto& tid = task->taskId();
+          LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                       << "]: removeTask(" << tid
+                       << ") state=" << static_cast<int>(task->state());
+          try {
+            bufferManager_->removeTask(tid);
+          } catch (...) {
+          }
         }
       }
     }
+  }
+  // Explicit teardown with NVTX so we can attribute close-phase time to
+  // specific resources. Without these, the cost falls into implicit
+  // class-member destruction (reverse declaration order) after this NVTX
+  // range, invisible in profiles. Order matters: drop the Task vector
+  // first (which joins driver threads + frees per-task memory pools),
+  // then OutputBufferManager handle, then per-query deserialize pool,
+  // then QueryCtx (which holds the root memory pool).
+  {
+    nvtx3::scoped_range_in<GlutenMppDomain> r{
+        "coordinator::~destructor:fragmentTasks.clear"};
+    fragmentTasks_.clear();
+  }
+  {
+    nvtx3::scoped_range_in<GlutenMppDomain> r{
+        "coordinator::~destructor:bufferManager.reset"};
+    bufferManager_.reset();
+  }
+  {
+    nvtx3::scoped_range_in<GlutenMppDomain> r{
+        "coordinator::~destructor:deserializePool.reset"};
+    deserializePool_.reset();
+  }
+  {
+    nvtx3::scoped_range_in<GlutenMppDomain> r{
+        "coordinator::~destructor:queryCtx.reset"};
+    queryCtx_.reset();
   }
   LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: destructor exit";
 }
@@ -209,6 +262,7 @@ bool MppQueryCoordinator::isTerminalState(TaskState state) {
 // ---------------------------------------------------------------------------
 
 void MppQueryCoordinator::start() {
+  nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"coordinator::start"};
   VELOX_CHECK(!started_, "MppQueryCoordinator already started");
   started_ = true;
   LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: start() "
@@ -576,10 +630,17 @@ void MppQueryCoordinator::start() {
     // same error message every tick.
     std::unordered_set<std::string> reportedFailures;
     while (!watchdogStop_.load(std::memory_order_acquire)) {
-      std::this_thread::sleep_for(std::chrono::seconds(5));
-      if (watchdogStop_.load(std::memory_order_acquire)) {
+      // wait_for returns true if the predicate is met (stop requested),
+      // false if it timed out — in either case the next iteration's loop
+      // condition checks watchdogStop_, so the thread exits within microseconds
+      // of notify_all from the destructor instead of waiting up to 5s.
+      std::unique_lock<std::mutex> lock(watchdogMutex_);
+      if (watchdogCv_.wait_for(lock, std::chrono::seconds(5), [this]() {
+            return watchdogStop_.load(std::memory_order_acquire);
+          })) {
         break;
       }
+      lock.unlock();
       ++tick;
       // Summarize per-fragment state counts (more scannable than per-task).
       for (size_t f = 0; f < fragmentTasks_.size(); ++f) {
@@ -673,6 +734,8 @@ void MppQueryCoordinator::start() {
 
 bool MppQueryCoordinator::fetchNextOutputPage(
     std::vector<std::unique_ptr<SerializedPageBase>>& pages) {
+  nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{
+      "coordinator::fetchNextOutputPage"};
   const auto rootReplicas = fragmentReplicaCount_[rootFragmentId_];
   constexpr int32_t kDestination = 0; // each root Task gathers to dest 0
   constexpr uint64_t kMaxBytes = std::numeric_limits<uint64_t>::max();
@@ -845,6 +908,7 @@ void MppQueryCoordinator::rethrowFirstTaskError() const {
 }
 
 RowVectorPtr MppQueryCoordinator::next() {
+  nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"coordinator::next"};
   VELOX_CHECK(started_, "Must call start() before next()");
 
   const auto deserializePage =
@@ -944,6 +1008,7 @@ bool MppQueryCoordinator::isFinished() const {
 // ---------------------------------------------------------------------------
 
 void MppQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
+  nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"coordinator::abort"};
   // Serialize abort callers. The same coordinator can be aborted by two
   // paths (an explicit JNI nativeAbortMppQuery from the JVM-side close, and
   // the destructor when ~MppQueryHandle drops the shared_ptr); without this
@@ -969,6 +1034,7 @@ void MppQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
   // because we'll wait on taskCompletionFuture() in Phase 2 — that's
   // realized whenever the task is no longer running, regardless of which
   // call drove it to terminal.
+  nvtx3::mark_in<GlutenMppDomain>("abort:Phase1-requestAbort-begin");
   size_t firedCount = 0;
   size_t alreadyTerminalCount = 0;
   for (auto& replicas : fragmentTasks_) {
@@ -1007,6 +1073,8 @@ void MppQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
   // running. Cap each wait so a stuck task can't hold up shutdown forever —
   // a leak warning at process exit is strictly better than an infinite hang
   // or a removePool() VELOX_CHECK abort.
+  nvtx3::scoped_range_in<GlutenMppDomain> phase2Range{
+      "coordinator::abort:Phase2-waitTaskTerminal"};
   size_t terminalAfterWait = 0;
   size_t timedOut = 0;
   for (auto& replicas : fragmentTasks_) {
@@ -1019,6 +1087,8 @@ void MppQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
         continue;
       }
       try {
+        nvtx3::scoped_range_in<GlutenMppDomain> waitRange{
+            "coordinator::abort:taskCompletionFuture.wait"};
         // Wait blocks up to perTaskTimeout. After the wait, just check the
         // Task's own state; we don't depend on wait()'s return value to
         // sidestep folly Future API drift between Velox versions.

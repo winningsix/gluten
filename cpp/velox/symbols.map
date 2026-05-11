@@ -21,6 +21,20 @@
         *fLU64::*;
         *fLD::*;
         *fLS::*;
+        # rmm / cudf inline functions with function-local static state
+        # (rmm::mr::detail::get_map, get_ref_map, initial_resource; cudf
+        # default-stream pool; etc.). Without these in the global list,
+        # the `local: *;` line demotes them to LOCAL BSS, breaking dedup
+        # against libcudf.so / librmm.so which export the same symbols
+        # as STB_GNU_UNIQUE. Result: each .so has its own copy of the
+        # per-device-resource map, and GpuMemoryTracker installed via
+        # `rmm::mr::set_current_device_resource(tracker)` only updates
+        # libgluten.so's private map; libcudf.so's map stays empty and
+        # cuDF's reader_impl falls back to initial_resource() → 42K
+        # cudaMalloc bypass tracker. (See option3 GpuMemoryTracker
+        # ODR investigation 2026-04-29.)
+        *rmm::*;
+        *cudf::*;
     };
 
     Java_org_apache_gluten_*;

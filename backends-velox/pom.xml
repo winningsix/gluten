@@ -33,12 +33,12 @@
     <byte-buddy.version>1.9.3</byte-buddy.version>
     <!-- Defaults for scalatest systemProperties forwards: without these, unresolved ${...}
          becomes the literal string "null" in the forked test JVM and overrides SparkConf. -->
-    <gluten.tpch.prestoReferenceDir></gluten.tpch.prestoReferenceDir>
-    <gluten.tpch.allowPrestoSampleOnly></gluten.tpch.allowPrestoSampleOnly>
-    <gluten.tpch.compareAllQueries></gluten.tpch.compareAllQueries>
-    <spark.gluten.mpp.maxInboundExchangesPerFragment></spark.gluten.mpp.maxInboundExchangesPerFragment>
-    <spark.gluten.mpp.maxHashInboundExchangesPerFragment></spark.gluten.mpp.maxHashInboundExchangesPerFragment>
-    <spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment></spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment>
+    <gluten.tpch.prestoReferenceDir/>
+    <gluten.tpch.allowPrestoSampleOnly/>
+    <gluten.tpch.compareAllQueries/>
+    <spark.gluten.mpp.maxInboundExchangesPerFragment/>
+    <spark.gluten.mpp.maxHashInboundExchangesPerFragment/>
+    <spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment/>
   </properties>
 
   <dependencies>
