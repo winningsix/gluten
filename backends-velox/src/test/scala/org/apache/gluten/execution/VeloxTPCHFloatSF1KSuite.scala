@@ -75,12 +75,18 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
 
   override protected def sparkConf: SparkConf = {
     val conf = super.sparkConf
+    conf.getAll.collect { case (key, "null") => key }.foreach(conf.remove)
     conf
       // 1TB-scale resources; parent default is too small. 32g (was 16g) so the
       // 22-query sweep doesn't OOM on heavy joins like Q1 where 16-replica
       // PartitionedOutput each holds ~512MB. Long-term fix: switch to
       // 1-task-per-worker model so memory is shared across drivers.
-      .set("spark.sql.shuffle.partitions", "16")
+      .set(
+        "spark.sql.shuffle.partitions",
+        sys.props
+          .get("spark.sql.shuffle.partitions")
+          .filter(v => v.nonEmpty && v != "null")
+          .getOrElse("16"))
       .set("spark.memory.offHeap.size", "32g")
       .set("spark.sql.adaptive.enabled", "false")
       // BHJ via explicit BROADCAST(t) hints (see tpchSQL override). CBO is
@@ -131,9 +137,47 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       // Dump every MppNativeQueryExec plan for offline diagnosis if the run fails.
       .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps-tpch-sf1k")
 
+    if (!conf.contains("spark.master")) {
+      conf.set("spark.master", "local[2]")
+    }
+    if (!conf.contains("spark.executor.instances")) {
+      conf.set("spark.executor.instances", "1")
+    }
+    if (!conf.contains("spark.executor.cores")) {
+      conf.set("spark.executor.cores", "2")
+    }
+    if (!conf.contains("spark.executor.memory")) {
+      conf.set("spark.executor.memory", "16g")
+    }
+    if (!conf.contains("spark.executor.memoryOverhead")) {
+      conf.set("spark.executor.memoryOverhead", "4g")
+    }
+
     Seq(
+      "spark.master",
+      "spark.executor.instances",
+      "spark.executor.cores",
+      "spark.executor.memory",
+      "spark.executor.memoryOverhead",
+      "spark.driver.extraLibraryPath",
+      "spark.executor.extraLibraryPath",
+      "spark.executorEnv.LD_LIBRARY_PATH",
+      "spark.executorEnv.CUDA_VISIBLE_DEVICES",
+      "spark.executorEnv.KVIKIO_NTHREADS",
+      "spark.driverEnv.KVIKIO_NTHREADS",
       "spark.driver.maxResultSize",
+      "spark.sql.files.maxPartitionBytes",
+      "spark.sql.files.minPartitionNum",
+      "spark.sql.files.openCostInBytes",
       "spark.gluten.sql.columnar.libpath",
+      "spark.gluten.sql.columnar.backend.velox.IOThreads",
+      "spark.gluten.sql.columnar.backend.velox.cudf.memoryResource",
+      "spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_rows",
+      "spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_max_batch_rows",
+      "spark.gluten.sql.columnar.backend.velox.cudf.hive.scan-output-rows",
+      "spark.gluten.sql.columnar.backend.velox.cudf.hive.use-buffered-input",
+      "spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk-read-limit",
+      "spark.gluten.sql.columnar.backend.velox.parquet.reader.pass-read-limit",
       "spark.gluten.loadLibFromJar",
       "spark.gluten.mpp.substraitDumpDir",
       "spark.gluten.mpp.localHashExchangeTasks",
@@ -144,6 +188,8 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       "spark.gluten.mpp.q3.replicateOrdersPath",
       "spark.gluten.mpp.fuseBroadcastBuilds",
       "spark.gluten.mpp.normalizeJoinBuildSide",
+      "spark.gluten.mpp.normalizeOuterJoinBuildSide",
+      "spark.gluten.mpp.forceOuterJoinPreservedBuildSide",
       q4ExistsLineitemDedupKey
     ).foreach(key => nonNullProperty(key).foreach(conf.set(key, _)))
     conf

@@ -271,8 +271,11 @@ object JoinUtils {
         case _: ExistenceJoin =>
           inputBuildOutput.indices.map(ExpressionBuilder.makeSelection(_)) :+
             ExpressionBuilder.makeSelection(buildOutput.size)
-        case LeftSemi | LeftAnti =>
-          // When the left semi/anti join support the BuildLeft
+        case LeftSemi =>
+          // RIGHT_SEMI returns the original left/build columns directly.
+          leftOutput.indices.map(ExpressionBuilder.makeSelection(_))
+        case LeftAnti =>
+          // When the left anti join supports BuildLeft.
           leftOutput.indices.map(idx => ExpressionBuilder.makeSelection(idx + streamedOutput.size))
         case LeftExistence(_) =>
           leftOutput.indices.map(ExpressionBuilder.makeSelection(_))

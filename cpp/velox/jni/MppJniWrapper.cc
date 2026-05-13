@@ -18,9 +18,12 @@
 #include <jni.h>
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -652,7 +655,9 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
         targetNodeId,
         exchangeNodeId,
         producerWireType,
-        producerPlanForMerge);
+        producerPlanForMerge,
+        mergePartitionType,
+        mergeKeyIndices);
     if (newSource.get() != source.get()) {
       anyChanged = true;
     }
@@ -819,6 +824,247 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
       "node type in replaceValueStreamWithExchange().",
       node->name(),
       node->id());
+}
+
+bool schemaMatches(const velox::RowTypePtr& a, const velox::RowTypePtr& b) {
+  if (a == nullptr || b == nullptr || a->size() != b->size()) {
+    return false;
+  }
+  for (size_t k = 0; k < a->size(); ++k) {
+    if (!a->childAt(k)->equivalent(*b->childAt(k))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+velox::core::PlanNodePtr rewriteValueStreamsForMpp(
+    int32_t fragmentId,
+    velox::core::PlanNodePtr veloxPlanNode,
+    const std::vector<MppExchangeSpec>& exchangeSpecs,
+    const std::unordered_map<int, velox::RowTypePtr>& producerWireTypes,
+    const std::unordered_set<int32_t>& broadcastSlotSet,
+    int32_t numExchangeInputs,
+    int32_t numBroadcastInputs) {
+  std::vector<const MppExchangeSpec*> inboundExchanges;
+  for (const auto& exchange : exchangeSpecs) {
+    if (exchange.consumerFragmentId == fragmentId) {
+      inboundExchanges.push_back(&exchange);
+    }
+  }
+
+  if (inboundExchanges.empty() && broadcastSlotSet.empty()) {
+    return veloxPlanNode;
+  }
+
+  std::vector<velox::core::PlanNodePtr> valueStreamNodes;
+  collectValueStreamNodes(veloxPlanNode, valueStreamNodes);
+
+  VELOX_CHECK_EQ(
+      valueStreamNodes.size(),
+      static_cast<size_t>(numExchangeInputs + numBroadcastInputs),
+      "Fragment {} has {} ValueStream nodes but {} inbound exchanges + "
+      "{} fused broadcasts. These must match 1:1 (broadcast slots are "
+      "kept as ValueStream, exchange slots are rewritten to ExchangeNode).",
+      fragmentId,
+      valueStreamNodes.size(),
+      inboundExchanges.size(),
+      numBroadcastInputs);
+
+  std::vector<size_t> exchangeForStream(
+      valueStreamNodes.size(), std::numeric_limits<size_t>::max());
+  std::vector<bool> exchangeUsed(inboundExchanges.size(), false);
+  for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+    if (broadcastSlotSet.count(static_cast<int32_t>(j)) > 0) {
+      continue;
+    }
+    auto streamType = std::dynamic_pointer_cast<const velox::RowType>(
+        valueStreamNodes[j]->outputType());
+    for (size_t k = 0; k < inboundExchanges.size(); ++k) {
+      if (exchangeUsed[k]) {
+        continue;
+      }
+      velox::RowTypePtr producerWire;
+      auto it = producerWireTypes.find(inboundExchanges[k]->producerFragmentId);
+      if (it != producerWireTypes.end()) {
+        producerWire = it->second;
+      }
+      bool matched = schemaMatches(streamType, producerWire);
+      if (!matched && producerWire != nullptr && streamType != nullptr &&
+          producerWire->size() == streamType->size() + 1) {
+        std::vector<std::string> n;
+        std::vector<velox::TypePtr> t;
+        for (size_t kk = 1; kk < producerWire->size(); ++kk) {
+          n.push_back(producerWire->nameOf(kk));
+          t.push_back(producerWire->childAt(kk));
+        }
+        auto stripped =
+            std::make_shared<const velox::RowType>(std::move(n), std::move(t));
+        matched = schemaMatches(streamType, stripped);
+      }
+      if (matched) {
+        exchangeForStream[j] = k;
+        exchangeUsed[k] = true;
+        break;
+      }
+    }
+  }
+
+  for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+    if (broadcastSlotSet.count(static_cast<int32_t>(j)) > 0 ||
+        exchangeForStream[j] != std::numeric_limits<size_t>::max()) {
+      continue;
+    }
+    for (size_t k = 0; k < inboundExchanges.size(); ++k) {
+      if (!exchangeUsed[k]) {
+        exchangeForStream[j] = k;
+        exchangeUsed[k] = true;
+        break;
+      }
+    }
+  }
+
+  for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+    if (broadcastSlotSet.count(static_cast<int32_t>(j)) > 0) {
+      LOG(WARNING) << "MppJniWrapper: fragment " << fragmentId << " stream["
+                   << j << "] id=" << valueStreamNodes[j]->id()
+                   << " type=" << valueStreamNodes[j]->outputType()->toString()
+                   << " -> KEEP as ValueStream (fused broadcast slot)";
+      continue;
+    }
+    const auto k = exchangeForStream[j];
+    LOG(WARNING) << "MppJniWrapper: fragment " << fragmentId << " stream["
+                 << j << "] id=" << valueStreamNodes[j]->id()
+                 << " type=" << valueStreamNodes[j]->outputType()->toString()
+                 << " -> exchange[" << k << "] producerF="
+                 << inboundExchanges[k]->producerFragmentId
+                 << " nodeId=" << inboundExchanges[k]->exchangeNodeId;
+  }
+
+  for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
+    if (broadcastSlotSet.count(static_cast<int32_t>(j)) > 0) {
+      continue;
+    }
+    const auto k = exchangeForStream[j];
+    velox::RowTypePtr producerWire;
+    auto it = producerWireTypes.find(inboundExchanges[k]->producerFragmentId);
+    if (it != producerWireTypes.end()) {
+      producerWire = it->second;
+    }
+    veloxPlanNode = replaceValueStreamWithExchange(
+        veloxPlanNode,
+        valueStreamNodes[j]->id(),
+        inboundExchanges[k]->exchangeNodeId,
+        producerWire);
+  }
+
+  LOG(INFO) << "MppJniWrapper: fragment " << fragmentId
+            << " after ValueStream->Exchange replacement: "
+            << veloxPlanNode->toString(/*detailed=*/true, /*recursive=*/true);
+  return veloxPlanNode;
+}
+
+velox::core::PlanNodePtr wrapWithMppPartitionedOutput(
+    int32_t fragmentId,
+    velox::core::PlanNodePtr veloxPlanNode,
+    const std::vector<MppExchangeSpec>& exchangeSpecs) {
+  int32_t numOutputPartitions = 1;
+  const MppExchangeSpec* outboundExchange = nullptr;
+  for (const auto& exchange : exchangeSpecs) {
+    if (exchange.producerFragmentId == fragmentId) {
+      numOutputPartitions = exchange.numPartitions;
+      outboundExchange = &exchange;
+      break;
+    }
+  }
+
+  auto outputNodeId = fmt::format("mpp_output_{}", fragmentId);
+  const std::string partitionType =
+      outboundExchange != nullptr ? outboundExchange->partitionType : std::string("ROOT");
+  const bool isBroadcastOutput =
+      outboundExchange != nullptr && partitionType == "BROADCAST";
+  const char* outputKindHelper =
+      isBroadcastOutput ? "broadcast" : (numOutputPartitions == 1 ? "single" : "partitioned");
+
+  LOG(INFO) << "MppJniWrapper: fragment " << fragmentId
+            << " outbound partitionType=" << partitionType
+            << " outputKindHelper=" << outputKindHelper
+            << " numOutputPartitions=" << numOutputPartitions;
+
+  if (isBroadcastOutput) {
+    return velox::core::PartitionedOutputNode::broadcast(
+        outputNodeId,
+        numOutputPartitions,
+        veloxPlanNode->outputType(),
+        /*serdeKind=*/"Presto",
+        veloxPlanNode,
+        velox::core::PartitionedOutputNode::TransportType::kUcx);
+  }
+
+  if (numOutputPartitions == 1) {
+    const auto transportType = (outboundExchange != nullptr)
+        ? velox::core::PartitionedOutputNode::TransportType::kUcx
+        : velox::core::PartitionedOutputNode::TransportType::kHttp;
+    return velox::core::PartitionedOutputNode::single(
+        outputNodeId,
+        veloxPlanNode->outputType(),
+        /*serdeKind=*/"Presto",
+        veloxPlanNode,
+        transportType);
+  }
+
+  const auto& keyIndices =
+      outboundExchange != nullptr ? outboundExchange->partitionKeyIndices : std::vector<int32_t>{};
+  velox::core::PartitionFunctionSpecPtr funcSpec;
+  std::vector<velox::core::TypedExprPtr> partitionExprs;
+  const auto& outputType = veloxPlanNode->outputType();
+  const auto numFields = static_cast<int32_t>(outputType->size());
+
+  if ((partitionType == "HASH" || partitionType == "RANGE") && !keyIndices.empty()) {
+    std::vector<velox::column_index_t> keyChannels;
+    keyChannels.reserve(keyIndices.size());
+    for (auto idx : keyIndices) {
+      if (idx < 0 || idx >= numFields) {
+        LOG(WARNING) << "MppJniWrapper: fragment " << fragmentId
+                     << " partition key index " << idx
+                     << " out of range (output has " << numFields
+                     << " fields); falling back to round-robin";
+        keyChannels.clear();
+        break;
+      }
+      keyChannels.push_back(static_cast<velox::column_index_t>(idx));
+      partitionExprs.push_back(std::make_shared<velox::core::FieldAccessTypedExpr>(
+          outputType->childAt(idx), outputType->nameOf(idx)));
+    }
+    if (!keyChannels.empty()) {
+      funcSpec = std::make_shared<velox::exec::HashPartitionFunctionSpec>(
+          outputType, std::move(keyChannels));
+    }
+  }
+
+  if (funcSpec == nullptr) {
+    partitionExprs.clear();
+    funcSpec = std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>();
+  }
+
+  LOG(WARNING) << "MppJniWrapper: fragment " << fragmentId
+               << " outbound exchange type=" << partitionType
+               << " keyIndices.size=" << keyIndices.size()
+               << " func=" << (funcSpec ? funcSpec->toString() : "null")
+               << " usingRoundRobinFallback="
+               << (partitionType == "HASH" && keyIndices.empty() ? "YES" : "no");
+
+  return std::make_shared<velox::core::PartitionedOutputNode>(
+      outputNodeId,
+      velox::core::PartitionedOutputNode::Kind::kPartitioned,
+      std::move(partitionExprs),
+      numOutputPartitions,
+      /*replicateNullsAndAny=*/false,
+      std::move(funcSpec),
+      veloxPlanNode->outputType(),
+      /*serdeKind=*/"Presto",
+      veloxPlanNode,
+      velox::core::PartitionedOutputNode::TransportType::kUcx);
 }
 
 /// Parse the exchange specifications from a JSON byte array.
@@ -1236,16 +1482,6 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
               << " raw Velox plan: "
               << veloxPlanNode->toString(/*detailed=*/true, /*recursive=*/true);
 
-    // --- Problem 2: Replace ValueStream nodes with ExchangeNode ---
-    //
-    // Consumer fragments (those that receive data from a producer via an
-    // exchange) will have ValueStream leaf nodes (from Gluten's
-    // InputIteratorTransformer → ReadRel "iterator:N"). For MPP execution
-    // these must be replaced with Velox ExchangeNode so that the
-    // ExchangeClient + RemoteConnectorSplit mechanism can wire them to the
-    // producer task's OutputBufferManager.
-    //
-    // Collect exchanges targeting this fragment as consumer, ordered by ID.
     std::vector<const MppExchangeSpec*> inboundExchanges;
     for (const auto& exchange : exchangeSpecs) {
       if (exchange.consumerFragmentId == static_cast<int32_t>(i)) {
@@ -1744,6 +1980,11 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   auto mppPool = rootPool->addAggregateChild("MppQuery");
   std::unordered_map<std::string, std::shared_ptr<velox::config::ConfigBase>>
       connectorConfigs;
+  auto hiveConnectorSessionConfig = createHiveConnectorSessionConfig(sessionCfg);
+  connectorConfigs[kHiveConnectorId] = hiveConnectorSessionConfig;
+#ifdef GLUTEN_ENABLE_GPU
+  connectorConfigs[kCudfHiveConnectorId] = hiveConnectorSessionConfig;
+#endif
   // Velox's OutputBuffer.bufferedBytes_ is a single scalar shared across ALL
   // destinations of a Task; enqueue blocks when it exceeds max_*_buffer_size.
   // Default 32 MB is catastrophic at N>=16: 32MB/N per destination trips
@@ -1783,6 +2024,25 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   auto queryId =
       fmt::format("mpp-{}", gMppQueryCounter.fetch_add(1, std::memory_order_relaxed));
 
+  std::optional<velox::common::SpillDiskOptions> spillDiskOpts;
+  const auto spillStrategy =
+      sessionCfg->get<std::string>(kSpillStrategy, kSpillStrategyDefaultValue);
+  if (spillStrategy != "none") {
+    const auto spillDir =
+        std::filesystem::temp_directory_path() /
+        fmt::format("gluten-mpp-spill-{}", queryId);
+    std::filesystem::create_directories(spillDir);
+    velox::common::SpillDiskOptions opts;
+    opts.spillDirPath = spillDir.string();
+    opts.spillDirCreated = true;
+    opts.spillDirCreateCb = nullptr;
+    spillDiskOpts = std::move(opts);
+    LOG(WARNING) << "MppJniWrapper: spill disk enabled for " << queryId
+                 << " dir=" << spillDir.string();
+  } else {
+    LOG(WARNING) << "MppJniWrapper: spill disk disabled for " << queryId;
+  }
+
   // In single-task mode every exchange has been inlined as a LocalPartition,
   // and the producer fragments have been folded into the surviving root.
   // Clear exchangeSpecs so MppQueryCoordinator's wiring loop skips and the
@@ -1799,7 +2059,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       std::move(fragmentSpecs),
       std::move(exchangeSpecs),
       queryCtx,
-      executor.get());
+      executor.get(),
+      std::move(spillDiskOpts));
 
   // Bundle into a handle.
   auto handle = std::make_shared<MppQueryHandle>();
@@ -1818,6 +2079,217 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   return handleId;
 
   JNI_METHOD_END(kInvalidObjectHandle)
+}
+
+// ---------------------------------------------------------------------------
+// nativeExplainMppQuery
+// ---------------------------------------------------------------------------
+
+JNIEXPORT jobjectArray JNICALL
+Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeExplainMppQuery( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jobjectArray substraitPlansArr,
+    jintArray numDriversArr,
+    jbyteArray exchangeSpecsJsonArr,
+    jobjectArray splitInfosPerFragArr,
+    jobjectArray broadcastSlotIndicesPerFragArr,
+    jobjectArray broadcastIteratorsPerFragArr) {
+  JNI_METHOD_START
+
+  auto ctx = getRuntime(env, wrapper);
+  auto runtime = dynamic_cast<VeloxRuntime*>(ctx);
+  GLUTEN_CHECK(runtime != nullptr, "MppQuery explain requires VeloxRuntime");
+
+  const jsize numFragments = env->GetArrayLength(substraitPlansArr);
+  GLUTEN_CHECK(numFragments > 0, "At least one fragment plan is required");
+  GLUTEN_CHECK(
+      env->GetArrayLength(numDriversArr) == numFragments,
+      "numDriversPerFragment length must match substraitPlans length");
+
+  auto safeExchangeJson = getByteArrayElementsSafe(env, exchangeSpecsJsonArr);
+  auto exchangeSpecs = parseExchangeSpecs(
+      reinterpret_cast<const uint8_t*>(safeExchangeJson.elems()),
+      env->GetArrayLength(exchangeSpecsJsonArr));
+
+  if (broadcastSlotIndicesPerFragArr != nullptr) {
+    GLUTEN_CHECK(
+        env->GetArrayLength(broadcastSlotIndicesPerFragArr) == numFragments,
+        "broadcastSlotIndicesPerFrag length must match substraitPlans length");
+  }
+  if (broadcastIteratorsPerFragArr != nullptr) {
+    GLUTEN_CHECK(
+        env->GetArrayLength(broadcastIteratorsPerFragArr) == numFragments,
+        "broadcastIteratorsPerFrag length must match substraitPlans length");
+  }
+
+  auto veloxPool = defaultLeafVeloxMemoryPool();
+  auto sessionCfg = createMppSessionConfig(runtime);
+  std::unordered_map<int, velox::RowTypePtr> producerWireTypes;
+  std::vector<std::string> finalPlans;
+  finalPlans.reserve(numFragments);
+
+  for (jsize i = 0; i < numFragments; ++i) {
+    auto planByteArray =
+        static_cast<jbyteArray>(env->GetObjectArrayElement(substraitPlansArr, i));
+    auto safePlanBytes = getByteArrayElementsSafe(env, planByteArray);
+    auto planSize = env->GetArrayLength(planByteArray);
+
+    ::substrait::Plan substraitPlan;
+    GLUTEN_CHECK(
+        parseProtobuf(
+            reinterpret_cast<const uint8_t*>(safePlanBytes.elems()),
+            planSize,
+            &substraitPlan),
+        fmt::format("Failed to parse Substrait plan for fragment {}", i));
+
+    int32_t numExchangeInputs = 0;
+    for (const auto& exchange : exchangeSpecs) {
+      if (exchange.consumerFragmentId == static_cast<int32_t>(i)) {
+        numExchangeInputs++;
+      }
+    }
+
+    std::vector<int32_t> broadcastSlotIndicesForFrag;
+    jobjectArray broadcastIterForFragArr = nullptr;
+    if (broadcastSlotIndicesPerFragArr != nullptr) {
+      auto slotsArrObj = static_cast<jintArray>(
+          env->GetObjectArrayElement(broadcastSlotIndicesPerFragArr, i));
+      if (slotsArrObj != nullptr) {
+        auto safeSlots = getIntArrayElementsSafe(env, slotsArrObj);
+        jsize n = env->GetArrayLength(slotsArrObj);
+        broadcastSlotIndicesForFrag.reserve(n);
+        for (jsize s = 0; s < n; ++s) {
+          broadcastSlotIndicesForFrag.push_back(safeSlots.elems()[s]);
+        }
+        env->DeleteLocalRef(slotsArrObj);
+      }
+    }
+    if (broadcastIteratorsPerFragArr != nullptr) {
+      broadcastIterForFragArr = static_cast<jobjectArray>(
+          env->GetObjectArrayElement(broadcastIteratorsPerFragArr, i));
+    }
+
+    const int32_t numBroadcastInputs =
+        static_cast<int32_t>(broadcastSlotIndicesForFrag.size());
+    if (broadcastIterForFragArr != nullptr) {
+      jsize iterLen = env->GetArrayLength(broadcastIterForFragArr);
+      GLUTEN_CHECK(
+          iterLen == numBroadcastInputs,
+          fmt::format(
+              "Fragment {} broadcastSlotIndices length {} != broadcastIterators length {}",
+              i,
+              numBroadcastInputs,
+              iterLen));
+    }
+
+    const int32_t numStreamInputs = numExchangeInputs + numBroadcastInputs;
+    std::vector<int32_t> iteratorIndices;
+    collectIteratorIndices(substraitPlan, iteratorIndices);
+    int32_t maxIteratorIndex = -1;
+    for (const auto index : iteratorIndices) {
+      maxIteratorIndex = std::max(maxIteratorIndex, index);
+    }
+    VELOX_CHECK_LT(
+        maxIteratorIndex,
+        numStreamInputs,
+        "Fragment {} Substrait has ReadRel iterator slot(s) {} but JNI "
+        "prepared only {} MPP stream input(s): {} inbound exchange(s) + {} "
+        "fused broadcast(s).",
+        i,
+        formatIndices(iteratorIndices),
+        numStreamInputs,
+        numExchangeInputs,
+        numBroadcastInputs);
+
+    std::vector<std::shared_ptr<ResultIterator>> placeholderIters(
+        numStreamInputs, nullptr);
+    std::unordered_set<int32_t> broadcastSlotSet;
+    for (int32_t b = 0; b < numBroadcastInputs; ++b) {
+      const int32_t slotIdx = broadcastSlotIndicesForFrag[b];
+      GLUTEN_CHECK(
+          slotIdx >= 0 && slotIdx < numStreamInputs,
+          fmt::format(
+              "Fragment {} broadcast slot {} out of range (numStreamInputs={})",
+              i,
+              slotIdx,
+              numStreamInputs));
+      auto jIter = env->GetObjectArrayElement(broadcastIterForFragArr, b);
+      GLUTEN_CHECK(
+          jIter != nullptr,
+          fmt::format("Fragment {} broadcast iterator at index {} is null", i, b));
+      auto wrapped = makeJniColumnarBatchIterator(env, jIter, ctx);
+      placeholderIters[slotIdx] =
+          std::make_shared<ResultIterator>(std::move(wrapped));
+      broadcastSlotSet.insert(slotIdx);
+      env->DeleteLocalRef(jIter);
+    }
+    if (broadcastIterForFragArr != nullptr) {
+      env->DeleteLocalRef(broadcastIterForFragArr);
+    }
+
+    VeloxPlanConverter converter(
+        veloxPool.get(),
+        sessionCfg.get(),
+        placeholderIters,
+        /*writeFilesTempPath=*/std::nullopt,
+        /*writeFileName=*/std::nullopt,
+        /*validationMode=*/false);
+
+    std::vector<::substrait::ReadRel_LocalFiles> localFiles;
+    if (splitInfosPerFragArr != nullptr) {
+      auto fragSplitArr = static_cast<jobjectArray>(
+          env->GetObjectArrayElement(splitInfosPerFragArr, i));
+      if (fragSplitArr != nullptr) {
+        jsize numSplits = env->GetArrayLength(fragSplitArr);
+        for (jsize j = 0; j < numSplits; ++j) {
+          auto splitBytes = static_cast<jbyteArray>(
+              env->GetObjectArrayElement(fragSplitArr, j));
+          auto safeSplitBytes = getByteArrayElementsSafe(env, splitBytes);
+          auto splitSize = env->GetArrayLength(splitBytes);
+          ::substrait::ReadRel_LocalFiles localFile;
+          GLUTEN_CHECK(
+              parseProtobuf(
+                  reinterpret_cast<const uint8_t*>(safeSplitBytes.elems()),
+                  splitSize,
+                  &localFile),
+              fmt::format(
+                  "Failed to parse split info for fragment {} split {}", i, j));
+          localFiles.push_back(std::move(localFile));
+          env->DeleteLocalRef(splitBytes);
+        }
+        env->DeleteLocalRef(fragSplitArr);
+      }
+    }
+
+    auto veloxPlanNode = converter.toVeloxPlan(substraitPlan, localFiles);
+    producerWireTypes[static_cast<int>(i)] = veloxPlanNode->outputType();
+    veloxPlanNode = rewriteValueStreamsForMpp(
+        static_cast<int32_t>(i),
+        veloxPlanNode,
+        exchangeSpecs,
+        producerWireTypes,
+        broadcastSlotSet,
+        numExchangeInputs,
+        numBroadcastInputs);
+    auto wrappedPlan = wrapWithMppPartitionedOutput(
+        static_cast<int32_t>(i), veloxPlanNode, exchangeSpecs);
+    finalPlans.push_back(
+        wrappedPlan->toString(/*detailed=*/true, /*recursive=*/true));
+    env->DeleteLocalRef(planByteArray);
+  }
+
+  auto stringClass = env->FindClass("java/lang/String");
+  auto result = env->NewObjectArray(numFragments, stringClass, nullptr);
+  for (jsize i = 0; i < numFragments; ++i) {
+    auto planString = env->NewStringUTF(finalPlans[i].c_str());
+    env->SetObjectArrayElement(result, i, planString);
+    env->DeleteLocalRef(planString);
+  }
+  env->DeleteLocalRef(stringClass);
+  return result;
+
+  JNI_METHOD_END(nullptr)
 }
 
 // ---------------------------------------------------------------------------

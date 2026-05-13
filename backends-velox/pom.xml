@@ -36,15 +36,47 @@
     <gluten.tpch.prestoReferenceDir/>
     <gluten.tpch.allowPrestoSampleOnly/>
     <gluten.tpch.compareAllQueries/>
+    <spark.master/>
+    <spark.executor.instances/>
+    <spark.executor.cores/>
+    <spark.executor.memory/>
+    <spark.executor.memoryOverhead/>
+    <spark.driver.extraLibraryPath/>
+    <spark.executor.extraLibraryPath/>
+    <spark.executorEnv.LD_LIBRARY_PATH/>
+    <spark.executorEnv.CUDA_VISIBLE_DEVICES/>
+    <spark.executorEnv.KVIKIO_NTHREADS/>
+    <spark.driverEnv.KVIKIO_NTHREADS/>
+    <spark.sql.shuffle.partitions/>
+    <spark.sql.files.maxPartitionBytes/>
+    <spark.sql.files.minPartitionNum/>
+    <spark.sql.files.openCostInBytes/>
+    <spark.gluten.sql.columnar.backend.velox.cudf.memoryResource/>
+    <spark.gluten.sql.columnar.backend.velox.IOThreads/>
+    <spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_rows/>
+    <spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_max_batch_rows/>
+    <spark.gluten.sql.columnar.backend.velox.cudf.hive.scan-output-rows/>
+    <spark.gluten.sql.columnar.backend.velox.cudf.hive.use-buffered-input/>
+    <spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk-read-limit/>
+    <spark.gluten.sql.columnar.backend.velox.parquet.reader.pass-read-limit/>
     <spark.gluten.mpp.maxInboundExchangesPerFragment/>
     <spark.gluten.mpp.maxHashInboundExchangesPerFragment/>
     <spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment/>
+    <spark.gluten.mpp.forceLeftSemiBuildLeft/>
+    <spark.gluten.mpp.normalizeOuterJoinBuildSide/>
+    <spark.gluten.mpp.forceOuterJoinPreservedBuildSide/>
   </properties>
 
   <dependencies>
     <dependency>
       <groupId>org.apache.gluten</groupId>
       <artifactId>gluten-substrait</artifactId>
+      <version>${project.version}</version>
+      <scope>compile</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.gluten</groupId>
+      <artifactId>gluten-ui</artifactId>
       <version>${project.version}</version>
       <scope>compile</scope>
     </dependency>
@@ -295,9 +327,32 @@
             <gluten.tpch.q13DiagnosticCustomerStart>${gluten.tpch.q13DiagnosticCustomerStart}</gluten.tpch.q13DiagnosticCustomerStart>
             <gluten.tpch.q13DiagnosticCustomerEnd>${gluten.tpch.q13DiagnosticCustomerEnd}</gluten.tpch.q13DiagnosticCustomerEnd>
             <gluten.tpch.q13DiagnosticBucketCount>${gluten.tpch.q13DiagnosticBucketCount}</gluten.tpch.q13DiagnosticBucketCount>
+            <spark.master>${spark.master}</spark.master>
+            <spark.executor.instances>${spark.executor.instances}</spark.executor.instances>
+            <spark.executor.cores>${spark.executor.cores}</spark.executor.cores>
+            <spark.executor.memory>${spark.executor.memory}</spark.executor.memory>
+            <spark.executor.memoryOverhead>${spark.executor.memoryOverhead}</spark.executor.memoryOverhead>
+            <spark.driver.extraLibraryPath>${spark.driver.extraLibraryPath}</spark.driver.extraLibraryPath>
+            <spark.executor.extraLibraryPath>${spark.executor.extraLibraryPath}</spark.executor.extraLibraryPath>
+            <spark.executorEnv.LD_LIBRARY_PATH>${spark.executorEnv.LD_LIBRARY_PATH}</spark.executorEnv.LD_LIBRARY_PATH>
+            <spark.executorEnv.CUDA_VISIBLE_DEVICES>${spark.executorEnv.CUDA_VISIBLE_DEVICES}</spark.executorEnv.CUDA_VISIBLE_DEVICES>
+            <spark.executorEnv.KVIKIO_NTHREADS>${spark.executorEnv.KVIKIO_NTHREADS}</spark.executorEnv.KVIKIO_NTHREADS>
+            <spark.driverEnv.KVIKIO_NTHREADS>${spark.driverEnv.KVIKIO_NTHREADS}</spark.driverEnv.KVIKIO_NTHREADS>
             <spark.driver.maxResultSize>${spark.driver.maxResultSize}</spark.driver.maxResultSize>
+            <spark.sql.files.maxPartitionBytes>${spark.sql.files.maxPartitionBytes}</spark.sql.files.maxPartitionBytes>
+            <spark.sql.files.minPartitionNum>${spark.sql.files.minPartitionNum}</spark.sql.files.minPartitionNum>
+            <spark.sql.files.openCostInBytes>${spark.sql.files.openCostInBytes}</spark.sql.files.openCostInBytes>
             <spark.gluten.loadLibFromJar>${spark.gluten.loadLibFromJar}</spark.gluten.loadLibFromJar>
             <spark.gluten.sql.columnar.libpath>${spark.gluten.sql.columnar.libpath}</spark.gluten.sql.columnar.libpath>
+            <spark.gluten.sql.columnar.backend.velox.cudf.memoryResource>${spark.gluten.sql.columnar.backend.velox.cudf.memoryResource}</spark.gluten.sql.columnar.backend.velox.cudf.memoryResource>
+            <spark.gluten.sql.columnar.backend.velox.IOThreads>${spark.gluten.sql.columnar.backend.velox.IOThreads}</spark.gluten.sql.columnar.backend.velox.IOThreads>
+            <spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_rows>${spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_rows}</spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_rows>
+            <spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_max_batch_rows>${spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_max_batch_rows}</spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_max_batch_rows>
+            <spark.gluten.sql.columnar.backend.velox.cudf.hive.scan-output-rows>${spark.gluten.sql.columnar.backend.velox.cudf.hive.scan-output-rows}</spark.gluten.sql.columnar.backend.velox.cudf.hive.scan-output-rows>
+            <spark.gluten.sql.columnar.backend.velox.cudf.hive.use-buffered-input>${spark.gluten.sql.columnar.backend.velox.cudf.hive.use-buffered-input}</spark.gluten.sql.columnar.backend.velox.cudf.hive.use-buffered-input>
+            <spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk-read-limit>${spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk-read-limit}</spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk-read-limit>
+            <spark.gluten.sql.columnar.backend.velox.parquet.reader.pass-read-limit>${spark.gluten.sql.columnar.backend.velox.parquet.reader.pass-read-limit}</spark.gluten.sql.columnar.backend.velox.parquet.reader.pass-read-limit>
+            <spark.sql.shuffle.partitions>${spark.sql.shuffle.partitions}</spark.sql.shuffle.partitions>
             <spark.gluten.mpp.localHashExchangeTasks>${spark.gluten.mpp.localHashExchangeTasks}</spark.gluten.mpp.localHashExchangeTasks>
             <spark.gluten.mpp.maxDriversPerFragment>${spark.gluten.mpp.maxDriversPerFragment}</spark.gluten.mpp.maxDriversPerFragment>
             <spark.gluten.mpp.maxInboundExchangesPerFragment>${spark.gluten.mpp.maxInboundExchangesPerFragment}</spark.gluten.mpp.maxInboundExchangesPerFragment>
@@ -306,7 +361,11 @@
             <spark.gluten.mpp.q3.replicateOrdersPath>${spark.gluten.mpp.q3.replicateOrdersPath}</spark.gluten.mpp.q3.replicateOrdersPath>
             <spark.gluten.mpp.fuseBroadcastBuilds>${spark.gluten.mpp.fuseBroadcastBuilds}</spark.gluten.mpp.fuseBroadcastBuilds>
             <spark.gluten.mpp.normalizeJoinBuildSide>${spark.gluten.mpp.normalizeJoinBuildSide}</spark.gluten.mpp.normalizeJoinBuildSide>
+            <spark.gluten.mpp.normalizeOuterJoinBuildSide>${spark.gluten.mpp.normalizeOuterJoinBuildSide}</spark.gluten.mpp.normalizeOuterJoinBuildSide>
+            <spark.gluten.mpp.forceOuterJoinPreservedBuildSide>${spark.gluten.mpp.forceOuterJoinPreservedBuildSide}</spark.gluten.mpp.forceOuterJoinPreservedBuildSide>
+            <spark.gluten.mpp.forceLeftSemiBuildLeft>${spark.gluten.mpp.forceLeftSemiBuildLeft}</spark.gluten.mpp.forceLeftSemiBuildLeft>
             <spark.gluten.mpp.q4ExistsLineitemDedup>${spark.gluten.mpp.q4ExistsLineitemDedup}</spark.gluten.mpp.q4ExistsLineitemDedup>
+            <spark.gluten.mpp.q21ExistsAggRewrite>${spark.gluten.mpp.q21ExistsAggRewrite}</spark.gluten.mpp.q21ExistsAggRewrite>
           </systemProperties>
         </configuration>
       </plugin>

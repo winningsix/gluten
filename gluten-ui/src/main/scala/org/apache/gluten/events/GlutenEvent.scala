@@ -47,3 +47,24 @@ case class GlutenPlanFallbackEvent(
     physicalPlanDescription: String,
     fallbackNodeToReason: Map[String, String])
   extends GlutenEvent {}
+
+case class GlutenMppPlanFragmentEvent(
+    fragmentId: Int,
+    plan: String,
+    originalCharCount: Int,
+    sha256: String,
+    truncated: Boolean)
+
+case class GlutenMppPlanEvent(
+    executionId: Long,
+    queryId: String,
+    numFragments: Int,
+    numExchanges: Int,
+    dumpPath: String,
+    totalOriginalCharCount: Long,
+    planSha256: String,
+    truncated: Boolean,
+    captureEnabled: Boolean,
+    captureError: String,
+    fragments: Seq[GlutenMppPlanFragmentEvent])
+  extends GlutenEvent {}

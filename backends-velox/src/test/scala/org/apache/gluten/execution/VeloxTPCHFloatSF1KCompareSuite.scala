@@ -141,7 +141,12 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
 
   override protected def sparkConf: SparkConf = {
     val conf = super.sparkConf
-      .set("spark.sql.shuffle.partitions", "16")
+      .set(
+        "spark.sql.shuffle.partitions",
+        sys.props
+          .get("spark.sql.shuffle.partitions")
+          .filter(v => v.nonEmpty && v != "null")
+          .getOrElse("16"))
       .set("spark.memory.offHeap.size", "32g")
       .set("spark.sql.adaptive.enabled", "false")
       .set("spark.sql.autoBroadcastJoinThreshold", (2L * 1024 * 1024 * 1024).toString)
@@ -165,7 +170,31 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
       .set("spark.gluten.mpp.substraitDumpDir", mppDumpDir)
 
     Seq(
+      "spark.master",
+      "spark.executor.instances",
+      "spark.executor.cores",
+      "spark.executor.memory",
+      "spark.executor.memoryOverhead",
+      "spark.driver.extraLibraryPath",
+      "spark.executor.extraLibraryPath",
+      "spark.executorEnv.LD_LIBRARY_PATH",
+      "spark.executorEnv.CUDA_VISIBLE_DEVICES",
+      "spark.executorEnv.KVIKIO_NTHREADS",
+      "spark.driverEnv.KVIKIO_NTHREADS",
+      "spark.eventLog.enabled",
+      "spark.eventLog.dir",
+      "spark.sql.files.maxPartitionBytes",
+      "spark.sql.files.minPartitionNum",
+      "spark.sql.files.openCostInBytes",
       "spark.gluten.sql.columnar.libpath",
+      "spark.gluten.sql.columnar.backend.velox.IOThreads",
+      "spark.gluten.sql.columnar.backend.velox.cudf.memoryResource",
+      "spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_rows",
+      "spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_max_batch_rows",
+      "spark.gluten.sql.columnar.backend.velox.cudf.hive.scan-output-rows",
+      "spark.gluten.sql.columnar.backend.velox.cudf.hive.use-buffered-input",
+      "spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk-read-limit",
+      "spark.gluten.sql.columnar.backend.velox.parquet.reader.pass-read-limit",
       "spark.gluten.loadLibFromJar",
       "spark.gluten.mpp.substraitDumpDir",
       "spark.gluten.mpp.localHashExchangeTasks",
@@ -176,7 +205,10 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
       "spark.gluten.mpp.q3.replicateOrdersPath",
       "spark.gluten.mpp.fuseBroadcastBuilds",
       "spark.gluten.mpp.normalizeJoinBuildSide",
-      "spark.gluten.mpp.q4ExistsLineitemDedup"
+      "spark.gluten.mpp.forceLeftSemiBuildLeft",
+      "spark.gluten.mpp.q4ExistsLineitemDedup",
+      "spark.gluten.mpp.veloxPlan.eventLog.enabled",
+      "spark.gluten.mpp.veloxPlan.eventLog.maxChars"
     ).foreach {
       key =>
         sys.props

@@ -17,22 +17,26 @@
 package org.apache.gluten.execution
 
 import org.apache.gluten.backendsapi.BackendsApiManager
+import org.apache.gluten.events.{GlutenMppPlanEvent, GlutenMppPlanFragmentEvent}
 import org.apache.gluten.expression.ConverterUtils
 import org.apache.gluten.extension.{ExchangeSpec, MppParallelSortSplitRule, MppRemoveRedundantShuffleRule, MppSinglePartitionSortRule, NativeFragment}
 import org.apache.gluten.extension.columnar.transition.{Convention, ConventionReq}
+import org.apache.gluten.runtime.Runtimes
 import org.apache.gluten.substrait.SubstraitContext
 import org.apache.gluten.substrait.plan.PlanBuilder
 import org.apache.gluten.substrait.rel.SplitInfo
 import org.apache.gluten.utils.SubstraitPlanPrinterUtil
+import org.apache.gluten.vectorized.MppQueryJniWrapper
 
 import org.apache.spark.SparkEnv
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
+import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide, JoinSelectionHelper}
-import org.apache.spark.sql.catalyst.plans.InnerLike
+import org.apache.spark.sql.catalyst.plans.{InnerLike, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
 import org.apache.spark.sql.execution.{ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, InputIteratorTransformer, SparkPlan, SQLExecution, UnaryExecNode}
@@ -40,6 +44,7 @@ import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, Shuffle
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.joins.BuildSideRelation
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
+import org.apache.spark.sql.execution.ui.GlutenUIUtils
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -48,6 +53,7 @@ import io.substrait.proto.ReadRel
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
+import java.security.MessageDigest
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -235,6 +241,14 @@ case class MppNativeQueryExec(
           extractedExchanges,
           exchangeSpecsJson,
           fragmentSplitInfos)
+        postMppPlanEvent(
+          fragmentPlans,
+          numDriversPerFragment,
+          extractedFragments,
+          extractedExchanges,
+          exchangeSpecsJson,
+          fragmentSplitInfos,
+          fusedBroadcastsByConsumer)
 
         return new MppNativeQueryRDD(
           sparkContext,
@@ -287,6 +301,14 @@ case class MppNativeQueryExec(
       exchanges,
       exchangeSpecsJson,
       fragmentSplitInfos)
+    postMppPlanEvent(
+      fragmentPlans,
+      numDriversPerFragment,
+      fragments,
+      exchanges,
+      exchangeSpecsJson,
+      fragmentSplitInfos,
+      Map.empty[Int, Seq[FusedBroadcast]])
 
     // RDD only receives serialized bytes - no SparkPlan references.
     // Pre-built fragments path doesn't fuse broadcasts (legacy MppCollapseRule
@@ -660,7 +682,22 @@ case class MppNativeQueryExec(
       return plan
     }
     plan.transformUp {
-      case join: ShuffledHashJoinExecTransformer if join.joinType.isInstanceOf[InnerLike] =>
+      case join: SortMergeJoinExecTransformer
+          if join.joinType == LeftSemi && forceLeftSemiBuildLeftEnabled =>
+        logWarning(
+          s"MppNativeQueryExec: rewriting LEFT SEMI sort-merge join to " +
+            s"shuffled hash join with BuildLeft; " +
+            s"spark.gluten.mpp.forceLeftSemiBuildLeft=true")
+        ShuffledHashJoinExecTransformer(
+          join.leftKeys,
+          join.rightKeys,
+          join.joinType,
+          BuildLeft,
+          join.condition,
+          join.left,
+          join.right,
+          join.isSkewJoin)
+      case join: ShuffledHashJoinExecTransformer if canNormalizeMppBuildSide(join) =>
         preferredMppBuildSide(join)
           .filter(_.side != join.buildSide)
           .map {
@@ -674,12 +711,72 @@ case class MppNativeQueryExec(
     }
   }
 
+  private def canNormalizeMppBuildSide(join: ShuffledHashJoinExecTransformer): Boolean = {
+    join.joinType match {
+      case _: InnerLike => true
+      case LeftSemi => true
+      case LeftOuter | RightOuter
+          if normalizeMppOuterJoinBuildSideEnabled || forceMppOuterJoinPreservedBuildSideEnabled =>
+        true
+      case _ => false
+    }
+  }
+
   private def preferredMppBuildSide(
       join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
-    broadcastBuildSide(join).orElse {
-      sparkJoinSelectionBuildSide(join).orElse {
-        statsBuildSide(join)
+    if (join.joinType == LeftSemi) {
+      return preferredLeftSemiBuildSide(join)
+    }
+    if (forceMppOuterJoinPreservedBuildSideEnabled) {
+      preferredOuterJoinPreservedBuildSide(join) match {
+        case forced @ Some(_) => return forced
+        case None =>
       }
+    }
+    broadcastBuildSide(join).orElse {
+      statsBuildSide(join).orElse {
+        sparkJoinSelectionBuildSide(join)
+      }
+    }
+  }
+
+  private def preferredLeftSemiBuildSide(
+      join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
+    // Spark normally builds the right side for LeftSemi to preserve left-side output semantics.
+    // Velox/cuDF also supports the swapped shape via RIGHT_SEMI, so MPP can build the left side
+    // when stats show it is clearly smaller. This avoids Q21-style lineitem RHS hash builds.
+    statsBuildSide(join).filter(_.side == BuildLeft).orElse {
+      if (forceLeftSemiBuildLeftEnabled) {
+        Some(
+          BuildSideChoice(
+            BuildLeft,
+            "spark.gluten.mpp.forceLeftSemiBuildLeft=true forced LEFT SEMI build-left"))
+      } else {
+        None
+      }
+    }
+  }
+
+  private def forceLeftSemiBuildLeftEnabled: Boolean = {
+    booleanConf("spark.gluten.mpp.forceLeftSemiBuildLeft", defaultValue = false)
+  }
+
+  private def preferredOuterJoinPreservedBuildSide(
+      join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
+    join.joinType match {
+      case LeftOuter =>
+        Some(
+          BuildSideChoice(
+            BuildLeft,
+            "spark.gluten.mpp.forceOuterJoinPreservedBuildSide=true forced LEFT OUTER " +
+              "preserved side build"))
+      case RightOuter =>
+        Some(
+          BuildSideChoice(
+            BuildRight,
+            "spark.gluten.mpp.forceOuterJoinPreservedBuildSide=true forced RIGHT OUTER " +
+              "preserved side build"))
+      case _ => None
     }
   }
 
@@ -839,6 +936,14 @@ case class MppNativeQueryExec(
 
   private def normalizeMppJoinBuildSideEnabled: Boolean = {
     booleanConf("spark.gluten.mpp.normalizeJoinBuildSide", defaultValue = true)
+  }
+
+  private def normalizeMppOuterJoinBuildSideEnabled: Boolean = {
+    booleanConf("spark.gluten.mpp.normalizeOuterJoinBuildSide", defaultValue = false)
+  }
+
+  private def forceMppOuterJoinPreservedBuildSideEnabled: Boolean = {
+    booleanConf("spark.gluten.mpp.forceOuterJoinPreservedBuildSide", defaultValue = false)
   }
 
   private def capLocalHashExchangeTasks(exchanges: Seq[ExchangeSpec]): Seq[ExchangeSpec] = {
@@ -1189,6 +1294,21 @@ case class MppNativeQueryExec(
           .getOrElse(defaultValue)
       case fromSqlConf if fromSqlConf.equalsIgnoreCase("null") => defaultValue
       case fromSqlConf => fromSqlConf.toBoolean
+    }
+  }
+
+  private def stringConf(key: String, defaultValue: String): String = {
+    SQLConf.get.getConfString(key, "").trim match {
+      case "" =>
+        Option(sparkContext.getConf.get(key, null))
+          .orElse(Option(SparkEnv.get).flatMap(env => Option(env.conf.get(key, null))))
+          .orElse(sys.props.get(key))
+          .map(_.trim)
+          .filter(_.nonEmpty)
+          .filterNot(_.equalsIgnoreCase("null"))
+          .getOrElse(defaultValue)
+      case fromSqlConf if fromSqlConf.equalsIgnoreCase("null") => defaultValue
+      case fromSqlConf => fromSqlConf
     }
   }
 
@@ -1588,6 +1708,123 @@ case class MppNativeQueryExec(
           t
         )
     }
+  }
+
+  private def postMppPlanEvent(
+      fragmentPlans: Array[Array[Byte]],
+      numDriversPerFragment: Array[Int],
+      fragmentSpecs: Seq[NativeFragment],
+      exchangeSpecs: Seq[ExchangeSpec],
+      exchangeSpecsJson: String,
+      fragmentSplitInfos: Array[Array[Array[Byte]]],
+      fusedBroadcastsByConsumer: Map[Int, Seq[FusedBroadcast]]): Unit = {
+    val executionId = Option(sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY))
+      .filter(_.nonEmpty)
+    if (executionId.isEmpty) {
+      logDebug("MppNativeQueryExec: skip MPP plan event because SQL execution id is unavailable")
+      return
+    }
+
+    val queryId = deriveQueryId()
+    val dumpDir = stringConf("spark.gluten.mpp.substraitDumpDir", "")
+    val dumpPath = if (dumpDir.nonEmpty) {
+      Paths.get(dumpDir, queryId).toString
+    } else {
+      ""
+    }
+
+    val requestedCaptureEnabled =
+      booleanConf("spark.gluten.mpp.veloxPlan.eventLog.enabled", false)
+    val maxChars = mppNonNegativeIntConf("spark.gluten.mpp.veloxPlan.eventLog.maxChars", 262144)
+    val (plans, captureError) =
+      if (!requestedCaptureEnabled) {
+        (Seq.empty[String], "")
+      } else if (Thread.currentThread().getName.startsWith("subquery-")) {
+        (
+          Seq.empty[String],
+          "Final Velox plan capture skipped during scalar subquery materialization.")
+      } else if (exchangeSpecs.isEmpty) {
+        (Seq.empty[String], "Final Velox plan capture skipped for single-fragment MPP plan.")
+      } else if (fusedBroadcastsByConsumer.values.exists(_.nonEmpty)) {
+        (
+          Seq.empty[String],
+          "Final Velox plan capture skipped because fused broadcast inputs require " +
+            "runtime iterators during native plan conversion.")
+      } else {
+        captureFinalVeloxPlans(
+          fragmentPlans,
+          numDriversPerFragment,
+          exchangeSpecsJson,
+          fragmentSplitInfos)
+      }
+
+    val fragments = truncatePlanFragments(plans, maxChars)
+    val event = GlutenMppPlanEvent(
+      executionId.get.toLong,
+      queryId,
+      fragmentSpecs.size,
+      exchangeSpecs.size,
+      dumpPath,
+      plans.map(_.length.toLong).sum,
+      if (plans.nonEmpty) sha256Hex(plans.mkString("\n")) else "",
+      fragments.exists(_.truncated),
+      requestedCaptureEnabled,
+      captureError,
+      fragments)
+    GlutenUIUtils.postEvent(sparkContext, event)
+  }
+
+  private def captureFinalVeloxPlans(
+      fragmentPlans: Array[Array[Byte]],
+      numDriversPerFragment: Array[Int],
+      exchangeSpecsJson: String,
+      fragmentSplitInfos: Array[Array[Array[Byte]]]): (Seq[String], String) = {
+    try {
+      val runtime = Runtimes.contextInstance(BackendsApiManager.getBackendName, "MppQueryExplain")
+      val jniWrapper = MppQueryJniWrapper.create(runtime)
+      val plans = jniWrapper.nativeExplainMppQuery(
+        fragmentPlans,
+        numDriversPerFragment,
+        exchangeSpecsJson.getBytes(StandardCharsets.UTF_8),
+        fragmentSplitInfos,
+        null,
+        null)
+      (Option(plans).map(_.toSeq).getOrElse(Seq.empty), "")
+    } catch {
+      case t: Throwable =>
+        logWarning(
+          s"MppNativeQueryExec: failed to capture final Velox plan for event log " +
+            s"(${t.getClass.getSimpleName}: ${t.getMessage}); continuing with native execution",
+          t)
+        (Seq.empty, s"${t.getClass.getSimpleName}: ${Option(t.getMessage).getOrElse("")}")
+    }
+  }
+
+  private def truncatePlanFragments(
+      plans: Seq[String],
+      maxChars: Int): Seq[GlutenMppPlanFragmentEvent] = {
+    var remaining = maxChars
+    plans.zipWithIndex.map {
+      case (plan, fragmentId) =>
+        val safePlan = Option(plan).getOrElse("")
+        val captured = if (remaining <= 0) {
+          ""
+        } else {
+          safePlan.take(remaining)
+        }
+        remaining = math.max(0, remaining - captured.length)
+        GlutenMppPlanFragmentEvent(
+          fragmentId,
+          captured,
+          safePlan.length,
+          sha256Hex(safePlan),
+          captured.length < safePlan.length)
+    }
+  }
+
+  private def sha256Hex(value: String): String = {
+    val digest = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8))
+    digest.map(b => "%02x".format(b & 0xff)).mkString
   }
 
   /**

@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -120,7 +121,9 @@ class MppQueryCoordinator {
       std::vector<MppFragmentSpec> fragments,
       std::vector<MppExchangeSpec> exchanges,
       std::shared_ptr<facebook::velox::core::QueryCtx> queryCtx,
-      folly::Executor* executor);
+      folly::Executor* executor,
+      std::optional<facebook::velox::common::SpillDiskOptions> spillDiskOpts =
+          std::nullopt);
 
   /// Launch all fragments concurrently (all-stages-up scheduling).
   /// Each fragment becomes a Velox Task running in parallel mode.
@@ -164,7 +167,8 @@ class MppQueryCoordinator {
       std::vector<MppFragmentSpec> fragments,
       std::vector<MppExchangeSpec> exchanges,
       std::shared_ptr<facebook::velox::core::QueryCtx> queryCtx,
-      folly::Executor* executor);
+      folly::Executor* executor,
+      std::optional<facebook::velox::common::SpillDiskOptions> spillDiskOpts);
 
   /// Build the task ID string for a given fragment + replica index.
   /// Every Task ID carries a replica suffix, including single-replica
@@ -200,6 +204,7 @@ class MppQueryCoordinator {
   std::vector<MppExchangeSpec> exchangeSpecs_;
   std::shared_ptr<facebook::velox::core::QueryCtx> queryCtx_;
   folly::Executor* executor_;
+  std::optional<facebook::velox::common::SpillDiskOptions> spillDiskOpts_;
 
   /// Id of the fragment whose output is the final query result (the one
   /// that is never a producer in any exchange). Computed in the
