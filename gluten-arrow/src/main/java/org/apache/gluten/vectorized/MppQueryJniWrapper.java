@@ -86,6 +86,22 @@ public class MppQueryJniWrapper implements RuntimeAware {
       Object[][] broadcastIteratorsPerFragment);
 
   /**
+   * Build the MPP fragments and return the final Velox plan text for each fragment without starting
+   * execution.
+   *
+   * <p>The returned plans are captured after the same MPP rewrites used by {@link
+   * #nativeCreateMppQuery}: ValueStream inputs are replaced with Exchange nodes and every fragment
+   * is wrapped with a PartitionedOutput node.
+   */
+  public native String[] nativeExplainMppQuery(
+      byte[][] substraitPlans,
+      int[] numDriversPerFragment,
+      byte[] exchangeSpecsJson,
+      byte[][][] splitInfosPerFragment,
+      int[][] broadcastSlotIndicesPerFragment,
+      Object[][] broadcastIteratorsPerFragment);
+
+  /**
    * Start all fragments concurrently (all-stages-up scheduling). Must be called exactly once after
    * {@link #nativeCreateMppQuery}.
    *

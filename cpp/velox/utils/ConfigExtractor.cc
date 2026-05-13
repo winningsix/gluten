@@ -309,6 +309,19 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorConfig(
   // read as UTC
   hiveConfMap[facebook::velox::connector::hive::HiveConfig::kReadTimestampPartitionValueAsLocalTime] = "false";
 
+  const auto forwardDynamicToHive = [&](const std::string& sparkKey, const std::string& hiveKey) {
+    const auto value = conf->get<std::string>(sparkKey);
+    if (value.has_value() && !value->empty()) {
+      hiveConfMap[hiveKey] = value.value();
+    }
+  };
+  forwardDynamicToHive(
+      "spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk-read-limit",
+      "parquet.reader.chunk-read-limit");
+  forwardDynamicToHive(
+      "spark.gluten.sql.columnar.backend.velox.parquet.reader.pass-read-limit",
+      "parquet.reader.pass-read-limit");
+
   overwriteVeloxConf(conf.get(), hiveConfMap, kStaticBackendConfPrefix);
   return std::make_shared<facebook::velox::config::ConfigBase>(std::move(hiveConfMap));
 }

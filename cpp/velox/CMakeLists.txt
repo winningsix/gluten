@@ -558,12 +558,16 @@ if(ENABLE_GPU)
   target_link_libraries(velox PUBLIC /usr/local/lib/libthrift.a)
   # rmm cuda_stream_view + cudart_static + ucxx need explicit shared lib
   # links since the static archives forward-declare but don't link them.
+  set(GLUTEN_CUDART_LIBRARY /usr/local/cuda/lib64/libcudart.so)
+  if(EXISTS /usr/local/cuda/lib64/libcudart.so.13)
+    set(GLUTEN_CUDART_LIBRARY /usr/local/cuda/lib64/libcudart.so.13)
+  endif()
   target_link_libraries(velox PUBLIC
     ${VELOX_BUILD_PATH}/_deps/rmm-build/librmm.so
     ${VELOX_BUILD_PATH}/_deps/rapids_logger-build/librapids_logger.so
     ${VELOX_BUILD_PATH}/_deps/kvikio-build/libkvikio.so
     ${VELOX_BUILD_PATH}/_deps/ucxx-build/libucxx.so
-    /usr/local/cuda/lib64/libcudart.so
+    ${GLUTEN_CUDART_LIBRARY}
     /usr/lib64/libucp.so
     /usr/lib64/libuct.so
     /usr/lib64/libucs.so)

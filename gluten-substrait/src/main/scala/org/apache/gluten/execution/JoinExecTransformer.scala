@@ -150,7 +150,15 @@ trait HashJoinLikeExecTransformer extends BaseJoinExec with TransformSupport {
     }
   }
 
-  protected lazy val substraitJoinType: JoinRel.JoinType = SubstraitUtil.toSubstrait(joinType)
+  protected lazy val substraitJoinType: JoinRel.JoinType = (joinType, joinBuildSide) match {
+    case (LeftOuter, BuildLeft) | (RightOuter, BuildRight) =>
+      // The preserved outer side is the hash-build side. Velox can express this as a RIGHT join,
+      // avoiding a large RHS build for decorrelated EXISTS plans while keeping Spark output order
+      // via the post-join projection below.
+      JoinRel.JoinType.JOIN_TYPE_RIGHT
+    case _ =>
+      SubstraitUtil.toSubstrait(joinType)
+  }
   override def metricsUpdater(): MetricsUpdater =
     BackendsApiManager.getMetricsApiInstance.genHashJoinTransformerMetricsUpdater(metrics)
 
@@ -158,6 +166,7 @@ trait HashJoinLikeExecTransformer extends BaseJoinExec with TransformSupport {
     case BuildLeft =>
       joinType match {
         case _: InnerLike => expandPartitioning(right.outputPartitioning)
+        case LeftSemi => left.outputPartitioning
         case RightOuter => right.outputPartitioning
         case LeftOuter => left.outputPartitioning
         // LeftSingle (Spark 4.0+) - same as LeftOuter

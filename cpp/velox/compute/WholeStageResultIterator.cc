@@ -269,7 +269,11 @@ WholeStageResultIterator::WholeStageResultIterator(
 
 std::shared_ptr<velox::core::QueryCtx> WholeStageResultIterator::createNewVeloxQueryCtx() {
   std::unordered_map<std::string, std::shared_ptr<velox::config::ConfigBase>> connectorConfigs;
-  connectorConfigs[kHiveConnectorId] = createHiveConnectorSessionConfig(veloxCfg_);
+  auto hiveConnectorSessionConfig = createHiveConnectorSessionConfig(veloxCfg_);
+  connectorConfigs[kHiveConnectorId] = hiveConnectorSessionConfig;
+#ifdef GLUTEN_ENABLE_GPU
+  connectorConfigs[kCudfHiveConnectorId] = hiveConnectorSessionConfig;
+#endif
   std::shared_ptr<velox::core::QueryCtx> ctx = velox::core::QueryCtx::create(
       nullptr,
       facebook::velox::core::QueryConfig{getQueryContextConf()},

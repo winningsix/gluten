@@ -20,6 +20,8 @@
 #include <fmt/format.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/io/IOBuf.h>
+#include <algorithm>
+#include <cstdlib>
 #include <nvtx3/nvtx3.hpp>
 #include <unordered_set>
 
@@ -32,6 +34,7 @@
 #include <cudf/io/types.hpp>
 
 #include "config/VeloxConfig.h"
+#include "cudf/GpuMemoryTracker.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/memory/ByteStream.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
@@ -61,6 +64,20 @@ namespace {
 /// for data that's already enqueued under a different key.
 constexpr const char* kTaskIdPrefix = "gpu-local-";
 
+int envIntOrDefault(const char* name, int defaultValue) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return defaultValue;
+  }
+  char* end = nullptr;
+  auto parsed = std::strtol(value, &end, 10);
+  if (end == value) {
+    LOG(WARNING) << "Ignoring invalid " << name << "='" << value << "'";
+    return defaultValue;
+  }
+  return static_cast<int>(parsed);
+}
+
 // NVTX domain for gluten MPP. Same name as the one in MppJniWrapper.cc so
 // both files emit ranges into the same nsys lane.
 struct GlutenMppDomain {
@@ -78,12 +95,14 @@ MppQueryCoordinator::MppQueryCoordinator(
     std::vector<MppFragmentSpec> fragments,
     std::vector<MppExchangeSpec> exchanges,
     std::shared_ptr<core::QueryCtx> queryCtx,
-    folly::Executor* executor)
+    folly::Executor* executor,
+    std::optional<common::SpillDiskOptions> spillDiskOpts)
     : queryId_(std::move(queryId)),
       fragmentSpecs_(std::move(fragments)),
       exchangeSpecs_(std::move(exchanges)),
       queryCtx_(std::move(queryCtx)),
       executor_(executor),
+      spillDiskOpts_(std::move(spillDiskOpts)),
       bufferManager_(OutputBufferManager::getInstanceRef()) {
   VELOX_CHECK(!fragmentSpecs_.empty(), "At least one fragment is required");
   VELOX_CHECK(queryCtx_ != nullptr, "QueryCtx must not be null");
@@ -134,14 +153,16 @@ std::shared_ptr<MppQueryCoordinator> MppQueryCoordinator::create(
     std::vector<MppFragmentSpec> fragments,
     std::vector<MppExchangeSpec> exchanges,
     std::shared_ptr<core::QueryCtx> queryCtx,
-    folly::Executor* executor) {
+    folly::Executor* executor,
+    std::optional<common::SpillDiskOptions> spillDiskOpts) {
   // Using new + shared_ptr because the constructor is private.
   return std::shared_ptr<MppQueryCoordinator>(new MppQueryCoordinator(
       queryId,
       std::move(fragments),
       std::move(exchanges),
       std::move(queryCtx),
-      executor));
+      executor,
+      std::move(spillDiskOpts)));
 }
 
 MppQueryCoordinator::~MppQueryCoordinator() {
@@ -151,7 +172,7 @@ MppQueryCoordinator::~MppQueryCoordinator() {
   // promptly instead of blocking up to 5s for the next tick.
   {
     std::lock_guard<std::mutex> lock(watchdogMutex_);
-    watchdogStop_ = true;
+    watchdogStop_.store(true, std::memory_order_release);
   }
   watchdogCv_.notify_all();
   {
@@ -420,7 +441,10 @@ void MppQueryCoordinator::start() {
           // destination is moot; 0 is fine.
           /*destination=*/i,
           queryCtx_,
-          Task::ExecutionMode::kParallel);
+          Task::ExecutionMode::kParallel,
+          /*consumer=*/Consumer{},
+          /*memoryArbitrationPriority=*/0,
+          spillDiskOpts_);
       LOG(WARNING) << "MppQueryCoordinator[" << queryId_
                    << "]: starting fragment " << spec.id << " replica " << i
                    << "/" << replicas << " taskId=" << taskId
@@ -626,6 +650,12 @@ void MppQueryCoordinator::start() {
   // per 5s. Stops on destructor.
   watchdogThread_ = std::thread([this]() {
     int tick = 0;
+    const int gpuDiagnosticsIntervalTicks = envIntOrDefault(
+        "GLUTEN_GPU_MEMORY_DIAGNOSTICS_WATCHDOG_INTERVAL_TICKS", 0);
+    const int planStatsIntervalTicks =
+        envIntOrDefault("GLUTEN_MPP_WATCHDOG_PLAN_STATS_INTERVAL_TICKS", 0);
+    const int planStatsSampleTasks =
+        std::max(1, envIntOrDefault("GLUTEN_MPP_WATCHDOG_PLAN_STATS_SAMPLE_TASKS", 4));
     // Track which failed taskIds we've already logged to avoid repeating the
     // same error message every tick.
     std::unordered_set<std::string> reportedFailures;
@@ -692,6 +722,13 @@ void MppQueryCoordinator::start() {
         }
       }
 
+      if (gpuDiagnosticsIntervalTicks > 0 &&
+          tick % gpuDiagnosticsIntervalTicks == 0) {
+        GpuMemoryTracker::dumpDiagnosticsToLog(
+            "MppWatchdog[" + queryId_ + "] tick=" + std::to_string(tick) +
+            " periodic");
+      }
+
       // Dump error message for any newly-failed task. Velox Task::setError is
       // completely silent (only stashes exception_), so without this the only
       // visible signal is the watchdog's failed-count going up.
@@ -705,6 +742,11 @@ void MppQueryCoordinator::start() {
                        << " FAILED-TASK taskId=" << tid
                        << " frag=" << f
                        << " errorMessage={" << task->errorMessage() << "}";
+            GpuMemoryTracker::dumpDiagnosticsToLog(
+                "MppWatchdog[" + queryId_ + "] taskId=" + tid);
+            LOG(ERROR) << "MppWatchdog[" << queryId_ << "] taskId=" << tid
+                       << " planWithStats:\n"
+                       << task->printPlanWithStats(/*includeCustomStats=*/true);
           }
         }
       }
@@ -721,6 +763,28 @@ void MppQueryCoordinator::start() {
                          << " numFinishedDrivers="
                          << task->numFinishedDrivers();
             if (++sampled >= 6) break;
+          }
+        }
+      }
+
+      if (planStatsIntervalTicks > 0 && tick % planStatsIntervalTicks == 0) {
+        int statsSampled = 0;
+        for (size_t f = 0;
+             f < fragmentTasks_.size() && statsSampled < planStatsSampleTasks;
+             ++f) {
+          for (auto& task : fragmentTasks_[f]) {
+            if (!task) continue;
+            if (isTerminalState(task->state())) continue;
+            LOG(ERROR) << "MppWatchdog[" << queryId_ << "] tick=" << tick
+                       << " non-terminal planWithStats taskId="
+                       << task->taskId()
+                       << " frag=" << f
+                       << " state=" << static_cast<int>(task->state())
+                       << " numDrivers=" << task->numTotalDrivers()
+                       << " numFinishedDrivers=" << task->numFinishedDrivers()
+                       << "\n"
+                       << task->printPlanWithStats(/*includeCustomStats=*/true);
+            if (++statsSampled >= planStatsSampleTasks) break;
           }
         }
       }
@@ -860,6 +924,7 @@ void MppQueryCoordinator::rethrowFirstTaskError() const {
   std::exception_ptr firstError;
   std::string firstFailedTaskId;
   TaskState firstFailedState = TaskState::kRunning;
+  std::shared_ptr<Task> firstFailedTask;
   for (auto& replicas : fragmentTasks_) {
     for (auto& task : replicas) {
       if (task == nullptr) {
@@ -874,6 +939,7 @@ void MppQueryCoordinator::rethrowFirstTaskError() const {
           firstError = err;
           firstFailedTaskId = task->taskId();
           firstFailedState = state;
+          firstFailedTask = task;
         }
       }
     }
@@ -882,6 +948,20 @@ void MppQueryCoordinator::rethrowFirstTaskError() const {
     LOG(ERROR) << "MppQueryCoordinator[" << queryId_
                << "]: rethrowFirstTaskError taskId=" << firstFailedTaskId
                << " state=" << static_cast<int>(firstFailedState);
+    GpuMemoryTracker::dumpDiagnosticsToLog(
+        "MppQueryCoordinator[" + queryId_ + "] taskId=" + firstFailedTaskId);
+    if (firstFailedTask != nullptr) {
+      try {
+        LOG(ERROR) << "MppQueryCoordinator[" << queryId_
+                   << "]: failed task planWithStats taskId=" << firstFailedTaskId
+                   << "\n"
+                   << firstFailedTask->printPlanWithStats(/*includeCustomStats=*/true);
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "MppQueryCoordinator[" << queryId_
+                   << "]: failed to print planWithStats for taskId="
+                   << firstFailedTaskId << ": " << e.what();
+      }
+    }
     std::rethrow_exception(firstError);
   }
   // No captured std::exception_ptr but some task is in kFailed/kAborted
