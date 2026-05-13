@@ -140,6 +140,9 @@ class GlutenConfig(conf: SQLConf) extends GlutenCoreConfig(conf) {
   def enableCollapseNestedGetJsonObject: Boolean =
     getConf(ENABLE_COLLAPSE_GET_JSON_OBJECT)
 
+  def enableExistenceJoinRhsDedup: Boolean =
+    getConf(ENABLE_EXISTENCE_JOIN_RHS_DEDUP)
+
   def enableCommonSubexpressionEliminate: Boolean =
     getConf(ENABLE_COMMON_SUBEXPRESSION_ELIMINATE)
 
@@ -1406,6 +1409,14 @@ object GlutenConfig extends ConfigRegistry {
       .doc("Collapse nested get_json_object functions as one for optimization.")
       .booleanConf
       .createWithDefault(false)
+
+  val ENABLE_EXISTENCE_JOIN_RHS_DEDUP =
+    buildConf("spark.gluten.sql.optimizer.existenceJoinRhsDedup.enabled")
+      .doc(
+        "Deduplicate the right side of EXISTS/NOT EXISTS style joins on the " +
+          "condition-relevant right-side columns before the join.")
+      .booleanConf
+      .createWithDefault(true)
 
   val ENABLE_COLUMNAR_PROJECT_COLLAPSE =
     buildConf("spark.gluten.sql.columnar.project.collapse")

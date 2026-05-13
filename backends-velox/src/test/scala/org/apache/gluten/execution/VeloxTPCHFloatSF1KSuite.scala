@@ -17,6 +17,8 @@
 package org.apache.gluten.execution
 
 import org.apache.spark.SparkConf
+import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, LeftAnti, LeftSemi}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Join, LogicalPlan}
 
 import org.scalatest.concurrent.TimeLimits
 import org.scalatest.time.{Seconds, Span}
@@ -73,6 +75,7 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
 
   override protected def sparkConf: SparkConf = {
     val conf = super.sparkConf
+    conf
       // 1TB-scale resources; parent default is too small. 32g (was 16g) so the
       // 22-query sweep doesn't OOM on heavy joins like Q1 where 16-replica
       // PartitionedOutput each holds ~512MB. Long-term fix: switch to
@@ -230,6 +233,24 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
     // scalastyle:on println
   }
 
+  private def rhsDedupExistenceJoinCount(plan: LogicalPlan): Int = {
+    plan.collect {
+      case Join(_, _: Aggregate, LeftSemi | LeftAnti | _: ExistenceJoin, _, _) => true
+    }.size
+  }
+
+  private def assertQ21UsesGenericExistenceOptimization(
+      df: org.apache.spark.sql.DataFrame): Unit = {
+    val optimizedPlan = df.queryExecution.optimizedPlan
+    val dedupCount = rhsDedupExistenceJoinCount(optimizedPlan)
+    assert(
+      dedupCount >= 2,
+      "Expected original Q21 SQL to use generic RHS dedup for EXISTS/NOT EXISTS. " +
+        s"Found $dedupCount optimized existence join(s) with aggregate RHS.\n" +
+        optimizedPlan.treeString
+    )
+  }
+
   // Run all 22 TPC-H queries. noFallBack=false so non-MPP-eligible queries
   // surface as their actual failure mode (not as a generic fallback test
   // failure). The 60s per-query failAfter contains hangs.
@@ -261,6 +282,9 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
           logWarning(
             s"VeloxTPCHFloatSF1KSuite: Q$qid PRE-COLLECT optimizedPlan with stats:\n" +
               previewDf.queryExecution.stringWithStats)
+          if (qid == 21) {
+            assertQ21UsesGenericExistenceOptimization(previewDf)
+          }
           runTPCHQuery(qid, tpchQueries, queriesResults, compareResult = false, noFallBack = false)(
             df => dumpRows(qid, df))
         }

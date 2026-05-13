@@ -64,6 +64,9 @@ object VeloxRuleApi {
     injector.injectOptimizerRule(CollectRewriteRule.apply)
     injector.injectOptimizerRule(HLLRewriteRule.apply)
     injector.injectOptimizerRule(CollapseGetJsonObjectExpressionRule.apply)
+    injector.injectPostHocResolutionRule(RewriteExistenceJoinRhsDedup.apply)
+    injector.injectOptimizerRule(RewriteExistenceJoinRhsDedup.apply)
+    injector.injectPreCBORule(RewriteExistenceJoinRhsDedup.apply)
     injector.injectOptimizerRule(RewriteCastFromArray.apply)
     injector.injectOptimizerRule(RewriteUnboundedWindow.apply)
     if (BackendsApiManager.getSettings.supportAppendDataExec()) {
