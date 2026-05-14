@@ -219,7 +219,14 @@ void VeloxBackend::init(
         // run via standalone cudf::ast / cudf functions, avoiding "non-matching
         // operand types" / "like expects 2 inputs" errors (Q17/Q18 SF1K).
         {velox::cudf_velox::CudfConfig::kCudfAstExpressionEnabled,
-         backendConf_->get(kCudfAstExpressionEnabled, kCudfAstExpressionEnabledDefault)}};
+         backendConf_->get(kCudfAstExpressionEnabled, kCudfAstExpressionEnabledDefault)},
+        // Presto enables this for GPU aggregation so small scan batches are
+        // concatenated before cuDF aggregation. Without forwarding these global
+        // CudfConfig settings Spark cannot insert CudfBatchConcat at all.
+        {velox::cudf_velox::CudfConfig::kCudfConcatOptimizationEnabled,
+         backendConf_->get(kCudfConcatOptimizationEnabled, kCudfConcatOptimizationEnabledDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfBatchSizeMinThreshold,
+         backendConf_->get(kCudfBatchSizeMinThreshold, kCudfBatchSizeMinThresholdDefault)}};
     auto& cudfConfig = velox::cudf_velox::CudfConfig::getInstance();
     cudfConfig.initialize(std::move(options));
     velox::cudf_velox::registerCudf();

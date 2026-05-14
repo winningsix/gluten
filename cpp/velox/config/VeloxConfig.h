@@ -241,6 +241,18 @@ const std::string kCudfAstExpressionEnabled =
     "spark.gluten.sql.columnar.backend.velox.cudf.ast_expression_enabled";
 const std::string kCudfAstExpressionEnabledDefault = "true";
 
+// Forward to IBM CudfConfig::kCudfConcatOptimizationEnabled. When enabled,
+// CudfBatchConcat is inserted before supported cuDF operators, matching
+// Presto's GPU aggregation path.
+const std::string kCudfConcatOptimizationEnabled =
+    "spark.gluten.sql.columnar.backend.velox.cudf.concat_optimization_enabled";
+const std::string kCudfConcatOptimizationEnabledDefault = "false";
+
+// Minimum rows accumulated by CudfBatchConcat before forwarding a batch.
+const std::string kCudfBatchSizeMinThreshold =
+    "spark.gluten.sql.columnar.backend.velox.cudf.batch_size_min_threshold";
+const std::string kCudfBatchSizeMinThresholdDefault = "100000";
+
 const std::string kCudfGpuTargetBatchRows = "spark.gluten.sql.columnar.backend.velox.cudf.gpuTargetBatchRows";
 const std::string kCudfGpuTargetBatchRowsDefault = "1000000";
 

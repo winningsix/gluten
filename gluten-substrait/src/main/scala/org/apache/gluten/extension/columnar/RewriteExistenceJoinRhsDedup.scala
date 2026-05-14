@@ -152,7 +152,8 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
       return None
     }
 
-    val filteredRight = filtersBeforeAggregate(rightOnlyPredicates :+ IsNotNull(notEqualKey.right), right)
+    val filteredRight =
+      filtersBeforeAggregate(rightOnlyPredicates :+ IsNotNull(notEqualKey.right), right)
     if (isLikelySelfCorrelation(equalityKeys, notEqualKey)) {
       val minNotEqualKey =
         Alias(
@@ -167,7 +168,9 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
         groupingAttributes ++ Seq(minNotEqualKey, maxNotEqualKey),
         filteredRight)
       val filteredSummary =
-        Filter(Not(EqualTo(minNotEqualKey.toAttribute, maxNotEqualKey.toAttribute)), summarizedRight)
+        Filter(
+          Not(EqualTo(minNotEqualKey.toAttribute, maxNotEqualKey.toAttribute)),
+          summarizedRight)
       val equalityConditions = equalityKeys.map(key => EqualTo(key.right, key.outer): Expression)
       return Some(Filter(equalityConditions.reduce(And), filteredSummary))
     }
@@ -233,7 +236,8 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
       return None
     }
 
-    val filteredRight = filtersBeforeAggregate(rightOnlyPredicates :+ IsNotNull(notEqualKey.right), right)
+    val filteredRight =
+      filtersBeforeAggregate(rightOnlyPredicates :+ IsNotNull(notEqualKey.right), right)
     if (isLikelySelfJoin(equalityKeys, notEqualKey)) {
       val minNotEqualKey =
         Alias(
@@ -248,7 +252,9 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
         groupingAttributes ++ Seq(minNotEqualKey, maxNotEqualKey),
         filteredRight)
       val filteredSummary =
-        Filter(Not(EqualTo(minNotEqualKey.toAttribute, maxNotEqualKey.toAttribute)), summarizedRight)
+        Filter(
+          Not(EqualTo(minNotEqualKey.toAttribute, maxNotEqualKey.toAttribute)),
+          summarizedRight)
       val equalityConditions = equalityKeys.map(key => EqualTo(key.left, key.right): Expression)
       val newCondition = (leftOnlyPredicates ++ equalityConditions).reduce(And)
       return Some(join.copy(right = filteredSummary, condition = Some(newCondition)))
@@ -312,7 +318,9 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
     Some(join.copy(right = dedupRight, condition = newCondition))
   }
 
-  private def filtersBeforeAggregate(predicates: Seq[Expression], child: LogicalPlan): LogicalPlan = {
+  private def filtersBeforeAggregate(
+      predicates: Seq[Expression],
+      child: LogicalPlan): LogicalPlan = {
     predicates.reduceOption(And) match {
       case Some(filterCondition) => Filter(filterCondition, child)
       case None => child
@@ -402,7 +410,8 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
       case (Some(leftExpression), Some(rightAttribute)) => Some(leftExpression -> rightAttribute)
       case _ =>
         (asLeftExpression(second, left), asRightAttribute(first, right)) match {
-          case (Some(leftExpression), Some(rightAttribute)) => Some(leftExpression -> rightAttribute)
+          case (Some(leftExpression), Some(rightAttribute)) =>
+            Some(leftExpression -> rightAttribute)
           case _ => None
         }
     }
@@ -440,7 +449,8 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
       case (Some(outerExpression), Some(rightAttribute)) => Some(outerExpression -> rightAttribute)
       case _ =>
         (asOuterExpression(second, right), asRightAttribute(first, right)) match {
-          case (Some(outerExpression), Some(rightAttribute)) => Some(outerExpression -> rightAttribute)
+          case (Some(outerExpression), Some(rightAttribute)) =>
+            Some(outerExpression -> rightAttribute)
           case _ => None
         }
     }
@@ -448,7 +458,8 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
 
   private def asOuterExpression(expression: Expression, right: LogicalPlan): Option[Expression] = {
     if (
-      containsOuterReference(expression) && !expression.references.exists(isOutputAttribute(_, right))
+      containsOuterReference(expression) &&
+      !expression.references.exists(isOutputAttribute(_, right))
     ) {
       Some(expression)
     } else {
