@@ -220,9 +220,11 @@ void VeloxBackend::init(
         // operand types" / "like expects 2 inputs" errors (Q17/Q18 SF1K).
         {velox::cudf_velox::CudfConfig::kCudfAstExpressionEnabled,
          backendConf_->get(kCudfAstExpressionEnabled, kCudfAstExpressionEnabledDefault)},
-        // Presto enables this for GPU aggregation so small scan batches are
-        // concatenated before cuDF aggregation. Without forwarding these global
-        // CudfConfig settings Spark cannot insert CudfBatchConcat at all.
+        // Forward concat_optimization_enabled. When true, OperatorAdapters
+        // inserts CudfBatchConcat before each CudfHashAggregation to coalesce
+        // small upstream batches up to kCudfBatchSizeMinThreshold rows. Used
+        // together with maxPartialAggregationMemory to amortize per-batch
+        // concat-with-bufferedResult_ cost in high-cardinality groupbys.
         {velox::cudf_velox::CudfConfig::kCudfConcatOptimizationEnabled,
          backendConf_->get(kCudfConcatOptimizationEnabled, kCudfConcatOptimizationEnabledDefault)},
         {velox::cudf_velox::CudfConfig::kCudfBatchSizeMinThreshold,

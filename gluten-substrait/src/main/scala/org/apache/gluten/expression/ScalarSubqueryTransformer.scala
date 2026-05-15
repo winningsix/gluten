@@ -19,17 +19,23 @@ package org.apache.gluten.expression
 import org.apache.gluten.substrait.SubstraitContext
 import org.apache.gluten.substrait.expression.{ExpressionBuilder, ExpressionNode}
 
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.execution.ScalarSubquery
 
 case class ScalarSubqueryTransformer(substraitExprName: String, query: ScalarSubquery)
-  extends LeafExpressionTransformer {
+  extends LeafExpressionTransformer
+  with Logging {
   override def original: Expression = query
 
   override def doTransform(context: SubstraitContext): ExpressionNode = {
     // don't trigger collect when in validation phase
     if (TransformerState.underValidationState) {
+      logDebug(
+        s"ScalarSubqueryTransformer.doTransform: validation-state short-circuit, " +
+          s"emitting NULL literal. planId=${query.exprId.id} " +
+          s"thread=${Thread.currentThread.getName}")
       return ExpressionBuilder.makeLiteral(null, query.dataType, true)
     }
     // After https://github.com/apache/incubator-gluten/pull/5862, we do not need to execute
@@ -37,6 +43,9 @@ case class ScalarSubqueryTransformer(substraitExprName: String, query: ScalarSub
     // Note that, this code change is just for simplify. The subquery has already been materialized
     // before doing transform.
     val result = query.eval(InternalRow.empty)
+    logDebug(
+      s"ScalarSubqueryTransformer.doTransform: planId=${query.exprId.id} " +
+        s"thread=${Thread.currentThread.getName} result=$result isNull=${result == null}")
     ExpressionBuilder.makeLiteral(result, query.dataType, result == null)
   }
 }

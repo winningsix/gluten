@@ -241,14 +241,22 @@ const std::string kCudfAstExpressionEnabled =
     "spark.gluten.sql.columnar.backend.velox.cudf.ast_expression_enabled";
 const std::string kCudfAstExpressionEnabledDefault = "true";
 
-// Forward to IBM CudfConfig::kCudfConcatOptimizationEnabled. When enabled,
-// CudfBatchConcat is inserted before supported cuDF operators, matching
-// Presto's GPU aggregation path.
+// Forward to IBM CudfConfig::kCudfConcatOptimizationEnabled. When true,
+// OperatorAdapters inserts a CudfBatchConcat operator before every
+// CudfHashAggregation, coalescing upstream batches until their cumulative
+// row count reaches kCudfBatchSizeMinThreshold before forwarding to the
+// agg. Lets the per-batch concat-with-bufferedResult_ cost be amortized
+// across multiple raw input batches (reduces D2D for high-cardinality
+// non-converging groupbys such as Q18 lineitem-by-l_orderkey).
 const std::string kCudfConcatOptimizationEnabled =
     "spark.gluten.sql.columnar.backend.velox.cudf.concat_optimization_enabled";
 const std::string kCudfConcatOptimizationEnabledDefault = "false";
 
-// Minimum rows accumulated by CudfBatchConcat before forwarding a batch.
+// Forward to IBM CudfConfig::kCudfBatchSizeMinThreshold. Target minimum row
+// count CudfBatchConcat coalesces upstream batches up to. Only used when
+// kCudfConcatOptimizationEnabled is true. Default 100000 matches velox's
+// internal default but is far too small for the typical 100M-row lineitem
+// scan; reasonable values for SF1000 are 100M-1B.
 const std::string kCudfBatchSizeMinThreshold =
     "spark.gluten.sql.columnar.backend.velox.cudf.batch_size_min_threshold";
 const std::string kCudfBatchSizeMinThresholdDefault = "100000";

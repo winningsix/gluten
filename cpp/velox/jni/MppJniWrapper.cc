@@ -645,7 +645,13 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
     return node;
   }
 
-  // Recurse into children.
+  // Recurse into children. Forward mergePartitionType and mergeKeyIndices
+  // so HASH/RANGE/ROUND_ROBIN partition information survives the descent
+  // to the target ValueStream leaf. Without the explicit forwarding the
+  // 6th/7th parameters fall back to their defaults ("SINGLE", {}) and
+  // every recursive call below the outermost reverts the partition type
+  // to SINGLE, causing all single-task merges to take the kGather branch
+  // even when the original exchange was HASH-partitioned.
   std::vector<velox::core::PlanNodePtr> newSources;
   newSources.reserve(sources.size());
   bool anyChanged = false;

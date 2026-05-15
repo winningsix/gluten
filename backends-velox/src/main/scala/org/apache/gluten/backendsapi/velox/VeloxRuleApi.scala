@@ -20,7 +20,12 @@ import org.apache.gluten.backendsapi.{BackendsApiManager, RuleApi}
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.extension._
 import org.apache.gluten.extension.columnar._
-import org.apache.gluten.extension.columnar.MiscColumnarRules.{PreventBatchTypeMismatchInTableCache, RemoveGlutenTableCacheColumnarToRow, RemoveTopmostColumnarToRow, RewriteSubqueryBroadcast}
+import org.apache.gluten.extension.columnar.MiscColumnarRules.{
+  PreventBatchTypeMismatchInTableCache,
+  RemoveGlutenTableCacheColumnarToRow,
+  RemoveTopmostColumnarToRow,
+  RewriteSubqueryBroadcast
+}
 import org.apache.gluten.extension.columnar.V2WritePostRule
 import org.apache.gluten.extension.columnar.enumerated.RasOffload
 import org.apache.gluten.extension.columnar.heuristic.{ExpandFallbackPolicy, HeuristicTransform}
@@ -33,7 +38,11 @@ import org.apache.gluten.extension.injector.GlutenInjector.{LegacyInjector, RasI
 import org.apache.gluten.sql.shims.SparkShimLoader
 
 import org.apache.spark.sql.execution._
-import org.apache.spark.sql.execution.aggregate.{HashAggregateExec, ObjectHashAggregateExec, SortAggregateExec}
+import org.apache.spark.sql.execution.aggregate.{
+  HashAggregateExec,
+  ObjectHashAggregateExec,
+  SortAggregateExec
+}
 import org.apache.spark.sql.execution.datasources.WriteFilesExec
 import org.apache.spark.sql.execution.datasources.noop.GlutenNoopWriterRule
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanExecBase
@@ -69,6 +78,22 @@ object VeloxRuleApi {
     injector.injectPreCBORule(RewriteExistenceJoinRhsDedup.apply)
     injector.injectOptimizerRule(RewriteCastFromArray.apply)
     injector.injectOptimizerRule(RewriteUnboundedWindow.apply)
+    // Rewrite large LeftSemi joins to Inner + DISTINCT(rightKeys). Mirrors Presto's optimizer
+    // shape for EXISTS subqueries so cuDF SHJ does not have to build a multi-GB hash table on
+    // the right side (default BuildRight for LeftSemi). Default off; turn on with
+    // spark.gluten.mpp.rewriteLargeLeftSemiToInnerDistinct=true.
+    //
+    // The rule's apply() self-registers itself into spark.experimental.extraOptimizations on
+    // first call so it also runs in the "User Provided Optimizers" batch (FixedPoint) where
+    // it actually sees LeftSemiJoin post-RewriteSubquery. injectOptimizerRule alone is not
+    // enough because that batch runs BEFORE RewriteSubquery. injectPreCBORule should also
+    // work in theory (the Spark 3.5 wiring is intact: BaseSessionStateBuilder feeds
+    // SparkSessionExtensions.buildPreCBORules into SparkOptimizer's "Pre CBO Rules" batch,
+    // and Gluten does not intercept that path), but empirically a 2026-05-15 test with
+    // injectPreCBORule had Q4 SF1000 regress from 1.97s to 12s, indicating the rule did not
+    // fire there. Root cause not investigated; revisit if cleaner upstream APIs become
+    // available. See the rule's apply() doc comment for the full reasoning.
+    injector.injectOptimizerRule(RewriteLargeLeftSemiToInnerDistinct.apply)
     if (BackendsApiManager.getSettings.supportAppendDataExec()) {
       injector.injectPlannerStrategy(SparkShimLoader.getSparkShims.getRewriteCreateTableAsSelect(_))
     }
@@ -171,6 +196,11 @@ object VeloxRuleApi {
       c => GlutenAutoAdjustStageResourceProfile(new GlutenConfig(c.sqlConf), c.session))
     injector.injectFinal(c => GlutenFallbackReporter(new GlutenConfig(c.sqlConf), c.session))
     injector.injectFinal(_ => RemoveFallbackTagRule())
+    // Runs after all transforms and ColumnarBroadcastExchangeExec insertion: mark every
+    // BroadcastExchange under an MppNativeQueryExec as dead so SparkPlan.prepare()'s
+    // recursive doPrepare chain does not driver-collect a build side that the native
+    // single-task merge has already inlined into the consumer fragment.
+    injector.injectFinal(_ => MppSuppressDeadBroadcastsRule())
   }
 
   /**

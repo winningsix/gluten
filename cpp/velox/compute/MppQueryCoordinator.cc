@@ -191,6 +191,48 @@ MppQueryCoordinator::~MppQueryCoordinator() {
                << " fragments=" << fragmentTasks_.size()
                << " totalTasks=" << totalTasks
                << " rootFragmentId=" << rootFragmentId_;
+  // Per-operator cpu/blocked/peak-mem stats for the surviving tasks, so we
+  // can 1:1 compare against pv-cli's plan-with-stats dump. Only print for
+  // non-trivial tasks (skip the marker-row tasks with pipelines=2). Gated by
+  // VLOG(1) so production runs don't pay the per-task plan-string cost;
+  // enable via GLOG_v=1.
+  if (started_ && VLOG_IS_ON(1)) {
+    for (size_t f = 0; f < fragmentTasks_.size(); ++f) {
+      for (auto& task : fragmentTasks_[f]) {
+        if (!task) continue;
+        try {
+          const auto ts = task->taskStats();
+          if (ts.pipelineStats.size() < 5) {
+            continue;
+          }
+          VLOG(1) << "MppQueryCoordinator[" << queryId_
+                  << "]: plan-with-stats for fragment " << f
+                  << " taskId=" << task->taskId() << " (begin):";
+          // Split per-line so glog single-line buffer doesn't truncate
+          // the tree below ~64KB; the merged Q8 plan exceeds that.
+          const auto planStr = task->printPlanWithStats(true);
+          size_t pos = 0;
+          while (pos <= planStr.size()) {
+            const auto eol = planStr.find('\n', pos);
+            const auto lineEnd =
+                eol == std::string::npos ? planStr.size() : eol;
+            VLOG(1) << "  STATS["
+                    << task->taskId() << "] "
+                    << planStr.substr(pos, lineEnd - pos);
+            if (eol == std::string::npos) {
+              break;
+            }
+            pos = eol + 1;
+          }
+          VLOG(1) << "MppQueryCoordinator[" << queryId_
+                  << "]: plan-with-stats for fragment " << f
+                  << " taskId=" << task->taskId() << " (end)";
+        } catch (const std::exception& e) {
+          VLOG(1) << "  printPlanWithStats failed: " << e.what();
+        }
+      }
+    }
+  }
   if (started_) {
     // Abort any still-running tasks (with bounded wait) and then remove
     // their OutputBuffer entries from the global OutputBufferManager.
@@ -453,6 +495,26 @@ void MppQueryCoordinator::start() {
                    << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN)
                                   : std::string{});
       task->start(perReplicaDrivers);
+      // Pipeline structure after Velox LocalPlanner splits the merged plan
+      // at LocalPartitionNode boundaries. Used to compare batch
+      // fragmentation against pv-cli's single-stage layout. Per-pipeline
+      // driver count is filled in post-completion via operatorStats; here
+      // we capture the overall topology immediately after start.
+      // Gated by VLOG(1) so production runs don't drown in topology logs;
+      // enable via GLOG_v=1.
+      if (VLOG_IS_ON(1)) {
+        const auto ts = task->taskStats();
+        VLOG(1) << "MppQueryCoordinator[" << queryId_
+                << "]: task " << taskId
+                << " pipelines=" << ts.pipelineStats.size()
+                << " numTotalDrivers=" << task->numTotalDrivers();
+        for (size_t pid = 0; pid < ts.pipelineStats.size(); ++pid) {
+          const auto& ps = ts.pipelineStats[pid];
+          VLOG(1) << "  pipeline[" << pid
+                  << "] input=" << ps.inputPipeline
+                  << " output=" << ps.outputPipeline;
+        }
+      }
       if (bcastN > 0) {
         // Task::start() has now initializePartitionOutput() registered the
         // kBroadcast OutputBuffer with numBuffers=1 (the plan's placeholder).

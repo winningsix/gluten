@@ -28,7 +28,12 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
-import org.apache.spark.sql.catalyst.plans.physical.{BroadcastMode, BroadcastPartitioning, Partitioning}
+import org.apache.spark.sql.catalyst.trees.TreeNodeTag
+import org.apache.spark.sql.catalyst.plans.physical.{
+  BroadcastMode,
+  BroadcastPartitioning,
+  Partitioning
+}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, BroadcastExchangeLike}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
@@ -47,6 +52,26 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
   // Note: "metrics" is made transient to avoid sending driver-side metrics to tasks.
   @transient override lazy val metrics: Map[String, SQLMetric] =
     BackendsApiManager.getMetricsApiInstance.genColumnarBroadcastExchangeMetrics(sparkContext)
+
+  /**
+   * Marker check: this exchange has been tagged dead by
+   * MppSuppressDeadBroadcastsRule because it lives under an MppNativeQueryExec
+   * whose Plan C single-task merge has inlined the build subtree into the
+   * consumer fragment (see MppJniWrapper "single-task merge BROADCAST, no
+   * LocalPartition wrap"). The driver-side relationFuture collect is dead work
+   * in that path, and keeping it leaks ColumnarBatchSerializeResult arrays
+   * into driver heap (~5 GB per Q14 iter, OOM by iter 3). Stays false on the
+   * BSP fallback path, which still needs executeBroadcast for non-MPP
+   * BroadcastHashJoin.
+   *
+   * Implemented as a TreeNodeTag (not a transient var on the case class) so
+   * the marker survives Catalyst plan transformations (`copy()`,
+   * `withNewChildren()`, `transform*()`) -- Spark frequently rebuilds tree
+   * nodes during later columnar rules, and a per-instance var would silently
+   * reset to false.
+   */
+  def isMppSuppressed: Boolean =
+    getTagValue(ColumnarBroadcastExchangeExec.MppSuppressedTag).contains(true)
 
   @transient
   private lazy val promise = Promise[broadcast.Broadcast[Any]]()
@@ -137,7 +162,11 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
   }
 
   override def doPrepare(): Unit = {
-    // Materialize the future.
+    // Skip the driver-side build-side collect when an enclosing
+    // MppNativeQueryExec has inlined this build subtree into its consumer
+    // fragment via single-task merge. See [[isMppSuppressed]] for the full
+    // rationale and [[MppSuppressDeadBroadcastsRule]] for the marker pass.
+    if (isMppSuppressed) return
     relationFuture
   }
 
@@ -147,6 +176,17 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
   }
 
   override protected[sql] def doExecuteBroadcast[T](): broadcast.Broadcast[T] = {
+    // A suppressed exchange must never be consumed via doExecuteBroadcast: the
+    // build subtree has been inlined into a native MPP fragment and no one is
+    // supposed to await the broadcast variable. Fail loudly so a future
+    // re-enable of fused-broadcast paths or an unexpected BSP consumer surface
+    // here instead of returning null / a stale promise.
+    if (isMppSuppressed) {
+      throw new IllegalStateException(
+        "ColumnarBroadcastExchangeExec is marked mppSuppressed (build inlined " +
+          "into MppNativeQueryExec consumer fragment) and cannot serve " +
+          "doExecuteBroadcast.")
+    }
     try {
       relationFuture.get(timeout, TimeUnit.SECONDS).asInstanceOf[broadcast.Broadcast[T]]
     } catch {
@@ -177,4 +217,18 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
     val rowCount = metrics("numOutputRows").value
     Statistics(dataSize, Some(rowCount))
   }
+}
+
+object ColumnarBroadcastExchangeExec {
+
+  /**
+   * Plan-tree-attached marker set by `MppSuppressDeadBroadcastsRule` to indicate this exchange is
+   * dead work because an enclosing `MppNativeQueryExec` has inlined the build subtree into its
+   * consumer fragment. See `ColumnarBroadcastExchangeExec.isMppSuppressed` for full rationale.
+   *
+   * Using a `TreeNodeTag` (rather than a non-ctor `var` on the case class) means the marker
+   * survives `copy()` / `withNewChildren()` / `transform*()` because `TreeNode.copyTagsFrom`
+   * carries tags through plan rewrites.
+   */
+  val MppSuppressedTag: TreeNodeTag[Boolean] = TreeNodeTag[Boolean]("mpp.suppressed")
 }
