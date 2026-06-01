@@ -25,6 +25,7 @@ import org.apache.spark.{Partition, SparkContext, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.execution.metric.SQLMetric
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import java.util.{Iterator => JIterator}
@@ -76,7 +77,18 @@ class MppNativeQueryRDD(
   }
 
   override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
+    val mppPartition = split match {
+      case p: MppPartition => p
+      case other =>
+        throw new IllegalArgumentException(
+          s"MppNativeQueryRDD expected MppPartition, got ${other.getClass.getName}")
+    }
     val planBuildStart = System.nanoTime()
+    val runtimeTimingProbeEnabled = MppNativeQueryRDD.runtimeTimingProbeEnabled
+    val localPeerId = Option(org.apache.spark.SparkEnv.get).map(_.executorId).getOrElse("unknown")
+    val mppQueryId =
+      s"${Option(sc.applicationId).getOrElse("unknown-app")}-${context.stageId()}-" +
+        s"${context.partitionId()}-${context.taskAttemptId()}"
 
     // Substrait plans and exchange specs were pre-generated on the driver side
     // (by MppNativeQueryExec.doExecuteColumnar) to avoid NPE from accessing
@@ -132,6 +144,19 @@ class MppNativeQueryRDD(
       f"MppNativeQueryRDD: TIMING " +
         f"nativeCreateMppQuery=${(tCreateDoneStartBegin - tCreateStart) / 1e6}%.1fms " +
         f"nativeStartMppQuery=${(tStartDone - tCreateDoneStartBegin) / 1e6}%.1fms")
+    if (runtimeTimingProbeEnabled) {
+      logWarning(
+        MppNativeQueryRDD.runtimeTimingProbeLine(
+          "native_start",
+          Seq(
+            "queryId" -> MppNativeQueryRDD.quotedJson(mppQueryId),
+            "sparkPartition" -> mppPartition.index.toString,
+            "sparkPartitions" -> "1",
+            "fragments" -> fragmentPlans.length.toString,
+            "localPeerId" -> MppNativeQueryRDD.quotedJson(localPeerId),
+            "nativeCreateMppQueryNanos" -> (tCreateDoneStartBegin - tCreateStart).toString,
+            "nativeStartMppQueryNanos" -> (tStartDone - tCreateDoneStartBegin).toString)))
+    }
 
     logInfo("MppNativeQueryRDD: all MPP fragments started, streaming exchange active")
 
@@ -150,6 +175,8 @@ class MppNativeQueryRDD(
       private var minGetOutputNanos: Long = Long.MaxValue
       private val firstBatchStart: Long = System.nanoTime()
       private var firstBatchNanos: Long = -1L
+      private var totalOutputRows: Long = 0L
+      private var totalOutputBatches: Long = 0L
 
       override def hasNext: Boolean = {
         if (finished) return false
@@ -180,6 +207,27 @@ class MppNativeQueryRDD(
               f"max=${maxGetOutputNanos / 1e6}%.2fms " +
               f"timeToFirstBatch=${firstBatchNanos / 1e6}%.1fms " +
               f"nativeCloseMppQuery=${closeNanos / 1e6}%.1fms")
+          if (runtimeTimingProbeEnabled) {
+            val safeMinGetOutputNanos =
+              if (totalGetOutputCalls == 0) 0L else minGetOutputNanos
+            val safeFirstBatchNanos = if (firstBatchNanos < 0) 0L else firstBatchNanos
+            logWarning(
+              MppNativeQueryRDD.runtimeTimingProbeLine(
+                "native_output_complete",
+                Seq(
+                  "queryId" -> MppNativeQueryRDD.quotedJson(mppQueryId),
+                  "sparkPartition" -> mppPartition.index.toString,
+                  "sparkPartitions" -> "1",
+                  "fragments" -> fragmentPlans.length.toString,
+                  "nativeGetMppOutputCalls" -> totalGetOutputCalls.toString,
+                  "nativeGetMppOutputSumNanos" -> totalGetOutputNanos.toString,
+                  "nativeGetMppOutputMinNanos" -> safeMinGetOutputNanos.toString,
+                  "nativeGetMppOutputMaxNanos" -> maxGetOutputNanos.toString,
+                  "timeToFirstBatchNanos" -> safeFirstBatchNanos.toString,
+                  "nativeCloseMppQueryNanos" -> closeNanos.toString,
+                  "outputRows" -> totalOutputRows.toString,
+                  "outputBatches" -> totalOutputBatches.toString)))
+          }
           logInfo("MppNativeQueryRDD: MPP execution complete, all fragments finished")
           false
         } else {
@@ -195,6 +243,8 @@ class MppNativeQueryRDD(
         val batch = org.apache.gluten.columnarbatch.ColumnarBatches.create(handle)
         outputRows += batch.numRows()
         outputBatches += 1
+        totalOutputRows += batch.numRows()
+        totalOutputBatches += 1L
         batch
       }
     }
@@ -215,6 +265,35 @@ class MppNativeQueryRDD(
 private[execution] case class MppPartition(override val index: Int) extends Partition
 
 private[execution] object MppNativeQueryRDD {
+  val runtimeTimingProbeKey: String = "spark.gluten.mpp.runtimeTimingProbe"
+
+  def runtimeTimingProbeEnabled: Boolean =
+    SQLConf.get.getConfString(runtimeTimingProbeKey, "false").toBoolean
+
+  private[execution] def runtimeTimingProbeLine(
+      event: String,
+      fields: Seq[(String, String)]): String = {
+    val fieldJson = (Seq("event" -> quotedJson(event)) ++ fields)
+      .map { case (key, value) => quotedJson(key) + ":" + value }
+      .mkString(",")
+    s"[MPP_RUNTIME_PROBE] {$fieldJson}"
+  }
+
+  private[execution] def quotedJson(value: String): String = s"\"${jsonEscape(value)}\""
+
+  private[execution] def jsonEscape(value: String): String = {
+    value.flatMap {
+      case '"' => "\\\""
+      case '\\' => "\\\\"
+      case '\b' => "\\b"
+      case '\f' => "\\f"
+      case '\n' => "\\n"
+      case '\r' => "\\r"
+      case '\t' => "\\t"
+      case c if c < ' ' => f"\\u${c.toInt}%04x"
+      case c => c.toString
+    }
+  }
 
   /**
    * Materialize the broadcasted BuildSideRelation into a Java Iterator[ColumnarBatch] suitable for
