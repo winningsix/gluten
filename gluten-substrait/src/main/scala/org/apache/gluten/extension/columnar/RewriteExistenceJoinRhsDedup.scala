@@ -19,21 +19,7 @@ package org.apache.gluten.extension.columnar
 import org.apache.gluten.config.GlutenConfig
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.expressions.{
-  Alias,
-  And,
-  Attribute,
-  EqualTo,
-  Expression,
-  Exists,
-  GreaterThan,
-  IsNotNull,
-  Literal,
-  Not,
-  Or,
-  OuterReference,
-  PredicateHelper
-}
+import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, EqualTo, Exists, Expression, GreaterThan, IsNotNull, Literal, Not, Or, OuterReference, PredicateHelper}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Count, Max, Min}
 import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, LeftAnti, LeftSemi}
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LogicalPlan, Project}
@@ -119,8 +105,8 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
   private def rewriteExistsJoinConditions(
       subqueryPlan: LogicalPlan,
       joinConditions: Seq[Expression]): Option[LogicalPlan] = {
-    joinConditions.reduceOption(And).flatMap { condition =>
-      summarizeCorrelatedSingleNotEqualSubquery(subqueryPlan, condition)
+    joinConditions.reduceOption(And).flatMap {
+      condition => summarizeCorrelatedSingleNotEqualSubquery(subqueryPlan, condition)
     }
   }
 
@@ -145,8 +131,8 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
     if (!supportsMinMaxSummary(notEqualKey.right)) {
       return None
     }
-    val groupingAttributes = right.output.filter { attr =>
-      equalityKeys.exists(_.right.semanticEquals(attr))
+    val groupingAttributes = right.output.filter {
+      attr => equalityKeys.exists(_.right.semanticEquals(attr))
     }
     if (groupingAttributes.length != equalityKeys.length) {
       return None
@@ -201,7 +187,8 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
         IsNotNull(notEqualKey.outer),
         Or(
           GreaterThan(distinctNotEqualKeyCount.toAttribute, Literal(1L)),
-          Not(EqualTo(notEqualKey.outer, minNotEqualKey.toAttribute))))
+          Not(EqualTo(notEqualKey.outer, minNotEqualKey.toAttribute)))
+      )
     Some(Filter((equalityConditions :+ notEqualSummaryCondition).reduce(And), summarizedRight))
   }
 
@@ -213,8 +200,9 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
     val rightOnlyPredicates = predicates.filter(isRightOnlyPredicate(_, right))
     val leftOnlyPredicates = predicates.filter(isLeftOnlyPredicate(_, join.left))
     val mixedPredicates =
-      predicates.filterNot(predicate =>
-        rightOnlyPredicates.contains(predicate) || leftOnlyPredicates.contains(predicate))
+      predicates.filterNot(
+        predicate =>
+          rightOnlyPredicates.contains(predicate) || leftOnlyPredicates.contains(predicate))
     val equalityKeys = mixedPredicates.flatMap(extractEqualityKey(_, join.left, right))
     val notEqualKeys = mixedPredicates.flatMap(extractNotEqualKey(_, join.left, right))
 
@@ -229,8 +217,8 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
     if (!supportsMinMaxSummary(notEqualKey.right)) {
       return None
     }
-    val groupingAttributes = right.output.filter { attr =>
-      equalityKeys.exists(_.right.semanticEquals(attr))
+    val groupingAttributes = right.output.filter {
+      attr => equalityKeys.exists(_.right.semanticEquals(attr))
     }
     if (groupingAttributes.length != equalityKeys.length) {
       return None
@@ -286,7 +274,8 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
         IsNotNull(notEqualKey.left),
         Or(
           GreaterThan(distinctNotEqualKeyCount.toAttribute, Literal(1L)),
-          Not(EqualTo(notEqualKey.left, minNotEqualKey.toAttribute))))
+          Not(EqualTo(notEqualKey.left, minNotEqualKey.toAttribute)))
+      )
     val newCondition =
       (leftOnlyPredicates ++ equalityConditions :+ notEqualSummaryCondition).reduce(And)
     Some(join.copy(right = summarizedRight, condition = Some(newCondition)))
@@ -381,8 +370,9 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
       right: LogicalPlan): Option[EqualityKey] = {
     predicate match {
       case EqualTo(l, r) =>
-        extractMixedAttributePair(l, r, left, right).map { case (leftExpression, rightAttribute) =>
-          EqualityKey(leftExpression, rightAttribute)
+        extractMixedAttributePair(l, r, left, right).map {
+          case (leftExpression, rightAttribute) =>
+            EqualityKey(leftExpression, rightAttribute)
         }
       case _ => None
     }
@@ -394,8 +384,9 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
       right: LogicalPlan): Option[NotEqualKey] = {
     predicate match {
       case Not(EqualTo(l, r)) =>
-        extractMixedAttributePair(l, r, left, right).map { case (leftExpression, rightAttribute) =>
-          NotEqualKey(leftExpression, rightAttribute)
+        extractMixedAttributePair(l, r, left, right).map {
+          case (leftExpression, rightAttribute) =>
+            NotEqualKey(leftExpression, rightAttribute)
         }
       case _ => None
     }
@@ -422,8 +413,9 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
       right: LogicalPlan): Option[CorrelatedEqualityKey] = {
     predicate match {
       case EqualTo(l, r) =>
-        extractCorrelatedAttributePair(l, r, right).map { case (outerExpression, rightAttribute) =>
-          CorrelatedEqualityKey(outerExpression, rightAttribute)
+        extractCorrelatedAttributePair(l, r, right).map {
+          case (outerExpression, rightAttribute) =>
+            CorrelatedEqualityKey(outerExpression, rightAttribute)
         }
       case _ => None
     }
@@ -434,8 +426,9 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
       right: LogicalPlan): Option[CorrelatedNotEqualKey] = {
     predicate match {
       case Not(EqualTo(l, r)) =>
-        extractCorrelatedAttributePair(l, r, right).map { case (outerExpression, rightAttribute) =>
-          CorrelatedNotEqualKey(outerExpression, rightAttribute)
+        extractCorrelatedAttributePair(l, r, right).map {
+          case (outerExpression, rightAttribute) =>
+            CorrelatedNotEqualKey(outerExpression, rightAttribute)
         }
       case _ => None
     }

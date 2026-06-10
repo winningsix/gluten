@@ -238,6 +238,15 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorSessionC
   configs[facebook::velox::connector::hive::HiveConfig::kOrcUseColumnNamesSession] =
       conf->get<bool>(kOrcUseColumnNames, true) ? "true" : "false";
 
+  // Opt-in MPP scan chunk sizing (spark.gluten.mpp.largeParquetScanChunks, default
+  // false). Q16 Nsys shows Spark issues ~8.7x more libcudf:has_next calls than
+  // Presto with higher parquet_decode kernel time; raising cuDF chunked reader
+  // limits per session reduces per-chunk scan overhead without changing plans.
+  if (conf->get<bool>("spark.gluten.mpp.largeParquetScanChunks", false)) {
+    configs["parquet.reader.chunk_read_limit"] = "67108864"; // 64MB
+    configs["parquet.reader.pass_read_limit"] = "134217728"; // 128MB
+  }
+
   overwriteVeloxConf(conf.get(), configs, kDynamicBackendConfPrefix);
   return std::make_shared<facebook::velox::config::ConfigBase>(std::move(configs));
 }

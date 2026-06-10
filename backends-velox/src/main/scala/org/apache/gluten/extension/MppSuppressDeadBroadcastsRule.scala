@@ -33,8 +33,7 @@ import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, SparkPlan}
  * relationFuture, which materializes ColumnarBatchSerializeResult arrays in driver heap. Across
  * iterations the arrays accumulate (~5 GB / iter on Q14 SF1000 with autoBroadcastJoinThreshold=2GB)
  * and OOM the 20 GB driver heap by iter 3, then race against a Spark shutdown hook that resets
- * VeloxBackend's globalMemoryManager and crash with SIGSEGV at
- * gluten::defaultLeafVeloxMemoryPool.
+ * VeloxBackend's globalMemoryManager and crash with SIGSEGV at gluten::defaultLeafVeloxMemoryPool.
  *
  * The marker pattern (transient var on the exchange) is used instead of replacing the node so that
  * Catalyst tree walks, schema introspection, and the BSP fallback path that does need

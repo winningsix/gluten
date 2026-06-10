@@ -64,6 +64,8 @@ public class MppQueryJniWrapper implements RuntimeAware {
    *     {@code substraitPlans.length}.
    * @param exchangeSpecsJson UTF-8 JSON array describing exchanges, e.g.: {@code
    *     [{"producerFragmentId":1,"consumerFragmentId":0,"exchangeNodeId":"n3"}]}
+   * @param mppPeerSpecJson UTF-8 JSON object with the native query id, local peer id, and optional
+   *     producer peer endpoints. Empty {@code peers} preserves the single-process local path.
    * @param splitInfosPerFragment serialized scan split info per fragment.
    * @param broadcastSlotIndicesPerFragment for each consumer fragment, the iterator slot indices
    *     occupied by fused broadcasts (sorted ascending). {@code null} or empty when no broadcasts
@@ -81,6 +83,7 @@ public class MppQueryJniWrapper implements RuntimeAware {
       byte[][] substraitPlans,
       int[] numDriversPerFragment,
       byte[] exchangeSpecsJson,
+      byte[] mppPeerSpecJson,
       byte[][][] splitInfosPerFragment,
       int[][] broadcastSlotIndicesPerFragment,
       Object[][] broadcastIteratorsPerFragment);

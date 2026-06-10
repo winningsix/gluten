@@ -25,6 +25,7 @@ import org.apache.gluten.execution.WriteFilesExecTransformer
 import org.apache.gluten.expression.WindowFunctionsBuilder
 import org.apache.gluten.extension.columnar.cost.{LegacyCoster, LongCoster, RoughCoster}
 import org.apache.gluten.extension.columnar.transition.{Convention, ConventionFunc}
+import org.apache.gluten.mpp.control.GlutenMppDriverService
 import org.apache.gluten.sql.shims.SparkShimLoader
 import org.apache.gluten.substrait.rel.LocalFilesNode
 import org.apache.gluten.substrait.rel.LocalFilesNode.ReadFileFormat
@@ -70,6 +71,8 @@ class VeloxBackend extends SubstraitBackend {
   override def listenerApi(): ListenerApi = new VeloxListenerApi
   override def ruleApi(): RuleApi = new VeloxRuleApi
   override def settings(): BackendSettingsApi = VeloxBackendSettings
+  override def onDriverReceive(msg: Any): Option[AnyRef] =
+    GlutenMppDriverService.get().flatMap(service => Option(service.receive(msg)))
   override def convFuncOverride(): ConventionFunc.Override = new ConvFunc()
   override def costers(): Seq[LongCoster] = Seq(LegacyCoster, RoughCoster)
 }

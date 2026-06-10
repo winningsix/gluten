@@ -132,15 +132,14 @@ const std::string kVeloxSsdCheckSumReadVerificationEnabled =
 const std::string kVeloxIOThreads = "spark.gluten.sql.columnar.backend.velox.IOThreads";
 const uint32_t kVeloxIOThreadsDefault = 0;
 
-// MPP single-task mode: collapse all fragments into one Velox Task connected
-// via LocalPartitionNode (intra-task), bypassing UcxExchange entirely. Only
-// activates when every exchange in the plan is SINGLE/BROADCAST (1 partition).
-// HASH/RANGE/ROUND_ROBIN exchanges fall back to the regular multi-task UCX
-// path. Mirrors Presto's 1-worker behavior (cudf.exchange=false collapses
-// stages into a single task with LocalExchange between pipelines).
+// MPP local mode: collapse all fragments into one Velox Task connected via
+// LocalPartitionNode (intra-task), bypassing UcxExchange entirely. This is the
+// default path for the single-worker/local-task GPU backend. It supports
+// SINGLE/HASH/RANGE/ROUND_ROBIN via LocalPartition and BROADCAST by inlining the
+// producer plan.
 const std::string kMppSingleTaskMode =
     "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode";
-const bool kMppSingleTaskModeDefault = false;
+const bool kMppSingleTaskModeDefault = true;
 
 // Cap on per-task driver count (= local-partition lane count) when single-
 // task mode is active. Mirrors IBM's pbench GPU deployment choice

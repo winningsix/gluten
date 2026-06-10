@@ -20,12 +20,7 @@ import org.apache.gluten.backendsapi.{BackendsApiManager, RuleApi}
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.extension._
 import org.apache.gluten.extension.columnar._
-import org.apache.gluten.extension.columnar.MiscColumnarRules.{
-  PreventBatchTypeMismatchInTableCache,
-  RemoveGlutenTableCacheColumnarToRow,
-  RemoveTopmostColumnarToRow,
-  RewriteSubqueryBroadcast
-}
+import org.apache.gluten.extension.columnar.MiscColumnarRules.{PreventBatchTypeMismatchInTableCache, RemoveGlutenTableCacheColumnarToRow, RemoveTopmostColumnarToRow, RewriteSubqueryBroadcast}
 import org.apache.gluten.extension.columnar.V2WritePostRule
 import org.apache.gluten.extension.columnar.enumerated.RasOffload
 import org.apache.gluten.extension.columnar.heuristic.{ExpandFallbackPolicy, HeuristicTransform}
@@ -38,11 +33,7 @@ import org.apache.gluten.extension.injector.GlutenInjector.{LegacyInjector, RasI
 import org.apache.gluten.sql.shims.SparkShimLoader
 
 import org.apache.spark.sql.execution._
-import org.apache.spark.sql.execution.aggregate.{
-  HashAggregateExec,
-  ObjectHashAggregateExec,
-  SortAggregateExec
-}
+import org.apache.spark.sql.execution.aggregate.{HashAggregateExec, ObjectHashAggregateExec, SortAggregateExec}
 import org.apache.spark.sql.execution.datasources.WriteFilesExec
 import org.apache.spark.sql.execution.datasources.noop.GlutenNoopWriterRule
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanExecBase
@@ -76,12 +67,13 @@ object VeloxRuleApi {
     injector.injectPostHocResolutionRule(RewriteExistenceJoinRhsDedup.apply)
     injector.injectOptimizerRule(RewriteExistenceJoinRhsDedup.apply)
     injector.injectPreCBORule(RewriteExistenceJoinRhsDedup.apply)
+    injector.injectOptimizerRule(SelectiveDimensionJoinReorder.apply)
     injector.injectOptimizerRule(RewriteCastFromArray.apply)
     injector.injectOptimizerRule(RewriteUnboundedWindow.apply)
     // Rewrite large LeftSemi joins to Inner + DISTINCT(rightKeys). Mirrors Presto's optimizer
     // shape for EXISTS subqueries so cuDF SHJ does not have to build a multi-GB hash table on
-    // the right side (default BuildRight for LeftSemi). Default off; turn on with
-    // spark.gluten.mpp.rewriteLargeLeftSemiToInnerDistinct=true.
+    // the right side (default BuildRight for LeftSemi). Default on; turn off with
+    // spark.gluten.mpp.rewriteLargeLeftSemiToInnerDistinct=false.
     //
     // The rule's apply() self-registers itself into spark.experimental.extraOptimizations on
     // first call so it also runs in the "User Provided Optimizers" batch (FixedPoint) where

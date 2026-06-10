@@ -1,0 +1,174 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.gluten.mpp.control
+
+import org.apache.gluten.execution.UcxEndpointInfo
+
+import org.scalatest.funsuite.AnyFunSuite
+
+class GlutenMppPeerMapperSuite extends AnyFunSuite {
+
+  private def info(
+      executorId: String,
+      host: String,
+      blockManagerHost: String,
+      blockManagerPort: Int = 7079,
+      ucxListenerPort: Int = 12345,
+      ucxHost: String = "",
+      gpu: Seq[String] = Seq("0")): UcxEndpointInfo = {
+    val effectiveUcxHost = if (ucxHost.nonEmpty) ucxHost else host
+    UcxEndpointInfo(
+      executorId = executorId,
+      host = host,
+      blockManagerHost = blockManagerHost,
+      blockManagerPort = blockManagerPort,
+      gpuResourceAddresses = gpu,
+      nativeUcxListenerEndpoint = Some(s"ucx://$effectiveUcxHost:$ucxListenerPort")
+    )
+  }
+
+  // ---- Mapping ----
+
+  test("empty input -> empty output") {
+    val out = GlutenMppPeerMapper.toMppPeerInfos(Nil, 0)
+    assert(out == Nil)
+  }
+
+  test("requestedCount=0 -> empty output even with inputs") {
+    val out = GlutenMppPeerMapper.toMppPeerInfos(Seq(info("e1", "h1", "h1")), 0)
+    assert(out == Nil)
+  }
+
+  test("requestedCount negative -> require fails") {
+    intercept[IllegalArgumentException] {
+      GlutenMppPeerMapper.toMppPeerInfos(Nil, -1)
+    }
+  }
+
+  test("port = listenerPort - 3 invariant") {
+    val out =
+      GlutenMppPeerMapper.toMppPeerInfos(Seq(info("e1", "h1", "h1", ucxListenerPort = 20000)), 1)
+    assert(out.head.port == 19997)
+  }
+
+  test("rejects listenerPort <= 3") {
+    intercept[IllegalStateException] {
+      GlutenMppPeerMapper.toMppPeerInfos(Seq(info("e1", "h1", "h1", ucxListenerPort = 2)), 1)
+    }
+  }
+
+  test("rejects missing nativeUcxListenerEndpoint") {
+    val bad = UcxEndpointInfo(
+      executorId = "e1",
+      host = "h1",
+      blockManagerHost = "h1",
+      blockManagerPort = 0,
+      gpuResourceAddresses = Nil,
+      nativeUcxListenerEndpoint = None)
+    intercept[IllegalStateException] {
+      GlutenMppPeerMapper.toMppPeerInfos(Seq(bad), 1)
+    }
+  }
+
+  test("host selection prefers non-empty blockManagerHost") {
+    val infos = Seq(info("e1", host = "infoHost", blockManagerHost = "bmHost", ucxHost = "ucxHost"))
+    val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 1)
+    assert(out.head.host == "bmHost")
+    assert(out.head.preferredLocation == "executor_bmHost_e1")
+  }
+
+  test("host selection preserves localhost blockManagerHost") {
+    val infos =
+      Seq(info("e1", host = "infoHost", blockManagerHost = "localhost", ucxHost = "ucxHost"))
+    val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 1)
+    assert(out.head.host == "localhost")
+  }
+
+  test("host selection preserves 127.* blockManagerHost") {
+    val infos =
+      Seq(info("e1", host = "infoHost", blockManagerHost = "127.0.0.1", ucxHost = "ucxHost"))
+    val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 1)
+    assert(out.head.host == "127.0.0.1")
+  }
+
+  test("host selection falls through to info.host when blockManagerHost empty and URI host empty") {
+    // URI ucx://:12345 (no host portion) -> endpointHost = None -> use info.host
+    val bad = UcxEndpointInfo(
+      executorId = "e1",
+      host = "infoHost",
+      blockManagerHost = "",
+      blockManagerPort = 0,
+      gpuResourceAddresses = Nil,
+      nativeUcxListenerEndpoint = Some("ucx://:12345"))
+    val out = GlutenMppPeerMapper.toMppPeerInfos(Seq(bad), 1)
+    assert(out.head.host == "infoHost")
+  }
+
+  test("requestedCount truncation matches take()") {
+    val infos = (1 to 5).map(i => info(s"e$i", s"h$i", s"h$i"))
+    val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 2)
+    assert(out.size == 2)
+    assert(out.map(_.peerId) == Seq("e1", "e2"))
+  }
+
+  // ---- JSON parity ----
+
+  test("toPeerEndpointsJson empty -> []") {
+    assert(GlutenMppPeerMapper.toPeerEndpointsJson(Nil) == "[]")
+  }
+
+  test("toPeerEndpointsJson golden: 2 peers, byte-exact field order") {
+    val peers = GlutenMppPeerMapper.toMppPeerInfos(
+      Seq(
+        info("e1", host = "host-a", blockManagerHost = "host-a", ucxListenerPort = 50100),
+        info("e2", host = "host-b", blockManagerHost = "host-b", ucxListenerPort = 50200)),
+      2
+    )
+    val json = GlutenMppPeerMapper.toPeerEndpointsJson(peers)
+    val expected =
+      """[{"peerId":"e1","host":"host-a","port":50097,"peerIndex":0},""" +
+        """{"peerId":"e2","host":"host-b","port":50197,"peerIndex":1}]"""
+    assert(json == expected, s"\n  actual:   $json\n  expected: $expected")
+  }
+
+  test("toPeerEndpointsJson escapes quote / backslash / control chars in peerId and host") {
+    val peers = GlutenMppPeerMapper.toMppPeerInfos(
+      Seq(
+        info(
+          executorId = """e"1\x""",
+          host = "h\ta\nb",
+          blockManagerHost = "h\ta\nb",
+          ucxListenerPort = 60000)),
+      1)
+    val json = GlutenMppPeerMapper.toPeerEndpointsJson(peers)
+    // Must escape: " -> \", \ -> \\, \t -> \t, \n -> \n
+    val expected =
+      """[{"peerId":"e\"1\\x","host":"h\ta\nb","port":59997,"peerIndex":0}]"""
+    assert(json == expected, s"\n  actual:   $json\n  expected: $expected")
+  }
+
+  test("jsonEscape low control chars use \\u04x format") {
+    // 0x01 -> 
+    val escaped = GlutenMppPeerMapper.jsonEscape("ab")
+    assert(escaped == "a\\u0001b")
+  }
+
+  test("jsonEscape leaves printable ASCII untouched") {
+    val s = "abc 0123 !@#"
+    assert(GlutenMppPeerMapper.jsonEscape(s) == s)
+  }
+}

@@ -21,22 +21,25 @@ import org.apache.gluten.iterator.Iterators
 import org.apache.gluten.runtime.Runtimes
 import org.apache.gluten.vectorized.MppQueryJniWrapper
 
-import org.apache.spark.{Partition, SparkContext, TaskContext}
+import org.apache.spark.{Partition, SparkContext, SparkEnv, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
-import java.util.{Iterator => JIterator}
+import java.util.{HashMap => JHashMap, Iterator => JIterator}
+
+import scala.util.control.NonFatal
 
 /**
  * RDD that executes an MPP query plan via JNI.
  *
- * This is a single-partition RDD: the native MPP coordinator handles all parallelism internally.
- * Substrait plans are pre-generated on the driver side (by [[MppNativeQueryExec]]) and passed as
- * serialized byte arrays. This avoids accessing SparkPlan.sparkContext on executor nodes (which
- * would cause NPE).
+ * By default this is a single-partition RDD: the native MPP coordinator handles all parallelism
+ * internally. When multi-executor MPP is enabled, each Spark partition is pinned to one executor
+ * peer and starts its own native coordinator with a sharded set of scan splits. Substrait plans are
+ * pre-generated on the driver side (by [[MppNativeQueryExec]]) and passed as serialized byte
+ * arrays. This avoids accessing SparkPlan.sparkContext on executor nodes (which would cause NPE).
  *
  * The native side creates an MppQueryCoordinator that:
  *   - Launches all fragment pipelines concurrently
@@ -51,6 +54,18 @@ import java.util.{Iterator => JIterator}
  *   The parallelism for each fragment.
  * @param exchangeSpecsJson
  *   JSON-serialized exchange specifications (generated on driver).
+ * @param mppQueryId
+ *   Query id shared by all native peers for this MPP query attempt.
+ * @param configuredPeerEndpointsJson
+ *   JSON array of producer peer endpoint records from discovered peers or
+ *   spark.gluten.mpp.peerEndpoints.
+ * @param peerInfos
+ *   Optional Spark executor peer metadata. Non-empty means one Spark partition per peer.
+ * @param sparkPartitionCount
+ *   Number of Spark tasks to expose for this native MPP query.
+ * @param broadcastProducerFragmentIds
+ *   Fragments that produce BROADCAST exchanges. Only peer 0 scans these fragments to avoid
+ *   duplicating build-side rows across peers.
  * @param pipelineTime
  *   Metric for tracking total pipeline execution time.
  * @param outputRows
@@ -63,17 +78,39 @@ class MppNativeQueryRDD(
     fragmentPlans: Array[Array[Byte]],
     numDriversPerFragment: Array[Int],
     exchangeSpecsJson: String,
+    mppQueryId: String,
+    configuredPeerEndpointsJson: String,
+    peerInfos: Array[MppPeerInfo],
     fragmentSplitInfos: Array[Array[Array[Byte]]],
     fusedBroadcastsByConsumer: Map[Int, Seq[FusedBroadcast]],
+    sparkPartitionCount: Int,
+    broadcastProducerFragmentIds: Set[Int],
     pipelineTime: SQLMetric,
     outputRows: SQLMetric,
     outputBatches: SQLMetric
 ) extends RDD[ColumnarBatch](sc, Nil)
   with Logging {
 
+  private val numSparkPartitions: Int =
+    if (peerInfos.nonEmpty) peerInfos.length else math.max(1, sparkPartitionCount)
+
   override protected def getPartitions: Array[Partition] = {
-    // Single partition -- the MPP coordinator handles parallelism internally.
-    Array(MppPartition(0))
+    Array.tabulate(numSparkPartitions) {
+      partitionIndex =>
+        MppPartition(
+          index = partitionIndex,
+          totalPartitions = numSparkPartitions,
+          peerInfo = peerInfos.lift(partitionIndex))
+    }
+  }
+
+  override protected def getPreferredLocations(split: Partition): Seq[String] = {
+    split match {
+      case partition: MppPartition =>
+        partition.peerInfo.map(_.preferredLocation).toSeq
+      case _ =>
+        Nil
+    }
   }
 
   override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
@@ -83,12 +120,9 @@ class MppNativeQueryRDD(
         throw new IllegalArgumentException(
           s"MppNativeQueryRDD expected MppPartition, got ${other.getClass.getName}")
     }
+
     val planBuildStart = System.nanoTime()
     val runtimeTimingProbeEnabled = MppNativeQueryRDD.runtimeTimingProbeEnabled
-    val localPeerId = Option(org.apache.spark.SparkEnv.get).map(_.executorId).getOrElse("unknown")
-    val mppQueryId =
-      s"${Option(sc.applicationId).getOrElse("unknown-app")}-${context.stageId()}-" +
-        s"${context.partitionId()}-${context.taskAttemptId()}"
 
     // Substrait plans and exchange specs were pre-generated on the driver side
     // (by MppNativeQueryExec.doExecuteColumnar) to avoid NPE from accessing
@@ -96,15 +130,44 @@ class MppNativeQueryRDD(
 
     logInfo(
       s"MppNativeQueryRDD: *** LAUNCHING MPP EXECUTION *** " +
-        s"with ${fragmentPlans.length} fragments")
+        s"with ${fragmentPlans.length} fragments " +
+        s"(Spark partition ${mppPartition.index}/${mppPartition.totalPartitions})")
     logDebug(s"MppNativeQueryRDD: exchange specs JSON: $exchangeSpecsJson")
 
     // Submit all fragment plans to MppQueryCoordinator via JNI.
     // This launches ALL fragments concurrently (MPP all-stages-up)
     // and wires them together via OutputBufferManager streaming exchange.
-    val runtime = Runtimes.contextInstance(BackendsApiManager.getBackendName, "MppQuery")
+    val runtimeExtraConf = new JHashMap[String, String]()
+    if (MppNativeQueryRDD.largeParquetScanChunksEnabled) {
+      runtimeExtraConf.put(MppNativeQueryRDD.largeParquetScanChunksKey, "true")
+    }
+    val runtime =
+      Runtimes.contextInstance(BackendsApiManager.getBackendName, "MppQuery", runtimeExtraConf)
     val jniWrapper = MppQueryJniWrapper.create(runtime)
+    val actualExecutorId = Option(SparkEnv.get).map(_.executorId).getOrElse("unknown")
+    val localPeerId = mppPartition.peerInfo.map(_.peerId).getOrElse(actualExecutorId)
+    mppPartition.peerInfo.foreach {
+      expected =>
+        if (expected.peerId != actualExecutorId) {
+          throw new IllegalStateException(
+            s"MppNativeQueryRDD partition ${mppPartition.index} expected executor " +
+              s"${expected.peerId}, but Spark scheduled it on $actualExecutorId")
+        }
+    }
+    val mppPeerSpecJson =
+      MppNativeQueryRDD.buildPeerSpecJson(
+        mppQueryId,
+        localPeerId,
+        configuredPeerEndpointsJson,
+        mppPartition.index,
+        mppPartition.totalPartitions)
+    logInfo(s"MppNativeQueryRDD: peer spec JSON: $mppPeerSpecJson")
     val tCreateStart = System.nanoTime()
+    val localFragmentSplitInfos = MppNativeQueryRDD.partitionSplitInfos(
+      fragmentSplitInfos,
+      mppPartition.index,
+      mppPartition.totalPartitions,
+      broadcastProducerFragmentIds)
 
     // For each consumer fragment that has fused broadcasts, materialize the
     // build side as Iterator[ColumnarBatch] (one iterator per fused broadcast)
@@ -133,7 +196,8 @@ class MppNativeQueryRDD(
       fragmentPlans,
       numDriversPerFragment,
       exchangeSpecsJson.getBytes("UTF-8"),
-      fragmentSplitInfos,
+      mppPeerSpecJson.getBytes("UTF-8"),
+      localFragmentSplitInfos,
       broadcastSlotIndicesPerFrag,
       broadcastIteratorsPerFrag.asInstanceOf[Array[Array[Object]]]
     )
@@ -151,17 +215,46 @@ class MppNativeQueryRDD(
           Seq(
             "queryId" -> MppNativeQueryRDD.quotedJson(mppQueryId),
             "sparkPartition" -> mppPartition.index.toString,
-            "sparkPartitions" -> "1",
+            "sparkPartitions" -> mppPartition.totalPartitions.toString,
             "fragments" -> fragmentPlans.length.toString,
             "localPeerId" -> MppNativeQueryRDD.quotedJson(localPeerId),
             "nativeCreateMppQueryNanos" -> (tCreateDoneStartBegin - tCreateStart).toString,
-            "nativeStartMppQueryNanos" -> (tStartDone - tCreateDoneStartBegin).toString)))
+            "nativeStartMppQueryNanos" -> (tStartDone - tCreateDoneStartBegin).toString
+          )
+        ))
     }
 
     logInfo("MppNativeQueryRDD: all MPP fragments started, streaming exchange active")
 
     val tracker = org.apache.gluten.metrics.TaskWallTimeTracker.get()
     tracker.planBuildNanos += (System.nanoTime() - planBuildStart)
+
+    @volatile var mppClosed = false
+    def closeMppHandle(): Long = this.synchronized {
+      if (mppClosed) {
+        0L
+      } else {
+        val tCloseStart = System.nanoTime()
+        try {
+          jniWrapper.nativeCloseMppQuery(mppHandle)
+        } finally {
+          mppClosed = true
+        }
+        System.nanoTime() - tCloseStart
+      }
+    }
+
+    context.addTaskCompletionListener[Unit] {
+      _ =>
+        if (!mppClosed) {
+          try {
+            closeMppHandle()
+          } catch {
+            case NonFatal(e) =>
+              logWarning("MppNativeQueryRDD: failed to close MPP query at task completion", e)
+          }
+        }
+    }
 
     // 4. Create iterator that pulls batches from MppQueryCoordinator via JNI.
     val mppIter = new Iterator[ColumnarBatch] {
@@ -182,7 +275,21 @@ class MppNativeQueryRDD(
         if (finished) return false
         if (nextHandle != -1L) return true
         val tStart = System.nanoTime()
-        nextHandle = jniWrapper.nativeGetMppOutput(mppHandle)
+        try {
+          nextHandle = jniWrapper.nativeGetMppOutput(mppHandle)
+        } catch {
+          case NonFatal(e) =>
+            finished = true
+            try {
+              closeMppHandle()
+            } catch {
+              case NonFatal(closeError) =>
+                logWarning(
+                  "MppNativeQueryRDD: failed to close MPP query after native error",
+                  closeError)
+            }
+            throw e
+        }
         val elapsed = System.nanoTime() - tStart
         totalGetOutputNanos += elapsed
         totalGetOutputCalls += 1
@@ -193,9 +300,7 @@ class MppNativeQueryRDD(
         }
         if (nextHandle == 0L) {
           finished = true
-          val tCloseStart = System.nanoTime()
-          jniWrapper.nativeCloseMppQuery(mppHandle)
-          val closeNanos = System.nanoTime() - tCloseStart
+          val closeNanos = closeMppHandle()
           val avgMs =
             totalGetOutputNanos.toDouble / math.max(1L, totalGetOutputCalls) / 1e6
           logWarning(
@@ -217,7 +322,7 @@ class MppNativeQueryRDD(
                 Seq(
                   "queryId" -> MppNativeQueryRDD.quotedJson(mppQueryId),
                   "sparkPartition" -> mppPartition.index.toString,
-                  "sparkPartitions" -> "1",
+                  "sparkPartitions" -> mppPartition.totalPartitions.toString,
                   "fragments" -> fragmentPlans.length.toString,
                   "nativeGetMppOutputCalls" -> totalGetOutputCalls.toString,
                   "nativeGetMppOutputSumNanos" -> totalGetOutputNanos.toString,
@@ -226,7 +331,9 @@ class MppNativeQueryRDD(
                   "timeToFirstBatchNanos" -> safeFirstBatchNanos.toString,
                   "nativeCloseMppQueryNanos" -> closeNanos.toString,
                   "outputRows" -> totalOutputRows.toString,
-                  "outputBatches" -> totalOutputBatches.toString)))
+                  "outputBatches" -> totalOutputBatches.toString
+                )
+              ))
           }
           logInfo("MppNativeQueryRDD: MPP execution complete, all fragments finished")
           false
@@ -261,11 +368,28 @@ class MppNativeQueryRDD(
 
 }
 
-/** Simple partition for the single-partition MppNativeQueryRDD. */
-private[execution] case class MppPartition(override val index: Int) extends Partition
+/** Spark partition descriptor for one native MPP query. */
+private[execution] case class MppPartition(
+    override val index: Int,
+    totalPartitions: Int,
+    peerInfo: Option[MppPeerInfo])
+  extends Partition
+
+private[gluten] case class MppPeerInfo(
+    peerId: String,
+    host: String,
+    port: Int,
+    preferredLocation: String)
 
 private[execution] object MppNativeQueryRDD {
+
+  /** Opt-in: raise cuDF parquet chunk/pass read limits for MPP table scans. */
+  val largeParquetScanChunksKey: String = "spark.gluten.mpp.largeParquetScanChunks"
+
   val runtimeTimingProbeKey: String = "spark.gluten.mpp.runtimeTimingProbe"
+
+  def largeParquetScanChunksEnabled: Boolean =
+    SQLConf.get.getConfString(largeParquetScanChunksKey, "false").toBoolean
 
   def runtimeTimingProbeEnabled: Boolean =
     SQLConf.get.getConfString(runtimeTimingProbeKey, "false").toBoolean
@@ -279,7 +403,36 @@ private[execution] object MppNativeQueryRDD {
     s"[MPP_RUNTIME_PROBE] {$fieldJson}"
   }
 
-  private[execution] def quotedJson(value: String): String = s"\"${jsonEscape(value)}\""
+  private[execution] def quotedJson(value: String): String = "\"" + jsonEscape(value) + "\""
+
+  def buildPeerSpecJson(
+      queryId: String,
+      localPeerId: String,
+      configuredPeerEndpointsJson: String,
+      peerIndex: Int,
+      peerCount: Int): String = {
+    val peersJson = Option(configuredPeerEndpointsJson)
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .getOrElse("[]")
+    s"""{
+       |  "queryId": "${jsonEscape(queryId)}",
+       |  "localPeerId": "${jsonEscape(localPeerId)}",
+       |  "peerIndex": $peerIndex,
+       |  "peerCount": $peerCount,
+       |  "peers": $peersJson
+       |}""".stripMargin
+  }
+
+  def partitionSplitInfos(
+      allSplits: Array[Array[Array[Byte]]],
+      peerIndex: Int,
+      peerCount: Int,
+      broadcastProducerFragmentIds: Set[Int]): Array[Array[Array[Byte]]] = {
+    // Each byte array is one scan-node SplitInfo blob, not one file split.
+    // File-level sharding happens after JNI parses SplitInfo on the native side.
+    allSplits
+  }
 
   private[execution] def jsonEscape(value: String): String = {
     value.flatMap {

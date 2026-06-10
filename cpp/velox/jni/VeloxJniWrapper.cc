@@ -44,6 +44,7 @@
 #include "cudf/GpuLock.h"
 #include "cudf/GpuMemoryTracker.h"
 #include "utils/GpuBufferBatchResizer.h"
+#include "velox/experimental/ucx-exchange/Communicator.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -143,6 +144,32 @@ JNIEXPORT void JNICALL Java_org_apache_gluten_init_NativeBackendInitializer_shut
   JNI_METHOD_START
   VeloxBackend::get()->tearDown();
   JNI_METHOD_END()
+}
+
+JNIEXPORT jstring JNICALL Java_org_apache_gluten_init_NativeBackendInitializer_getUcxListenerEndpoint0( // NOLINT
+    JNIEnv* env,
+    jobject,
+    jstring advertisedHost) {
+  JNI_METHOD_START
+#ifdef GLUTEN_ENABLE_GPU
+  try {
+    auto comm = facebook::velox::ucx_exchange::Communicator::getInstance();
+    if (comm == nullptr || comm->getListenerPort() == 0) {
+      return nullptr;
+    }
+    const auto host = jStringToCString(env, advertisedHost);
+    const auto endpoint =
+        fmt::format("ucx://{}:{}", host, comm->getListenerPort());
+    return env->NewStringUTF(endpoint.c_str());
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "Unable to get process UCX listener endpoint: "
+                 << e.what();
+    return nullptr;
+  }
+#else
+  return nullptr;
+#endif
+  JNI_METHOD_END(nullptr)
 }
 
 JNIEXPORT void JNICALL Java_org_apache_gluten_udf_UdfJniWrapper_registerFunctionSignatures( // NOLINT

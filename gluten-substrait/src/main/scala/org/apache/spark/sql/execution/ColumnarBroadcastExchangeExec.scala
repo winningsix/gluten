@@ -28,12 +28,8 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
+import org.apache.spark.sql.catalyst.plans.physical.{BroadcastMode, BroadcastPartitioning, Partitioning}
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
-import org.apache.spark.sql.catalyst.plans.physical.{
-  BroadcastMode,
-  BroadcastPartitioning,
-  Partitioning
-}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, BroadcastExchangeLike}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
@@ -54,21 +50,18 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
     BackendsApiManager.getMetricsApiInstance.genColumnarBroadcastExchangeMetrics(sparkContext)
 
   /**
-   * Marker check: this exchange has been tagged dead by
-   * MppSuppressDeadBroadcastsRule because it lives under an MppNativeQueryExec
-   * whose Plan C single-task merge has inlined the build subtree into the
-   * consumer fragment (see MppJniWrapper "single-task merge BROADCAST, no
-   * LocalPartition wrap"). The driver-side relationFuture collect is dead work
-   * in that path, and keeping it leaks ColumnarBatchSerializeResult arrays
-   * into driver heap (~5 GB per Q14 iter, OOM by iter 3). Stays false on the
-   * BSP fallback path, which still needs executeBroadcast for non-MPP
+   * Marker check: this exchange has been tagged dead by MppSuppressDeadBroadcastsRule because it
+   * lives under an MppNativeQueryExec whose Plan C single-task merge has inlined the build subtree
+   * into the consumer fragment (see MppJniWrapper "single-task merge BROADCAST, no LocalPartition
+   * wrap"). The driver-side relationFuture collect is dead work in that path, and keeping it leaks
+   * ColumnarBatchSerializeResult arrays into driver heap (~5 GB per Q14 iter, OOM by iter 3). Stays
+   * false on the BSP fallback path, which still needs executeBroadcast for non-MPP
    * BroadcastHashJoin.
    *
-   * Implemented as a TreeNodeTag (not a transient var on the case class) so
-   * the marker survives Catalyst plan transformations (`copy()`,
-   * `withNewChildren()`, `transform*()`) -- Spark frequently rebuilds tree
-   * nodes during later columnar rules, and a per-instance var would silently
-   * reset to false.
+   * Implemented as a TreeNodeTag (not a transient var on the case class) so the marker survives
+   * Catalyst plan transformations (`copy()`, `withNewChildren()`, `transform*()`) -- Spark
+   * frequently rebuilds tree nodes during later columnar rules, and a per-instance var would
+   * silently reset to false.
    */
   def isMppSuppressed: Boolean =
     getTagValue(ColumnarBroadcastExchangeExec.MppSuppressedTag).contains(true)

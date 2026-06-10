@@ -52,8 +52,7 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
 
   private def hasOptimizedExistenceAggregate(plan: LogicalPlan): Boolean = {
     plan.collect {
-      case join @ Join(_, _, LeftSemi | LeftAnti, _, _)
-          if join.right.exists {
+      case join @ Join(_, _, LeftSemi | LeftAnti, _, _) if join.right.exists {
             case Aggregate(groupingExpressions, aggregateExpressions, _) =>
               groupingExpressions.length == 1 && aggregateExpressions.length == 3
             case _ => false
@@ -64,8 +63,7 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
 
   private def optimizedExistenceAggregateCount(plan: LogicalPlan): Int = {
     plan.collect {
-      case join @ Join(_, _, LeftSemi | LeftAnti, _, _)
-          if join.right.exists {
+      case join @ Join(_, _, LeftSemi | LeftAnti, _, _) if join.right.exists {
             case Aggregate(groupingExpressions, aggregateExpressions, _) =>
               groupingExpressions.length == 1 && aggregateExpressions.length == 3
             case _ => false
@@ -81,18 +79,18 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
   test("deduplicates RHS of correlated EXISTS after Spark decorrelation") {
     createTestViews()
     val df = spark.sql("""
-        |select id, supp
-        |from exist_l l
-        |where exists (
-        |  select 1
-        |  from exist_r r
-        |  where r.id = l.id
-        |    and r.supp <> l.supp
-        |    and r.flag = 'Y'
-        |    and l.payload is not null
-        |)
-        |order by id, supp
-        |""".stripMargin)
+                         |select id, supp
+                         |from exist_l l
+                         |where exists (
+                         |  select 1
+                         |  from exist_r r
+                         |  where r.id = l.id
+                         |    and r.supp <> l.supp
+                         |    and r.flag = 'Y'
+                         |    and l.payload is not null
+                         |)
+                         |order by id, supp
+                         |""".stripMargin)
     val rewrittenPlan = rewrite(df.queryExecution.optimizedPlan)
     val rewrittenDf = ClassicDataset.ofRows(spark, rewrittenPlan)
 
@@ -104,23 +102,24 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
     assert(
       optimizedExistenceAggregateCount(repeatedRewritePlan) ==
         optimizedExistenceAggregateCount(rewrittenPlan),
-      s"Expected existence summary rewrite to be idempotent:\n${repeatedRewritePlan.treeString}")
+      s"Expected existence summary rewrite to be idempotent:\n${repeatedRewritePlan.treeString}"
+    )
   }
 
   test("rewrites correlated EXISTS before Spark predicate subquery rewrite") {
     createTestViews()
     val df = spark.sql("""
-        |select id, supp
-        |from exist_l l
-        |where exists (
-        |  select 1
-        |  from exist_r r
-        |  where r.id = l.id
-        |    and r.supp <> l.supp
-        |    and r.flag = 'Y'
-        |)
-        |order by id, supp
-        |""".stripMargin)
+                         |select id, supp
+                         |from exist_l l
+                         |where exists (
+                         |  select 1
+                         |  from exist_r r
+                         |  where r.id = l.id
+                         |    and r.supp <> l.supp
+                         |    and r.flag = 'Y'
+                         |)
+                         |order by id, supp
+                         |""".stripMargin)
     val rewrittenAnalyzedPlan = rewrite(df.queryExecution.analyzed)
     val rewrittenDf = ClassicDataset.ofRows(spark, rewrittenAnalyzedPlan)
     val optimizedPlan = rewrittenDf.queryExecution.optimizedPlan
@@ -128,7 +127,8 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
     checkAnswer(rewrittenDf, Seq(Row(1, 10), Row(1, 20)))
     assert(
       rewrittenAnalyzedPlan.treeString.contains("_existence_min_supp"),
-      s"Expected analyzed EXISTS subquery to be summarized:\n${rewrittenAnalyzedPlan.treeString}")
+      s"Expected analyzed EXISTS subquery to be summarized:\n${rewrittenAnalyzedPlan.treeString}"
+    )
     assert(
       hasOptimizedExistenceAggregate(optimizedPlan),
       s"Expected Spark predicate subquery rewrite to preserve RHS summary:\n$optimizedPlan")

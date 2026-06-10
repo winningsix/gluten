@@ -202,7 +202,21 @@ void VeloxBackend::init(
         // adapter declines to swap and producer falls back to CPU (Presto serde),
         // which the consumer's GpuExchange rejects at runtime.
         {velox::cudf_velox::CudfConfig::kUcxExchange, "true"},
-        {velox::cudf_velox::CudfConfig::kUcxIntraNodeExchange, "true"},
+        // Default to the cudf-velox-native value (false): same-process exchange
+        // goes through the event-driven UCX path (tagSend/tagRecv callbacks),
+        // NOT the IntraNodeTransferRegistry busy-poll. The poll bypass
+        // (waitForIntraNodeData → addToWorkQueue self-requeue) can livelock the
+        // single-threaded Communicator — a consumer's poll-requeue starves the
+        // producer so it never publishes (observed: root frag busy-polled 456M
+        // times until a 400s timeout). intraNodeExchange only selects the
+        // same-worker transfer path (Acceptor.cc) — it does NOT affect the
+        // PartitionedOutput→UcxPartitionedOutput swap (that is gated by
+        // kUcxExchange), so disabling it does not trigger CPU/Presto-serde
+        // fallback. Overridable to "true" to restore the legacy poll bypass.
+        {velox::cudf_velox::CudfConfig::kUcxIntraNodeExchange,
+         backendConf_->get<std::string>(
+             "spark.gluten.sql.columnar.backend.velox.cudf.intra_node_exchange",
+             "false")},
         // Tell cuDF expression evaluator to register the Spark function set
         // (might_contain, hash_with_seed, xxhash64_with_seed, ...) instead of
         // the Presto default. Without this, registerSparkFunctions() never
@@ -228,7 +242,18 @@ void VeloxBackend::init(
         {velox::cudf_velox::CudfConfig::kCudfConcatOptimizationEnabled,
          backendConf_->get(kCudfConcatOptimizationEnabled, kCudfConcatOptimizationEnabledDefault)},
         {velox::cudf_velox::CudfConfig::kCudfBatchSizeMinThreshold,
-         backendConf_->get(kCudfBatchSizeMinThreshold, kCudfBatchSizeMinThresholdDefault)}};
+         backendConf_->get(kCudfBatchSizeMinThreshold, kCudfBatchSizeMinThresholdDefault)},
+        // Forward the ucx-exchange VLOG level so CudfConfig.exchangeLogLevel is
+        // populated BEFORE the once-per-process Communicator starts here at
+        // backend init (Communicator::start reads it and calls
+        // google::SetVLOGLevel for the ucx-exchange modules). Without this the
+        // value only reaches CudfConfig per-query via ToCudf, far too late for
+        // the Communicator. Pair with glogSeverityLevel=0 so the INFO-severity
+        // VLOG lines are not filtered out of stderr.
+        {velox::cudf_velox::CudfConfig::kUcxExchangeLogLevel,
+         backendConf_->get<std::string>(
+             "spark.gluten.sql.columnar.backend.velox.cudf.exchange_log_level",
+             std::string("0"))}};
     auto& cudfConfig = velox::cudf_velox::CudfConfig::getInstance();
     cudfConfig.initialize(std::move(options));
     velox::cudf_velox::registerCudf();

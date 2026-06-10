@@ -65,6 +65,17 @@ struct MppFragmentSpec {
   std::vector<std::string> scanConnectorIds;
 };
 
+/// Describes one native MPP peer that can host producer fragment tasks.
+///
+/// `port` is the URI port used by RemoteConnectorSplit. For IBM UCX exchange
+/// this is the communicator listener port minus three.
+struct MppPeerEndpoint {
+  std::string peerId;
+  std::string host;
+  int32_t port{-1};
+  int32_t peerIndex{-1};
+};
+
 /// Describes a data exchange between two fragments.
 /// The consumer fragment has an ExchangeNode whose input comes from
 /// the producer fragment's PartitionedOutput.
@@ -95,6 +106,10 @@ struct MppExchangeSpec {
   /// partitioning keys in the producer's output schema. Used directly as
   /// Velox keyChannels for HashPartitionFunctionSpec.
   std::vector<int32_t> partitionKeyIndices;
+
+  /// Native peers that host this exchange's producer fragment. Empty means
+  /// "this process only" and preserves the current single-executor path.
+  std::vector<MppPeerEndpoint> producerEndpoints;
 };
 
 /// Coordinates execution of multiple Velox Task fragments within a single
@@ -122,8 +137,10 @@ class MppQueryCoordinator {
       std::vector<MppExchangeSpec> exchanges,
       std::shared_ptr<facebook::velox::core::QueryCtx> queryCtx,
       folly::Executor* executor,
-      std::optional<facebook::velox::common::SpillDiskOptions> spillDiskOpts =
-          std::nullopt);
+      std::optional<facebook::velox::common::SpillDiskOptions> spillDiskOpts = std::nullopt,
+      std::string localPeerId = "local",
+      int32_t peerIndex = 0,
+      int32_t peerCount = 1);
 
   /// Launch all fragments concurrently (all-stages-up scheduling).
   /// Each fragment becomes a Velox Task running in parallel mode.
@@ -155,6 +172,14 @@ class MppQueryCoordinator {
       std::chrono::milliseconds perTaskTimeout =
           std::chrono::milliseconds(10000));
 
+  /// Emit one JSON line per Velox operator in every fragment task.
+  ///
+  /// The output is intended for Spark executor logs and downstream parsing.
+  /// It is safe to call on a completed query and also useful on failures, where
+  /// it reports the partial stats Velox has accumulated so far. Idempotent:
+  /// only the first call emits rows.
+  void logOperatorMetrics() const;
+
   /// Block until all fragments have reached a terminal state.
   /// Throws if any fragment ended with an error.
   void waitForCompletion();
@@ -168,13 +193,19 @@ class MppQueryCoordinator {
       std::vector<MppExchangeSpec> exchanges,
       std::shared_ptr<facebook::velox::core::QueryCtx> queryCtx,
       folly::Executor* executor,
-      std::optional<facebook::velox::common::SpillDiskOptions> spillDiskOpts);
+      std::optional<facebook::velox::common::SpillDiskOptions> spillDiskOpts,
+      std::string localPeerId,
+      int32_t peerIndex,
+      int32_t peerCount);
 
   /// Build the task ID string for a given fragment + replica index.
   /// Every Task ID carries a replica suffix, including single-replica
   /// fragments (replicaIdx=0), so exchange wiring treats all fragments
   /// uniformly (no special case for replicated vs non-replicated).
   std::string makeTaskId(int32_t fragmentId, int32_t replicaIdx) const;
+
+  /// Build a producer task ID for a task hosted by a specific peer.
+  std::string makeTaskIdForPeer(const std::string& peerId, int32_t fragmentId, int32_t replicaIdx) const;
 
   /// Check if a task state is terminal.
   static bool isTerminalState(facebook::velox::exec::TaskState state);
@@ -205,6 +236,9 @@ class MppQueryCoordinator {
   std::shared_ptr<facebook::velox::core::QueryCtx> queryCtx_;
   folly::Executor* executor_;
   std::optional<facebook::velox::common::SpillDiskOptions> spillDiskOpts_;
+  std::string localPeerId_;
+  int32_t peerIndex_{0};
+  int32_t peerCount_{1};
 
   /// Id of the fragment whose output is the final query result (the one
   /// that is never a producer in any exchange). Computed in the
@@ -224,6 +258,7 @@ class MppQueryCoordinator {
 
   bool started_{false};
   bool noMoreData_{false};
+  mutable std::atomic<bool> operatorMetricsLogged_{false};
 
   /// Guards the abort path so concurrent abort() callers (e.g. JNI explicit
   /// close racing with destructor) don't double-issue requestAbort or stomp
@@ -242,6 +277,7 @@ class MppQueryCoordinator {
   std::vector<std::unique_ptr<facebook::velox::exec::SerializedPageBase>>
       pendingRootPages_;
   int32_t rootFetchCursor_{0};
+  bool rootProducesOutput_{true};
   /// True for RANGE (order-preserving) drain; false for round-robin.
   bool rootDrainSequential_{false};
 

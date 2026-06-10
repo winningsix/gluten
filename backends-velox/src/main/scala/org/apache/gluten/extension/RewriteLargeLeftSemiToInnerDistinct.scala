@@ -26,20 +26,20 @@ import org.apache.spark.sql.catalyst.trees.TreePattern.JOIN
 import org.apache.spark.sql.internal.SQLConf
 
 /**
- * Rewrite `LeftSemiJoin(left, right, equi-condition)` into
- * `InnerJoin(left, Aggregate(rightKeys -> rightKeys, right), equi-condition)` when the right side
- * is estimated to be too large for BHJ. Mirrors what Presto's optimizer auto-produces for `EXISTS`
- * subqueries (TPC-H Q4 plan reference at SF1000: 28 GB lineitem build becomes 1.5 GB
- * distinct-orderkey build -> BHJ-eligible / smaller SHJ hash table).
+ * Rewrite `LeftSemiJoin(left, right, equi-condition)` into `InnerJoin(left, Aggregate(rightKeys ->
+ * rightKeys, right), equi-condition)` when the right side is estimated to be too large for BHJ.
+ * Mirrors what Presto's optimizer auto-produces for `EXISTS` subqueries (TPC-H Q4 plan reference at
+ * SF1000: 28 GB lineitem build becomes 1.5 GB distinct-orderkey build -> BHJ-eligible / smaller SHJ
+ * hash table).
  *
  * Why this helps cuDF-velox specifically: Spark Catalyst pins LeftSemi to BuildRight as a
  * semantic-driven choice ("right is the existence set"), independent of cost. When the right side
  * is huge (e.g. lineitem after only a date-window filter), cudf::hash_join must materialize the
- * full build table as a single GPU allocation; this trips ~30+ GB allocations on SF1000 Q4 and
- * Q21. Adding `DISTINCT(rightKeys)` to the right input collapses it to one row per join-key
- * value, after which the build either fits in `autoBroadcastJoinThreshold` (Catalyst picks BHJ
- * with the now-small distinct side as build) or yields an InnerJoin where the optimizer can
- * freely flip BuildSide based on stats.
+ * full build table as a single GPU allocation; this trips ~30+ GB allocations on SF1000 Q4 and Q21.
+ * Adding `DISTINCT(rightKeys)` to the right input collapses it to one row per join-key value, after
+ * which the build either fits in `autoBroadcastJoinThreshold` (Catalyst picks BHJ with the
+ * now-small distinct side as build) or yields an InnerJoin where the optimizer can freely flip
+ * BuildSide based on stats.
  *
  * Conservative match - only triggers when ALL hold:
  *   - LeftSemiJoin with a single equi-join condition tree (AND of `attr = attr` pairs)
@@ -47,19 +47,19 @@ import org.apache.spark.sql.internal.SQLConf
  *     correlated non-key predicates such as `l_suppkey <> l1.l_suppkey`)
  *   - No user-supplied JoinHint on the Join
  *   - `right.stats.sizeInBytes` exceeds `autoBroadcastJoinThreshold * rewriteThresholdMultiplier`
- *     (default 2x). For unanalyzed parquet temp views Spark reports the raw file-size sum, which
- *     is a usable proxy.
+ *     (default 2x). For unanalyzed parquet temp views Spark reports the raw file-size sum, which is
+ *     a usable proxy.
  *
- * Gated by `spark.gluten.mpp.rewriteLargeLeftSemiToInnerDistinct` (default false). Multiplier
- * tunable via `spark.gluten.mpp.leftSemiDistinctThresholdMultiplier`. Q21-style
- * mixed-semi-join (non-equi conjunct) is intentionally NOT covered by this minimal rule.
+ * Gated by `spark.gluten.mpp.rewriteLargeLeftSemiToInnerDistinct` (default true). Multiplier
+ * tunable via `spark.gluten.mpp.leftSemiDistinctThresholdMultiplier`. Q21-style mixed-semi-join
+ * (non-equi conjunct) is intentionally NOT covered by this minimal rule.
  */
 case class RewriteLargeLeftSemiToInnerDistinct(spark: SparkSession)
   extends Rule[LogicalPlan]
   with Logging {
 
   private val confKey = "spark.gluten.mpp.rewriteLargeLeftSemiToInnerDistinct"
-  private val confDefault = "false"
+  private val confDefault = "true"
   private val multiplierKey = "spark.gluten.mpp.leftSemiDistinctThresholdMultiplier"
   private val multiplierDefault = "2"
 
@@ -140,10 +140,9 @@ case class RewriteLargeLeftSemiToInnerDistinct(spark: SparkSession)
 
   /**
    * Split `cond` into top-level conjuncts and verify every conjunct is `EqualTo(leftAttr,
-   * rightAttr)` (or the symmetric form) where one side references only `leftOut` and the other
-   * only `rightOut`. Returns Some((leftKeys, rightKeys)) on match, None otherwise (e.g. when a
-   * conjunct mixes both sides like a `<>` correlation, or wraps an expression around the
-   * attribute).
+   * rightAttr)` (or the symmetric form) where one side references only `leftOut` and the other only
+   * `rightOut`. Returns Some((leftKeys, rightKeys)) on match, None otherwise (e.g. when a conjunct
+   * mixes both sides like a `<>` correlation, or wraps an expression around the attribute).
    */
   private def extractEquiKeys(
       cond: Expression,

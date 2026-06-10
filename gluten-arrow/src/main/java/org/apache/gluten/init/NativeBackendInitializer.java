@@ -82,5 +82,11 @@ public final class NativeBackendInitializer {
 
   private native void initialize(ReservationListener rl, byte[] configPlan);
 
+  public String getUcxListenerEndpoint(String advertisedHost) {
+    return getUcxListenerEndpoint0(advertisedHost);
+  }
+
+  private native String getUcxListenerEndpoint0(String advertisedHost);
+
   private native void shutdown();
 }

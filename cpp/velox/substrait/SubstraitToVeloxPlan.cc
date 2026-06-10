@@ -69,6 +69,24 @@ core::SortOrder toSortOrder(const ::substrait::SortField& sortField) {
   }
 }
 
+std::vector<TypePtr> toVeloxAggregateRawInputTypes(
+    const std::string& baseFuncName,
+    const core::AggregationNode::Step funcStep,
+    const std::vector<TypePtr>& functionSignatureTypes) {
+  if ((funcStep == core::AggregationNode::Step::kFinal ||
+       funcStep == core::AggregationNode::Step::kIntermediate) &&
+      baseFuncName == "avg" && functionSignatureTypes.size() == 1 &&
+      functionSignatureTypes[0]->isRow()) {
+    const auto& stateType = functionSignatureTypes[0]->asRow();
+    if (stateType.size() == 2 && stateType.childAt(0)->isDouble() &&
+        stateType.childAt(1)->isBigint()) {
+      return {DOUBLE()};
+    }
+  }
+
+  return functionSignatureTypes;
+}
+
 /// Holds the information required to create
 /// a project node to simulate the emit
 /// behavior in Substrait.
@@ -234,12 +252,25 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::processEmit(
 }
 
 core::AggregationNode::Step SubstraitToVeloxPlanConverter::toAggregationStep(const ::substrait::AggregateRel& aggRel) {
-  // TODO Simplify Velox's aggregation steps
   if (aggRel.has_advanced_extension() &&
       SubstraitParser::configSetInOptimization(aggRel.advanced_extension(), "allowFlush=")) {
     return core::AggregationNode::Step::kPartial;
   }
-  return core::AggregationNode::Step::kSingle;
+
+  if (aggRel.measures().empty()) {
+    return core::AggregationNode::Step::kSingle;
+  }
+
+  const auto step = toAggregationFunctionStep(aggRel.measures(0).measure());
+  for (int32_t i = 1; i < aggRel.measures().size(); ++i) {
+    if (toAggregationFunctionStep(aggRel.measures(i).measure()) != step) {
+      // Velox AggregationNode has one node-level step. Spark can encode step
+      // per aggregate function, so mixed-phase nodes still rely on companion
+      // function names to preserve per-measure semantics.
+      return core::AggregationNode::Step::kSingle;
+    }
+  }
+  return step;
 }
 
 /// Get aggregation function step for AggregateFunction.
@@ -496,11 +527,14 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
 
     auto aggVeloxType = SubstraitParser::parseType(aggFunction.output_type());
     auto baseFuncName = SubstraitParser::findVeloxFunction(functionMap_, aggFunction.function_reference());
-    auto funcName = toAggregationFunctionName(baseFuncName, toAggregationFunctionStep(aggFunction), aggVeloxType);
+    const auto funcStep = toAggregationFunctionStep(aggFunction);
+    auto funcName = toAggregationFunctionName(baseFuncName, funcStep, aggVeloxType);
 
     auto aggExpr = std::make_shared<const core::CallTypedExpr>(aggVeloxType, std::move(aggParams), funcName);
-    std::vector<TypePtr> rawInputTypes =
+    auto functionSignatureTypes =
         SubstraitParser::sigToTypes(SubstraitParser::findFunctionSpec(functionMap_, aggFunction.function_reference()));
+    std::vector<TypePtr> rawInputTypes =
+        toVeloxAggregateRawInputTypes(baseFuncName, funcStep, functionSignatureTypes);
     aggregates.emplace_back(core::AggregationNode::Aggregate{aggExpr, rawInputTypes, mask, {}, {}});
   }
 

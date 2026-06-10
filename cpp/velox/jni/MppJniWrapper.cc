@@ -60,6 +60,7 @@
 #include "operators/plannodes/RowVectorStream.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include "operators/plannodes/CudfVectorStream.h"
+#include "velox/experimental/ucx-exchange/Communicator.h"
 #endif
 
 using namespace gluten;
@@ -824,6 +825,16 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
         .build();
   }
 
+  // TableWriteNode (write-in-MPP): the final fragment's parquet write. Rebuild with the
+  // rewritten source so the write executes inside the pinned MPP native task -- each peer
+  // writes its own slice. Unary node: one source = the data to write.
+  if (auto tableWriteNode =
+          std::dynamic_pointer_cast<const velox::core::TableWriteNode>(node)) {
+    return velox::core::TableWriteNode::Builder(*tableWriteNode)
+        .source(newSources[0])
+        .build();
+  }
+
   VELOX_FAIL(
       "MppJniWrapper: unsupported plan node type '{}' (id='{}') encountered "
       "during ValueStream replacement. Add explicit Builder support for this "
@@ -1073,6 +1084,69 @@ velox::core::PlanNodePtr wrapWithMppPartitionedOutput(
       velox::core::PartitionedOutputNode::TransportType::kUcx);
 }
 
+struct MppPeerSpec {
+  std::string queryId;
+  std::string localPeerId{"local"};
+  int32_t peerIndex{0};
+  int32_t peerCount{1};
+  std::vector<MppPeerEndpoint> producerEndpoints;
+};
+
+std::vector<MppPeerEndpoint> parsePeerEndpointArray(
+    const folly::dynamic& endpoints) {
+  VELOX_CHECK(endpoints.isArray(), "MPP peer endpoints must be a JSON array");
+  std::vector<MppPeerEndpoint> parsed;
+  parsed.reserve(endpoints.size());
+  int32_t fallbackPeerIndex = 0;
+  for (const auto& item : endpoints) {
+    VELOX_CHECK(item.isObject(), "MPP peer endpoint must be an object");
+    VELOX_CHECK(
+        item.count("peerId") > 0,
+        "MPP peer endpoint is missing required peerId");
+    VELOX_CHECK(
+        item.count("host") > 0,
+        "MPP peer endpoint is missing required host");
+    MppPeerEndpoint endpoint;
+    endpoint.peerId = item["peerId"].asString();
+    endpoint.host = item["host"].asString();
+    endpoint.port = item.count("port") > 0
+        ? static_cast<int32_t>(item["port"].asInt())
+        : -1;
+    endpoint.peerIndex = item.count("peerIndex") > 0
+        ? static_cast<int32_t>(item["peerIndex"].asInt())
+        : fallbackPeerIndex;
+    parsed.push_back(std::move(endpoint));
+    ++fallbackPeerIndex;
+  }
+  return parsed;
+}
+
+MppPeerSpec parseMppPeerSpec(const uint8_t* data, int32_t size) {
+  MppPeerSpec spec;
+  if (data == nullptr || size <= 0) {
+    return spec;
+  }
+  std::string jsonStr(reinterpret_cast<const char*>(data), size);
+  auto parsed = folly::parseJson(jsonStr);
+  VELOX_CHECK(parsed.isObject(), "mppPeerSpecJson must be a JSON object");
+  if (parsed.count("queryId") > 0) {
+    spec.queryId = parsed["queryId"].asString();
+  }
+  if (parsed.count("localPeerId") > 0) {
+    spec.localPeerId = parsed["localPeerId"].asString();
+  }
+  if (parsed.count("peerIndex") > 0) {
+    spec.peerIndex = static_cast<int32_t>(parsed["peerIndex"].asInt());
+  }
+  if (parsed.count("peerCount") > 0) {
+    spec.peerCount = static_cast<int32_t>(parsed["peerCount"].asInt());
+  }
+  if (parsed.count("peers") > 0) {
+    spec.producerEndpoints = parsePeerEndpointArray(parsed["peers"]);
+  }
+  return spec;
+}
+
 /// Parse the exchange specifications from a JSON byte array.
 ///
 /// Expected format:
@@ -1111,6 +1185,10 @@ std::vector<MppExchangeSpec> parseExchangeSpecs(
             static_cast<int32_t>(key.asInt()));
       }
     }
+    if (item.count("producerEndpoints") &&
+        item["producerEndpoints"].isArray()) {
+      spec.producerEndpoints = parsePeerEndpointArray(item["producerEndpoints"]);
+    }
     specs.push_back(std::move(spec));
   }
   return specs;
@@ -1133,6 +1211,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     jobjectArray substraitPlansArr,
     jintArray numDriversArr,
     jbyteArray exchangeSpecsJsonArr,
+    jbyteArray mppPeerSpecJsonArr,
     jobjectArray splitInfosPerFragArr,
     jobjectArray broadcastSlotIndicesPerFragArr,
     jobjectArray broadcastIteratorsPerFragArr) {
@@ -1158,6 +1237,21 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   auto exchangeSpecs = parseExchangeSpecs(
       reinterpret_cast<const uint8_t*>(safeExchangeJson.elems()),
       env->GetArrayLength(exchangeSpecsJsonArr));
+  MppPeerSpec peerSpec;
+  if (mppPeerSpecJsonArr != nullptr &&
+      env->GetArrayLength(mppPeerSpecJsonArr) > 0) {
+    auto safePeerSpecJson = getByteArrayElementsSafe(env, mppPeerSpecJsonArr);
+    peerSpec = parseMppPeerSpec(
+        reinterpret_cast<const uint8_t*>(safePeerSpecJson.elems()),
+        env->GetArrayLength(mppPeerSpecJsonArr));
+  }
+  if (!peerSpec.producerEndpoints.empty()) {
+    for (auto& exchange : exchangeSpecs) {
+      if (exchange.producerEndpoints.empty()) {
+        exchange.producerEndpoints = peerSpec.producerEndpoints;
+      }
+    }
+  }
   const auto numExchanges = exchangeSpecs.size();
 
   // Validate fused-broadcast arrays. They are parallel int[][] / Object[][] of
@@ -1194,13 +1288,15 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   // so the producer's entry is always populated before the consumer reads it.
   std::unordered_map<int, velox::RowTypePtr> producerWireTypes;
 
-  // Single-task mode: collapse all fragments into one Velox Task, replacing
-  // every UcxExchange boundary with a LocalPartitionNode (intra-task pipeline
-  // boundary). Activates only when every exchange is SINGLE/BROADCAST
-  // (numPartitions == 1) — HASH/RANGE fall back to the multi-task path.
+  // Local/single-task mode: collapse all fragments into one Velox Task,
+  // replacing every UcxExchange boundary with a LocalPartitionNode or direct
+  // broadcast inline. This is the default path for local MPP execution: the
+  // exchange semantics stay intact, but data stays inside the Velox task
+  // instead of going through UCX split wiring.
+  //
   // When active, "merged producer" fragments don't get a PartitionedOutput
   // wrapper and don't appear in fragmentSpecs; their plan tree is inlined
-  // into the consumer fragment via LocalPartitionNode::gather.
+  // into the consumer fragment via LocalPartitionNode.
   // Read from the merged session+backend conf to honor per-query overrides.
   auto preLoopBackendConf = VeloxBackend::get()->getBackendConf();
   auto preLoopMergedMap = preLoopBackendConf->rawConfigsCopy();
@@ -1248,6 +1344,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       mergedProducerScanInfos;
   std::unordered_map<int, std::vector<velox::core::PlanNodeId>>
       mergedProducerScanNodeIds;
+  int32_t singleTaskThreadPoolDriverBudget = 0;
   if (singleTaskMode) {
     for (const auto& exch : exchangeSpecs) {
       mergedProducerIds.insert(exch.producerFragmentId);
@@ -1408,8 +1505,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
         veloxPool.get(),
         sessionCfg.get(),
         placeholderIters,
-        /*writeFilesTempPath=*/std::nullopt,
-        /*writeFileName=*/std::nullopt,
+        /*writeFilesTempPath=*/*Runtime::localWriteFilesTempPath(),
+        /*writeFileName=*/*Runtime::localWriteFileName(),
         /*validationMode=*/false);
     // In single-task mode, fragments will be spliced into a single Velox plan
     // tree, so plan node ids must be globally unique across fragments. Advance
@@ -1909,6 +2006,16 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
                      << " (singleTaskMaxDrivers)";
         mergedNumDrivers = driverCap;
       }
+
+      // LocalPartitionNode creates additional Velox pipelines inside the
+      // surviving merged task. The JNI-level fragmentSpecs list only sees that
+      // surviving task, so size the executor for the folded producer pipelines
+      // as well as the root pipeline.
+      const int32_t mergedPipelineCount =
+          static_cast<int32_t>(mergedProducerIds.size()) + 1;
+      singleTaskThreadPoolDriverBudget = std::max(
+          singleTaskThreadPoolDriverBudget,
+          mergedPipelineCount * std::max(1, mergedNumDrivers));
     }
     fragSpec.numDrivers = mergedNumDrivers;
     fragSpec.scanInfos = std::move(fragScanInfos);
@@ -1968,9 +2075,13 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   // producer-wait headroom. No hard ceiling — Velox drivers yield on
   // GPU/exchange waits, so oversubscribing a few hundred threads is fine
   // and cheaper than starving.
-  int32_t poolSize = std::max(4, totalPhysicalDrivers * 2);
+  const int32_t effectivePhysicalDrivers =
+      std::max(totalPhysicalDrivers, singleTaskThreadPoolDriverBudget);
+  int32_t poolSize = std::max(4, effectivePhysicalDrivers * 2);
   LOG(WARNING) << "MppJniWrapper: threadPool size=" << poolSize
                << " physicalDrivers=" << totalPhysicalDrivers
+               << " effectivePhysicalDrivers=" << effectivePhysicalDrivers
+               << " singleTaskBudget=" << singleTaskThreadPoolDriverBudget
                << " fragments=" << fragmentSpecs.size();
   auto executor =
       std::make_shared<folly::CPUThreadPoolExecutor>(poolSize);
@@ -2027,8 +2138,11 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   // and hangs the second one. Use a monotonically increasing counter
   // instead.
   static std::atomic<uint64_t> gMppQueryCounter{0};
-  auto queryId =
-      fmt::format("mpp-{}", gMppQueryCounter.fetch_add(1, std::memory_order_relaxed));
+  auto queryId = peerSpec.queryId.empty()
+      ? fmt::format(
+            "mpp-{}",
+            gMppQueryCounter.fetch_add(1, std::memory_order_relaxed))
+      : peerSpec.queryId;
 
   std::optional<velox::common::SpillDiskOptions> spillDiskOpts;
   const auto spillStrategy =
@@ -2066,7 +2180,10 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       std::move(exchangeSpecs),
       queryCtx,
       executor.get(),
-      std::move(spillDiskOpts));
+      std::move(spillDiskOpts),
+      peerSpec.localPeerId,
+      peerSpec.peerIndex,
+      peerSpec.peerCount);
 
   // Bundle into a handle.
   auto handle = std::make_shared<MppQueryHandle>();
@@ -2238,8 +2355,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeExplainMppQuery( // N
         veloxPool.get(),
         sessionCfg.get(),
         placeholderIters,
-        /*writeFilesTempPath=*/std::nullopt,
-        /*writeFileName=*/std::nullopt,
+        /*writeFilesTempPath=*/*Runtime::localWriteFilesTempPath(),
+        /*writeFileName=*/*Runtime::localWriteFileName(),
         /*validationMode=*/false);
 
     std::vector<::substrait::ReadRel_LocalFiles> localFiles;
@@ -2429,6 +2546,15 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCloseMppQuery( // NOL
   // nativeAbortMppQuery just see the aborted_ short-circuit.
   auto mppHandle = ObjectStore::retrieve<MppQueryHandle>(handle);
   if (mppHandle != nullptr && mppHandle->coordinator != nullptr) {
+    try {
+      mppHandle->coordinator->logOperatorMetrics();
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "MppJniWrapper: nativeCloseMppQuery handle=" << handle
+                 << " coordinator->logOperatorMetrics() threw: " << e.what();
+    } catch (...) {
+      LOG(ERROR) << "MppJniWrapper: nativeCloseMppQuery handle=" << handle
+                 << " coordinator->logOperatorMetrics() threw unknown exception";
+    }
     try {
       mppHandle->coordinator->abort();
     } catch (const std::exception& e) {

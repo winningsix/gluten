@@ -129,7 +129,11 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // would interfere with subqueries and cause "cannot transform shuffle node".
     val strategyEnabled =
       SQLConf.get.getConfString("spark.gluten.mpp.strategy.enabled", "false").toBoolean
-    if (strategyEnabled) {
+    if (strategyEnabled && !plan.isInstanceOf[DataWritingCommandExec]) {
+      // Plan C (MppStrategy) handles non-write queries at the strategy level. But it
+      // SKIPS write commands (InsertIntoHadoopFsRelationCommand / Command), so for a
+      // write we let Plan D collapse the write's child into MPP (DataWritingCommandExec
+      // case below) instead of letting the whole write subtree fall back to BSP.
       return plan
     }
     // Plan C check: if MppStrategy already claimed this plan
@@ -147,14 +151,32 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     val preRewritten = RewriteUncorrelatedScalarSubquery(plan)
     preRewritten match {
       case dwce: DataWritingCommandExec =>
-        // Collapse the query subtree; keep DWCE at the root so Spark still drives
-        // the file-write path. MppNativeQueryExec produces the result the writer consumes.
-        tryCollapseMpp(dwce.child)
-          .map(mppChild => dwce.withNewChildren(Seq(mppChild)))
-          .getOrElse {
-            logWarning("MppCollapseRule: FALLBACK TO BSP (inside DataWritingCommandExec)")
-            plan
-          }
+        // Collapse the whole WriteFilesExecTransformer subtree (write + query) INTO MPP: the
+        // write becomes the final fragment root, and each pinned peer's native task runs the
+        // velox TableWrite for its slice. WriteFilesExecTransformer is a TransformSupport, so
+        // isFullyNativeSupported accepts it; generateSubstraitForFragment -> doWholeStageTransform
+        // emits the WriteRel automatically. Keeping the write inside the pinned MPP task avoids the
+        // VeloxColumnarWriteFilesRDD-on-top scheduling break (write task on the wrong executor ->
+        // UCX peer mismatch -> crash).
+        var collapsedWrite = false
+        val rewrittenWrite = dwce.transformDown {
+          // Guard with !collapsedWrite: tryCollapseMpp(wft) returns MppNativeQueryExec(wft), and
+          // transformDown recurses into that result -- which still contains wft -- so without the
+          // guard it re-matches and re-wraps forever (StackOverflow). Collapse only the first.
+          case wft: WriteFilesExecTransformer if !collapsedWrite =>
+            tryCollapseMpp(wft) match {
+              case Some(mppWrite) =>
+                collapsedWrite = true
+                mppWrite
+              case None => wft
+            }
+        }
+        if (collapsedWrite) {
+          rewrittenWrite
+        } else {
+          logWarning("MppCollapseRule: FALLBACK TO BSP (inside DataWritingCommandExec)")
+          plan
+        }
       case _ =>
         tryCollapseMpp(preRewritten).getOrElse {
           logWarning("MppCollapseRule: FALLBACK TO BSP")

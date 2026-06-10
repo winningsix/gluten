@@ -17,7 +17,7 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.backendsapi.BackendsApiManager
-import org.apache.gluten.execution.{ColumnarToColumnarExec, ColumnarToRowExecBase, FilterExecTransformer, FilterExecTransformerBase, MppNativeQueryExec, ProjectExecTransformer, TransformSupport}
+import org.apache.gluten.execution.{ColumnarToColumnarExec, ColumnarToRowExecBase, FilterExecTransformer, FilterExecTransformerBase, MppNativeQueryExec, MppPreparedChildExec, ProjectExecTransformer, TransformSupport}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression, NamedExpression}
@@ -25,6 +25,8 @@ import org.apache.spark.sql.catalyst.optimizer.BuildRight
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.physical.IdentityBroadcastMode
 import org.apache.spark.sql.execution._
+
+import java.util.Locale
 
 /**
  * Presto-style rewrite of uncorrelated [[ScalarSubquery]] references into an inner
@@ -197,7 +199,16 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
       // wrapping the real native plan -- the driver-side eval() path needs rows. For the
       // broadcast side we want the underlying TransformSupport, so peel row/columnar shims.
       val innerPlan = peelColumnarWrappers(innerExec.child)
-      if (!innerPlan.isInstanceOf[TransformSupport]) {
+      if (isRuntimeBloomFilterSubquery(innerExec.child)) {
+        // Runtime-DPP bloom filters are already driven by materializeScalarSubqueries.
+        // Keeping them materialized avoids embedding a SINGLE->BROADCAST bloom producer
+        // chain inside the main multi-peer MPP graph, which can leave Q21 waiting on
+        // cross-peer broadcast/SINGLE completion. Ordinary scalar subqueries still use
+        // the exchange-based rewrite.
+        logDebug(
+          "RewriteUncorrelatedScalarSubquery: leaving runtime bloom-filter scalar " +
+            "subquery for materializeScalarSubqueries")
+      } else if (!innerPlan.isInstanceOf[TransformSupport]) {
         logWarning(
           "RewriteUncorrelatedScalarSubquery: leaving ScalarSubquery unrewritten because " +
             s"its inner plan root is not TransformSupport: ${innerPlan.getClass.getSimpleName}")
@@ -209,7 +220,8 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
           case ar: AttributeReference => ar
           case other => other.toAttribute.asInstanceOf[AttributeReference]
         }
-        val broadcast = cache.getOrBuild(innerPlan)
+        val broadcast =
+          ColumnarCollapseTransformStages.wrapInputIteratorTransformer(cache.getOrBuild(innerPlan))
         val bnlj = BackendsApiManager.getSparkPlanExecApiInstance
           .genBroadcastNestedLoopJoinExecTransformer(
             left = current,
@@ -276,6 +288,7 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
     // outer plan's rewrite runs. Peel it so we reach the underlying TransformSupport tree that
     // we can wrap in a ColumnarBroadcastExchangeExec on the broadcast side.
     case mpp: MppNativeQueryExec => peelColumnarWrappers(mpp.child)
+    case prepared: MppPreparedChildExec => peelColumnarWrappers(prepared.hiddenPlan)
     case other => other
   }
 
@@ -284,6 +297,26 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
     // expressions (decorrelation would have pulled them out) or as a LateralSubquery marker.
     // We also treat anything Spark labels a PlanExpression with non-empty children as correlated.
     sq.children.isEmpty
+  }
+
+  private def isRuntimeBloomFilterSubquery(plan: SparkPlan): Boolean = {
+    var found = false
+    plan.foreach {
+      node =>
+        if (node.output.exists(_.name.toLowerCase(Locale.ROOT).contains("bloomfilter"))) {
+          found = true
+        }
+        if (
+          node.expressions.exists {
+            expr =>
+              val text = expr.toString.toLowerCase(Locale.ROOT)
+              text.contains("bloom_filter_agg") || text.contains("velox_bloom_filter_agg")
+          }
+        ) {
+          found = true
+        }
+    }
+    found
   }
 
   /** Peel [[ReusedSubqueryExec]] layers to find the underlying [[BaseSubqueryExec]]. */

@@ -233,8 +233,9 @@ class SubstraitToVeloxPlanConverter {
       std::vector<const ::substrait::Expression::FieldReference*>& rightExprs);
 
   /// Get aggregation step from AggregateRel.
-  /// If returned Partial, it means the aggregate generated can leveraging flushing and abandoning like
-  /// what streaming pre-aggregation can do in MPP databases.
+  /// Substrait carries the phase per measure; when all measures agree, use
+  /// that phase as Velox's node-level aggregation step. Mixed-phase nodes
+  /// fall back to kSingle and rely on companion function names.
   core::AggregationNode::Step toAggregationStep(const ::substrait::AggregateRel& sAgg);
 
   /// Get aggregation function step for AggregateFunction.

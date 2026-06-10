@@ -35,6 +35,12 @@ BUILD_ARROW="ON"
 ENABLE_HDFS="OFF"
 ENABLE_S3="OFF"
 REBUILD=false   # if true: skip Arrow, clear cmake cache, re-run velox+cpp+mvn only
+JAVA_HOME_IN_CONTAINER="/usr/lib/jvm/java-1.8.0-openjdk"
+GLUTEN_ONLY=false  # if true: reuse existing Velox/cuDF build; rebuild only Gluten C++ + Maven
+JOBS="${JOBS:-16}"
+MAVEN_THREADS="${MAVEN_THREADS:-8}"
+MAVEN_PROFILES="${MAVEN_PROFILES:-backends-velox,spark-${SPARK_VERSION},celeborn,delta,hudi}"
+MAVEN_PROFILES_EXPLICIT=false
 
 # Velox source — only used if VELOX_DIR does not exist (fallback clone).
 VELOX_REPO="https://gitlab-master.nvidia.com/alfxu/velox.git"
@@ -56,6 +62,14 @@ Options:
                             Supported: 3.3, 3.4, 3.5, 4.0, 4.1, ALL
   --rebuild                 Incremental rebuild: skip Arrow, clear velox cmake cache,
                             re-run only velox + gluten C++ + Maven
+  --gluten_only             Fast rebuild: reuse existing Velox/cuDF build and rebuild only
+                            Gluten C++/JNI plus Maven jars
+  --jobs=N                  Native build threads for --gluten_only (default: ${JOBS})
+  --maven_threads=N         Maven build threads for --gluten_only (default: ${MAVEN_THREADS})
+  --maven_profiles=P        Maven profiles for --gluten_only
+                            (default: ${MAVEN_PROFILES})
+  --java_home=PATH          JAVA_HOME inside the build container
+                            (default: ${JAVA_HOME_IN_CONTAINER})
   --container=NAME          Docker container name (default: gluten_cudf_build)
   --image=IMAGE             Docker image to use (overrides --system image selection)
                             centos9 default:    apache/gluten:centos-9-jdk8-cudf
@@ -78,6 +92,15 @@ for arg in "$@"; do
     --system=*)        SYSTEM="${arg#*=}" ;;
     --spark_version=*) SPARK_VERSION="${arg#*=}" ;;
     --rebuild)         REBUILD=true ;;
+    --gluten_only|--gluten-only)
+                       GLUTEN_ONLY=true; BUILD_ARROW="OFF" ;;
+    --jobs=*)          JOBS="${arg#*=}" ;;
+    --maven_threads=*|--maven-threads=*)
+                       MAVEN_THREADS="${arg#*=}" ;;
+    --maven_profiles=*|--maven-profiles=*)
+                       MAVEN_PROFILES="${arg#*=}"; MAVEN_PROFILES_EXPLICIT=true ;;
+    --java_home=*|--java-home=*)
+                       JAVA_HOME_IN_CONTAINER="${arg#*=}" ;;
     --container=*)     CONTAINER_NAME="${arg#*=}" ;;
     --image=*)         DOCKER_IMAGE="${arg#*=}"; IMAGE_EXPLICIT=true ;;
     --velox_repo=*)    VELOX_REPO="${arg#*=}" ;;
@@ -104,6 +127,15 @@ fi
 
 if [ "$REBUILD" = true ]; then
   BUILD_ARROW="OFF"
+fi
+
+if [ "$MAVEN_PROFILES_EXPLICIT" = false ]; then
+  MAVEN_PROFILES="backends-velox,spark-${SPARK_VERSION},celeborn,delta,hudi"
+fi
+
+if [ "$GLUTEN_ONLY" = true ] && [ "$CUDA_ARCH_EXPLICIT" = false ]; then
+  CUDA_ARCH="existing-cmake"
+  CUDA_ARCH_EXPLICIT=true
 fi
 
 # ── CUDA arch prompt (skipped if --cuda_arch was passed) ─────────────────────
@@ -157,6 +189,39 @@ if [ ! -d "$VELOX_DIR" ]; then
   exit 1
 fi
 
+canonical_dir() {
+  (cd "$1" && pwd -P)
+}
+
+validate_container_mounts() {
+  local expected_gluten expected_velox actual_gluten actual_velox
+  expected_gluten="$(canonical_dir "${GLUTEN_DIR}")"
+  expected_velox="$(canonical_dir "${VELOX_DIR}")"
+  actual_gluten="$(docker inspect \
+    --format='{{range .Mounts}}{{if eq .Destination "/opt/gluten"}}{{.Source}}{{end}}{{end}}' \
+    "${CONTAINER_NAME}")"
+  actual_velox="$(docker inspect \
+    --format='{{range .Mounts}}{{if eq .Destination "/opt/velox"}}{{.Source}}{{end}}{{end}}' \
+    "${CONTAINER_NAME}")"
+
+  if [ -z "${actual_gluten}" ] || [ -z "${actual_velox}" ]; then
+    echo "ERROR: container '${CONTAINER_NAME}' must mount /opt/gluten and /opt/velox." >&2
+    exit 2
+  fi
+
+  actual_gluten="$(canonical_dir "${actual_gluten}")"
+  actual_velox="$(canonical_dir "${actual_velox}")"
+  if [ "${actual_gluten}" != "${expected_gluten}" ] || [ "${actual_velox}" != "${expected_velox}" ]; then
+    echo "ERROR: container '${CONTAINER_NAME}' is mounted to a different source tree." >&2
+    echo "  /opt/gluten: ${actual_gluten}" >&2
+    echo "  expected   : ${expected_gluten}" >&2
+    echo "  /opt/velox : ${actual_velox}" >&2
+    echo "  expected   : ${expected_velox}" >&2
+    echo "Use --container with the correct build container, or recreate the stale container." >&2
+    exit 2
+  fi
+}
+
 # ── Banner ───────────────────────────────────────────────────────────────────
 echo "=============================================="
 echo " Gluten cuDF Build"
@@ -172,6 +237,9 @@ echo " Spark version : $SPARK_VERSION"
 echo " Build Arrow   : $BUILD_ARROW"
 echo " Enable HDFS   : $ENABLE_HDFS"
 echo " Rebuild mode  : $REBUILD"
+echo " Gluten only   : $GLUTEN_ONLY"
+echo " Native jobs   : $JOBS"
+echo " Maven threads : $MAVEN_THREADS"
 echo "=============================================="
 echo ""
 
@@ -195,21 +263,44 @@ else
   echo "      Container started."
 fi
 
+validate_container_mounts
+
+# Some CUDA 13 images install UCX under /usr/local/lib while Gluten's CMake
+# link rules may still resolve UCX imported targets through /usr/lib64.
+docker exec "$CONTAINER_NAME" bash -c "
+  set -euo pipefail
+  for lib in ucm ucp ucs uct; do
+    if [ -e /usr/local/lib/lib\${lib}.so ] && [ ! -e /usr/lib64/lib\${lib}.so ]; then
+      ln -s /usr/local/lib/lib\${lib}.so /usr/lib64/lib\${lib}.so
+    fi
+  done
+"
+
 # ── Step 2: Verify GPU ────────────────────────────────────────────────────────
 echo ""
-echo "[2/5] Verifying GPU access..."
-if ! docker exec "$CONTAINER_NAME" nvidia-smi --query-gpu=name,driver_version,memory.total \
-    --format=csv,noheader 2>/dev/null; then
-  echo "ERROR: nvidia-smi failed. Check that --gpus all is working and nvidia-container-toolkit is configured."
-  exit 1
+if [ "$GLUTEN_ONLY" = true ]; then
+  echo "[2/5] Gluten-only mode — skipping GPU probe."
+else
+  echo "[2/5] Verifying GPU access..."
+  if ! docker exec "$CONTAINER_NAME" nvidia-smi --query-gpu=name,driver_version,memory.total \
+      --format=csv,noheader 2>/dev/null; then
+    echo "ERROR: nvidia-smi failed. Check that --gpus all is working and nvidia-container-toolkit is configured."
+    exit 1
+  fi
 fi
 
 # ── Step 3: Clear cmake cache on rebuild ──────────────────────────────────────
-if [ "$REBUILD" = true ]; then
+if [ "$GLUTEN_ONLY" = true ]; then
   echo ""
-  echo "[3/5] Rebuild mode: clearing velox cmake cache..."
+  echo "[3/5] Gluten-only mode — preserving Velox/cuDF and Gluten CMake cache."
+elif [ "$REBUILD" = true ]; then
+  echo ""
+  echo "[3/5] Rebuild mode: clearing Gluten and Velox cmake caches..."
   docker exec "$CONTAINER_NAME" bash -c \
-    "rm -f /opt/velox/_build/release/CMakeCache.txt && echo '      CMakeCache.txt removed.'"
+    "rm -rf \
+      /opt/gluten/cpp/build \
+      /opt/velox/_build/release && \
+      echo '      CMake native build directories removed.'"
 else
   echo ""
   echo "[3/5] Full build — skipping cmake cache clear."
@@ -222,33 +313,81 @@ echo ""
 
 TEE_FLAG=$([ "$REBUILD" = true ] && echo "-a" || echo "")
 
-docker exec "$CONTAINER_NAME" bash -c "
-  cd /opt/gluten && \
-  bash ./dev/buildbundle-veloxbe.sh \
-    --run_setup_script=OFF \
-    --build_arrow=${BUILD_ARROW} \
-    --spark_version=${SPARK_VERSION} \
-    --enable_gpu=ON \
-    --enable_hdfs=${ENABLE_HDFS} \
-    --enable_s3=${ENABLE_S3} \
-    --velox_home=/opt/velox \
-    --velox_repo=${VELOX_REPO} \
-    --velox_branch=${VELOX_BRANCH} \
-    --cuda_arch=${CUDA_ARCH} \
-    2>&1 | tee ${TEE_FLAG} /opt/gluten/build.log
-"
+if [ "$GLUTEN_ONLY" = true ]; then
+  docker exec "$CONTAINER_NAME" bash -c "
+    set -euo pipefail
+    if [ -f /opt/rh/gcc-toolset-14/enable ]; then
+      source /opt/rh/gcc-toolset-14/enable
+    fi
+    export JAVA_HOME=${JAVA_HOME_IN_CONTAINER}
+    export PATH=${JAVA_HOME_IN_CONTAINER}/bin:\$PATH
+    cd /opt/gluten && \
+    bash ./dev/rebuild-libgluten-incremental.sh --jobs ${JOBS} \
+      2>&1 | tee ${TEE_FLAG} /opt/gluten/build.log
+  "
+else
+  docker exec "$CONTAINER_NAME" bash -c "
+    set -euo pipefail
+    if [ -f /opt/rh/gcc-toolset-14/enable ]; then
+      source /opt/rh/gcc-toolset-14/enable
+    fi
+    export JAVA_HOME=${JAVA_HOME_IN_CONTAINER}
+    export PATH=${JAVA_HOME_IN_CONTAINER}/bin:\$PATH
+    if [ -x /opt/rh/gcc-toolset-14/root/usr/bin/gcc ]; then
+      export CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc
+      export CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
+    fi
+    cd /opt/gluten && \
+    bash ./dev/buildbundle-veloxbe.sh \
+      --run_setup_script=OFF \
+      --build_arrow=${BUILD_ARROW} \
+      --spark_version=${SPARK_VERSION} \
+      --enable_gpu=ON \
+      --enable_hdfs=${ENABLE_HDFS} \
+      --enable_s3=${ENABLE_S3} \
+      --velox_home=/opt/velox \
+      --velox_repo=${VELOX_REPO} \
+      --velox_branch=${VELOX_BRANCH} \
+      --cuda_arch=${CUDA_ARCH} \
+      --num_threads=${JOBS} \
+      2>&1 | tee ${TEE_FLAG} /opt/gluten/build.log
+  "
+fi
 
 # ── Step 5: Build 3rd-party jars ──────────────────────────────────────────────
 echo ""
-echo "[5/5] Building 3rd-party jars (output -> gluten/thirdparty.log)..."
+if [ "$GLUTEN_ONLY" = true ]; then
+  echo "[5/5] Building Maven jars (output -> gluten/maven.log)..."
+else
+  echo "[5/5] Building 3rd-party jars (output -> gluten/thirdparty.log)..."
+fi
 echo ""
 
-docker exec "$CONTAINER_NAME" bash -c "
-  cd /opt/gluten && \
-  bash ./dev/build-thirdparty.sh \
-    --spark_version=${SPARK_VERSION} \
-    2>&1 | tee ${TEE_FLAG} /opt/gluten/thirdparty.log
-"
+if [ "$GLUTEN_ONLY" = true ]; then
+  docker exec "$CONTAINER_NAME" bash -c "
+    set -euo pipefail
+    export JAVA_HOME=${JAVA_HOME_IN_CONTAINER}
+    export PATH=${JAVA_HOME_IN_CONTAINER}/bin:\$PATH
+    cd /opt/gluten
+    MVN_CMD=/usr/bin/mvn
+    if [ ! -x \"\${MVN_CMD}\" ]; then
+      MVN_CMD=./build/mvn
+    fi
+    \"\${MVN_CMD}\" -T ${MAVEN_THREADS} -pl package -am package \
+      -P${MAVEN_PROFILES} -DskipTests \
+      2>&1 | tee ${TEE_FLAG} /opt/gluten/maven.log
+  "
+else
+  docker exec "$CONTAINER_NAME" bash -c "
+    set -euo pipefail
+    export JAVA_HOME=${JAVA_HOME_IN_CONTAINER}
+    export PATH=${JAVA_HOME_IN_CONTAINER}/bin:\$PATH
+    cd /opt/gluten && \
+    bash ./dev/build-thirdparty.sh \
+      --spark_version=${SPARK_VERSION} \
+      2>&1 | tee ${TEE_FLAG} /opt/gluten/thirdparty.log
+  "
+fi
 
 # ── Step 6: Verify JAR ↔ native lib consistency ──────────────────────────────
 echo ""

@@ -70,6 +70,16 @@ private[gluten] class GlutenDriverPlugin extends DriverPlugin with Logging {
     Component.sorted().foreach(_.registerMetrics(appId, pluginContext))
   }
 
+  override def receive(msg: Any): AnyRef = {
+    Component
+      .sorted()
+      .iterator
+      .map(_.onDriverReceive(msg))
+      .find(_.isDefined)
+      .flatten
+      .orNull
+  }
+
   override def shutdown(): Unit = {
     Component.sorted().reverse.foreach(_.onDriverShutdown())
   }

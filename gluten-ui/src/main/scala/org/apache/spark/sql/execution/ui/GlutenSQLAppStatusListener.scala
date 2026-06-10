@@ -97,7 +97,8 @@ private class GlutenSQLAppStatusListener(conf: SparkConf, kvstore: ElementTracki
     val fallback = fallbackEvent
       .map(ExistingFallbackData.from)
       .orElse(existing.map(ExistingFallbackData.from))
-    val mppPlan = mppPlanEvent.map(toMppPlanUIData).orElse(existing.map(_.mppPlan).filter(_ != null))
+    val mppPlan =
+      mppPlanEvent.map(toMppPlanUIData).orElse(existing.map(_.mppPlan).filter(_ != null))
 
     val uiData = new GlutenSQLExecutionUIData(
       executionId,

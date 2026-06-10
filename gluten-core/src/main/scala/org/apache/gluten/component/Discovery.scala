@@ -16,7 +16,6 @@
  */
 package org.apache.gluten.component
 
-import org.apache.gluten.exception.GlutenException
 import org.apache.gluten.utils.ResourceUtil
 
 import org.apache.spark.internal.Logging
@@ -70,10 +69,10 @@ private object Discovery extends Logging {
               SparkReflectionUtil.classForName(className)
             } catch {
               case e: ClassNotFoundException =>
-                throw new GlutenException(s"Component class not found: $className", e)
+                logWarning(s"Component class not found: $className, skipping.", e)
+                null
             }
-          val instance = clazz.getDeclaredConstructor().newInstance().asInstanceOf[Component]
-          Some(instance)
+          Option(clazz).map(_.getDeclaredConstructor().newInstance().asInstanceOf[Component])
         }
       case _ => None
     }.toSeq

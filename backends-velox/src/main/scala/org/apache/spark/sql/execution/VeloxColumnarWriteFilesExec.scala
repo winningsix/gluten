@@ -210,19 +210,26 @@ class VeloxColumnarWriteFilesRDD(
 
         // Initialize the native plan
         val iter = firstParent[ColumnarBatch].iterator(split, context)
-        assert(iter.hasNext)
-        val resultColumnarBatch = iter.next()
-        assert(resultColumnarBatch != null)
-        val nativeWriteTaskResult = collectNativeWriteFilesMetrics(resultColumnarBatch)
-        if (nativeWriteTaskResult.isEmpty) {
-          // If we are writing an empty iterator, then velox would do nothing.
-          // Here we fallback to use vanilla Spark write files to generate an empty file for
-          // metadata only.
+        if (!iter.hasNext) {
+          // Write-in-MPP: a peer that owns no input slice for this write (e.g. a
+          // SINGLE gather feeding a global top-N, which lands entirely on peer 0)
+          // produces no native commit batch for this Spark partition. Emit an
+          // empty file, mirroring the empty-iterator write path below.
           writeTaskResult = writeFilesForEmptyIterator(commitProtocol)
-          // We have done commit task inside `writeFilesForEmptyIterator`.
         } else {
-          writeTaskResult = nativeWriteTaskResult.get
-          commitProtocol.commitTask()
+          val resultColumnarBatch = iter.next()
+          assert(resultColumnarBatch != null)
+          val nativeWriteTaskResult = collectNativeWriteFilesMetrics(resultColumnarBatch)
+          if (nativeWriteTaskResult.isEmpty) {
+            // If we are writing an empty iterator, then velox would do nothing.
+            // Here we fallback to use vanilla Spark write files to generate an empty file for
+            // metadata only.
+            writeTaskResult = writeFilesForEmptyIterator(commitProtocol)
+            // We have done commit task inside `writeFilesForEmptyIterator`.
+          } else {
+            writeTaskResult = nativeWriteTaskResult.get
+            commitProtocol.commitTask()
+          }
         }
       })(
         catchBlock = {
@@ -246,6 +253,12 @@ class VeloxColumnarWriteFilesRDD(
   }
 
   override protected def getPartitions: Array[Partition] = firstParent[ColumnarBatch].partitions
+
+  // Delegate placement to the parent RDD. With an MppNativeQueryRDD parent, each partition is
+  // pinned to the executor where its MPP native peer lives; without this Spark may run the write on
+  // the wrong executor (single-host, multi-executor) and break the MPP pin -> native crash.
+  override protected def getPreferredLocations(split: Partition): Seq[String] =
+    firstParent[ColumnarBatch].preferredLocations(split)
 
   override def clearDependencies(): Unit = {
     super.clearDependencies()

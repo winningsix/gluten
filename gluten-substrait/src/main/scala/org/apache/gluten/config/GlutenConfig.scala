@@ -143,6 +143,9 @@ class GlutenConfig(conf: SQLConf) extends GlutenCoreConfig(conf) {
   def enableExistenceJoinRhsDedup: Boolean =
     getConf(ENABLE_EXISTENCE_JOIN_RHS_DEDUP)
 
+  def enableSelectiveDimensionJoinReorder: Boolean =
+    getConf(SELECTIVE_DIMENSION_JOIN_REORDER_ENABLED)
+
   def enableCommonSubexpressionEliminate: Boolean =
     getConf(ENABLE_COMMON_SUBEXPRESSION_ELIMINATE)
 
@@ -926,6 +929,14 @@ object GlutenConfig extends ConfigRegistry {
       .doc("Whether to allow Gluten to choose an optimal build side for shuffled hash join.")
       .booleanConf
       .createWithDefault(true)
+
+  val SELECTIVE_DIMENSION_JOIN_REORDER_ENABLED =
+    buildConf("spark.gluten.sql.columnar.selectiveDimensionJoinReorder.enabled")
+      .experimental()
+      .doc("Experimental: Reorder a narrow inner-join pattern so a selectively filtered " +
+        "dimension joins its dimension parent before probing the fact side.")
+      .booleanConf
+      .createWithDefault(false)
 
   val COLUMNAR_SORTMERGEJOIN_ENABLED =
     buildConf("spark.gluten.sql.columnar.sortMergeJoin")

@@ -171,30 +171,35 @@ function compile {
     exit 1
   fi
 
+  SUDO=""
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  fi
+
   # Install deps to system as needed
   if [ -d "_build/$COMPILE_TYPE/_deps" ]; then
     cd _build/$COMPILE_TYPE/_deps
     if [ -d xsimd-build ]; then
       echo "INSTALL xsimd."
       if [ $OS == 'Linux' ]; then
-        sudo cmake --install xsimd-build/
+        $SUDO cmake --install xsimd-build/
       elif [ $OS == 'Darwin' ]; then
-        sudo cmake --install xsimd-build/
+        $SUDO cmake --install xsimd-build/
       fi
     fi
     if [ -d cudf-build ]; then
       echo "INSTALL cudf."
       if [ $OS == 'Linux' ]; then
-        sudo cmake --install cudf-build/
+        $SUDO cmake --install cudf-build/
       fi
     fi
     if [ -d googletest-build ]; then
       echo "INSTALL gtest."
       if [ $OS == 'Linux' ]; then
-        cd googletest-src; cmake . ; sudo make install -j
-        #sudo cmake --install googletest-build/
+        cd googletest-src; cmake . ; $SUDO make install -j
+        #$SUDO cmake --install googletest-build/
       elif [ $OS == 'Darwin' ]; then
-        sudo cmake --install googletest-build/
+        $SUDO cmake --install googletest-build/
       fi
     fi
   fi

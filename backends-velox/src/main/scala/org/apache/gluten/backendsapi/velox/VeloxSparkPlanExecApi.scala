@@ -368,22 +368,6 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
 
     val child = shuffle.child
 
-    // MPP path bypass: skip the synthetic "hash_partition_key" prefix project
-    // (and the round-robin sort-before-repartition project). Velox's
-    // PartitionedOutputNode + HashPartitionFunctionSpec computes the partition
-    // hash from named partition keys directly, so the pre-materialized hash
-    // column is dead weight on the wire and -- worse -- shifts every real
-    // column right by one, causing mis-indexed partition keys when
-    // extractFragmentsFromChildPlan / MppCollapseRule resolves them. This
-    // matches Presto-GPU's exchange model (no JVM-side prefix project).
-    // Plan D's MppCollapseRule.stripSyntheticHashProject becomes redundant
-    // when this gate is on.
-    val mppEnabled =
-      SQLConf.get.getConfString("spark.gluten.mpp.enabled", "false").toBoolean
-    if (mppEnabled) {
-      return ColumnarShuffleExchangeExec(shuffle, child, null)
-    }
-
     val newShuffle = shuffle.outputPartitioning match {
       case HashPartitioning(exprs, _) =>
         val hashExpr = if (exprs.isEmpty) {
