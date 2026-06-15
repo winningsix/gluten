@@ -1311,8 +1311,10 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
 core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::TopNRel& topNRel) {
   auto childNode = convertSingleInput<::substrait::TopNRel>(topNRel);
   auto [sortingKeys, sortingOrders] = processSortField(topNRel.sorts(), childNode->outputType());
+  const auto isPartial = topNRel.has_advanced_extension() &&
+      SubstraitParser::configSetInOptimization(topNRel.advanced_extension(), "isPartial=");
   return std::make_shared<core::TopNNode>(
-      nextPlanNodeId(), sortingKeys, sortingOrders, static_cast<int32_t>(topNRel.n()), false /*isPartial*/, childNode);
+      nextPlanNodeId(), sortingKeys, sortingOrders, static_cast<int32_t>(topNRel.n()), isPartial, childNode);
 }
 
 core::PlanNodePtr SubstraitToVeloxPlanConverter::constructValueStreamNode(

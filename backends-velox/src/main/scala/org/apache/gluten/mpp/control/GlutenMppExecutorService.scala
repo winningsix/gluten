@@ -32,6 +32,10 @@ object GlutenMppExecutorService extends Logging {
   @volatile private var registeredContext: Option[PluginContext] = None
 
   def onExecutorStart(ctx: PluginContext): Unit = {
+    if (!GlutenMppControlPlaneConfig.endpointRegistryEnabled(ctx.conf())) {
+      logInfo("GlutenMppExecutorService: endpoint registry disabled; skip register")
+      return
+    }
     try {
       buildEndpointRecord(ctx) match {
         case Some(record) =>

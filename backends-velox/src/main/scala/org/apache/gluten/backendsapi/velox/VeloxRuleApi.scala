@@ -67,7 +67,14 @@ object VeloxRuleApi {
     injector.injectPostHocResolutionRule(RewriteExistenceJoinRhsDedup.apply)
     injector.injectOptimizerRule(RewriteExistenceJoinRhsDedup.apply)
     injector.injectPreCBORule(RewriteExistenceJoinRhsDedup.apply)
+    injector.injectOptimizerRule(PruneRedundantLeftSemiFilters.apply)
     injector.injectOptimizerRule(SelectiveDimensionJoinReorder.apply)
+    // Prune a large dimension through a selective filtered dimension chain before the
+    // dimension joins a large fact side. This covers multi-hop shapes that the single-hop
+    // SelectiveDimensionJoinReorder above cannot reach. The rule self-registers into
+    // spark.experimental.extraOptimizations so it can also run after CostBasedJoinReorder.
+    injector.injectOptimizerRule(PushSelectiveDimensionChainBeforeFact.apply)
+    injector.injectOptimizerRule(MppFactProbeBroadcastHint.apply)
     injector.injectOptimizerRule(RewriteCastFromArray.apply)
     injector.injectOptimizerRule(RewriteUnboundedWindow.apply)
     // Rewrite large LeftSemi joins to Inner + DISTINCT(rightKeys). Mirrors Presto's optimizer

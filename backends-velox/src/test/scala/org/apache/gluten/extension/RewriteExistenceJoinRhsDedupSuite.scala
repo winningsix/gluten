@@ -166,4 +166,39 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
       !hasOptimizedExistenceAggregate(disabledPlan),
       s"Expected disabled rule to leave the existence join unchanged:\n${disabledPlan.treeString}")
   }
+
+  test("explicit config keeps not-equal existence joins in Spark decorrelated shape") {
+    createTestViews()
+    val sql =
+      """
+        |select id, supp
+        |from exist_l l
+        |where exists (
+        |  select 1
+        |  from exist_r r
+        |  where r.id = l.id
+        |    and r.supp <> l.supp
+        |    and r.flag = 'Y'
+        |)
+        |order by id, supp
+        |""".stripMargin
+
+    withSQLConf("spark.gluten.mpp.enabled" -> "true") {
+      val mppDefaultPlan = rewrite(spark.sql(sql).queryExecution.optimizedPlan)
+      assert(
+        hasOptimizedExistenceAggregate(mppDefaultPlan),
+        "Expected MPP default to preserve min/max existence summary:\n" +
+          mppDefaultPlan.treeString)
+    }
+
+    withSQLConf(
+      "spark.gluten.mpp.enabled" -> "true",
+      "spark.gluten.sql.optimizer.existenceJoinRhsDedup.summarizeNotEqual.enabled" -> "false") {
+      val disabledPlan = rewrite(spark.sql(sql).queryExecution.optimizedPlan)
+      assert(
+        !hasOptimizedExistenceAggregate(disabledPlan),
+        "Expected explicit override to avoid min/max existence summary:\n" +
+          disabledPlan.treeString)
+    }
+  }
 }

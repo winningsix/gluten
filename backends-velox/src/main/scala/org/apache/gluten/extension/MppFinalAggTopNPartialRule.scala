@@ -16,7 +16,7 @@
  */
 package org.apache.gluten.extension
 
-import org.apache.gluten.execution.{HashAggregateExecTransformer, ProjectExecTransformer, TakeOrderedAndProjectExecTransformer, TopNTransformer, WholeStageTransformer}
+import org.apache.gluten.execution.{HashAggregateExecTransformer, ProjectExecTransformer, TakeOrderedAndProjectExecTransformer, TopNTransformer}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
@@ -40,13 +40,13 @@ import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
  * TakeOrdered fragment still performs the final merge/limit on at most `limit * numPartitions` rows
  * instead of the full grouped cardinality.
  *
- * Gated by spark.gluten.mpp.finalAggTopNPartial (default: false).
+ * Gated by spark.gluten.mpp.finalAggTopNPartial (default: true).
  */
 case class MppFinalAggTopNPartialRule() extends Rule[SparkPlan] with Logging {
   private val confKey = "spark.gluten.mpp.finalAggTopNPartial"
 
   override def apply(plan: SparkPlan): SparkPlan = {
-    val enabled = SparkSession.getActiveSession.exists(_.conf.get(confKey, "false").toBoolean)
+    val enabled = SparkSession.getActiveSession.forall(_.conf.get(confKey, "true").toBoolean)
     if (!enabled) {
       return plan
     }
@@ -89,10 +89,7 @@ case class MppFinalAggTopNPartialRule() extends Rule[SparkPlan] with Logging {
         buildPartialTopN(limit, sortOrder, project).getOrElse(producer)
       case agg: HashAggregateExecTransformer if isFinalHashAggregate(agg) =>
         buildPartialTopN(limit, sortOrder, agg).getOrElse(producer)
-      case wst: WholeStageTransformer =>
-        val rewritten = insertPartialTopNOnSpine(wst.child, limit, sortOrder)
-        if (rewritten.fastEquals(wst.child)) wst else wst.withNewChildren(Seq(rewritten))
-      case other if other.children.size == 1 =>
+      case other if other.children.size == 1 && isPartialTopNTransparentSpine(other) =>
         val rewritten = insertPartialTopNOnSpine(other.children.head, limit, sortOrder)
         if (rewritten.fastEquals(other.children.head)) {
           other
@@ -103,6 +100,17 @@ case class MppFinalAggTopNPartialRule() extends Rule[SparkPlan] with Logging {
     }
   }
 
+  private def isPartialTopNTransparentSpine(plan: SparkPlan): Boolean = {
+    val name = plan.getClass.getSimpleName
+    name.contains("ColumnarInputAdapter") ||
+    name.contains("ColumnarToColumnar") ||
+    name.contains("ColumnarToRow") ||
+    name.contains("InputIteratorTransformer") ||
+    name.contains("RowToColumnar") ||
+    name.contains("RowToVeloxColumnar") ||
+    name.contains("WholeStageTransformer")
+  }
+
   private def buildPartialTopN(
       limit: Long,
       sortOrder: Seq[SortOrder],
@@ -110,7 +118,17 @@ case class MppFinalAggTopNPartialRule() extends Rule[SparkPlan] with Logging {
     if (limit <= 0) {
       return None
     }
-    val topN = TopNTransformer(limit, sortOrder, global = false, child)
+    if (!sortOrder.forall(_.deterministic)) {
+      return None
+    }
+    val missingReferences = sortOrder.flatMap(_.references).filterNot(child.outputSet.contains)
+    if (missingReferences.nonEmpty) {
+      logWarning(
+        s"MppFinalAggTopNPartialRule: sort references ${missingReferences.mkString(",")} " +
+          s"are not produced by ${child.nodeName}; leaving plan unchanged")
+      return None
+    }
+    val topN = TopNTransformer(limit, sortOrder, global = false, child, isPartial = true)
     val validation = topN.doValidate()
     if (validation.ok()) {
       Some(topN)

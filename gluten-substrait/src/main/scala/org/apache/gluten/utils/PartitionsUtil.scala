@@ -22,12 +22,13 @@ import org.apache.gluten.utils.PartitionsUtil.regeneratePartition
 
 import org.apache.spark.Partition
 import org.apache.spark.internal.Logging
+import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.execution.datasources.{BucketingUtils, FilePartition, HadoopFsRelation, PartitionDirectory, PartitionedFile}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.collection.BitSet
 
-import org.apache.hadoop.fs.Path
+import org.apache.hadoop.fs.{FileStatus, Path}
 
 import scala.collection.mutable
 
@@ -52,8 +53,14 @@ case class PartitionsUtil(
 
   private def genNonBuckedPartitionSeq(): Seq[Partition] = {
     val openCostInBytes = relation.sparkSession.sessionState.conf.filesOpenCostInBytes
-    val maxSplitBytes =
+    val sparkMaxSplitBytes =
       FilePartition.maxSplitBytes(relation.sparkSession, selectedPartitions)
+    val partitionFiles = selectedPartitions.flatMap {
+      partition =>
+        SparkShimLoader.getSparkShims.getFileStatus(partition).map(file => (partition, file))
+    }
+    val maxSplitBytes =
+      maybeAdjustMppScanMaxSplitBytes(sparkMaxSplitBytes, partitionFiles, openCostInBytes)
     logInfo(
       s"Planning scan with bin packing, max size: $maxSplitBytes bytes, " +
         s"open cost is considered as scanning $openCostInBytes bytes.")
@@ -74,28 +81,25 @@ case class PartitionsUtil(
         _ => true
     }
 
-    val splitFiles = selectedPartitions
+    val splitFiles = partitionFiles
       .flatMap {
-        partition =>
-          SparkShimLoader.getSparkShims.getFileStatus(partition).flatMap {
-            file =>
-              // getPath() is very expensive so we only want to call it once in this block:
-              val filePath = file._1.getPath
-              if (shouldProcess(filePath)) {
-                val isSplitable =
-                  SparkShimLoader.getSparkShims.isFileSplittable(relation, filePath, requiredSchema)
-                SparkShimLoader.getSparkShims.splitFiles(
-                  sparkSession = relation.sparkSession,
-                  file = file._1,
-                  filePath = filePath,
-                  isSplitable = isSplitable,
-                  maxSplitBytes = maxSplitBytes,
-                  partitionValues = partition.values,
-                  metadata = file._2
-                )
-              } else {
-                Seq.empty
-              }
+        case (partition, file) =>
+          // getPath() is very expensive so we only want to call it once in this block:
+          val filePath = file._1.getPath
+          if (shouldProcess(filePath)) {
+            val isSplitable =
+              SparkShimLoader.getSparkShims.isFileSplittable(relation, filePath, requiredSchema)
+            SparkShimLoader.getSparkShims.splitFiles(
+              sparkSession = relation.sparkSession,
+              file = file._1,
+              filePath = filePath,
+              isSplitable = isSplitable,
+              maxSplitBytes = maxSplitBytes,
+              partitionValues = partition.values,
+              metadata = file._2
+            )
+          } else {
+            Seq.empty
           }
       }
       .sortBy(_.length)(implicitly[Ordering[Long]].reverse)
@@ -104,6 +108,72 @@ case class PartitionsUtil(
       FilePartition.getFilePartitions(relation.sparkSession, splitFiles, maxSplitBytes)
 
     regeneratePartition(inputPartitions, GlutenConfig.get.smallFileThreshold)
+  }
+
+  private def maybeAdjustMppScanMaxSplitBytes(
+      sparkMaxSplitBytes: Long,
+      partitionFiles: Seq[(PartitionDirectory, (FileStatus, Map[String, Any]))],
+      openCostInBytes: Long): Long = {
+    val conf = relation.sparkSession.sessionState.conf
+    val mppEnabled = conf.getConfString("spark.gluten.mpp.enabled", "false").toBoolean
+    val sizeAwareEnabled =
+      conf.getConfString("spark.gluten.mpp.scan.sizeAwarePartitioning", "true").toBoolean
+    if (!mppEnabled || !sizeAwareEnabled || partitionFiles.isEmpty) {
+      return sparkMaxSplitBytes
+    }
+
+    val targetSplitBytes = optionalBytesConf("spark.gluten.mpp.scan.targetSplitBytes")
+    val maxWholeFileBytes =
+      bytesConf("spark.gluten.mpp.scan.maxWholeFileBytes", conf.filesMaxPartitionBytes.toString)
+    val largestFileBytes = partitionFiles.map(_._2._1.getLen).max
+    val wholeFileMinFiles =
+      intConf(
+        "spark.gluten.mpp.scan.wholeFileMinFiles",
+        conf.getConfString("spark.gluten.mpp.multiExecutor.numPartitions", "1"))
+    val wholeFileFloorEnabled =
+      conf.getConfString("spark.gluten.mpp.scan.wholeFileFloor", "true").toBoolean
+    val wholeFileFloor =
+      if (
+        wholeFileFloorEnabled &&
+        partitionFiles.size >= wholeFileMinFiles &&
+        largestFileBytes > 0 &&
+        largestFileBytes <= maxWholeFileBytes
+      ) {
+        safeAdd(largestFileBytes, openCostInBytes)
+      } else {
+        0L
+      }
+    val adjusted =
+      (Seq(sparkMaxSplitBytes, wholeFileFloor).filter(_ > 0) ++ targetSplitBytes).max
+    if (adjusted != sparkMaxSplitBytes) {
+      logInfo(
+        s"Adjusted MPP scan max split bytes from $sparkMaxSplitBytes to $adjusted " +
+          s"(target=${targetSplitBytes.map(_.toString).getOrElse("<unset>")}, " +
+          s"wholeFileFloorEnabled=$wholeFileFloorEnabled, largestFile=$largestFileBytes, " +
+          s"maxWholeFile=$maxWholeFileBytes, fileCount=${partitionFiles.size}, " +
+          s"wholeFileMinFiles=$wholeFileMinFiles).")
+    }
+    adjusted
+  }
+
+  private def optionalBytesConf(key: String): Option[Long] = {
+    relation.sparkSession.sessionState.conf.getAllConfs
+      .get(key)
+      .map(JavaUtils.byteStringAsBytes)
+  }
+
+  private def bytesConf(key: String, defaultValue: String): Long = {
+    val raw = relation.sparkSession.sessionState.conf.getConfString(key, defaultValue)
+    JavaUtils.byteStringAsBytes(raw)
+  }
+
+  private def intConf(key: String, defaultValue: String): Int = {
+    val raw = relation.sparkSession.sessionState.conf.getConfString(key, defaultValue)
+    math.max(1, raw.toInt)
+  }
+
+  private def safeAdd(left: Long, right: Long): Long = {
+    if (Long.MaxValue - left < right) Long.MaxValue else left + right
   }
 
   private def genBucketedPartitionSeq(): Seq[Partition] = {

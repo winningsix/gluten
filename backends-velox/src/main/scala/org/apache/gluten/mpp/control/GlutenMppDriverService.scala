@@ -53,7 +53,11 @@ object GlutenMppDriverService extends Logging {
   @volatile private var instance: Option[GlutenMppDriverService] = None
 
   def init(conf: SparkConf): Unit = synchronized {
-    // UcxEndpointProbeRDD removed: the endpoint registry is the sole discovery path, always on.
+    if (!GlutenMppControlPlaneConfig.endpointRegistryEnabled(conf)) {
+      instance = None
+      logInfo("GlutenMppDriverService: endpoint registry disabled")
+      return
+    }
     instance = Some(new GlutenMppDriverService(GlutenMppEndpointRegistry(), enabled = true))
     logInfo("GlutenMppDriverService: endpoint registry initialized")
   }

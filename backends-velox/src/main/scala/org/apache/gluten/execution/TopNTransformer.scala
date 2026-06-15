@@ -16,9 +16,12 @@
  */
 package org.apache.gluten.execution
 
-import org.apache.gluten.expression.ExpressionConverter
+import org.apache.gluten.backendsapi.BackendsApiManager
+import org.apache.gluten.expression.{ConverterUtils, ExpressionConverter}
 import org.apache.gluten.metrics.MetricsUpdater
+import org.apache.gluten.substrait.`type`.TypeBuilder
 import org.apache.gluten.substrait.SubstraitContext
+import org.apache.gluten.substrait.extensions.{AdvancedExtensionNode, ExtensionBuilder}
 import org.apache.gluten.substrait.rel.{RelBuilder, RelNode}
 
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
@@ -26,6 +29,7 @@ import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, Distribution, Pa
 import org.apache.spark.sql.catalyst.util.truncatedString
 import org.apache.spark.sql.execution.SparkPlan
 
+import com.google.protobuf.StringValue
 import io.substrait.proto.SortField
 
 import scala.collection.JavaConverters._
@@ -34,7 +38,8 @@ case class TopNTransformer(
     limit: Long,
     sortOrder: Seq[SortOrder],
     global: Boolean,
-    child: SparkPlan)
+    child: SparkPlan,
+    isPartial: Boolean = false)
   extends UnaryTransformSupport {
   override def output: Seq[Attribute] = child.output
   override def outputPartitioning: Partitioning = child.outputPartitioning
@@ -48,7 +53,7 @@ case class TopNTransformer(
     val outputString = truncatedString(output, "[", ",", "]", maxFields)
 
     s"TopNTransformer (limit=$limit, " +
-      s"orderBy=$orderByString, global=$global, output=$outputString)"
+      s"orderBy=$orderByString, global=$global, isPartial=$isPartial, output=$outputString)"
   }
 
   override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan = {
@@ -97,16 +102,38 @@ case class TopNTransformer(
         builder.setDirectionValue(SortExecTransformer.transformSortDirection(order))
         builder.build()
     }
-    if (!validation) {
+    val extensionNode = makeExtensionNode(inputAttributes, validation)
+    if (extensionNode == null) {
       RelBuilder.makeTopNRel(input, count, sortFieldList.asJava, context, operatorId)
     } else {
-      RelBuilder.makeTopNRel(
-        input,
-        count,
-        sortFieldList.asJava,
-        RelBuilder.createExtensionNode(inputAttributes.asJava),
-        context,
-        operatorId)
+      RelBuilder.makeTopNRel(input, count, sortFieldList.asJava, extensionNode, context, operatorId)
+    }
+  }
+
+  private def makeExtensionNode(
+      inputAttributes: Seq[Attribute],
+      validation: Boolean): AdvancedExtensionNode = {
+    val optimization =
+      if (isPartial) {
+        BackendsApiManager.getTransformerApiInstance.packPBMessage(
+          StringValue.newBuilder.setValue("isPartial=1").build)
+      } else {
+        null
+      }
+    val enhancement =
+      if (validation) {
+        val inputTypeNodeList = inputAttributes
+          .map(attr => ConverterUtils.getTypeNode(attr.dataType, attr.nullable))
+          .asJava
+        BackendsApiManager.getTransformerApiInstance.packPBMessage(
+          TypeBuilder.makeStruct(false, inputTypeNodeList).toProtobuf)
+      } else {
+        null
+      }
+    if (optimization == null && enhancement == null) {
+      null
+    } else {
+      ExtensionBuilder.makeAdvancedExtension(optimization, enhancement)
     }
   }
 

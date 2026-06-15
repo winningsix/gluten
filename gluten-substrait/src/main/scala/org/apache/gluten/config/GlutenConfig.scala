@@ -146,6 +146,9 @@ class GlutenConfig(conf: SQLConf) extends GlutenCoreConfig(conf) {
   def enableSelectiveDimensionJoinReorder: Boolean =
     getConf(SELECTIVE_DIMENSION_JOIN_REORDER_ENABLED)
 
+  def enablePushDimensionChainBeforeFact: Boolean =
+    getConf(PUSH_DIMENSION_CHAIN_BEFORE_FACT_ENABLED)
+
   def enableCommonSubexpressionEliminate: Boolean =
     getConf(ENABLE_COMMON_SUBEXPRESSION_ELIMINATE)
 
@@ -937,6 +940,14 @@ object GlutenConfig extends ConfigRegistry {
         "dimension joins its dimension parent before probing the fact side.")
       .booleanConf
       .createWithDefault(false)
+
+  val PUSH_DIMENSION_CHAIN_BEFORE_FACT_ENABLED =
+    buildConf("spark.gluten.sql.columnar.pushDimensionChainBeforeFact.enabled")
+      .experimental()
+      .doc("Experimental: Push a selective filtered dimension chain into a large dimension " +
+        "before the dimension joins the fact side.")
+      .booleanConf
+      .createWithDefault(true)
 
   val COLUMNAR_SORTMERGEJOIN_ENABLED =
     buildConf("spark.gluten.sql.columnar.sortMergeJoin")

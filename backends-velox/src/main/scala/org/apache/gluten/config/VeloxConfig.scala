@@ -71,8 +71,13 @@ class VeloxConfig(conf: SQLConf) extends GlutenConfig(conf) {
 
   def enableRewriteUnboundedWindow: Boolean = getConf(ENABLE_REWRITE_UNBOUNDED_WINDOW)
 
-  def enableEnhancedFeatures(): Boolean = ConfigJniWrapper.isEnhancedFeaturesEnabled &&
-    getConf(ENABLE_ENHANCED_FEATURES)
+  def enableEnhancedFeatures(): Boolean = {
+    try {
+      ConfigJniWrapper.isEnhancedFeaturesEnabled && getConf(ENABLE_ENHANCED_FEATURES)
+    } catch {
+      case _: UnsatisfiedLinkError => false
+    }
+  }
 
   def veloxPreferredBatchBytes: Long = getConf(COLUMNAR_VELOX_PREFERRED_BATCH_BYTES)
 

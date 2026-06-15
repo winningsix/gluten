@@ -73,7 +73,13 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
   }
 
   private def rewriteJoin(join: Join, right: LogicalPlan, condition: Expression): Option[Join] = {
-    summarizeSingleNotEqualJoin(join, right, condition).orElse {
+    val summarized =
+      if (summarizeNotEqualExistenceJoinEnabled) {
+        summarizeSingleNotEqualJoin(join, right, condition)
+      } else {
+        None
+      }
+    summarized.orElse {
       deduplicateJoinRhs(join, right, condition)
     }
   }
@@ -93,6 +99,9 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
   }
 
   private def rewriteExistsSubquery(subqueryPlan: LogicalPlan): Option[LogicalPlan] = {
+    if (!summarizeNotEqualExistenceJoinEnabled) {
+      return None
+    }
     subqueryPlan match {
       case Project(_, Filter(condition, right)) =>
         summarizeCorrelatedSingleNotEqualSubquery(right, condition)
@@ -105,9 +114,20 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
   private def rewriteExistsJoinConditions(
       subqueryPlan: LogicalPlan,
       joinConditions: Seq[Expression]): Option[LogicalPlan] = {
+    if (!summarizeNotEqualExistenceJoinEnabled) {
+      return None
+    }
     joinConditions.reduceOption(And).flatMap {
       condition => summarizeCorrelatedSingleNotEqualSubquery(subqueryPlan, condition)
     }
+  }
+
+  private def summarizeNotEqualExistenceJoinEnabled: Boolean = {
+    spark.sessionState.conf
+      .getConfString(
+        "spark.gluten.sql.optimizer.existenceJoinRhsDedup.summarizeNotEqual.enabled",
+        "true")
+      .toBoolean
   }
 
   private def summarizeCorrelatedSingleNotEqualSubquery(

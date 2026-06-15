@@ -55,6 +55,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #endif
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/vector/VectorStream.h"
 
 using namespace facebook::velox;
@@ -89,6 +90,7 @@ int envIntOrDefault(const char* name, int defaultValue) {
   return static_cast<int>(parsed);
 }
 
+
 bool isSafeTaskIdComponent(const std::string& value) {
   return !value.empty() && value.find('/') == std::string::npos &&
       value.find("://") == std::string::npos;
@@ -96,6 +98,11 @@ bool isSafeTaskIdComponent(const std::string& value) {
 
 bool mppOperatorMetricsEnabled() {
   const char* value = std::getenv("GLUTEN_MPP_OPERATOR_METRICS_ENABLED");
+  return value != nullptr && std::string(value) == "1";
+}
+
+bool mppLifecycleLogEnabled() {
+  const char* value = std::getenv("GLUTEN_MPP_LIFECYCLE_LOG_ENABLED");
   return value != nullptr && std::string(value) == "1";
 }
 
@@ -398,6 +405,20 @@ void MppQueryCoordinator::start() {
   nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"coordinator::start"};
   VELOX_CHECK(!started_, "MppQueryCoordinator already started");
   started_ = true;
+  lifecycleStartTime_ = std::chrono::steady_clock::now();
+  const bool lifecycleLogEnabled = mppLifecycleLogEnabled();
+  const auto lifecycleElapsedMs = [this]() -> int64_t {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - lifecycleStartTime_)
+        .count();
+  };
+  if (lifecycleLogEnabled) {
+    LOG(WARNING) << "[MPP_LIFECYCLE] event=query_start elapsedMs=0"
+                 << " queryId=" << queryId_
+                 << " peer=" << peerIndex_ << "/" << peerCount_
+                 << " fragments=" << fragmentSpecs_.size()
+                 << " rootFragment=" << rootFragmentId_;
+  }
   LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: start() "
                << fragmentSpecs_.size() << " fragments, rootFragmentId="
                << rootFragmentId_ << " peer=" << peerIndex_ << "/"
@@ -544,16 +565,60 @@ void MppQueryCoordinator::start() {
   }
 
   const auto baseFragmentReplicaCount = fragmentReplicaCount_;
-  std::vector<bool> isBroadcastProducerFragment(fragmentSpecs_.size(), false);
+
+  std::vector<bool> isBroadcastProducer(fragmentSpecs_.size(), false);
   for (const auto& exchange : exchangeSpecs_) {
     if (exchange.partitionType == "BROADCAST") {
       const auto producer = exchange.producerFragmentId;
       if (producer >= 0 &&
-          static_cast<size_t>(producer) < isBroadcastProducerFragment.size()) {
-        isBroadcastProducerFragment[producer] = true;
+          static_cast<size_t>(producer) < isBroadcastProducer.size()) {
+        isBroadcastProducer[producer] = true;
       }
     }
   }
+
+  const auto peerSlots = std::max(1, peerCount_);
+  std::vector<std::vector<size_t>> scanSplitsByPeer(
+      fragmentSpecs_.size(), std::vector<size_t>(peerSlots, 0));
+  std::vector<size_t> totalScanSplits(fragmentSpecs_.size(), 0);
+  for (const auto& spec : fragmentSpecs_) {
+    if (spec.scanInfos.empty()) {
+      continue;
+    }
+    for (const auto& scanInfo : spec.scanInfos) {
+      for (size_t j = 0; j < scanInfo->paths.size(); ++j) {
+        const auto splitPeer = peerCount_ > 1
+            ? static_cast<int32_t>(j % static_cast<size_t>(peerCount_))
+            : 0;
+        scanSplitsByPeer[spec.id][splitPeer]++;
+        totalScanSplits[spec.id]++;
+      }
+    }
+    if (isBroadcastProducer[spec.id]) {
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                   << "]: broadcast scan producer fragment " << spec.id
+                   << " split ownership total=" << totalScanSplits[spec.id]
+                   << " peer=" << peerIndex_ << "/" << peerCount_
+                   << " localSplits="
+                   << scanSplitsByPeer[spec.id][peerIndex_];
+    }
+  }
+
+  std::vector<bool> bootstrapBroadcastProducer(fragmentSpecs_.size(), false);
+  for (const auto& spec : fragmentSpecs_) {
+    bootstrapBroadcastProducer[spec.id] =
+        isBroadcastProducer[spec.id] && !spec.scanInfos.empty() &&
+        totalScanSplits[spec.id] <= static_cast<size_t>(peerSlots);
+    if (bootstrapBroadcastProducer[spec.id]) {
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                   << "]: bootstrap broadcast scan producer fragment "
+                   << spec.id << " before bulk scans (totalSplits="
+                   << totalScanSplits[spec.id] << ", peer=" << peerIndex_
+                   << "/" << peerCount_ << ", localSplits="
+                   << scanSplitsByPeer[spec.id][peerIndex_] << ")";
+    }
+  }
+
   const auto peerOwnsExchangeDestination =
       [&](const MppExchangeSpec& exchange, int32_t peerIndex) {
         if (peerCount_ <= 1 || exchange.partitionType == "BROADCAST") {
@@ -584,12 +649,33 @@ void MppQueryCoordinator::start() {
     if (peerCount_ <= 1 || peerIndex < 0) {
       return true;
     }
-    if (peerIndex != 0 && fragmentId >= 0 &&
-        static_cast<size_t>(fragmentId) < isBroadcastProducerFragment.size() &&
-        isBroadcastProducerFragment[fragmentId] &&
-        !fragmentSpecs_[fragmentId].scanNodeIds.empty()) {
-      return false;
+    if (fragmentId >= 0 &&
+        static_cast<size_t>(fragmentId) < bootstrapBroadcastProducer.size() &&
+        bootstrapBroadcastProducer[fragmentId]) {
+      const auto peerSlot = static_cast<size_t>(peerIndex);
+      if (peerSlot >= scanSplitsByPeer[fragmentId].size() ||
+          scanSplitsByPeer[fragmentId][peerSlot] == 0) {
+        return false;
+      }
     }
+    // K-way distributed broadcast production: a scan-bearing BROADCAST producer
+    // runs on every peer that owns at least one stripe of the leaf (see the
+    // Phase 2 split striping below) and broadcasts ONLY its partial. Tiny
+    // bootstrap producers with no local split are not materialized; they cannot
+    // contribute rows, and starting them only makes downstream consumers wait
+    // for empty EOS. Each consumer replica fans in all active producer partials
+    // (the Phase 3 BROADCAST wiring already loops over producer endpoints) and
+    // its HashBuild merges the k partials into the full build table -- the
+    // k-way merge. This replaces the old peer-0-only model where peer 0 alone
+    // scanned + built + broadcast the entire build side (serial; ~20x slower on
+    // Q5's all-REPLICATE plan). Correctness: every output row of the producer's
+    // join carries exactly one row from the striped scan, so the scan stripe
+    // cleanly partitions the producer output with no duplication or loss,
+    // regardless of the build/probe role of the broadcasts it consumes. This
+    // change only affects scan-bearing broadcast producers (the ones the old
+    // gate pinned to peer 0); scan-less producers are unaffected -- they always
+    // fell through to the inbound-exchange check below and remain gated by
+    // whatever non-broadcast (HASH/RANGE/SINGLE) exchange they consume.
     for (const auto& exchange : exchangeSpecs_) {
       if (exchange.consumerFragmentId != fragmentId ||
           exchange.partitionType == "BROADCAST") {
@@ -681,18 +767,37 @@ void MppQueryCoordinator::start() {
       continue;
     }
     const auto producer = exchange.producerFragmentId;
+    const auto consumer = exchange.consumerFragmentId;
     if (producer >= 0 && static_cast<size_t>(producer) < broadcastFanout.size()) {
-      broadcastFanout[producer] =
-          std::max(1, fragmentReplicaCount_[exchange.consumerFragmentId]) *
-          peerCount_;
+      int32_t consumerTasks = 0;
+      if (peerCount_ <= 1) {
+        consumerTasks = fragmentReplicaCount_[consumer];
+      } else {
+        for (int32_t peer = 0; peer < peerCount_; ++peer) {
+          if (peerHasFragment(consumer, peer)) {
+            consumerTasks += baseFragmentReplicaCount[consumer];
+          }
+        }
+      }
+      broadcastFanout[producer] = std::max(1, consumerTasks);
     }
   }
 
   // --- Create Tasks: one per (fragment, replica) ---
+  // Create all Task objects first so exchange splits can be attached to
+  // downstream consumers before those consumers start. We start tiny bootstrap
+  // broadcast producers ahead of bulk scans below; this keeps their zero-row
+  // EOS path from waiting behind large scan/probe drivers.
   fragmentTasks_.assign(fragmentSpecs_.size(), {});
+  std::vector<std::vector<int32_t>> fragmentTaskDrivers(fragmentSpecs_.size());
+  std::vector<std::vector<int32_t>> fragmentTaskBroadcastFanout(fragmentSpecs_.size());
+  std::vector<std::vector<bool>> fragmentTaskStarted(fragmentSpecs_.size());
   for (auto& spec : fragmentSpecs_) {
     const auto replicas = fragmentReplicaCount_[spec.id];
     fragmentTasks_[spec.id].reserve(replicas);
+    fragmentTaskDrivers[spec.id].reserve(replicas);
+    fragmentTaskBroadcastFanout[spec.id].reserve(replicas);
+    fragmentTaskStarted[spec.id].reserve(replicas);
     // TODO: scale per-replica driver count with N and core budget. Default
     // to 1/replica for replicated fragments (matches GpuMultiFragmentTest);
     // preserve Scala-supplied numDrivers for non-replicated fragments.
@@ -731,63 +836,106 @@ void MppQueryCoordinator::start() {
           /*consumer=*/Consumer{},
           /*memoryArbitrationPriority=*/0,
           spillDiskOpts_);
+      fragmentTasks_[spec.id].push_back(std::move(task));
+      fragmentTaskDrivers[spec.id].push_back(perReplicaDrivers);
+      fragmentTaskBroadcastFanout[spec.id].push_back(bcastN);
+      fragmentTaskStarted[spec.id].push_back(false);
       LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: starting fragment " << spec.id << " replica " << i
+                   << "]: created fragment " << spec.id << " replica " << i
                    << "/" << replicas << " taskId=" << taskId
                    << " drivers=" << perReplicaDrivers
                    << " inboundN=" << inboundN
                    << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN)
                                   : std::string{});
-      task->start(perReplicaDrivers);
-      // Pipeline structure after Velox LocalPlanner splits the merged plan
-      // at LocalPartitionNode boundaries. Used to compare batch
-      // fragmentation against pv-cli's single-stage layout. Per-pipeline
-      // driver count is filled in post-completion via operatorStats; here
-      // we capture the overall topology immediately after start.
-      // Gated by VLOG(1) so production runs don't drown in topology logs;
-      // enable via GLOG_v=1.
-      if (VLOG_IS_ON(1)) {
-        const auto ts = task->taskStats();
-        VLOG(1) << "MppQueryCoordinator[" << queryId_
-                << "]: task " << taskId
-                << " pipelines=" << ts.pipelineStats.size()
-                << " numTotalDrivers=" << task->numTotalDrivers();
-        for (size_t pid = 0; pid < ts.pipelineStats.size(); ++pid) {
-          const auto& ps = ts.pipelineStats[pid];
-          VLOG(1) << "  pipeline[" << pid
-                  << "] input=" << ps.inputPipeline
-                  << " output=" << ps.outputPipeline;
-        }
-      }
-      if (bcastN > 0) {
-        // Task::start() has now initializePartitionOutput() registered the
-        // kBroadcast OutputBuffer with numBuffers=1 (the plan's placeholder).
-        // Expand to N destination buffers AND stamp noMoreBuffers=true so
-        // enqueueBroadcastOutputLocked replicates every page to all N
-        // consumer replicas and isFinishedLocked() can eventually return.
-        // Drivers have been scheduled but scan-leaf producers block on
-        // splits (added in Phase 3), so this happens before any enqueue.
-        task->updateOutputBuffers(bcastN, /*noMoreBuffers=*/true);
-      }
-      fragmentTasks_[spec.id].push_back(std::move(task));
     }
   }
 
-  // Phase 2: Add file scan splits to scan-containing fragments.
-  //
-  // Native UCX exchange opens producer connections as soon as a consumer gets
-  // its RemoteConnectorSplit. Release scan inputs first so producer-side
-  // UcxPartitionedOutput queues are constructed before consumers handshake.
-  for (auto& spec : fragmentSpecs_) {
-    if (spec.scanNodeIds.empty()) {
-      continue;
+  const auto startFragmentTask = [&](int32_t fragmentId, int32_t replica) {
+    auto& task = fragmentTasks_[fragmentId][replica];
+    if (!task || fragmentTaskStarted[fragmentId][replica]) {
+      return;
     }
+    const auto perReplicaDrivers = fragmentTaskDrivers[fragmentId][replica];
+    const auto bcastN = fragmentTaskBroadcastFanout[fragmentId][replica];
+    const auto inboundN = consumerInboundPartitions[fragmentId];
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                 << "]: starting fragment " << fragmentId << " replica "
+                 << replica << "/" << fragmentTasks_[fragmentId].size()
+                 << " taskId=" << task->taskId()
+                 << " drivers=" << perReplicaDrivers
+                 << " inboundN=" << inboundN
+                 << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN)
+                                : std::string{});
+    task->start(perReplicaDrivers);
+    fragmentTaskStarted[fragmentId][replica] = true;
+    if (lifecycleLogEnabled) {
+      LOG(WARNING) << "[MPP_LIFECYCLE] event=task_start"
+                   << " elapsedMs=" << lifecycleElapsedMs()
+                   << " queryId=" << queryId_
+                   << " peer=" << peerIndex_ << "/" << peerCount_
+                   << " fragment=" << fragmentId
+                   << " replica=" << replica
+                   << " replicas=" << fragmentTasks_[fragmentId].size()
+                   << " drivers=" << perReplicaDrivers
+                   << " inboundN=" << inboundN
+                   << " bcastFanout=" << bcastN
+                   << " taskId=" << task->taskId();
+    }
+    // Pipeline structure after Velox LocalPlanner splits the merged plan
+    // at LocalPartitionNode boundaries. Used to compare batch
+    // fragmentation against pv-cli's single-stage layout. Per-pipeline
+    // driver count is filled in post-completion via operatorStats; here
+    // we capture the overall topology immediately after start.
+    // Gated by VLOG(1) so production runs don't drown in topology logs;
+    // enable via GLOG_v=1.
+    if (VLOG_IS_ON(1)) {
+      const auto ts = task->taskStats();
+      VLOG(1) << "MppQueryCoordinator[" << queryId_
+              << "]: task " << task->taskId()
+              << " pipelines=" << ts.pipelineStats.size()
+              << " numTotalDrivers=" << task->numTotalDrivers();
+      for (size_t pid = 0; pid < ts.pipelineStats.size(); ++pid) {
+        const auto& ps = ts.pipelineStats[pid];
+        VLOG(1) << "  pipeline[" << pid
+                << "] input=" << ps.inputPipeline
+                << " output=" << ps.outputPipeline;
+      }
+    }
+    if (bcastN > 0) {
+      // Task::start() has now initializePartitionOutput() registered the
+      // kBroadcast OutputBuffer with numBuffers=1 (the plan's placeholder).
+      // Expand to N destination buffers AND stamp noMoreBuffers=true so
+      // enqueueBroadcastOutputLocked replicates every page to all N
+      // consumer replicas and isFinishedLocked() can eventually return.
+      // Bootstrap producers are started before their splits are added, so this
+      // still happens before any enqueue.
+      task->updateOutputBuffers(bcastN, /*noMoreBuffers=*/true);
+    }
+  };
+
+  // Phase 2/3: Add file scan splits and wire exchanges.
+  //
+  // Small scan-bearing BROADCAST producers (for example region/nation in
+  // TPC-H Q5) need to publish EOS before large scans occupy the driver pool.
+  // Otherwise downstream build operators wait for 0-row producer endpoints,
+  // which shows up as seconds of UCX/control-plane blocked time even though no
+  // data is being transferred. Bootstrap those small broadcast chains first,
+  // then release the bulk scans. This preserves all producer endpoints and
+  // partition ownership; it only changes split delivery order.
+  std::vector<bool> scanSplitsWired(fragmentSpecs_.size(), false);
+  std::vector<bool> exchangeWired(exchangeSpecs_.size(), false);
+
+  const auto addScanSplitsForFragment = [&](MppFragmentSpec& spec) {
+    if (scanSplitsWired[spec.id] || spec.scanNodeIds.empty()) {
+      return;
+    }
+    scanSplitsWired[spec.id] = true;
     if (fragmentTasks_[spec.id].empty()) {
       LOG(WARNING) << "MppQueryCoordinator[" << queryId_
                    << "]: skipping scan split wiring for non-local fragment "
                    << spec.id << " on peer " << peerIndex_ << "/"
                    << peerCount_;
-      continue;
+      return;
     }
     VELOX_CHECK_EQ(
         fragmentTasks_[spec.id].size(),
@@ -797,13 +945,7 @@ void MppQueryCoordinator::start() {
         spec.id,
         fragmentTasks_[spec.id].size());
     auto& task = fragmentTasks_[spec.id][0];
-    const bool isBroadcastProducer = std::any_of(
-        exchangeSpecs_.begin(),
-        exchangeSpecs_.end(),
-        [&](const auto& exchange) {
-          return exchange.producerFragmentId == spec.id &&
-              exchange.partitionType == "BROADCAST";
-        });
+    const bool fragmentIsBroadcastProducer = isBroadcastProducer[spec.id];
     VELOX_CHECK_EQ(
         spec.scanNodeIds.size(),
         spec.scanInfos.size(),
@@ -816,8 +958,8 @@ void MppQueryCoordinator::start() {
       const auto& scanInfo = spec.scanInfos[i];
       const auto& scanNodeId = spec.scanNodeIds[i];
       // Use the connector ID from the plan's TableScanNode.
-      // This is critical: "test-hive" → Velox Hive connector,
-      // "cudf-hive" → cuDF GPU connector (handles type casting).
+      // This is critical: "test-hive" -> Velox Hive connector,
+      // "cudf-hive" -> cuDF GPU connector (handles type casting).
       const auto& connectorId = (i < spec.scanConnectorIds.size() &&
                                   !spec.scanConnectorIds[i].empty())
           ? spec.scanConnectorIds[i]
@@ -825,10 +967,14 @@ void MppQueryCoordinator::start() {
 
       size_t addedSplits = 0;
       for (size_t j = 0; j < scanInfo->paths.size(); j++) {
-        if (isBroadcastProducer && peerIndex_ != 0) {
-          continue;
-        }
-        if (!isBroadcastProducer && peerCount_ > 1) {
+        // K-way distributed broadcast production: every scan-bearing fragment --
+        // INCLUDING BROADCAST producers -- strides its files 1/peerCount so each
+        // peer scans a distinct slice. For a BROADCAST producer this means each
+        // peer broadcasts only its partial; consumers fan in all peers' partials
+        // and the HashBuild merges them (see peerHasFragment + Phase 3 BROADCAST
+        // wiring). The old model pinned the entire build-side scan to peer 0,
+        // which then serially scanned + built + broadcast it all.
+        if (peerCount_ > 1) {
           if (j % static_cast<size_t>(peerCount_) != static_cast<size_t>(peerIndex_)) {
             continue;
           }
@@ -880,20 +1026,28 @@ void MppQueryCoordinator::start() {
                    << "') to fragment " << spec.id
                    << " scan node " << scanNodeId << " peer=" << peerIndex_
                    << "/" << peerCount_
-                   << (isBroadcastProducer ? " broadcastProducer" : "");
+                   << (fragmentIsBroadcastProducer ? " broadcastProducer" : "");
+      if (lifecycleLogEnabled) {
+        LOG(WARNING) << "[MPP_LIFECYCLE] event=scan_splits"
+                     << " elapsedMs=" << lifecycleElapsedMs()
+                     << " queryId=" << queryId_
+                     << " peer=" << peerIndex_ << "/" << peerCount_
+                     << " fragment=" << spec.id
+                     << " scanNode=" << scanNodeId
+                     << " added=" << addedSplits
+                     << " total=" << scanInfo->paths.size()
+                     << " connector=" << connectorId
+                     << " broadcastProducer=" << fragmentIsBroadcastProducer;
+      }
     }
-  }
+  };
 
-  // Phase 3: Wire exchanges via RemoteConnectorSplits (cartesian product).
-  //
-  // For each exchange E(producer P, consumer C), every native peer wires only
-  // the global destinations owned by that peer. This keeps a destination owned
-  // by exactly one consumer peer, while still letting that consumer fan in all
-  // producer peers through UCX RemoteConnectorSplit URLs.
-  //
-  // Task count stays O(k*N) across the query; split count is O(N*M) per
-  // exchange (but splits are lightweight Velox objects, not Task lifecycles).
-  for (auto& exchange : exchangeSpecs_) {
+  const auto wireExchange = [&](size_t exchangeIndex) {
+    if (exchangeWired[exchangeIndex]) {
+      return;
+    }
+    exchangeWired[exchangeIndex] = true;
+    auto& exchange = exchangeSpecs_[exchangeIndex];
     auto& producerReplicas = fragmentTasks_[exchange.producerFragmentId];
     auto& consumerReplicas = fragmentTasks_[exchange.consumerFragmentId];
     if (consumerReplicas.empty()) {
@@ -902,7 +1056,7 @@ void MppQueryCoordinator::start() {
                    << " on peer=" << peerIndex_ << "/" << peerCount_
                    << " because consumer fragment " << exchange.consumerFragmentId
                    << " is not local to this peer";
-      continue;
+      return;
     }
 
     struct ProducerEndpointForSplit {
@@ -913,6 +1067,7 @@ void MppQueryCoordinator::start() {
     auto comm = facebook::velox::ucx_exchange::Communicator::getInstance();
     VELOX_CHECK_NOT_NULL(comm, "UCX Communicator must be initialized before MPP exchange wiring");
     const int urlPort = static_cast<int>(comm->getListenerPort()) - 3;
+    const bool isBroadcast = exchange.partitionType == "BROADCAST";
     std::vector<ProducerEndpointForSplit> producerEndpoints;
     const auto appendProducerEndpoints =
         [&](const std::string& peerId,
@@ -982,20 +1137,6 @@ void MppQueryCoordinator::start() {
     // Build the IBM ucx-exchange URL format expected by
     // UcxExchangeSource::extractTaskAndDestinationId:
     //   http://127.0.0.1:<port-3>/v1/task/<taskId>/results/<dest>
-    // The "+3" port hack is documented in UcxExchangeSource::create
-    // (host port = uri.port() + 3). The taskId is embedded verbatim as a
-    // single path component, so kTaskIdPrefix MUST NOT contain "://" or
-    // "/" (see kTaskIdPrefix definition). The producer publishes via the
-    // same per-process Communicator, so loopback + the taskId suffices;
-    // UcxExchangeServer/Source detect same-Communicator and bypass the
-    // wire via IntraNodeTransferRegistry.
-    // Split wiring rules:
-    //   * BROADCAST: consumer replica i receives producer destination i.
-    //   * HASH: all logical destinations remain on the producer, striped
-    //     across bounded local consumer tasks by dest % localTaskCount.
-    //   * RANGE: consumer task i receives only destination i.
-    //   * SINGLE/ROUND_ROBIN: each local consumer receives all destinations.
-    const bool isBroadcast = exchange.partitionType == "BROADCAST";
     const bool isHash = exchange.partitionType == "HASH";
     const bool isRange = exchange.partitionType == "RANGE";
     const bool isRootConsumer = exchange.consumerFragmentId == rootFragmentId_;
@@ -1019,7 +1160,7 @@ void MppQueryCoordinator::start() {
     for (size_t cIdx = 0; cIdx < consumerReplicas.size(); ++cIdx) {
       auto& consumerTask = consumerReplicas[cIdx];
       if (isBroadcast) {
-        const auto globalDest =
+        const auto destination =
             peerIndex_ * static_cast<int32_t>(consumerReplicas.size()) +
             static_cast<int32_t>(cIdx);
         for (const auto& producerEndpoint : producerEndpoints) {
@@ -1028,7 +1169,7 @@ void MppQueryCoordinator::start() {
               producerEndpoint.host,
               producerEndpoint.urlPort,
               producerEndpoint.taskId,
-              globalDest);
+              destination);
           consumerTask->addSplit(
               exchange.exchangeNodeId,
               Split(std::make_shared<RemoteConnectorSplit>(url)));
@@ -1076,11 +1217,110 @@ void MppQueryCoordinator::start() {
                  << (isHash ? "HASH-striped" : isRange ? "RANGE-fanout" : "single-consumer")
                  << ", peer=" << peerIndex_ << "/" << peerCount_
                  << ")";
+    if (lifecycleLogEnabled) {
+      LOG(WARNING) << "[MPP_LIFECYCLE] event=exchange_wired"
+                   << " elapsedMs=" << lifecycleElapsedMs()
+                   << " queryId=" << queryId_
+                   << " peer=" << peerIndex_ << "/" << peerCount_
+                   << " exchange=" << exchange.id
+                   << " type=" << exchange.partitionType
+                   << " producerF=" << exchange.producerFragmentId
+                   << " consumerF=" << exchange.consumerFragmentId
+                   << " consumerTasks=" << consumerReplicas.size()
+                   << " producerEndpoints=" << producerEndpoints.size()
+                   << " prunedEmptyProducerEndpoints=0"
+                   << " splits=" << splitCount
+                   << " totalDestinations=" << totalDestinations;
+    }
+  };
+
+  const auto waitForBootstrapBroadcastNoMoreData = [&]() {
+    const int waitMs = envIntOrDefault("GLUTEN_MPP_BROADCAST_BOOTSTRAP_WAIT_MS", 500);
+    if (waitMs <= 0) {
+      return;
+    }
+    std::vector<std::string> taskIds;
+    for (const auto& spec : fragmentSpecs_) {
+      if (!bootstrapBroadcastProducer[spec.id]) {
+        continue;
+      }
+      for (size_t i = 0; i < fragmentTasks_[spec.id].size(); ++i) {
+        taskIds.push_back(makeTaskId(spec.id, static_cast<int32_t>(i)));
+      }
+    }
+    if (taskIds.empty()) {
+      return;
+    }
+    auto queueMgr = facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::milliseconds(waitMs);
+    size_t pending = taskIds.size();
+    while (std::chrono::steady_clock::now() < deadline) {
+      pending = 0;
+      for (const auto& taskId : taskIds) {
+        auto stats = queueMgr->stats(taskId);
+        if (!stats.has_value() || !stats->noMoreData) {
+          ++pending;
+        }
+      }
+      if (pending == 0) {
+        const auto waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                     << "]: bootstrap broadcast producers reached noMoreData in "
+                     << waitedMs << " ms (" << taskIds.size() << " local task(s))";
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                 << "]: bootstrap broadcast noMoreData wait timed out after "
+                 << waitMs << " ms; pendingLocalTasks=" << pending << "/"
+                 << taskIds.size();
+  };
+
+  for (const auto& spec : fragmentSpecs_) {
+    if (!bootstrapBroadcastProducer[spec.id]) {
+      continue;
+    }
+    for (int32_t i = 0;
+         i < static_cast<int32_t>(fragmentTasks_[spec.id].size());
+         ++i) {
+      startFragmentTask(spec.id, i);
+    }
   }
 
-  // Phase 3.5: broadcast producer output buffer fan-out already set in
-  // Phase 1 (before task->start()); nothing to do here. See the
-  // broadcastFanout precompute above for the ordering rationale.
+  for (auto& spec : fragmentSpecs_) {
+    if (bootstrapBroadcastProducer[spec.id]) {
+      addScanSplitsForFragment(spec);
+    }
+  }
+  for (size_t i = 0; i < exchangeSpecs_.size(); ++i) {
+    const auto& exchange = exchangeSpecs_[i];
+    if (exchange.partitionType == "BROADCAST" &&
+        bootstrapBroadcastProducer[exchange.producerFragmentId]) {
+      wireExchange(i);
+    }
+  }
+  waitForBootstrapBroadcastNoMoreData();
+
+  for (const auto& spec : fragmentSpecs_) {
+    for (int32_t i = 0;
+         i < static_cast<int32_t>(fragmentTasks_[spec.id].size());
+         ++i) {
+      startFragmentTask(spec.id, i);
+    }
+  }
+
+  for (auto& spec : fragmentSpecs_) {
+    addScanSplitsForFragment(spec);
+  }
+  for (size_t i = 0; i < exchangeSpecs_.size(); ++i) {
+    wireExchange(i);
+  }
+
+  // Phase 3.5: broadcast producer output buffer fan-out is set inside
+  // startFragmentTask() immediately after Task::start(); nothing else to do.
 
   // Diagnostic watchdog: every 5s dump the state of every (fragId, replicaIdx)
   // Task so we can see where a hang is happening. Cheap: N_tasks log lines
@@ -1089,10 +1329,13 @@ void MppQueryCoordinator::start() {
     int tick = 0;
     const int gpuDiagnosticsIntervalTicks = envIntOrDefault(
         "GLUTEN_GPU_MEMORY_DIAGNOSTICS_WATCHDOG_INTERVAL_TICKS", 0);
+    const int watchdogIntervalMs =
+        std::max(1, envIntOrDefault("GLUTEN_MPP_WATCHDOG_INTERVAL_MS", 5000));
     const int planStatsIntervalTicks =
         envIntOrDefault("GLUTEN_MPP_WATCHDOG_PLAN_STATS_INTERVAL_TICKS", 0);
     const int planStatsSampleTasks =
         std::max(1, envIntOrDefault("GLUTEN_MPP_WATCHDOG_PLAN_STATS_SAMPLE_TASKS", 4));
+    const bool lifecycleLogEnabled = mppLifecycleLogEnabled();
     // Track which failed taskIds we've already logged to avoid repeating the
     // same error message every tick.
     std::unordered_set<std::string> reportedFailures;
@@ -1102,13 +1345,18 @@ void MppQueryCoordinator::start() {
       // condition checks watchdogStop_, so the thread exits within microseconds
       // of notify_all from the destructor instead of waiting up to 5s.
       std::unique_lock<std::mutex> lock(watchdogMutex_);
-      if (watchdogCv_.wait_for(lock, std::chrono::seconds(5), [this]() {
-            return watchdogStop_.load(std::memory_order_acquire);
-          })) {
+      if (watchdogCv_.wait_for(
+              lock, std::chrono::milliseconds(watchdogIntervalMs), [this]() {
+                return watchdogStop_.load(std::memory_order_acquire);
+              })) {
         break;
       }
       lock.unlock();
       ++tick;
+      const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() -
+                                 lifecycleStartTime_)
+                                 .count();
       // Summarize per-fragment state counts (more scannable than per-task).
       for (size_t f = 0; f < fragmentTasks_.size(); ++f) {
         int counts[5] = {0, 0, 0, 0, 0}; // running,finished,canceled,aborted,failed
@@ -1200,6 +1448,76 @@ void MppQueryCoordinator::start() {
                          << " numFinishedDrivers="
                          << task->numFinishedDrivers();
             if (++sampled >= 6) break;
+          }
+        }
+      }
+
+      if (lifecycleLogEnabled) {
+        for (size_t f = 0; f < fragmentTasks_.size(); ++f) {
+          for (size_t replica = 0; replica < fragmentTasks_[f].size(); ++replica) {
+            const auto& task = fragmentTasks_[f][replica];
+            if (!task) {
+              continue;
+            }
+            const auto taskStats = task->taskStats();
+            LOG(WARNING) << "[MPP_LIFECYCLE] event=task_snapshot"
+                         << " elapsedMs=" << elapsedMs
+                         << " tick=" << tick
+                         << " queryId=" << queryId_
+                         << " peer=" << peerIndex_ << "/" << peerCount_
+                         << " fragment=" << f
+                         << " replica=" << replica
+                         << " state=" << static_cast<int>(task->state())
+                         << " drivers=" << task->numTotalDrivers()
+                         << " finishedDrivers=" << task->numFinishedDrivers()
+                         << " pipelines=" << taskStats.pipelineStats.size()
+                         << " taskId=" << task->taskId();
+            for (size_t pipelineIdx = 0;
+                 pipelineIdx < taskStats.pipelineStats.size();
+                 ++pipelineIdx) {
+              const auto& pipelineStats = taskStats.pipelineStats[pipelineIdx];
+              for (const auto& opStats : pipelineStats.operatorStats) {
+                const auto wallNanos =
+                    opStats.addInputTiming.wallNanos +
+                    opStats.getOutputTiming.wallNanos +
+                    opStats.finishTiming.wallNanos;
+                const bool interesting =
+                    opStats.blockedWallNanos > 0 || wallNanos > 0 ||
+                    opStats.inputPositions > 0 || opStats.outputPositions > 0 ||
+                    opStats.rawInputPositions > 0 ||
+                    opStats.planNodeId.find("mpp_") != std::string::npos ||
+                    opStats.operatorType.find("Exchange") != std::string::npos ||
+                    opStats.operatorType.find("PartitionedOutput") !=
+                        std::string::npos ||
+                    opStats.operatorType.find("TableScan") !=
+                        std::string::npos ||
+                    opStats.operatorType.find("HashJoin") !=
+                        std::string::npos;
+                if (!interesting) {
+                  continue;
+                }
+                LOG(WARNING) << "[MPP_LIFECYCLE] event=operator_snapshot"
+                             << " elapsedMs=" << elapsedMs
+                             << " tick=" << tick
+                             << " queryId=" << queryId_
+                             << " peer=" << peerIndex_ << "/" << peerCount_
+                             << " fragment=" << f
+                             << " replica=" << replica
+                             << " pipeline=" << pipelineIdx
+                             << " planNode=" << opStats.planNodeId
+                             << " operator=" << opStats.operatorType
+                             << " drivers=" << opStats.numDrivers
+                             << " splits=" << opStats.numSplits
+                             << " rawInRows=" << opStats.rawInputPositions
+                             << " inRows=" << opStats.inputPositions
+                             << " outRows=" << opStats.outputPositions
+                             << " blockedMs="
+                             << static_cast<int64_t>(
+                                    opStats.blockedWallNanos / 1000000)
+                             << " wallMs="
+                             << static_cast<int64_t>(wallNanos / 1000000);
+              }
+            }
           }
         }
       }

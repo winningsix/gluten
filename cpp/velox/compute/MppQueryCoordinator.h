@@ -292,6 +292,9 @@ class MppQueryCoordinator {
   /// watchdog to wake from its tick interval.
   std::mutex watchdogMutex_;
   std::condition_variable watchdogCv_;
+  /// Monotonic timestamp captured at start(), used only for debug lifecycle
+  /// logs so timestamps are comparable across coordinator events in one query.
+  std::chrono::steady_clock::time_point lifecycleStartTime_;
 
   /// Leaf memory pool for deserializing pages in next(). Velox requires
   /// allocations to happen on leaf pools, not the aggregate root returned

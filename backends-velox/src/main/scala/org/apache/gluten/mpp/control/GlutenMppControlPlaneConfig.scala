@@ -22,10 +22,17 @@ import org.apache.spark.SparkConf
  * Spark configuration keys + defaults for the driver-side MPP control plane.
  *
  * UcxEndpointProbeRDD has been removed: the driver endpoint registry is the sole endpoint-discovery
- * path and is always active (executors register on native init; the resolver consults the
- * registry). There is therefore no endpoint-registry enable flag and no probe fallback knob.
+ * path when native MPP is enabled. Driver-only sessions and non-MPP runs must not initialize or
+ * register UCX endpoints.
  */
 object GlutenMppControlPlaneConfig {
+
+  val MppEnabledKey: String = "spark.gluten.mpp.enabled"
+  val MppEnabledDefault: Boolean = false
+
+  val EndpointRegistryEnabledKey: String =
+    "spark.gluten.mpp.controlPlane.endpointRegistry.enabled"
+  val EndpointRegistryEnabledDefault: Boolean = true
 
   // ---- Phase 1 (active) ----
 
@@ -40,6 +47,10 @@ object GlutenMppControlPlaneConfig {
   val AwaitTimeoutMsDefault: Long = 10000L
 
   // ---- Accessors ----
+
+  def endpointRegistryEnabled(conf: SparkConf): Boolean =
+    conf.getBoolean(MppEnabledKey, MppEnabledDefault) &&
+      conf.getBoolean(EndpointRegistryEnabledKey, EndpointRegistryEnabledDefault)
 
   def awaitMinExecutors(conf: SparkConf): Boolean =
     conf.getBoolean(AwaitMinExecutorsKey, AwaitMinExecutorsDefault)

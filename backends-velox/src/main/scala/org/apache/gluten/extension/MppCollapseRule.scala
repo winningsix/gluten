@@ -107,9 +107,19 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   private val BROADCAST_FUSE_ENABLED_KEY = "spark.gluten.mpp.fuseBroadcastBuilds"
   private val BROADCAST_FUSE_ENABLED_DEFAULT = "false"
 
+  private val SCALAR_SUBQUERY_REWRITE_ENABLED_KEY =
+    "spark.gluten.mpp.rewriteUncorrelatedScalarSubquery"
+  private val SCALAR_SUBQUERY_REWRITE_ENABLED_DEFAULT = "true"
+
   private def isBroadcastFuseEnabled: Boolean = {
     SQLConf.get
       .getConfString(BROADCAST_FUSE_ENABLED_KEY, BROADCAST_FUSE_ENABLED_DEFAULT)
+      .toBoolean
+  }
+
+  private def isScalarSubqueryRewriteEnabled: Boolean = {
+    SQLConf.get
+      .getConfString(SCALAR_SUBQUERY_REWRITE_ENABLED_KEY, SCALAR_SUBQUERY_REWRITE_ENABLED_DEFAULT)
       .toBoolean
   }
 
@@ -144,11 +154,17 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // Presto-style rewrite: turn every uncorrelated ScalarSubquery still dangling off a Filter /
     // Project into a BroadcastExchange + BroadcastNestedLoopJoin(Inner). This folds the subquery
     // into the main plan tree (so MPP absorbs it as an additional fragment) instead of leaving it
-    // as a driver-materialized sibling. We apply the rewrite up front so downstream collapse /
-    // walk logic sees a tree with no ScalarSubquery expressions left. If MPP collapse ultimately
-    // fails we fall back to the ORIGINAL (unrewritten) plan so Spark's BSP path can run the
-    // query unchanged.
-    val preRewritten = RewriteUncorrelatedScalarSubquery(plan)
+    // as a driver-materialized sibling. Keep it configurable because singleton scalar broadcasts
+    // can be worse than materialized-literal semantics for Q11-like filters.
+    val preRewritten =
+      if (isScalarSubqueryRewriteEnabled) {
+        RewriteUncorrelatedScalarSubquery(plan)
+      } else {
+        logWarning(
+          s"MppCollapseRule: keeping ScalarSubquery expressions materialized by Spark " +
+            s"because $SCALAR_SUBQUERY_REWRITE_ENABLED_KEY=false")
+        plan
+      }
     preRewritten match {
       case dwce: DataWritingCommandExec =>
         // Collapse the whole WriteFilesExecTransformer subtree (write + query) INTO MPP: the
