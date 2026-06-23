@@ -18,6 +18,7 @@ package org.apache.gluten.extension.columnar
 
 import org.apache.gluten.config.GlutenConfig
 
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, EqualTo, Exists, Expression, GreaterThan, IsNotNull, Literal, Not, Or, OuterReference, PredicateHelper}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Count, Max, Min}
@@ -36,7 +37,8 @@ import org.apache.spark.sql.catalyst.rules.Rule
  */
 case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
   extends Rule[LogicalPlan]
-  with PredicateHelper {
+  with PredicateHelper
+  with Logging {
 
   private case class EqualityKey(left: Expression, right: Attribute)
   private case class NotEqualKey(left: Expression, right: Attribute)
@@ -52,6 +54,9 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
       case Filter(condition, child) =>
         Filter(rewriteExistsExpression(condition), child)
     }
+    if (hasExistsExpression(rewrittenSubqueries)) {
+      registerPostSubqueryPass()
+    }
 
     if (!rewrittenSubqueries.resolved) {
       return rewrittenSubqueries
@@ -62,6 +67,31 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
           if isExistenceJoin(joinType) && condition.deterministic =>
         rewriteJoin(join, right, condition)
           .getOrElse(join)
+    }
+  }
+
+  private def registerPostSubqueryPass(): Unit = {
+    val experimental = spark.experimental
+    experimental.synchronized {
+      if (!experimental.extraOptimizations.exists(_.isInstanceOf[RewriteExistenceJoinRhsDedup])) {
+        experimental.extraOptimizations = experimental.extraOptimizations :+ this
+        logDebug(
+          "RewriteExistenceJoinRhsDedup: self-registered into " +
+            "spark.experimental.extraOptimizations for post-RewriteSubquery pass")
+      }
+    }
+  }
+
+  private def hasExistsExpression(plan: LogicalPlan): Boolean = {
+    plan.exists {
+      node =>
+        node.expressions.exists {
+          expression =>
+            expression.exists {
+              case _: Exists => true
+              case _ => false
+            }
+        }
     }
   }
 

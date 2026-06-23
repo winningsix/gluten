@@ -20,10 +20,11 @@ import org.apache.gluten.config.GlutenConfig
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.expressions.{AttributeSet, EqualNullSafe, EqualTo, Expression, In, InSet, PredicateHelper}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, EqualNullSafe, EqualTo, Expression, In, InSet, PredicateHelper}
 import org.apache.spark.sql.catalyst.plans.Inner
-import org.apache.spark.sql.catalyst.plans.logical.{Filter, Join, JoinHint, LogicalPlan, Project, SubqueryAlias}
+import org.apache.spark.sql.catalyst.plans.logical.{BROADCAST, Filter, HintInfo, Join, JoinHint, LogicalPlan, Project, SubqueryAlias}
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.execution.datasources.LogicalRelation
 
 /**
  * Conservatively rotates a Q11-like join chain so a selective dimension joins its dimension parent
@@ -34,9 +35,9 @@ import org.apache.spark.sql.catalyst.rules.Rule
  * ~32M rows instead of ~800M. Spark's default join order keeps partsupp on the probe side of an
  * unfiltered supplier join first.
  *
- * The rule is intentionally narrow: it only handles inner joins without hints, keeps conditions on
- * the same attribute sets, and requires the filtered dimension to carry an obvious selective
- * literal predicate plus small table statistics.
+ * The rule is intentionally narrow: it only handles inner joins with no hints or broadcast-only
+ * hints, keeps conditions on the same attribute sets, and requires the filtered dimension to carry
+ * an obvious selective literal predicate plus small table statistics.
  */
 case class SelectiveDimensionJoinReorder(spark: SparkSession)
   extends Rule[LogicalPlan]
@@ -47,10 +48,15 @@ case class SelectiveDimensionJoinReorder(spark: SparkSession)
   private val maxFilteredDimensionRows = BigInt(100000)
   private val maxSelectiveInListValues = 16
   private val maxFilteredDimensionWrapperDepth = 4
+  private val selectiveDimensionJoinReorderKey =
+    GlutenConfig.SELECTIVE_DIMENSION_JOIN_REORDER_ENABLED.key
+  private val mppEnabledKey = "spark.gluten.mpp.enabled"
+
+  registerPostCboPass()
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
-    val glutenConfig = new GlutenConfig(spark.sessionState.conf)
-    if (!glutenConfig.enableSelectiveDimensionJoinReorder || !plan.resolved) {
+    registerPostCboPass()
+    if (!enabledForSession || !plan.resolved) {
       return plan
     }
 
@@ -62,29 +68,146 @@ case class SelectiveDimensionJoinReorder(spark: SparkSession)
 
   private def reorder(join: Join): Option[LogicalPlan] = {
     join match {
-      case Join(
-            Join(fact, dimension, Inner, Some(factDimensionCondition), leftHint),
-            filteredDimension,
-            Inner,
-            Some(dimensionFilterCondition),
-            topHint)
-          if leftHint == JoinHint.NONE &&
-            topHint == JoinHint.NONE &&
-            factDimensionCondition.deterministic &&
-            dimensionFilterCondition.deterministic &&
-            isSelectiveFilteredDimension(filteredDimension) &&
-            conditionStaysBetween(factDimensionCondition, fact.outputSet, dimension.outputSet) &&
-            conditionStaysBetween(
-              dimensionFilterCondition,
-              dimension.outputSet,
-              filteredDimension.outputSet) =>
-        val dimensionJoin =
-          Join(dimension, filteredDimension, Inner, Some(dimensionFilterCondition), JoinHint.NONE)
-        logInfo("Reordered selective dimension join before fact-table probe.")
-        Some(Join(fact, dimensionJoin, Inner, Some(factDimensionCondition), JoinHint.NONE))
+      case Join(left, filteredDimension, Inner, Some(dimensionFilterCondition), topHint)
+          if hintAllowsReorder(topHint) =>
+        extractFactDimensionJoin(left).flatMap {
+          case FactDimensionJoin(fact, dimension, factDimensionCondition, leftHint) =>
+            if (
+              hintAllowsReorder(leftHint) &&
+              factDimensionCondition.deterministic &&
+              dimensionFilterCondition.deterministic &&
+              isSelectiveFilteredDimension(filteredDimension) &&
+              conditionStaysBetween(factDimensionCondition, fact.outputSet, dimension.outputSet) &&
+              conditionStaysBetween(
+                dimensionFilterCondition,
+                dimension.outputSet,
+                filteredDimension.outputSet)
+            ) {
+              val dimensionJoin =
+                Join(
+                  dimension,
+                  filteredDimension,
+                  Inner,
+                  Some(dimensionFilterCondition),
+                  JoinHint.NONE)
+              val outerHint =
+                dimensionChainBroadcastHint(fact, dimensionJoin).getOrElse(JoinHint.NONE)
+              val reordered =
+                Join(fact, dimensionJoin, Inner, Some(factDimensionCondition), outerHint)
+              logInfo("Reordered selective dimension join before fact-table probe.")
+              Some(preserveOutputIfNeeded(join, reordered))
+            } else {
+              None
+            }
+        }
       case _ =>
         None
     }
+  }
+
+  private case class FactDimensionJoin(
+      fact: LogicalPlan,
+      dimension: LogicalPlan,
+      condition: Expression,
+      hint: JoinHint)
+
+  private def extractFactDimensionJoin(plan: LogicalPlan): Option[FactDimensionJoin] = {
+    val unwrapped = plan match {
+      case Project(projectList, child) if projectList.forall(_.isInstanceOf[Attribute]) => child
+      case other => other
+    }
+    unwrapped match {
+      case Join(fact, dimension, Inner, Some(condition), hint) =>
+        Some(FactDimensionJoin(fact, dimension, condition, hint))
+      case _ =>
+        None
+    }
+  }
+
+  private def dimensionChainBroadcastHint(
+      fact: LogicalPlan,
+      dimensionJoin: LogicalPlan): Option[JoinHint] = {
+    val maxBroadcastBytes = BigInt(spark.sessionState.conf.autoBroadcastJoinThreshold)
+    if (maxBroadcastBytes < 0) {
+      return None
+    }
+
+    val factBytes = leafScanOrStatsBytes(fact)
+    val dimensionChainBytes = leafScanOrStatsBytes(dimensionJoin)
+    if (
+      factBytes > 0 &&
+      dimensionChainBytes > 0 &&
+      factBytes > dimensionChainBytes &&
+      dimensionChainBytes <= maxBroadcastBytes
+    ) {
+      logWarning(
+        "SelectiveDimensionJoinReorder: broadcasting reordered dimension chain " +
+          s"(factLeafBytes=$factBytes dimensionChainLeafBytes=$dimensionChainBytes " +
+          s"autoBroadcastJoinThreshold=$maxBroadcastBytes)")
+      Some(JoinHint(None, Some(HintInfo(strategy = Some(BROADCAST)))))
+    } else {
+      None
+    }
+  }
+
+  private def leafScanOrStatsBytes(plan: LogicalPlan): BigInt = {
+    var total = BigInt(0)
+    plan.foreach {
+      case lr: LogicalRelation =>
+        total += BigInt(lr.relation.sizeInBytes)
+      case leaf if leaf.children.isEmpty =>
+        total += leaf.stats.sizeInBytes
+      case _ =>
+    }
+    total
+  }
+
+  private def preserveOutputIfNeeded(original: Join, rewritten: LogicalPlan): LogicalPlan = {
+    val rewrittenOutput = rewritten.outputSet
+    if (original.outputSet.subsetOf(rewrittenOutput) && original.output != rewritten.output) {
+      Project(original.output, rewritten)
+    } else {
+      rewritten
+    }
+  }
+
+  private def hintAllowsReorder(hint: JoinHint): Boolean = {
+    hint == JoinHint.NONE ||
+    Seq(hint.leftHint, hint.rightHint).flatten.forall(_.strategy.contains(BROADCAST))
+  }
+
+  private def registerPostCboPass(): Unit = {
+    if (!enabledForSession) {
+      return
+    }
+
+    val experimental = spark.experimental
+    experimental.synchronized {
+      val current = experimental.extraOptimizations
+      val existing =
+        current.collectFirst { case r: SelectiveDimensionJoinReorder => r }.getOrElse(this)
+      val without = current.filterNot(_.isInstanceOf[SelectiveDimensionJoinReorder])
+      val hintIndex = without.indexWhere(_.isInstanceOf[MppFactProbeBroadcastHint])
+      val reordered =
+        if (hintIndex >= 0) {
+          without.patch(hintIndex, Seq(existing), 0)
+        } else {
+          without :+ existing
+        }
+
+      if (reordered != current) {
+        experimental.extraOptimizations = reordered
+        logDebug("SelectiveDimensionJoinReorder: registered post-CBO rewrite")
+      }
+    }
+  }
+
+  private def enabledForSession: Boolean = {
+    val conf = spark.sessionState.conf
+    conf.getAllConfs
+      .get(selectiveDimensionJoinReorderKey)
+      .map(_.toBoolean)
+      .getOrElse(conf.getConfString(mppEnabledKey, "false").toBoolean)
   }
 
   private def isSelectiveFilteredDimension(plan: LogicalPlan): Boolean = {

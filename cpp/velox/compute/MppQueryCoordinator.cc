@@ -55,7 +55,6 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #endif
 #include "velox/experimental/ucx-exchange/Communicator.h"
-#include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #include "velox/vector/VectorStream.h"
 
 using namespace facebook::velox;
@@ -1234,51 +1233,6 @@ void MppQueryCoordinator::start() {
     }
   };
 
-  const auto waitForBootstrapBroadcastNoMoreData = [&]() {
-    const int waitMs = envIntOrDefault("GLUTEN_MPP_BROADCAST_BOOTSTRAP_WAIT_MS", 500);
-    if (waitMs <= 0) {
-      return;
-    }
-    std::vector<std::string> taskIds;
-    for (const auto& spec : fragmentSpecs_) {
-      if (!bootstrapBroadcastProducer[spec.id]) {
-        continue;
-      }
-      for (size_t i = 0; i < fragmentTasks_[spec.id].size(); ++i) {
-        taskIds.push_back(makeTaskId(spec.id, static_cast<int32_t>(i)));
-      }
-    }
-    if (taskIds.empty()) {
-      return;
-    }
-    auto queueMgr = facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
-    const auto start = std::chrono::steady_clock::now();
-    const auto deadline = start + std::chrono::milliseconds(waitMs);
-    size_t pending = taskIds.size();
-    while (std::chrono::steady_clock::now() < deadline) {
-      pending = 0;
-      for (const auto& taskId : taskIds) {
-        auto stats = queueMgr->stats(taskId);
-        if (!stats.has_value() || !stats->noMoreData) {
-          ++pending;
-        }
-      }
-      if (pending == 0) {
-        const auto waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - start).count();
-        LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                     << "]: bootstrap broadcast producers reached noMoreData in "
-                     << waitedMs << " ms (" << taskIds.size() << " local task(s))";
-        return;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                 << "]: bootstrap broadcast noMoreData wait timed out after "
-                 << waitMs << " ms; pendingLocalTasks=" << pending << "/"
-                 << taskIds.size();
-  };
-
   for (const auto& spec : fragmentSpecs_) {
     if (!bootstrapBroadcastProducer[spec.id]) {
       continue;
@@ -1302,7 +1256,6 @@ void MppQueryCoordinator::start() {
       wireExchange(i);
     }
   }
-  waitForBootstrapBroadcastNoMoreData();
 
   for (const auto& spec : fragmentSpecs_) {
     for (int32_t i = 0;

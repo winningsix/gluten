@@ -76,6 +76,45 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
     RewriteExistenceJoinRhsDedup(spark).apply(plan)
   }
 
+  test("self-registers post-subquery optimizer pass") {
+    val experimental = spark.experimental
+    val originalExtraOptimizations = experimental.extraOptimizations
+    try {
+      experimental.extraOptimizations =
+        originalExtraOptimizations.filterNot(_.isInstanceOf[RewriteExistenceJoinRhsDedup])
+      assert(!experimental.extraOptimizations.exists(_.isInstanceOf[RewriteExistenceJoinRhsDedup]))
+
+      createTestViews()
+      val sql =
+        """
+          |select id, supp
+          |from exist_l l
+          |where exists (
+          |  select 1
+          |  from exist_r r
+          |  where r.id = l.id
+          |    and r.supp <> l.supp
+          |    and r.flag = 'Y'
+          |)
+          |order by id, supp
+          |""".stripMargin
+
+      rewrite(spark.sql(sql).queryExecution.analyzed)
+
+      assert(
+        experimental.extraOptimizations.count(_.isInstanceOf[RewriteExistenceJoinRhsDedup]) == 1,
+        "Expected RewriteExistenceJoinRhsDedup to install one post-subquery optimizer pass"
+      )
+
+      val optimizedPlan = spark.sql(sql).queryExecution.optimizedPlan
+      assert(
+        hasOptimizedExistenceAggregate(optimizedPlan),
+        s"Expected post-subquery optimizer pass to summarize RHS:\n${optimizedPlan.treeString}")
+    } finally {
+      experimental.extraOptimizations = originalExtraOptimizations
+    }
+  }
+
   test("deduplicates RHS of correlated EXISTS after Spark decorrelation") {
     createTestViews()
     val df = spark.sql("""

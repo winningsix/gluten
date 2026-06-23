@@ -60,7 +60,7 @@ case class MppFinalAggTopNPartialRule() extends Rule[SparkPlan] with Logging {
       if (rewrittenChild.fastEquals(topk.child)) {
         topk
       } else {
-        logWarning(
+        logInfo(
           s"MppFinalAggTopNPartialRule: inserted partial TopN(limit=${topk.limit}) " +
             s"after final aggregate before SINGLE gather")
         topk.copy(child = rewrittenChild)

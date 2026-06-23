@@ -71,7 +71,7 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
 
   override def apply(plan: LogicalPlan): Seq[SparkPlan] = {
     if (!isMppStrategyEnabled) {
-      logWarning(
+      logDebug(
         s"MppStrategy: disabled (" +
           s"mpp.enabled=${session.conf.get(MPP_ENABLED_KEY, MPP_ENABLED_DEFAULT)}, " +
           s"strategy.enabled=${session.conf.get(MPP_STRATEGY_KEY, MPP_STRATEGY_DEFAULT)})")
@@ -79,7 +79,7 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
     }
     if (generatingShadowPlan) return Nil
 
-    logWarning(s"MppStrategy: apply() called with ${plan.getClass.getSimpleName}")
+    logDebug(s"MppStrategy: apply() called with ${plan.getClass.getSimpleName}")
 
     if (isTopLevelPlan(plan)) {
       // Unwrap ReturnAnswer - it's just a Spark wrapper, not a real operator.
@@ -92,13 +92,13 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
       if (queryPlan.isInstanceOf[org.apache.spark.sql.catalyst.plans.logical.Command]) {
         return Nil
       }
-      logWarning(
+      logDebug(
         s"MppStrategy: top-level plan detected (${plan.getClass.getSimpleName} " +
           s"-> ${queryPlan.getClass.getSimpleName}), attempting MPP...")
       tryMpp(queryPlan)
         .map {
           exec =>
-            logWarning(s"MppStrategy: *** PLAN C ACTIVE *** returning MppNativeQueryExec")
+            logInfo(s"MppStrategy: *** PLAN C ACTIVE *** returning MppNativeQueryExec")
             Seq(exec)
         }
         .getOrElse {
@@ -106,7 +106,7 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
           Nil
         }
     } else {
-      logWarning(s"MppStrategy: not a top-level plan (${plan.getClass.getSimpleName}), skipping")
+      logDebug(s"MppStrategy: not a top-level plan (${plan.getClass.getSimpleName}), skipping")
       Nil
     }
   }
@@ -138,7 +138,7 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
    * cannot be fully handled in MPP mode.
    */
   private def tryMpp(logicalPlan: LogicalPlan): Option[MppNativeQueryExec] = {
-    logWarning("MppStrategy: attempting Plan C MPP transformation")
+    logDebug("MppStrategy: attempting Plan C MPP transformation")
 
     // Plan C Approach: Return MppNativeQueryExec with planLater(logicalPlan) as child.
     // Spark will plan the child normally (including EnsureRequirements inserting
@@ -160,12 +160,12 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
       ))
     val exchanges = Seq.empty[ExchangeSpec]
 
-    logWarning(
+    logDebug(
       s"MppStrategy: *** MPP MODE (Plan C) *** query=${logicalPlan.getClass.getSimpleName}, " +
         s"fragments will be extracted at execution time from child physical plan")
     exchanges.foreach {
       e =>
-        logWarning(
+        logDebug(
           s"  Exchange ${e.id}: F${e.producerFragmentId} -> F${e.consumerFragmentId} " +
             s"(${e.exchangeType}, ${e.numPartitions} partitions)")
     }
@@ -242,7 +242,7 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
       // Instead, use planLater to let Spark plan the children normally,
       // then we intercept and wrap.
       val physicalPlan = planLater(logicalPlan)
-      logWarning(s"MppStrategy: planLater result class=${physicalPlan.getClass.getSimpleName}")
+      logDebug(s"MppStrategy: planLater result class=${physicalPlan.getClass.getSimpleName}")
       Some(physicalPlan)
     } finally {
       generatingShadowPlan = false

@@ -41,7 +41,7 @@ case class MppRemoveRedundantShuffleRule() extends Rule[SparkPlan] with Logging 
   override def apply(plan: SparkPlan): SparkPlan = {
     val sess = org.apache.spark.sql.SparkSession.getActiveSession
     val enabled = sess.exists(_.conf.get(confKey, "false").toBoolean)
-    logWarning(
+    logDebug(
       s"MppRemoveRedundantShuffleRule.apply: enabled=$enabled plan=${plan.getClass.getSimpleName}")
     if (!enabled) {
       return plan
@@ -50,7 +50,7 @@ case class MppRemoveRedundantShuffleRule() extends Rule[SparkPlan] with Logging 
       case s @ ShuffleExchangeExec(req: HashPartitioning, child, _, _)
           if !child.isInstanceOf[AQEShuffleReadExec] &&
             hashSatisfies(child.outputPartitioning, req) =>
-        logWarning(
+        logInfo(
           s"MppRemoveRedundantShuffle: eliminated redundant shuffle, " +
             s"child partitioning ${child.outputPartitioning} already satisfies $req")
         child

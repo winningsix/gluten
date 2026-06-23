@@ -42,10 +42,10 @@ case class MppSinglePartitionSortRule() extends Rule[SparkPlan] with Logging {
   override def apply(plan: SparkPlan): SparkPlan = {
     val sess = org.apache.spark.sql.SparkSession.getActiveSession
     val enabled = sess.exists(_.conf.get(confKey, "false").toBoolean)
-    logWarning(
+    logDebug(
       s"[MppSinglePartitionSortRule] apply: enabled=$enabled root=${plan.getClass.getSimpleName}")
     if (enabled) {
-      logWarning(s"[MppSinglePartitionSortRule] tree:\n${plan.treeString.take(1500)}")
+      logDebug(s"[MppSinglePartitionSortRule] tree:\n${plan.treeString.take(1500)}")
     }
     if (!enabled) {
       return plan
@@ -88,12 +88,12 @@ case class MppSinglePartitionSortRule() extends Rule[SparkPlan] with Logging {
     case stage: ShuffleQueryStageExec =>
       stage.plan match {
         case sh: ShuffleExchangeLike if sh.outputPartitioning.isInstanceOf[RangePartitioning] =>
-          logWarning("MppSinglePartitionSortRule: rewriting RANGE -> SINGLE (AQE stage)")
+          logInfo("MppSinglePartitionSortRule: rewriting RANGE -> SINGLE (AQE stage)")
           rewriteShuffle(sh)
         case _ => node
       }
     case sh: ShuffleExchangeLike if sh.outputPartitioning.isInstanceOf[RangePartitioning] =>
-      logWarning(
+      logInfo(
         s"MppSinglePartitionSortRule: rewriting RANGE -> SINGLE (${sh.getClass.getSimpleName})")
       rewriteShuffle(sh)
     case other if other.children.size == 1 =>

@@ -21,6 +21,7 @@ import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.extension._
 import org.apache.gluten.extension.columnar._
 import org.apache.gluten.extension.columnar.MiscColumnarRules.{PreventBatchTypeMismatchInTableCache, RemoveGlutenTableCacheColumnarToRow, RemoveTopmostColumnarToRow, RewriteSubqueryBroadcast}
+import org.apache.gluten.extension.columnar.PruneRedundantLeftSemiFilters
 import org.apache.gluten.extension.columnar.V2WritePostRule
 import org.apache.gluten.extension.columnar.enumerated.RasOffload
 import org.apache.gluten.extension.columnar.heuristic.{ExpandFallbackPolicy, HeuristicTransform}
@@ -67,7 +68,7 @@ object VeloxRuleApi {
     injector.injectPostHocResolutionRule(RewriteExistenceJoinRhsDedup.apply)
     injector.injectOptimizerRule(RewriteExistenceJoinRhsDedup.apply)
     injector.injectPreCBORule(RewriteExistenceJoinRhsDedup.apply)
-    injector.injectOptimizerRule(PruneRedundantLeftSemiFilters.apply)
+    injector.injectOptimizerRule(spark => PruneRedundantLeftSemiFilters(spark))
     injector.injectOptimizerRule(SelectiveDimensionJoinReorder.apply)
     // Prune a large dimension through a selective filtered dimension chain before the
     // dimension joins a large fact side. This covers multi-hop shapes that the single-hop

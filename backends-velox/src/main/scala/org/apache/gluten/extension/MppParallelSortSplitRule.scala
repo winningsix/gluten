@@ -19,7 +19,6 @@ package org.apache.gluten.extension
 import org.apache.gluten.execution.SortExecTransformer
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
 import org.apache.spark.sql.catalyst.plans.physical.{RoundRobinPartitioning, SinglePartition}
@@ -61,7 +60,10 @@ import org.apache.spark.sql.internal.SQLConf
  * [[SortExecTransformer]] on a later pass. `N` defaults to `spark.sql.shuffle.partitions` (falling
  * back to 4).
  *
- * Gated by spark.gluten.mpp.parallelSortSplit (default: false).
+ * Gated by spark.gluten.mpp.parallelSortSplit (default: true). The missing-stats aggregate fallback
+ * is intentionally narrow: it only covers the simple post-join aggregate ORDER BY shape that
+ * benefits from the extra RR merge, and skips broader broadcast/nested-loop join trees where the
+ * extra fragment is a regression.
  */
 case class MppParallelSortSplitRule() extends Rule[SparkPlan] with Logging {
   private val confKey = "spark.gluten.mpp.parallelSortSplit"
@@ -69,20 +71,21 @@ case class MppParallelSortSplitRule() extends Rule[SparkPlan] with Logging {
   private val minBytesConfKey = "spark.gluten.mpp.parallelSortSplit.minBytes"
   private val splitAggregateUnknownStatsConfKey =
     "spark.gluten.mpp.parallelSortSplit.aggregateUnknownStats"
+  private val forceUnknownStatsConfKey =
+    "spark.gluten.mpp.parallelSortSplit.forceUnknownStats"
   private val defaultMinRows = BigInt(1000000L)
   private val defaultMinBytes = BigInt(256L * 1024L * 1024L)
   private val maxStatsLookupDepth = 4
   private val maxAggregateLookupDepth = 8
 
   override def apply(plan: SparkPlan): SparkPlan = {
-    val sess = SparkSession.getActiveSession
-    val enabled = sess.exists(_.conf.get(confKey, "false").toBoolean)
-    logWarning(
+    val enabled = confString(confKey, "true").toBoolean
+    logDebug(
       s"[MppParallelSortSplitRule] apply: enabled=$enabled root=${plan.getClass.getSimpleName}")
     if (!enabled) {
       return plan
     }
-    logWarning(s"[MppParallelSortSplitRule] tree:\n${plan.treeString.take(1500)}")
+    logDebug(s"[MppParallelSortSplitRule] tree:\n${plan.treeString.take(1500)}")
     rewriteRoot(plan)
   }
 
@@ -138,7 +141,7 @@ case class MppParallelSortSplitRule() extends Rule[SparkPlan] with Logging {
       stage.plan match {
         case sh: ShuffleExchangeLike if sh.outputPartitioning == SinglePartition =>
           if (shouldSplit(sh.children.head)) {
-            logWarning("MppParallelSortSplitRule: splicing parallel-sort + RR merge (AQE stage)")
+            logInfo("MppParallelSortSplitRule: splicing parallel-sort + RR merge (AQE stage)")
             spliceParallelSortMerge(sh, sortOrder)
           } else {
             node
@@ -147,7 +150,7 @@ case class MppParallelSortSplitRule() extends Rule[SparkPlan] with Logging {
       }
     case sh: ShuffleExchangeLike if sh.outputPartitioning == SinglePartition =>
       if (shouldSplit(sh.children.head)) {
-        logWarning(
+        logInfo(
           s"MppParallelSortSplitRule: splicing parallel-sort + RR merge " +
             s"(${sh.getClass.getSimpleName})")
         spliceParallelSortMerge(sh, sortOrder)
@@ -200,7 +203,7 @@ case class MppParallelSortSplitRule() extends Rule[SparkPlan] with Logging {
         val rowsOk = stats.rowCount.exists(_ >= rowThreshold)
         val bytesOk = isConfidentSize(stats.sizeInBytes) && stats.sizeInBytes >= byteThreshold
         if (isAggregateProducer(producer) && !rowsOk) {
-          logWarning(
+          logDebug(
             "MppParallelSortSplitRule: skipped; aggregate producer output is below " +
               "split row threshold or lacks reliable row stats " +
               s"rows=${stats.rowCount.getOrElse("unknown")} bytes=${stats.sizeInBytes} " +
@@ -209,21 +212,25 @@ case class MppParallelSortSplitRule() extends Rule[SparkPlan] with Logging {
         }
         val enabled = rowsOk || bytesOk
         if (!enabled) {
-          logWarning(
+          logDebug(
             "MppParallelSortSplitRule: skipped; producer output below split threshold " +
               s"rows=${stats.rowCount.getOrElse("unknown")} bytes=${stats.sizeInBytes} " +
               s"minRows=$rowThreshold minBytes=$byteThreshold")
         }
         enabled
       case None =>
-        if (splitAggregateUnknownStats() && containsAggregateProducer(producer)) {
-          logWarning(
+        if (forceUnknownStats()) {
+          logInfo(
             "MppParallelSortSplitRule: splicing parallel-sort + RR merge despite missing " +
-              "logical stats; producer contains aggregate and " +
-              s"$splitAggregateUnknownStatsConfKey=true")
+              "logical stats; forceUnknownStats=true")
+          true
+        } else if (shouldSplitUnknownAggregateStats(producer)) {
+          logInfo(
+            "MppParallelSortSplitRule: splicing parallel-sort + RR merge despite missing " +
+              "logical stats; producer is eligible for aggregate unknown-stats split")
           true
         } else {
-          logWarning("MppParallelSortSplitRule: skipped; producer has no reliable logical stats")
+          logDebug("MppParallelSortSplitRule: skipped; producer has no reliable logical stats")
           false
         }
     }
@@ -250,6 +257,81 @@ case class MppParallelSortSplitRule() extends Rule[SparkPlan] with Logging {
     val className = plan.getClass.getSimpleName.toLowerCase(java.util.Locale.ROOT)
     nodeName.contains("aggregate") || className.contains("aggregate")
   }
+
+  private def shouldSplitUnknownAggregateStats(producer: SparkPlan): Boolean = {
+    if (!splitAggregateUnknownStats()) {
+      return false
+    }
+    val shape = UnknownStatsShape.from(producer)
+    val eligible =
+      shape.aggregateCount > 0 &&
+        shape.shuffledHashJoinCount == 1 &&
+        shape.broadcastHashJoinCount == 0 &&
+        shape.broadcastNestedLoopJoinCount == 0 &&
+        shape.otherJoinCount == 0
+    if (!eligible) {
+      logDebug(
+        "MppParallelSortSplitRule: skipped missing-stats aggregate split; " +
+          s"shape not eligible ($shape)")
+    }
+    eligible
+  }
+
+  private def forceUnknownStats(): Boolean =
+    confString(forceUnknownStatsConfKey, "false").toBoolean
+
+  private case class UnknownStatsShape(
+      aggregateCount: Int,
+      shuffledHashJoinCount: Int,
+      broadcastHashJoinCount: Int,
+      broadcastNestedLoopJoinCount: Int,
+      otherJoinCount: Int)
+
+  private object UnknownStatsShape {
+    def from(plan: SparkPlan): UnknownStatsShape = {
+      var aggregateCount = 0
+      var shuffledHashJoinCount = 0
+      var broadcastHashJoinCount = 0
+      var broadcastNestedLoopJoinCount = 0
+      var otherJoinCount = 0
+      plan.foreach {
+        node =>
+          if (isAggregateLike(node)) {
+            aggregateCount += 1
+          }
+          if (isShuffledHashJoinLike(node)) {
+            shuffledHashJoinCount += 1
+          } else if (isBroadcastHashJoinLike(node)) {
+            broadcastHashJoinCount += 1
+          } else if (isBroadcastNestedLoopJoinLike(node)) {
+            broadcastNestedLoopJoinCount += 1
+          } else if (isJoinLike(node)) {
+            otherJoinCount += 1
+          }
+      }
+      UnknownStatsShape(
+        aggregateCount,
+        shuffledHashJoinCount,
+        broadcastHashJoinCount,
+        broadcastNestedLoopJoinCount,
+        otherJoinCount)
+    }
+  }
+
+  private def isShuffledHashJoinLike(plan: SparkPlan): Boolean =
+    planName(plan).contains("shuffledhashjoin")
+
+  private def isBroadcastHashJoinLike(plan: SparkPlan): Boolean =
+    planName(plan).contains("broadcasthashjoin")
+
+  private def isBroadcastNestedLoopJoinLike(plan: SparkPlan): Boolean =
+    planName(plan).contains("broadcastnestedloopjoin")
+
+  private def isJoinLike(plan: SparkPlan): Boolean =
+    planName(plan).contains("join")
+
+  private def planName(plan: SparkPlan): String =
+    (plan.nodeName + " " + plan.getClass.getSimpleName).toLowerCase(java.util.Locale.ROOT)
 
   private def containsAggregateProducer(plan: SparkPlan): Boolean =
     containsAggregateProducer(plan, depth = 0)

@@ -241,7 +241,7 @@ case class MppNativeQueryExec(
     // unnecessary and harmful: Spark eagerly starts stale scalar-subquery and broadcast jobs.
     // Required inputs are prepared at execution time, including scalar materialization when the
     // inline scalar-subquery rewrite is disabled.
-    logWarning("MppNativeQueryExec: skipping child prepare; MPP will prepare required inputs")
+    logDebug("MppNativeQueryExec: skipping child prepare; MPP will prepare required inputs")
   }
 
   override protected def doExecute(): RDD[InternalRow] = {
@@ -256,7 +256,7 @@ case class MppNativeQueryExec(
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val executionChild = preparedChildPlan
-    logWarning(
+    logDebug(
       s"MppNativeQueryExec: executing with ${fragments.size} fragments " +
         s"and ${exchanges.size} exchanges")
 
@@ -268,7 +268,7 @@ case class MppNativeQueryExec(
       if (isScalarSubqueryRewriteEnabled) {
         RewriteUncorrelatedScalarSubquery(executionChild)
       } else {
-        logWarning(
+        logInfo(
           s"MppNativeQueryExec: keeping ScalarSubquery expressions materialized by Spark " +
             s"because $SCALAR_SUBQUERY_REWRITE_ENABLED_KEY=false")
         executionChild
@@ -289,11 +289,11 @@ case class MppNativeQueryExec(
     val hasRealFragments = fragments.nonEmpty && fragments.head.rootOperator != null
     if (!hasRealFragments) {
       // Phase 2: Extract fragments from child BSP plan and generate Substrait plans.
-      logWarning(s"MppNativeQueryExec: child plan tree:\n${childForMpp.treeString.take(2000)}")
+      logDebug(s"MppNativeQueryExec: child plan tree:\n${childForMpp.treeString.take(2000)}")
 
       val (extractedFragments, extractedExchanges, fusedBroadcastsByConsumer) =
         extractFragmentsFromChildPlan(childForMpp)
-      logWarning(
+      logDebug(
         s"MppNativeQueryExec: Phase 2 extracted ${extractedFragments.size} fragments " +
           s"and ${extractedExchanges.size} exchanges " +
           s"and ${fusedBroadcastsByConsumer.values.map(_.size).sum} fused " +
@@ -305,14 +305,14 @@ case class MppNativeQueryExec(
           val rootName = if (frag.rootOperator != null) {
             frag.rootOperator.getClass.getSimpleName
           } else "<null>"
-          logWarning(
+          logDebug(
             s"  Fragment ${frag.id}: root=$rootName, " +
               s"output=${frag.outputAttributes.map(_.name).mkString("[", ", ", "]")}, " +
               s"parallelism=${frag.parallelism}")
       }
       extractedExchanges.foreach {
         ex =>
-          logWarning(
+          logDebug(
             s"  Exchange ${ex.id}: F${ex.producerFragmentId} -> F${ex.consumerFragmentId} " +
               s"(${ex.exchangeType}, ${ex.numPartitions} partitions)")
       }
@@ -329,13 +329,13 @@ case class MppNativeQueryExec(
         frag => generateSubstraitForFragment(frag)
       }
 
-      logWarning(
+      logDebug(
         s"MppNativeQueryExec: generated ${fragmentSubstraitPlans.size} Substrait plans " +
           s"(sizes: ${fragmentSubstraitPlans.map(_.length).mkString("[", ", ", "]")} bytes)")
 
       if (extractedFragments.size >= 2 && extractedExchanges.nonEmpty) {
         // We have real fragments with exchanges -- use MPP streaming execution!
-        logWarning(
+        logDebug(
           s"MppNativeQueryExec: *** PHASE 3 MPP EXECUTION *** " +
             s"${extractedFragments.size} fragments, ${extractedExchanges.size} exchanges")
         suppressDeadBroadcastsForNativeMpp(childForMpp)
@@ -363,7 +363,7 @@ case class MppNativeQueryExec(
         val fragmentSplitInfos: Array[Array[Array[Byte]]] =
           extractedFragments.map(extractSplitInfosForFragment).toArray
 
-        logWarning(
+        logDebug(
           s"MppNativeQueryExec: split infos per fragment: " +
             s"${fragmentSplitInfos.map(_.length).mkString("[", ", ", "]")}")
 
@@ -403,7 +403,7 @@ case class MppNativeQueryExec(
         )
       } else {
         // Single fragment or no exchanges -- BSP is fine
-        logWarning(
+        logDebug(
           s"MppNativeQueryExec: single fragment (${extractedFragments.size} fragments, " +
             s"${extractedExchanges.size} exchanges), delegating to BSP")
         if (childForMpp.supportsColumnar) {
@@ -438,7 +438,7 @@ case class MppNativeQueryExec(
     val mppQueryId = newNativeMppQueryId()
     val broadcastProducerFragmentIds = broadcastProducerIds(exchanges)
 
-    logInfo(s"MppNativeQueryExec: generated ${fragmentPlans.length} Substrait plans on driver")
+    logDebug(s"MppNativeQueryExec: generated ${fragmentPlans.length} Substrait plans on driver")
 
     val requestedSparkPartitionCount = mppSparkPartitionCount
     val sparkPartitionCount =
@@ -607,7 +607,7 @@ case class MppNativeQueryExec(
           // single-writer; local/BSP write never has >1 writer per attempt dir).
           val parallelism =
             if (wst.find(_.isInstanceOf[WriteFilesExecTransformer]).isDefined) {
-              logWarning(
+              logInfo(
                 s"MppNativeQueryExec: write fragment $fragId -> parallelism=1 (1 writer/task)")
               1
             } else {
@@ -637,7 +637,7 @@ case class MppNativeQueryExec(
                     val bcast = bex.executeBroadcast[BuildSideRelation]()
                     broadcastsByConsumer.getOrElseUpdate(fragId, mutable.ArrayBuffer.empty) +=
                       FusedBroadcast(slotIdx, bcast)
-                    logWarning(
+                    logDebug(
                       s"MppNativeQueryExec: captured fused broadcast at " +
                         s"consumerF=$fragId slot=$slotIdx " +
                         s"(${bex.getClass.getSimpleName})")
@@ -658,7 +658,7 @@ case class MppNativeQueryExec(
                   val forceBroadcast = isReplicatedJoinBuildInput(child)
                   val (exchangeType, partitionKeys, numPartitions) =
                     if (forceBroadcast) {
-                      logWarning(
+                      logInfo(
                         s"MppNativeQueryExec: forcing exchange ${exchangeNode.id} " +
                           s"(${exchangeNode.getClass.getSimpleName}) to BROADCAST for " +
                           s"replicated MPP hash join build side")
@@ -718,7 +718,7 @@ case class MppNativeQueryExec(
             org.apache.spark.sql.SparkSession.getActiveSession
               .exists(_.conf.get("spark.gluten.mpp.collapseSingleGather", "false").toBoolean)
           if (isSingleGather && collapseSingleGather) {
-            logWarning(
+            logInfo(
               "MppNativeQueryExec.walk: collapsing SinglePartition shuffle into parent fragment")
             walk(unwrapTransparent(exchange.child))
             -1
@@ -840,10 +840,9 @@ case class MppNativeQueryExec(
 
     // Sort fragments by ID (ensures topological order: producers before consumers)
     val sortedFragments = extractedFragments.sortBy(_.id).toSeq
-    val cappedExchanges = capLocalHashExchangeTasks(extractedExchanges.toSeq)
+    val sortedExchanges = capLocalHashExchangeTasks(extractedExchanges.toSeq).sortBy(_.id).toSeq
     val adjustedFragments =
-      tunePostJoinFinalAggSplitParallelism(sortedFragments, cappedExchanges)
-    val sortedExchanges = cappedExchanges.sortBy(_.id).toSeq
+      tunePostJoinFinalAggSplitParallelism(sortedFragments, sortedExchanges)
     val frozenBroadcasts = broadcastsByConsumer.iterator.map {
       case (consumerId, buf) => consumerId -> buf.toSeq
     }.toMap
@@ -865,7 +864,8 @@ case class MppNativeQueryExec(
     // parallelSortSplit must run AFTER MppSinglePartitionSortRule so the
     // RangePartitioning -> SinglePartition rewrite has already happened.
     val afterParallelSortSplit = parallelSortSplitRule(afterSkipShuffle)
-    val afterRootFinalAggSplit = splitPostJoinFinalAgg(afterParallelSortSplit)
+    val afterScalarProbeSplit = splitScalarSubqueryProbeRepartition(afterParallelSortSplit)
+    val afterRootFinalAggSplit = splitPostJoinFinalAgg(afterScalarProbeSplit)
     // finalAggTopNPartial inserts local TopN after final agg before the TakeOrdered
     // SINGLE gather; run after post-join agg splitting so it limits the split final output.
     val afterFinalAggTopNPartial = finalAggTopNPartialRule(afterRootFinalAggSplit)
@@ -904,11 +904,75 @@ case class MppNativeQueryExec(
         }
     }
     if (splitCount > 0) {
-      logWarning(
+      logInfo(
         s"MppNativeQueryExec: inserted $splitCount post-join final-aggregate split(s) " +
           s"after join hubs")
     }
     rewritten
+  }
+
+  private def splitScalarSubqueryProbeRepartition(plan: SparkPlan): SparkPlan = {
+    if (!booleanConf("spark.gluten.mpp.scalarSubqueryProbeRepartition.enabled", false)) {
+      return plan
+    }
+
+    var splitCount = 0
+    val rewritten = plan.transformUp {
+      case join: VeloxBroadcastNestedLoopJoinExecTransformer
+          if shouldSplitScalarSubqueryProbe(join) =>
+        val partitionExpressions = scalarSubqueryProbePartitionExpressions(join.left)
+        val repartitionedProbe =
+          ShuffleExchangeExec(
+            HashPartitioning(partitionExpressions, scalarSubqueryProbeRepartitionPartitions),
+            join.left)
+        splitCount += 1
+        join.copy(left = repartitionedProbe)
+    }
+    if (splitCount > 0) {
+      logInfo(
+        s"MppNativeQueryExec: inserted $splitCount scalar-subquery probe repartition split(s)")
+    }
+    rewritten
+  }
+
+  private def shouldSplitScalarSubqueryProbe(
+      join: VeloxBroadcastNestedLoopJoinExecTransformer): Boolean = {
+    join.buildSide == BuildRight &&
+    join.joinType == Inner &&
+    join.condition.isEmpty &&
+    !join.left.isInstanceOf[ShuffleExchangeLike] &&
+    boundaryExchange(join.right).exists(_.isInstanceOf[BroadcastExchangeLike]) &&
+    scalarSubqueryProbePartitionExpressions(join.left).nonEmpty
+  }
+
+  private def scalarSubqueryProbePartitionExpressions(plan: SparkPlan): Seq[Expression] = {
+    plan match {
+      case agg: HashAggregateExecBaseTransformer if isScalarSubqueryProbeAggregate(agg) =>
+        agg.groupingExpressions
+      case project: ProjectExecTransformer =>
+        scalarSubqueryProbePartitionExpressions(project.child)
+      case filter: FilterExecTransformerBase =>
+        scalarSubqueryProbePartitionExpressions(filter.child)
+      case _ =>
+        Seq.empty
+    }
+  }
+
+  private def isScalarSubqueryProbeAggregate(agg: HashAggregateExecBaseTransformer): Boolean = {
+    agg.groupingExpressions.size == 1 &&
+    agg.output.size <= 4 &&
+    agg.aggregateExpressions.nonEmpty &&
+    agg.aggregateExpressions.exists(expr => expr.mode == Final || expr.mode == Complete)
+  }
+
+  private def scalarSubqueryProbeRepartitionPartitions: Int = {
+    math.max(
+      1,
+      SQLConf.get
+        .getConfString(
+          "spark.gluten.mpp.scalarSubqueryProbeRepartition.partitions",
+          mppSplitHashPartitions().toString)
+        .toInt)
   }
 
   private def shouldSplitPostJoinFinalAgg(agg: HashAggregateExecTransformer): Boolean = {
@@ -1006,8 +1070,7 @@ case class MppNativeQueryExec(
         }
     }
     if (splitCount > 0) {
-      logWarning(
-        s"MppNativeQueryExec: inserted $splitCount final-aggregate split(s) before join hubs")
+      logInfo(s"MppNativeQueryExec: inserted $splitCount final-aggregate split(s) before join hubs")
     }
     rewritten
   }
@@ -1066,8 +1129,7 @@ case class MppNativeQueryExec(
         }
     }
     if (splitCount > 0) {
-      logWarning(
-        s"MppNativeQueryExec: inserted $splitCount existence-final split(s) before join hubs")
+      logInfo(s"MppNativeQueryExec: inserted $splitCount existence-final split(s) before join hubs")
     }
     rewritten
   }
@@ -1187,7 +1249,7 @@ case class MppNativeQueryExec(
           join.isNullAwareAntiJoin)
     }
     if (strippedSorts > 0) {
-      logWarning(
+      logInfo(
         s"MppNativeQueryExec: stripped $strippedSorts local sort(s) " +
           s"from hash join inputs")
     }
@@ -1210,7 +1272,7 @@ case class MppNativeQueryExec(
     if (maxInbound <= 0 && maxHashInbound <= 0 && maxBroadcastInbound <= 0) {
       return None
     }
-    logWarning(
+    logInfo(
       s"MppNativeQueryExec: inbound exchange guardrails enabled " +
         s"(maxInbound=$maxInbound maxHash=$maxHashInbound maxBroadcast=$maxBroadcastInbound)")
 
@@ -1350,11 +1412,13 @@ case class MppNativeQueryExec(
    * exchanges and higher join_hash / scan-I/O overhead.
    */
   private def coLocateBroadcastJoinProbe(plan: SparkPlan): SparkPlan = {
-    if (!coLocateBroadcastJoinProbeEnabled) {
+    val (enabled, useAutoGuard) = coLocateBroadcastJoinProbeConfig
+    if (!enabled) {
       return plan
     }
     plan.transformUp {
-      case join: BroadcastHashJoinExecTransformer if shouldCoLocateBroadcastJoinProbe(join) =>
+      case join: BroadcastHashJoinExecTransformer
+          if shouldCoLocateBroadcastJoinProbe(join, useAutoGuard) =>
         val streamedExchange = boundaryExchange(join.streamedPlan).get
         val buildExchange = boundaryExchange(join.buildPlan).get
         coLocateJoinProbeSide(join, join.buildSide, streamedExchange, buildExchange)
@@ -1399,7 +1463,7 @@ case class MppNativeQueryExec(
         }
     }
     if (pushCount > 0) {
-      logWarning(
+      logInfo(
         s"MppNativeQueryExec: pushed $pushCount replicated broadcast join(s) into " +
           "probe exchange producer fragments")
     }
@@ -1419,7 +1483,7 @@ case class MppNativeQueryExec(
       (join.leftKeys ++ join.rightKeys ++ join.condition.toSeq).flatMap(_.references).distinct
     val allowedRefs = streamed.outputSet ++ build.outputSet
     if (!allJoinRefs.forall(allowedRefs.contains)) {
-      logWarning(
+      logDebug(
         s"MppNativeQueryExec: not pushing broadcast join into probe exchange; " +
           s"join=${join.nodeName} has references outside streamed/build outputs")
       return None
@@ -1436,7 +1500,7 @@ case class MppNativeQueryExec(
       AttributeSet(requiredOutput)).flatMap {
       pushed =>
         if (!requiredOutput.forall(pushed.outputSet.contains)) {
-          logWarning(
+          logDebug(
             s"MppNativeQueryExec: not pushing broadcast join into probe exchange; " +
               s"pushed subtree lost required output attributes " +
               s"required=${requiredOutput.map(_.name).mkString("[", ", ", "]")} " +
@@ -1467,7 +1531,7 @@ case class MppNativeQueryExec(
       case Some(maxBuildBytes) =>
         val buildBytes = estimatedPlanBytes(join.buildPlan)
         if (buildBytes > maxBuildBytes) {
-          logWarning(
+          logDebug(
             s"MppNativeQueryExec: not pushing broadcast join into probe exchange; " +
               s"buildBytes=$buildBytes exceeds maxBuildBytes=$maxBuildBytes")
           return false
@@ -1508,7 +1572,7 @@ case class MppNativeQueryExec(
         val exchangeRequired =
           orderedAvailableAttributes(requiredOutput.toSeq ++ partitioningRefs, pushedJoin.output)
         val exchangeChild = projectTo(exchangeRequired, pushedJoin)
-        logWarning(
+        logInfo(
           s"MppNativeQueryExec: pushing broadcast join into HASH exchange producer " +
             s"exchange=${ex.id} partitioning=${ex.outputPartitioning} " +
             s"output=${exchangeChild.output.map(_.name).mkString("[", ", ", "]")}")
@@ -1612,7 +1676,7 @@ case class MppNativeQueryExec(
       streamedExchange: Exchange,
       buildExchange: Exchange): T = {
     val inlinedStreamed = inlineExchangeProducer(streamedExchange)
-    logWarning(
+    logInfo(
       s"MppNativeQueryExec: co-locating hash join probe side " +
         s"join=${join.nodeName} buildSide=$buildSide " +
         s"streamedExchange=${streamedExchange.id} buildExchange=${buildExchange.id}; " +
@@ -1626,11 +1690,13 @@ case class MppNativeQueryExec(
     relocated.asInstanceOf[T]
   }
 
-  private def shouldCoLocateBroadcastJoinProbe(join: BroadcastHashJoinExecTransformer): Boolean = {
+  private def shouldCoLocateBroadcastJoinProbe(
+      join: BroadcastHashJoinExecTransformer,
+      useAutoGuard: Boolean): Boolean = {
     join.joinType match {
       case _: InnerLike =>
       case _ =>
-        logWarning(
+        logDebug(
           s"MppNativeQueryExec: not co-locating broadcast hash join probe side; " +
             s"join=${join.nodeName} joinType=${join.joinType} is not inner-like")
         return false
@@ -1639,7 +1705,7 @@ case class MppNativeQueryExec(
     val streamedExchange = boundaryExchange(join.streamedPlan)
     val buildExchange = boundaryExchange(join.buildPlan)
     if (streamedExchange.isEmpty || buildExchange.isEmpty) {
-      logWarning(
+      logDebug(
         s"MppNativeQueryExec: not co-locating broadcast hash join probe side; " +
           s"join=${join.nodeName} buildSide=${join.buildSide} " +
           s"streamedExchangeFound=${streamedExchange.isDefined} " +
@@ -1648,7 +1714,7 @@ case class MppNativeQueryExec(
     }
     val streamed = streamedExchange.get
     if (!streamed.isInstanceOf[ShuffleExchangeLike]) {
-      logWarning(
+      logDebug(
         s"MppNativeQueryExec: not co-locating broadcast hash join probe side; " +
           s"join=${join.nodeName} buildSide=${join.buildSide} " +
           s"streamedExchange=${streamed.nodeName} " +
@@ -1656,7 +1722,7 @@ case class MppNativeQueryExec(
       return false
     }
     if (!isHashPartitioned(streamed)) {
-      logWarning(
+      logDebug(
         s"MppNativeQueryExec: not co-locating broadcast hash join probe side; " +
           s"join=${join.nodeName} buildSide=${join.buildSide} " +
           s"streamedExchange=${streamed.nodeName} " +
@@ -1664,11 +1730,42 @@ case class MppNativeQueryExec(
       return false
     }
     if (!buildExchange.get.isInstanceOf[BroadcastExchangeLike]) {
-      logWarning(
+      logDebug(
         s"MppNativeQueryExec: not co-locating broadcast hash join probe side; " +
           s"join=${join.nodeName} buildSide=${join.buildSide} " +
           s"buildExchange=${buildExchange.get.nodeName} is not broadcast")
       return false
+    }
+
+    if (useAutoGuard) {
+      if (join.buildSide == BuildLeft) {
+        logDebug(
+          s"MppNativeQueryExec: not auto co-locating broadcast hash join probe side; " +
+            s"join=${join.nodeName} buildSide=${join.buildSide} has not been proven safe")
+        return false
+      }
+
+      val buildBytes = estimatedPlanBytes(join.buildPlan)
+      val streamedBytes = estimatedPlanBytes(join.streamedPlan)
+      if (
+        isConfidentSize(buildBytes) &&
+        isConfidentSize(streamedBytes) &&
+        buildBytes > streamedBytes
+      ) {
+        logDebug(
+          s"MppNativeQueryExec: not co-locating broadcast hash join probe side; " +
+            s"join=${join.nodeName} buildBytes=$buildBytes exceeds " +
+            s"streamedBytes=$streamedBytes")
+        return false
+      }
+      val maxBuildBytes = broadcastJoinPushdownMaxBuildBytes
+      if (maxBuildBytes.exists(limit => isConfidentSize(buildBytes) && buildBytes > limit)) {
+        logDebug(
+          s"MppNativeQueryExec: not co-locating broadcast hash join probe side; " +
+            s"join=${join.nodeName} buildBytes=$buildBytes exceeds " +
+            s"autoBroadcastJoinThreshold=${maxBuildBytes.get}")
+        return false
+      }
     }
     true
   }
@@ -1677,7 +1774,7 @@ case class MppNativeQueryExec(
     join.joinType match {
       case _: InnerLike =>
       case _ =>
-        logWarning(
+        logDebug(
           s"MppNativeQueryExec: not co-locating replicated hash join probe side; " +
             s"join=${join.nodeName} joinType=${join.joinType} is not inner-like")
         return false
@@ -1686,7 +1783,7 @@ case class MppNativeQueryExec(
     val streamedExchange = boundaryExchange(join.streamedPlan)
     val buildExchange = boundaryExchange(join.buildPlan)
     if (streamedExchange.isEmpty || buildExchange.isEmpty) {
-      logWarning(
+      logDebug(
         s"MppNativeQueryExec: not co-locating replicated hash join probe side; " +
           s"join=${join.nodeName} buildSide=${join.buildSide} " +
           s"streamedExchangeFound=${streamedExchange.isDefined} " +
@@ -1694,7 +1791,7 @@ case class MppNativeQueryExec(
       return false
     }
     if (!streamedExchange.get.isInstanceOf[ShuffleExchangeLike]) {
-      logWarning(
+      logDebug(
         s"MppNativeQueryExec: not co-locating replicated hash join probe side; " +
           s"join=${join.nodeName} buildSide=${join.buildSide} " +
           s"streamedExchange=${streamedExchange.get.nodeName} " +
@@ -1703,7 +1800,7 @@ case class MppNativeQueryExec(
     }
 
     if (buildExchange.get.isInstanceOf[BroadcastExchangeLike]) {
-      logWarning(
+      logInfo(
         s"MppNativeQueryExec: co-locating replicated hash join probe side; " +
           s"join=${join.nodeName} buildSide=${join.buildSide} " +
           s"buildExchange=${buildExchange.get.nodeName} is already broadcast")
@@ -1712,7 +1809,7 @@ case class MppNativeQueryExec(
 
     val eligible = replicatedJoinStats(join).isDefined
     if (!eligible) {
-      logWarning(
+      logDebug(
         s"MppNativeQueryExec: not co-locating replicated hash join probe side; " +
           s"join=${join.nodeName} buildSide=${join.buildSide} " +
           s"streamedExchange=${streamedExchange.get.nodeName} " +
@@ -1757,7 +1854,7 @@ case class MppNativeQueryExec(
               s"streamedSize=${streamedStats.sizeInBytes}"
         }
         .mkString("; ")
-      logWarning(
+      logDebug(
         s"MppNativeQueryExec: not co-locating hash join probe side; " +
           s"maxBuildBytes=$maxBuildBytes candidates=[$reasons]")
     }
@@ -1814,7 +1911,7 @@ case class MppNativeQueryExec(
         rewriteFactBroadcastJoin(bhj).getOrElse(bhj)
       case join: SortMergeJoinExecTransformer
           if join.joinType == LeftSemi && forceLeftSemiBuildLeftEnabled =>
-        logWarning(
+        logInfo(
           s"MppNativeQueryExec: rewriting LEFT SEMI sort-merge join to " +
             s"shuffled hash join with BuildLeft; " +
             s"spark.gluten.mpp.forceLeftSemiBuildLeft=true")
@@ -1832,7 +1929,7 @@ case class MppNativeQueryExec(
           .filter(_.side != join.buildSide)
           .map {
             choice =>
-              logWarning(
+              logInfo(
                 s"MppNativeQueryExec: normalizing MPP hash join build side " +
                   s"from ${join.buildSide} to ${choice.side}; ${choice.reason}")
               join.copy(buildSide = choice.side)
@@ -1861,7 +1958,7 @@ case class MppNativeQueryExec(
   // small-dimension broadcasts are left untouched.
   private def rewriteFactBroadcastJoin(
       join: BroadcastHashJoinExecTransformer): Option[SparkPlan] = {
-    val cap = replicatedJoinMaxBuildBytes
+    val cap = factBroadcastMaxBuildBytes
     val leftBytes = realScanBytes(join.left)
     val rightBytes = realScanBytes(join.right)
     val (buildBytes, probeBytes) = join.buildSide match {
@@ -1910,7 +2007,7 @@ case class MppNativeQueryExec(
     val (newLeft, newRight) =
       if (smallIsLeft) (smallBroadcast: SparkPlan, factRaw)
       else (factRaw, smallBroadcast: SparkPlan)
-    logWarning(
+    logInfo(
       s"MppNativeQueryExec: flipping fact-table BROADCAST hash join build side to the small " +
         s"dimension (was buildSide=${join.buildSide}; leftScanBytes=$leftBytes " +
         s"rightScanBytes=$rightBytes); new buildSide=$newBuildSide -- fact stays streamed probe")
@@ -1942,7 +2039,7 @@ case class MppNativeQueryExec(
     val shuffledRight =
       ShuffleExchangeExec(HashPartitioning(join.rightKeys, numPartitions), rightProducer)
     val newBuildSide: BuildSide = if (leftBytes <= rightBytes) BuildLeft else BuildRight
-    logWarning(
+    logInfo(
       s"MppNativeQueryExec: demoting fact x fact BROADCAST hash join to shuffle hash join " +
         s"(was buildSide=${join.buildSide}; leftScanBytes=$leftBytes " +
         s"rightScanBytes=$rightBytes); new buildSide=$newBuildSide")
@@ -1988,13 +2085,19 @@ case class MppNativeQueryExec(
         case None =>
       }
     }
-    broadcastBuildSide(join).orElse {
-      selectiveAggregateFilterBuildSide(join).orElse {
-        statsBuildSide(join).orElse {
-          sparkJoinSelectionBuildSide(join)
-        }
+    broadcastBuildSide(join)
+      .orElse {
+        smallRawDimensionBuildSide(join)
       }
-    }
+      .orElse {
+        selectiveAggregateFilterBuildSide(join)
+      }
+      .orElse {
+        statsBuildSide(join)
+      }
+      .orElse {
+        sparkJoinSelectionBuildSide(join)
+      }
   }
 
   private def preferredLeftSemiBuildSide(
@@ -2081,6 +2184,59 @@ case class MppNativeQueryExec(
           BuildRight,
           "right side contains a post-aggregate filter and left side is a raw scan " +
             "pipeline with payload columns"))
+    } else {
+      None
+    }
+  }
+
+  private def smallRawDimensionBuildSide(
+      join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
+    if (!smallRawDimensionBuildSideEnabled) {
+      return None
+    }
+    join.joinType match {
+      case _: InnerLike =>
+      case _ => return None
+    }
+
+    val leftRaw = isRawScanPipeline(join.left)
+    val rightRaw = isRawScanPipeline(join.right)
+    val leftSelective = containsPostAggregateFilter(join.left)
+    val rightSelective = containsPostAggregateFilter(join.right)
+
+    if (leftRaw && rightSelective) {
+      rawDimensionBuildChoice(join, BuildLeft, join.left, join.right, join.leftKeys)
+    } else if (rightRaw && leftSelective) {
+      rawDimensionBuildChoice(join, BuildRight, join.right, join.left, join.rightKeys)
+    } else {
+      None
+    }
+  }
+
+  private def rawDimensionBuildChoice(
+      join: ShuffledHashJoinExecTransformer,
+      side: BuildSide,
+      rawSide: SparkPlan,
+      otherSide: SparkPlan,
+      rawJoinKeys: Seq[Expression]): Option[BuildSideChoice] = {
+    if (!hasPayloadBeyondJoinKeys(rawSide, rawJoinKeys) || rawSide.output.size > 4) {
+      return None
+    }
+    val rawBytes = estimatedPlanBytes(rawSide)
+    val otherBytes = estimatedPlanBytes(otherSide)
+    if (
+      isConfidentSize(rawBytes) &&
+      isConfidentSize(otherBytes) &&
+      rawBytes <= replicatedJoinMaxBuildBytes &&
+      isSignificantlySmaller(rawBytes, otherBytes)
+    ) {
+      Some(
+        BuildSideChoice(
+          side,
+          s"small raw dimension side selected as replicated build " +
+            s"(rawSize=$rawBytes, otherSize=$otherBytes, " +
+            s"maxBuildBytes=$replicatedJoinMaxBuildBytes)"
+        ))
     } else {
       None
     }
@@ -2282,32 +2438,42 @@ case class MppNativeQueryExec(
     booleanConf("spark.gluten.mpp.coLocateReplicatedJoinProbe", defaultValue = true)
   }
 
-  private def coLocateBroadcastJoinProbeEnabled: Boolean = {
-    booleanConf("spark.gluten.mpp.coLocateBroadcastJoinProbe", defaultValue = false)
+  private def coLocateBroadcastJoinProbeConfig: (Boolean, Boolean) = {
+    val explicit = optionalBooleanConf("spark.gluten.mpp.coLocateBroadcastJoinProbe")
+    (
+      explicit.getOrElse(booleanConf("spark.gluten.mpp.enabled", defaultValue = false)),
+      explicit.isEmpty)
   }
 
   private def pushBroadcastJoinIntoProbeExchangeEnabled: Boolean = {
     booleanConf("spark.gluten.mpp.pushBroadcastJoinIntoProbeExchange", defaultValue = true)
   }
 
+  private def smallRawDimensionBuildSideEnabled: Boolean = {
+    booleanConf("spark.gluten.mpp.smallRawDimensionBuildSide.enabled", defaultValue = false)
+  }
+
   private def replicatedJoinMaxBuildBytes: BigInt = {
     bytesConf("spark.gluten.mpp.replicatedJoinMaxBuildBytes", BigInt(32L) << 30)
   }
 
+  private def factBroadcastMaxBuildBytes: BigInt = {
+    bytesConf("spark.gluten.mpp.factBroadcastMaxBuildBytes", BigInt(8L) << 30)
+  }
+
   private def capLocalHashExchangeTasks(exchanges: Seq[ExchangeSpec]): Seq[ExchangeSpec] = {
-    localHashExchangeTasks match {
-      case Some(cap) =>
+    effectiveLocalHashExchangeTasks match {
+      case Some((cap, source)) =>
         exchanges.map {
           spec =>
             if (
               (spec.exchangeType == "HASH" || spec.exchangeType == "RANGE") &&
               spec.numPartitions > cap
             ) {
-              logWarning(
+              logDebug(
                 s"MppNativeQueryExec: capping local ${spec.exchangeType} exchange ${spec.id} " +
                   s"F${spec.producerFragmentId}->F${spec.consumerFragmentId} native partitions " +
-                  s"from ${spec.numPartitions} to $cap via " +
-                  s"spark.gluten.mpp.localHashExchangeTasks")
+                  s"from ${spec.numPartitions} to $cap via $source")
               spec.copy(numPartitions = cap)
             } else {
               spec
@@ -2343,7 +2509,7 @@ case class MppNativeQueryExec(
       fragment =>
         tunedConsumers.get(fragment.id) match {
           case Some(tunedParallelism) if tunedParallelism > fragment.parallelism =>
-            logWarning(
+            logInfo(
               s"MppNativeQueryExec: raising post-join final-aggregate fragment " +
                 s"F${fragment.id} drivers from ${fragment.parallelism} to $tunedParallelism")
             fragment.copy(parallelism = tunedParallelism)
@@ -2392,6 +2558,22 @@ case class MppNativeQueryExec(
     positiveIntConf("spark.gluten.mpp.localHashExchangeTasks")
   }
 
+  private def effectiveLocalHashExchangeTasks: Option[(Int, String)] = {
+    localHashExchangeTasks.map(_ -> "spark.gluten.mpp.localHashExchangeTasks").orElse {
+      if (!booleanConf("spark.gluten.mpp.multiExecutor.enabled", defaultValue = false)) {
+        None
+      } else {
+        val count = mppNonNegativeIntConf("spark.gluten.mpp.multiExecutor.numPartitions", 2)
+        if (count <= 0) {
+          throw new IllegalArgumentException(
+            "spark.gluten.mpp.multiExecutor.numPartitions must be positive when " +
+              "spark.gluten.mpp.multiExecutor.enabled=true")
+        }
+        Some(count -> "spark.gluten.mpp.multiExecutor.numPartitions")
+      }
+    }
+  }
+
   private def mppSparkPartitionCount: Int = {
     if (!booleanConf("spark.gluten.mpp.multiExecutor.enabled", defaultValue = false)) {
       return 1
@@ -2403,7 +2585,7 @@ case class MppNativeQueryExec(
         "spark.gluten.mpp.multiExecutor.numPartitions must be positive when " +
           "spark.gluten.mpp.multiExecutor.enabled=true")
     }
-    logWarning(s"MppNativeQueryExec: multi-executor MPP requested; target Spark partitions=$count")
+    logDebug(s"MppNativeQueryExec: multi-executor MPP requested; target Spark partitions=$count")
     count
   }
 
@@ -2433,7 +2615,7 @@ case class MppNativeQueryExec(
       hasOnlySinglePeerExchange &&
       !isWriteJob && Thread.currentThread().getName.startsWith("subquery-")
     ) {
-      logWarning(
+      logDebug(
         s"MppNativeQueryExec: keeping this MPP subquery single-peer despite requested " +
           s"$requestedCount Spark partitions because the exchange graph contains only " +
           "SINGLE/BROADCAST exchanges. " +
@@ -2467,7 +2649,7 @@ case class MppNativeQueryExec(
             .forall(_.exchangeType == "SINGLE")
       }
       if (rootFedBySingleGather) {
-        logWarning(
+        logDebug(
           s"MppNativeQueryExec: keeping this MPP query single-peer despite requested " +
             s"$requestedCount Spark partitions because its root fragment is fed by a SINGLE " +
             "gather and it is not a write (uncorrelated scalar subquery / global gather); " +
@@ -2643,7 +2825,7 @@ case class MppNativeQueryExec(
         }
     }
     if (materializedCount == 0) {
-      logWarning(
+      logDebug(
         "materializeScalarSubqueries: no remaining executable subquery expressions; " +
           "rewritten scalars will be supplied by native MPP exchanges")
     }
@@ -2658,7 +2840,7 @@ case class MppNativeQueryExec(
       case _ =>
     }
     if (markedCount > 0) {
-      logWarning(
+      logDebug(
         s"MppNativeQueryExec: suppressed $markedCount ColumnarBroadcastExchangeExec " +
           "node(s) under native MPP execution")
     }
@@ -2815,7 +2997,7 @@ case class MppNativeQueryExec(
       case Some(maxDrivers) =>
         val capped = math.min(coreCapped, maxDrivers)
         if (capped != coreCapped) {
-          logWarning(
+          logDebug(
             s"MppNativeQueryExec: capping fragment drivers from $coreCapped to $capped " +
               s"(raw=$raw, executorCores=$cores) via " +
               s"spark.gluten.mpp.maxDriversPerFragment")
@@ -2849,6 +3031,21 @@ case class MppNativeQueryExec(
 
   // spark.gluten.mpp.largeParquetScanChunks (default false): session-level cuDF
   // parquet chunk/pass read limits for MPP scans. See MppNativeQueryRDD companion.
+
+  private def optionalBooleanConf(key: String): Option[Boolean] = {
+    SQLConf.get.getConfString(key, "").trim match {
+      case "" =>
+        Option(SparkEnv.get)
+          .flatMap(env => Option(env.conf.get(key, null)))
+          .orElse(sys.props.get(key))
+          .map(_.trim)
+          .filter(_.nonEmpty)
+          .filterNot(_.equalsIgnoreCase("null"))
+          .map(_.toBoolean)
+      case fromSqlConf if fromSqlConf.equalsIgnoreCase("null") => None
+      case fromSqlConf => Some(fromSqlConf.toBoolean)
+    }
+  }
 
   private def booleanConf(key: String, defaultValue: Boolean): Boolean = {
     SQLConf.get.getConfString(key, "").trim match {
@@ -2988,7 +3185,7 @@ case class MppNativeQueryExec(
   private def generateSubstraitForFragment(fragment: NativeFragment): Array[Byte] = {
     fragment.rootOperator match {
       case wst: WholeStageTransformer =>
-        logWarning(
+        logDebug(
           s"generateSubstraitForFragment: fragment ${fragment.id} " +
             s"WST stageId=${wst.stageId}")
 
@@ -2996,7 +3193,7 @@ case class MppNativeQueryExec(
         val planNode = wsCtx.root
         val planBytes = planNode.toProtobuf.toByteArray
 
-        logWarning(
+        logDebug(
           s"generateSubstraitForFragment: fragment ${fragment.id} " +
             s"Substrait plan size=${planBytes.length} bytes")
         logDebug(
@@ -3024,7 +3221,7 @@ case class MppNativeQueryExec(
   private def generateSubstraitPlan(fragment: NativeFragment): Array[Byte] = {
     // Unwrap non-TransformSupport wrappers to find the actual native operator
     val rootOp = unwrapToTransformSupport(fragment.rootOperator)
-    logWarning(
+    logDebug(
       s"generateSubstraitPlan: fragment ${fragment.id} " +
         s"original=${fragment.rootOperator.getClass.getSimpleName} " +
         s"unwrapped=${rootOp.getClass.getSimpleName}")
@@ -3183,13 +3380,13 @@ case class MppNativeQueryExec(
       case wst: WholeStageTransformer =>
         val leafTransformers = findLeafTransformersInWST(wst)
         if (leafTransformers.nonEmpty) {
-          logWarning(
+          logDebug(
             s"extractSplitInfosForFragment: fragment ${fragment.id} has " +
               s"${leafTransformers.size} leaf scan(s)")
           leafTransformers.map {
             leaf =>
               val allPartitionSplits = leaf.getSplitInfos
-              logWarning(
+              logDebug(
                 s"  leaf ${leaf.getClass.getSimpleName}: " +
                   s"${allPartitionSplits.size} partition splits")
               mergeSplitInfosToBytes(allPartitionSplits)
@@ -3230,7 +3427,7 @@ case class MppNativeQueryExec(
         builder.addAllItems(localFiles.getItemsList)
     }
     val merged = builder.build()
-    logWarning(
+    logDebug(
       s"mergeSplitInfosToBytes: merged ${splitInfos.size} partitions " +
         s"into ${merged.getItemsCount} file items")
     merged.toByteArray
@@ -3318,7 +3515,7 @@ case class MppNativeQueryExec(
       Files.write(outDir.resolve("query.sql"), sqlBytes)
 
       val totalSplitFiles = fragmentSplitInfos.map(_.length).sum
-      logWarning(
+      logInfo(
         s"MppNativeQueryExec: dumped Substrait plan " +
           s"(${fragmentPlans.length} fragments, ${exchangeSpecs.size} exchanges, " +
           s"$totalSplitFiles split files) to $outDir")
