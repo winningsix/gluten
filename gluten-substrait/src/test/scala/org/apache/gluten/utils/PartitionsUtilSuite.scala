@@ -159,4 +159,24 @@ class PartitionsUtilSuite extends AnyFunSuite {
     assert(result.physicalSplitBytes === 512 * mb)
     assert(result.partitionMaxSplitBytes === 256 * mb)
   }
+
+  test("MPP scan size-aware disabled keeps Spark split bytes") {
+    val mb = 1024L * 1024L
+
+    val result = PartitionsUtil.planMppScanSplitBytes(
+      sparkMaxSplitBytes = 256 * mb,
+      fileSizes = Seq.fill(15)(3 * 1024 * mb),
+      openCostInBytes = 4 * mb,
+      mppEnabled = true,
+      sizeAwareEnabled = false,
+      targetSplitBytes = None,
+      maxWholeFileBytes = 8 * 1024 * mb,
+      wholeFileMinFiles = 1,
+      wholeFileFloorEnabled = true,
+      maxNativeSplitBytes = None
+    )
+
+    assert(result.physicalSplitBytes === 256 * mb)
+    assert(result.partitionMaxSplitBytes === 256 * mb)
+  }
 }

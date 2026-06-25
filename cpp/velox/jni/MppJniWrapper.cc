@@ -2007,15 +2007,13 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
         mergedNumDrivers = driverCap;
       }
 
-      // LocalPartitionNode creates additional Velox pipelines inside the
-      // surviving merged task. The JNI-level fragmentSpecs list only sees that
-      // surviving task, so size the executor for the folded producer pipelines
-      // as well as the root pipeline.
-      const int32_t mergedPipelineCount =
-          static_cast<int32_t>(mergedProducerIds.size()) + 1;
+      // Keep the single-GPU executor budget tied to the capped per-pipeline
+      // driver count. Multiplying by folded pipeline count can start many
+      // independent cuDF-heavy pipelines concurrently in one merged task,
+      // increasing peak RMM pressure without increasing useful GPU parallelism.
       singleTaskThreadPoolDriverBudget = std::max(
           singleTaskThreadPoolDriverBudget,
-          mergedPipelineCount * std::max(1, mergedNumDrivers));
+          std::max(1, mergedNumDrivers));
     }
     fragSpec.numDrivers = mergedNumDrivers;
     fragSpec.scanInfos = std::move(fragScanInfos);

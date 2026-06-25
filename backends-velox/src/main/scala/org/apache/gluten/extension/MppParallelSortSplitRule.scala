@@ -16,6 +16,7 @@
  */
 package org.apache.gluten.extension
 
+import org.apache.gluten.config.VeloxConfig
 import org.apache.gluten.execution.SortExecTransformer
 
 import org.apache.spark.internal.Logging
@@ -60,10 +61,10 @@ import org.apache.spark.sql.internal.SQLConf
  * [[SortExecTransformer]] on a later pass. `N` defaults to `spark.sql.shuffle.partitions` (falling
  * back to 4).
  *
- * Gated by spark.gluten.mpp.parallelSortSplit (default: true). The missing-stats aggregate fallback
- * is intentionally narrow: it only covers the simple post-join aggregate ORDER BY shape that
- * benefits from the extra RR merge, and skips broader broadcast/nested-loop join trees where the
- * extra fragment is a regression.
+ * Gated by spark.gluten.mpp.parallelSortSplit (default: false). The missing-stats aggregate
+ * fallback is intentionally narrow: it only covers the simple post-join aggregate ORDER BY shape
+ * that benefits from the extra RR merge, and skips broader broadcast/nested-loop join trees where
+ * the extra fragment is a regression.
  */
 case class MppParallelSortSplitRule() extends Rule[SparkPlan] with Logging {
   private val confKey = "spark.gluten.mpp.parallelSortSplit"
@@ -79,10 +80,12 @@ case class MppParallelSortSplitRule() extends Rule[SparkPlan] with Logging {
   private val maxAggregateLookupDepth = 8
 
   override def apply(plan: SparkPlan): SparkPlan = {
-    val enabled = confString(confKey, "true").toBoolean
+    val enabled = confString(confKey, "false").toBoolean
+    val singleTaskMode = confBoolean(VeloxConfig.MPP_SINGLE_TASK_MODE.key, defaultValue = false)
     logDebug(
-      s"[MppParallelSortSplitRule] apply: enabled=$enabled root=${plan.getClass.getSimpleName}")
-    if (!enabled) {
+      s"[MppParallelSortSplitRule] apply: enabled=$enabled singleTaskMode=$singleTaskMode " +
+        s"root=${plan.getClass.getSimpleName}")
+    if (!enabled || singleTaskMode) {
       return plan
     }
     logDebug(s"[MppParallelSortSplitRule] tree:\n${plan.treeString.take(1500)}")
@@ -398,6 +401,13 @@ case class MppParallelSortSplitRule() extends Rule[SparkPlan] with Logging {
   private def confString(key: String, defaultValue: String): String =
     try {
       SQLConf.get.getConfString(key, defaultValue)
+    } catch {
+      case _: Throwable => defaultValue
+    }
+
+  private def confBoolean(key: String, defaultValue: Boolean): Boolean =
+    try {
+      SQLConf.get.getConfString(key, defaultValue.toString).toBoolean
     } catch {
       case _: Throwable => defaultValue
     }

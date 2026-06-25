@@ -165,6 +165,8 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
       .set("spark.gluten.sql.columnar.cudf", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enabled", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan", "true")
+      // Keep the bounded async MR large enough for the single-GPU SF1K MPP profile.
+      .set("spark.gluten.sql.columnar.backend.velox.cudf.memoryPercent", "90")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.jit_expression_enabled", "false")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.ast_expression_enabled", "true")
       .set("spark.gluten.mpp.substraitDumpDir", mppDumpDir)
@@ -189,6 +191,7 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
       "spark.gluten.sql.columnar.libpath",
       "spark.gluten.sql.columnar.backend.velox.IOThreads",
       "spark.gluten.sql.columnar.backend.velox.cudf.memoryResource",
+      "spark.gluten.sql.columnar.backend.velox.cudf.memoryPercent",
       "spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_rows",
       "spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_max_batch_rows",
       "spark.gluten.sql.columnar.backend.velox.cudf.hive.scan-output-rows",

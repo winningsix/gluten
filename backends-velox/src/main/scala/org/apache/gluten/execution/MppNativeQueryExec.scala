@@ -20,14 +20,14 @@ import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.events.{GlutenMppPlanEvent, GlutenMppPlanFragmentEvent}
 import org.apache.gluten.expression.ConverterUtils
-import org.apache.gluten.extension.{ExchangeSpec, MppFinalAggTopNPartialRule, MppParallelSortSplitRule, MppRemoveRedundantShuffleRule, MppSinglePartitionSortRule, NativeFragment, RewriteUncorrelatedScalarSubquery}
+import org.apache.gluten.extension.{ExchangeSpec, FlushableHashAggregateRule, MppFinalAggTopNPartialRule, MppParallelSortSplitRule, MppRemoveRedundantShuffleRule, MppSinglePartitionSortRule, NativeFragment, RewriteUncorrelatedScalarSubquery}
 import org.apache.gluten.extension.columnar.transition.{Convention, ConventionReq}
 import org.apache.gluten.metrics.MetricsUpdater
 import org.apache.gluten.mpp.control.{GlutenMppPeerResolution, GlutenMppPeerResolver}
 import org.apache.gluten.runtime.Runtimes
 import org.apache.gluten.substrait.SubstraitContext
 import org.apache.gluten.substrait.plan.PlanBuilder
-import org.apache.gluten.substrait.rel.SplitInfo
+import org.apache.gluten.substrait.rel.{LocalFilesNode, SplitInfo}
 import org.apache.gluten.utils.SubstraitPlanPrinterUtil
 import org.apache.gluten.vectorized.MppQueryJniWrapper
 
@@ -211,11 +211,29 @@ case class MppNativeQueryExec(
   private val SCALAR_SUBQUERY_REWRITE_ENABLED_KEY =
     "spark.gluten.mpp.rewriteUncorrelatedScalarSubquery"
   private val SCALAR_SUBQUERY_REWRITE_ENABLED_DEFAULT = "true"
+  private val MPP_SINGLE_TASK_MODE_KEY =
+    "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode"
 
   private def isScalarSubqueryRewriteEnabled: Boolean = {
-    SQLConf.get
-      .getConfString(SCALAR_SUBQUERY_REWRITE_ENABLED_KEY, SCALAR_SUBQUERY_REWRITE_ENABLED_DEFAULT)
-      .toBoolean
+    val conf = SQLConf.get
+    conf.getAllConfs
+      .get(SCALAR_SUBQUERY_REWRITE_ENABLED_KEY)
+      .map(_.toBoolean)
+      .getOrElse(!isExplicitSingleTaskMode && SCALAR_SUBQUERY_REWRITE_ENABLED_DEFAULT.toBoolean)
+  }
+
+  private def isExplicitSingleTaskMode: Boolean =
+    SQLConf.get.getConfString(MPP_SINGLE_TASK_MODE_KEY, "false").toBoolean
+
+  private def scalarSubqueryRewriteDisabledReason: String = {
+    val conf = SQLConf.get
+    if (
+      isExplicitSingleTaskMode && !conf.getAllConfs.contains(SCALAR_SUBQUERY_REWRITE_ENABLED_KEY)
+    ) {
+      s"$MPP_SINGLE_TASK_MODE_KEY=true"
+    } else {
+      s"$SCALAR_SUBQUERY_REWRITE_ENABLED_KEY=false"
+    }
   }
 
   private def newNativeMppQueryId(): String = {
@@ -270,7 +288,7 @@ case class MppNativeQueryExec(
       } else {
         logInfo(
           s"MppNativeQueryExec: keeping ScalarSubquery expressions materialized by Spark " +
-            s"because $SCALAR_SUBQUERY_REWRITE_ENABLED_KEY=false")
+            s"because $scalarSubqueryRewriteDisabledReason")
         executionChild
       }
 
@@ -879,8 +897,13 @@ case class MppNativeQueryExec(
     val afterReplicatedJoin =
       coLocateReplicatedJoinProbe(afterBroadcastPushdown)
     val afterBroadcastJoin = coLocateBroadcastJoinProbe(afterReplicatedJoin)
+    // MppNativeQueryExec is injected before the normal columnar post-transform pass can see this
+    // subtree. Re-run the flushable partial aggregation rule here so MPP plans keep the same
+    // partial-aggregate flushing behavior as the regular Velox path.
+    val afterFlushableAgg =
+      FlushableHashAggregateRule(org.apache.spark.sql.SparkSession.active)(afterBroadcastJoin)
     normalizeInputIteratorTransformers(
-      ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(afterBroadcastJoin))
+      ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(afterFlushableAgg))
   }
 
   private def splitPostJoinFinalAgg(plan: SparkPlan): SparkPlan = {
@@ -3422,8 +3445,13 @@ case class MppNativeQueryExec(
     val builder = ReadRel.LocalFiles.newBuilder()
     splitInfos.foreach {
       si =>
-        // SplitInfo.toProtobuf returns Message; parse as typed LocalFiles
-        val localFiles = ReadRel.LocalFiles.parseFrom(si.toProtobuf.toByteArray)
+        val localFiles = si match {
+          case local: LocalFilesNode => local.toProtobuf
+          case other =>
+            throw new IllegalStateException(
+              s"MppNativeQueryExec: unsupported MPP split info " +
+                s"${other.getClass.getName}; expected LocalFilesNode")
+        }
         builder.addAllItems(localFiles.getItemsList)
     }
     val merged = builder.build()

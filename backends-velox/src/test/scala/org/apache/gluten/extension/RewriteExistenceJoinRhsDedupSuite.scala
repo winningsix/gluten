@@ -21,7 +21,7 @@ import org.apache.gluten.extension.columnar.RewriteExistenceJoinRhsDedup
 
 import org.apache.spark.sql.{QueryTest, Row}
 import org.apache.spark.sql.catalyst.plans.{LeftAnti, LeftSemi}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Join, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LogicalPlan, Project}
 import org.apache.spark.sql.classic.ClassicDataset
 import org.apache.spark.sql.test.SharedSparkSession
 
@@ -66,6 +66,32 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
       case join @ Join(_, _, LeftSemi | LeftAnti, _, _) if join.right.exists {
             case Aggregate(groupingExpressions, aggregateExpressions, _) =>
               groupingExpressions.length == 1 && aggregateExpressions.length == 3
+            case _ => false
+          } =>
+        true
+    }.size
+  }
+
+  private def hasExistenceSummary(plan: LogicalPlan): Boolean = {
+    plan match {
+      case Aggregate(_, aggregateExpressions, _) =>
+        aggregateExpressions.exists(_.name.startsWith("_existence_min_")) &&
+        (aggregateExpressions.exists(_.name.startsWith("_existence_max_")) ||
+          aggregateExpressions.exists(_.name.startsWith("_existence_count_")))
+      case Project(_, child) => hasExistenceSummary(child)
+      case Filter(_, child) => hasExistenceSummary(child)
+      case _ => false
+    }
+  }
+
+  private def redundantDedupOverExistenceSummaryCount(plan: LogicalPlan): Int = {
+    plan.collect {
+      case join @ Join(_, _, LeftSemi | LeftAnti, _, _) if join.right.exists {
+            case Aggregate(groupingExpressions, aggregateExpressions, child)
+                if groupingExpressions.nonEmpty &&
+                  groupingExpressions.length == aggregateExpressions.length &&
+                  hasExistenceSummary(child) =>
+              true
             case _ => false
           } =>
         true
@@ -171,6 +197,12 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
     assert(
       hasOptimizedExistenceAggregate(optimizedPlan),
       s"Expected Spark predicate subquery rewrite to preserve RHS summary:\n$optimizedPlan")
+    val rewrittenAgain = rewrite(optimizedPlan)
+    assert(
+      redundantDedupOverExistenceSummaryCount(rewrittenAgain) == 0,
+      s"Expected later optimizer pass to avoid dedup over summarized RHS:\n" +
+        rewrittenAgain.treeString
+    )
   }
 
   test("summarized NOT EXISTS remains semantically equivalent when disabled") {

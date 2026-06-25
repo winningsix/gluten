@@ -110,6 +110,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   private val SCALAR_SUBQUERY_REWRITE_ENABLED_KEY =
     "spark.gluten.mpp.rewriteUncorrelatedScalarSubquery"
   private val SCALAR_SUBQUERY_REWRITE_ENABLED_DEFAULT = "true"
+  private val MPP_SINGLE_TASK_MODE_KEY =
+    "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode"
 
   private def isBroadcastFuseEnabled: Boolean = {
     SQLConf.get
@@ -118,9 +120,25 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   }
 
   private def isScalarSubqueryRewriteEnabled: Boolean = {
-    SQLConf.get
-      .getConfString(SCALAR_SUBQUERY_REWRITE_ENABLED_KEY, SCALAR_SUBQUERY_REWRITE_ENABLED_DEFAULT)
-      .toBoolean
+    val conf = SQLConf.get
+    conf.getAllConfs
+      .get(SCALAR_SUBQUERY_REWRITE_ENABLED_KEY)
+      .map(_.toBoolean)
+      .getOrElse(!isExplicitSingleTaskMode && SCALAR_SUBQUERY_REWRITE_ENABLED_DEFAULT.toBoolean)
+  }
+
+  private def isExplicitSingleTaskMode: Boolean =
+    SQLConf.get.getConfString(MPP_SINGLE_TASK_MODE_KEY, "false").toBoolean
+
+  private def scalarSubqueryRewriteDisabledReason: String = {
+    val conf = SQLConf.get
+    if (
+      isExplicitSingleTaskMode && !conf.getAllConfs.contains(SCALAR_SUBQUERY_REWRITE_ENABLED_KEY)
+    ) {
+      s"$MPP_SINGLE_TASK_MODE_KEY=true"
+    } else {
+      s"$SCALAR_SUBQUERY_REWRITE_ENABLED_KEY=false"
+    }
   }
 
   private def rejectUnsafeBroadcastFusionIfRequested(context: String): Unit = {
@@ -162,7 +180,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       } else {
         logWarning(
           s"MppCollapseRule: keeping ScalarSubquery expressions materialized by Spark " +
-            s"because $SCALAR_SUBQUERY_REWRITE_ENABLED_KEY=false")
+            s"because $scalarSubqueryRewriteDisabledReason")
         plan
       }
     preRewritten match {

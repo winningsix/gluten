@@ -52,6 +52,7 @@
     <spark.sql.files.minPartitionNum/>
     <spark.sql.files.openCostInBytes/>
     <spark.gluten.sql.columnar.backend.velox.cudf.memoryResource/>
+    <spark.gluten.sql.columnar.backend.velox.cudf.memoryPercent/>
     <spark.gluten.sql.columnar.backend.velox.IOThreads/>
     <spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_rows/>
     <spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_max_batch_rows/>
@@ -345,6 +346,7 @@
             <spark.gluten.loadLibFromJar>${spark.gluten.loadLibFromJar}</spark.gluten.loadLibFromJar>
             <spark.gluten.sql.columnar.libpath>${spark.gluten.sql.columnar.libpath}</spark.gluten.sql.columnar.libpath>
             <spark.gluten.sql.columnar.backend.velox.cudf.memoryResource>${spark.gluten.sql.columnar.backend.velox.cudf.memoryResource}</spark.gluten.sql.columnar.backend.velox.cudf.memoryResource>
+            <spark.gluten.sql.columnar.backend.velox.cudf.memoryPercent>${spark.gluten.sql.columnar.backend.velox.cudf.memoryPercent}</spark.gluten.sql.columnar.backend.velox.cudf.memoryPercent>
             <spark.gluten.sql.columnar.backend.velox.IOThreads>${spark.gluten.sql.columnar.backend.velox.IOThreads}</spark.gluten.sql.columnar.backend.velox.IOThreads>
             <spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_rows>${spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_rows}</spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_rows>
             <spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_max_batch_rows>${spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_max_batch_rows}</spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_max_batch_rows>

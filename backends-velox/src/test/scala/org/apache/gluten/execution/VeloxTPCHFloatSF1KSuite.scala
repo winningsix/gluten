@@ -119,6 +119,8 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       .set("spark.gluten.sql.columnar.cudf", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enabled", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan", "true")
+      // Keep the bounded async MR large enough for the single-GPU SF1K MPP profile.
+      .set("spark.gluten.sql.columnar.backend.velox.cudf.memoryPercent", "90")
       // Disable cudf JIT-fused expressions: NVRTC fails to compile EQUAL on Q12's
       // filter (`cudf::ast::operator_functor<EQUAL, true>::operator() no instance
       // matches`), which produces a Spark task retry that masks as success but
@@ -172,6 +174,7 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       "spark.gluten.sql.columnar.libpath",
       "spark.gluten.sql.columnar.backend.velox.IOThreads",
       "spark.gluten.sql.columnar.backend.velox.cudf.memoryResource",
+      "spark.gluten.sql.columnar.backend.velox.cudf.memoryPercent",
       "spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_rows",
       "spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_max_batch_rows",
       "spark.gluten.sql.columnar.backend.velox.cudf.hive.scan-output-rows",

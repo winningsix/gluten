@@ -120,8 +120,13 @@ case class PartitionsUtil(
       openCostInBytes: Long): PartitionsUtil.MppScanSplitPlanning = {
     val conf = relation.sparkSession.sessionState.conf
     val mppEnabled = conf.getConfString("spark.gluten.mpp.enabled", "false").toBoolean
+    val singleTaskMode =
+      conf
+        .getConfString("spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode", "false")
+        .toBoolean
     val sizeAwareEnabled =
-      conf.getConfString("spark.gluten.mpp.scan.sizeAwarePartitioning", "true").toBoolean
+      conf.getConfString("spark.gluten.mpp.scan.sizeAwarePartitioning", "true").toBoolean &&
+        !singleTaskMode
     if (!mppEnabled || !sizeAwareEnabled || partitionFiles.isEmpty) {
       return PartitionsUtil.MppScanSplitPlanning(sparkMaxSplitBytes, sparkMaxSplitBytes)
     }

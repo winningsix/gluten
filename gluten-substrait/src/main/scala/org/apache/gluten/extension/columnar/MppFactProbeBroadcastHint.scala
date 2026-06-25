@@ -42,10 +42,12 @@ import org.apache.spark.sql.execution.datasources.LogicalRelation
  */
 case class MppFactProbeBroadcastHint(spark: SparkSession) extends Rule[LogicalPlan] with Logging {
 
+  private val singleTaskModeKey = "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode"
+
   private def enabled: Boolean =
     spark.sessionState.conf
       .getConfString("spark.gluten.mpp.factProbeBroadcastHint", "true")
-      .toBoolean
+      .toBoolean && !singleTaskModeEnabled
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
     if (!enabled || !plan.resolved) {
@@ -106,5 +108,8 @@ case class MppFactProbeBroadcastHint(spark: SparkSession) extends Rule[LogicalPl
   }
 
   private def broadcastBytes(plan: LogicalPlan): BigInt = plan.stats.sizeInBytes
+
+  private def singleTaskModeEnabled: Boolean =
+    spark.sessionState.conf.getConfString(singleTaskModeKey, "false").toBoolean
 
 }

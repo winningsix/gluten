@@ -555,6 +555,8 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
         aggregateExpressions.exists(_.name.startsWith("_existence_min_")) &&
         (aggregateExpressions.exists(_.name.startsWith("_existence_max_")) ||
           aggregateExpressions.exists(_.name.startsWith("_existence_count_")))
+      case Project(_, child) => isExistenceSummary(child)
+      case Filter(_, child) => isExistenceSummary(child)
       case _ => false
     }
   }

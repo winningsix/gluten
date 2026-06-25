@@ -51,6 +51,7 @@ case class SelectiveDimensionJoinReorder(spark: SparkSession)
   private val selectiveDimensionJoinReorderKey =
     GlutenConfig.SELECTIVE_DIMENSION_JOIN_REORDER_ENABLED.key
   private val mppEnabledKey = "spark.gluten.mpp.enabled"
+  private val singleTaskModeKey = "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode"
 
   registerPostCboPass()
 
@@ -204,10 +205,14 @@ case class SelectiveDimensionJoinReorder(spark: SparkSession)
 
   private def enabledForSession: Boolean = {
     val conf = spark.sessionState.conf
-    conf.getAllConfs
-      .get(selectiveDimensionJoinReorderKey)
-      .map(_.toBoolean)
-      .getOrElse(conf.getConfString(mppEnabledKey, "false").toBoolean)
+    if (conf.getConfString(singleTaskModeKey, "false").toBoolean) {
+      false
+    } else {
+      conf.getAllConfs
+        .get(selectiveDimensionJoinReorderKey)
+        .map(_.toBoolean)
+        .getOrElse(conf.getConfString(mppEnabledKey, "false").toBoolean)
+    }
   }
 
   private def isSelectiveFilteredDimension(plan: LogicalPlan): Boolean = {

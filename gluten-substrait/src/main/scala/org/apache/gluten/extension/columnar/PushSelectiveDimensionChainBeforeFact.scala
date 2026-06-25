@@ -70,14 +70,14 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
   private val maxClusterItems = 12
   private val maxWrapperDepth = 4
   private val maxSelectiveInListValues = 16
+  private val singleTaskModeKey = "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode"
   private val firstApplyLog = new AtomicBoolean(false)
 
   registerPostCboPass()
 
   override def apply(plan: LogicalPlan): LogicalPlan = {
     registerPostCboPass()
-    val glutenConfig = new GlutenConfig(spark.sessionState.conf)
-    if (!glutenConfig.enablePushDimensionChainBeforeFact || !plan.resolved) {
+    if (!enabledForSession || !plan.resolved) {
       return plan
     }
     if (firstApplyLog.compareAndSet(false, true)) {
@@ -268,8 +268,7 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
     // operator-optimization batches and may attach hints to the CBO output; accept those hints
     // while matching, then run a post-CBO hint pass after this rewrite so the rebuilt joins still
     // get the all-REPLICATE build-side choices.
-    val glutenConfig = new GlutenConfig(spark.sessionState.conf)
-    if (!glutenConfig.enablePushDimensionChainBeforeFact) {
+    if (!enabledForSession) {
       return
     }
 
@@ -293,6 +292,12 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
             "MppFactProbeBroadcastHint in spark.experimental.extraOptimizations")
       }
     }
+  }
+
+  private def enabledForSession: Boolean = {
+    val conf = spark.sessionState.conf
+    !conf.getConfString(singleTaskModeKey, "false").toBoolean &&
+    new GlutenConfig(conf).enablePushDimensionChainBeforeFact
   }
 
   private def tryReorder(
