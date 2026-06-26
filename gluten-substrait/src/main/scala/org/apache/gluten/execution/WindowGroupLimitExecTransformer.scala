@@ -17,16 +17,19 @@
 package org.apache.gluten.execution
 
 import org.apache.gluten.backendsapi.BackendsApiManager
-import org.apache.gluten.expression.ExpressionConverter
+import org.apache.gluten.exception.GlutenNotSupportException
+import org.apache.gluten.expression.{ExpressionConverter, ExpressionNames}
 import org.apache.gluten.metrics.MetricsUpdater
 import org.apache.gluten.substrait.SubstraitContext
+import org.apache.gluten.substrait.extensions.ExtensionBuilder
 import org.apache.gluten.substrait.rel.{RelBuilder, RelNode}
 
-import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, Expression, SortOrder}
+import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, DenseRank, Expression, Rank, RowNumber, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution, Distribution, Partitioning}
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.window.{GlutenFinal, GlutenPartial, GlutenWindowGroupLimitMode}
 
+import com.google.protobuf.StringValue
 import io.substrait.proto.SortField
 
 import scala.collection.JavaConverters._
@@ -111,11 +114,25 @@ case class WindowGroupLimitExecTransformer(
           builder.build()
       }.asJava
     if (!validation) {
+      val windowFunction = rankLikeFunction match {
+        case _: RowNumber => ExpressionNames.ROW_NUMBER
+        case _: Rank => ExpressionNames.RANK
+        case _: DenseRank => ExpressionNames.DENSE_RANK
+        case _ => throw new GlutenNotSupportException(s"Unknown window function $rankLikeFunction")
+      }
+      val message = StringValue
+        .newBuilder()
+        .setValue(s"WindowGroupLimitParameters:window_function=$windowFunction\n")
+        .build()
+      val extensionNode = ExtensionBuilder.makeAdvancedExtension(
+        BackendsApiManager.getTransformerApiInstance.packPBMessage(message),
+        null)
       RelBuilder.makeWindowGroupLimitRel(
         input,
         partitionsExpressions,
         sortFieldList,
         limit,
+        extensionNode,
         context,
         operatorId)
     } else {

@@ -31,6 +31,8 @@
 #include "config/GlutenConfig.h"
 #include "config/VeloxConfig.h"
 
+#include <google/protobuf/wrappers.pb.h>
+
 #ifdef GLUTEN_ENABLE_GPU
 #include "operators/plannodes/CudfVectorStream.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSink.h"
@@ -67,6 +69,30 @@ core::SortOrder toSortOrder(const ::substrait::SortField& sortField) {
     default:
       VELOX_FAIL("Sort direction is not supported.");
   }
+}
+
+core::TopNRowNumberNode::RankFunction windowGroupLimitRankFunction(
+    const ::substrait::WindowGroupLimitRel& windowGroupLimitRel) {
+  std::string functionName = "row_number";
+  if (windowGroupLimitRel.has_advanced_extension()) {
+    const auto& extension = windowGroupLimitRel.advanced_extension();
+    if (extension.has_optimization()) {
+      google::protobuf::StringValue msg;
+      if (extension.optimization().UnpackTo(&msg)) {
+        static const std::string kWindowFunctionPrefix = "window_function=";
+        const auto start = msg.value().find(kWindowFunctionPrefix);
+        if (start != std::string::npos) {
+          const auto valueStart = start + kWindowFunctionPrefix.size();
+          const auto valueEnd = msg.value().find('\n', valueStart);
+          functionName = msg.value().substr(
+              valueStart,
+              valueEnd == std::string::npos ? std::string::npos
+                                             : valueEnd - valueStart);
+        }
+      }
+    }
+  }
+  return core::TopNRowNumberNode::rankFunctionFromName(functionName);
 }
 
 std::vector<TypePtr> toVeloxAggregateRawInputTypes(
@@ -1210,9 +1236,15 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(
     }
   }
   const std::optional<std::string> rowNumberColumnName = std::nullopt;
+  const auto rankFunction = windowGroupLimitRankFunction(windowGroupLimitRel);
 
   if (sortingKeys.empty()) {
     // Handle if all sorting keys are also used as partition keys.
+    VELOX_USER_CHECK_EQ(
+        rankFunction,
+        core::TopNRowNumberNode::RankFunction::kRowNumber,
+        "WindowGroupLimit with {} requires non-partition sort keys.",
+        core::TopNRowNumberNode::rankFunctionName(rankFunction));
 
     return std::make_shared<core::RowNumberNode>(
         nextPlanNodeId(),
@@ -1224,7 +1256,7 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(
 
   return std::make_shared<core::TopNRowNumberNode>(
       nextPlanNodeId(),
-      core::TopNRowNumberNode::RankFunction::kRowNumber,
+      rankFunction,
       partitionKeys,
       sortingKeys,
       sortingOrders,
