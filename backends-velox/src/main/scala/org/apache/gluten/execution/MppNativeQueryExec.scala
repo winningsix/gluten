@@ -3778,6 +3778,7 @@ case class MppNativeQueryExec(
    */
   private def mergeSplitInfosToBytes(splitInfos: Seq[SplitInfo]): Array[Byte] = {
     val builder = ReadRel.LocalFiles.newBuilder()
+    var emptyScanExtension: Option[io.substrait.proto.AdvancedExtension] = None
     splitInfos.foreach {
       si =>
         val localFiles = si match {
@@ -3787,7 +3788,16 @@ case class MppNativeQueryExec(
               s"MppNativeQueryExec: unsupported MPP split info " +
                 s"${other.getClass.getName}; expected LocalFilesNode")
         }
+        if (
+          localFiles.getItemsCount == 0 && localFiles.hasAdvancedExtension &&
+          emptyScanExtension.isEmpty
+        ) {
+          emptyScanExtension = Some(localFiles.getAdvancedExtension)
+        }
         builder.addAllItems(localFiles.getItemsList)
+    }
+    if (builder.getItemsCount == 0) {
+      emptyScanExtension.foreach(builder.setAdvancedExtension)
     }
     val merged = builder.build()
     logDebug(

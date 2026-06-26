@@ -18,6 +18,7 @@
 #include "VeloxPlanConverter.h"
 #include <filesystem>
 
+#include "config.pb.h"
 #include "config/GlutenConfig.h"
 #include "iceberg/IcebergPlanConverter.h"
 #include "operators/plannodes/IteratorSplit.h"
@@ -40,19 +41,50 @@ VeloxPlanConverter::VeloxPlanConverter(
 }
 
 namespace {
+constexpr const char* kEmptyScanTableFormatKey = "gluten.localFiles.tableFormat";
+constexpr const char* kEmptyScanFileFormatKey = "gluten.localFiles.fileFormat";
+constexpr const char* kIcebergTableFormat = "iceberg";
+constexpr const char* kParquetFileFormat = "parquet";
+constexpr const char* kOrcFileFormat = "orc";
+
 std::shared_ptr<SplitInfo> parseScanSplitInfo(
     const facebook::velox::config::ConfigBase* veloxCfg,
-    const google::protobuf::RepeatedPtrField<substrait::ReadRel_LocalFiles_FileOrFiles>& fileList) {
+    const substrait::ReadRel_LocalFiles& localFiles) {
   using SubstraitFileFormatCase = ::substrait::ReadRel_LocalFiles_FileOrFiles::FileFormatCase;
 
+  const auto& fileList = localFiles.items();
   auto splitInfo = std::make_shared<SplitInfo>();
   splitInfo->leafType = SplitInfo::LeafType::TABLE_SCAN;
+  splitInfo->format = dwio::common::FileFormat::UNKNOWN;
   splitInfo->paths.reserve(fileList.size());
   splitInfo->starts.reserve(fileList.size());
   splitInfo->lengths.reserve(fileList.size());
   splitInfo->partitionColumns.reserve(fileList.size());
   splitInfo->properties.reserve(fileList.size());
   splitInfo->metadataColumns.reserve(fileList.size());
+  if (fileList.empty() && localFiles.has_advanced_extension() &&
+      localFiles.advanced_extension().has_optimization()) {
+    gluten::ConfigMap confMap;
+    if (localFiles.advanced_extension().optimization().UnpackTo(&confMap)) {
+      const auto& configs = confMap.configs();
+      auto tableFormatIt = configs.find(kEmptyScanTableFormatKey);
+      if (tableFormatIt != configs.end() &&
+          tableFormatIt->second == kIcebergTableFormat) {
+        auto icebergSplitInfo = std::make_shared<IcebergSplitInfo>(*splitInfo);
+        icebergSplitInfo->isIceberg = true;
+
+        auto fileFormatIt = configs.find(kEmptyScanFileFormatKey);
+        if (fileFormatIt != configs.end()) {
+          if (fileFormatIt->second == kParquetFileFormat) {
+            icebergSplitInfo->format = dwio::common::FileFormat::PARQUET;
+          } else if (fileFormatIt->second == kOrcFileFormat) {
+            icebergSplitInfo->format = dwio::common::FileFormat::ORC;
+          }
+        }
+        return icebergSplitInfo;
+      }
+    }
+  }
   for (const auto& file : fileList) {
     // Expect all Partitions share the same index.
     splitInfo->partitionIndex = file.partition_index();
@@ -134,8 +166,7 @@ void parseLocalFileNodes(
   std::vector<std::shared_ptr<SplitInfo>> splitInfos;
   splitInfos.reserve(localFiles.size());
   for (const auto& localFile : localFiles) {
-    const auto& fileList = localFile.items();
-    splitInfos.push_back(parseScanSplitInfo(veloxCfg, fileList));
+    splitInfos.push_back(parseScanSplitInfo(veloxCfg, localFile));
   }
 
   planConverter->setSplitInfos(std::move(splitInfos));

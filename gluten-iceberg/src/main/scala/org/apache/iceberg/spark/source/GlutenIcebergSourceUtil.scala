@@ -53,7 +53,8 @@ object GlutenIcebergSourceUtil {
 
   def genSplitInfo(
       partition: SparkDataSourceRDDPartition,
-      readPartitionSchema: StructType): SplitInfo = {
+      readPartitionSchema: StructType,
+      defaultFileFormat: ReadFileFormat): SplitInfo = {
     val paths = new JArrayList[String]()
     val starts = new JArrayList[JLong]()
     val lengths = new JArrayList[JLong]()
@@ -85,6 +86,9 @@ object GlutenIcebergSourceUtil {
       case o =>
         throw new GlutenNotSupportException(s"Unsupported input partition type: $o")
     }
+    if (fileFormat == ReadFileFormat.UnknownFormat) {
+      fileFormat = defaultFileFormat
+    }
     IcebergLocalFilesBuilder.makeIcebergLocalFiles(
       partition.index,
       paths,
@@ -100,10 +104,26 @@ object GlutenIcebergSourceUtil {
     )
   }
 
+  def genEmptySplitInfo(defaultFileFormat: ReadFileFormat): SplitInfo =
+    IcebergLocalFilesBuilder.makeIcebergLocalFiles(
+      0,
+      new JArrayList[String](),
+      new JArrayList[JLong](),
+      new JArrayList[JLong](),
+      new JArrayList[JMap[String, String]](),
+      defaultFileFormat,
+      new JArrayList[String](),
+      new JArrayList[JList[DeleteFile]]()
+    )
+
   def getFileFormat(sparkScan: Scan): ReadFileFormat = sparkScan match {
     case scan: SparkBatchQueryScan =>
       val tasks = scan.tasks().asScala
-      asFileScanTask(tasks.toList).foreach {
+      val fileTasks = asFileScanTask(tasks.toList)
+      if (fileTasks.isEmpty) {
+        return getDefaultFileFormat(scan.table())
+      }
+      fileTasks.foreach {
         task =>
           task.file().format() match {
             case FileFormat.PARQUET => return ReadFileFormat.ParquetReadFormat
@@ -119,7 +139,11 @@ object GlutenIcebergSourceUtil {
   def getReadPartitionSchema(sparkScan: Scan): StructType = sparkScan match {
     case scan: SparkBatchQueryScan =>
       val tasks = scan.tasks().asScala
-      asFileScanTask(tasks.toList).foreach {
+      val fileTasks = asFileScanTask(tasks.toList)
+      if (fileTasks.isEmpty) {
+        return new StructType()
+      }
+      fileTasks.foreach {
         task =>
           val spec = task.spec()
           if (spec.isPartitioned) {
@@ -209,4 +233,13 @@ object GlutenIcebergSourceUtil {
       case _ =>
         throw new GlutenNotSupportException("Iceberg Only support parquet and orc file format.")
     }
+
+  private def getDefaultFileFormat(table: Table): ReadFileFormat = {
+    val format = table
+      .properties()
+      .getOrDefault(
+        TableProperties.DEFAULT_FILE_FORMAT,
+        TableProperties.DEFAULT_FILE_FORMAT_DEFAULT)
+    convertFileFormat(FileFormat.fromString(format))
+  }
 }

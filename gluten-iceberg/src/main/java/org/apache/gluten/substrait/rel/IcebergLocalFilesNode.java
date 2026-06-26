@@ -16,6 +16,10 @@
  */
 package org.apache.gluten.substrait.rel;
 
+import org.apache.gluten.proto.ConfigMap;
+
+import com.google.protobuf.Any;
+import io.substrait.proto.AdvancedExtension;
 import io.substrait.proto.ReadRel;
 import org.apache.iceberg.DeleteFile;
 
@@ -25,6 +29,12 @@ import java.util.List;
 import java.util.Map;
 
 public class IcebergLocalFilesNode extends LocalFilesNode {
+  private static final String EMPTY_SCAN_TABLE_FORMAT_KEY = "gluten.localFiles.tableFormat";
+  private static final String EMPTY_SCAN_FILE_FORMAT_KEY = "gluten.localFiles.fileFormat";
+  private static final String ICEBERG_TABLE_FORMAT = "iceberg";
+  private static final String PARQUET_FILE_FORMAT = "parquet";
+  private static final String ORC_FILE_FORMAT = "orc";
+
   private final List<List<DeleteFile>> deleteFilesList;
 
   IcebergLocalFilesNode(
@@ -50,6 +60,34 @@ public class IcebergLocalFilesNode extends LocalFilesNode {
         new HashMap<>(),
         new ArrayList<>());
     this.deleteFilesList = deleteFilesList;
+  }
+
+  @Override
+  public ReadRel.LocalFiles toProtobuf() {
+    ReadRel.LocalFiles localFiles = super.toProtobuf();
+    if (!getPaths().isEmpty()) {
+      return localFiles;
+    }
+
+    ConfigMap.Builder marker =
+        ConfigMap.newBuilder().putConfigs(EMPTY_SCAN_TABLE_FORMAT_KEY, ICEBERG_TABLE_FORMAT);
+    switch (fileFormat) {
+      case ParquetReadFormat:
+        marker.putConfigs(EMPTY_SCAN_FILE_FORMAT_KEY, PARQUET_FILE_FORMAT);
+        break;
+      case OrcReadFormat:
+        marker.putConfigs(EMPTY_SCAN_FILE_FORMAT_KEY, ORC_FILE_FORMAT);
+        break;
+      default:
+        throw new UnsupportedOperationException(
+            "Unsupported file format " + fileFormat.name() + " for empty iceberg scan.");
+    }
+
+    return localFiles
+        .toBuilder()
+        .setAdvancedExtension(
+            AdvancedExtension.newBuilder().setOptimization(Any.pack(marker.build(), "")).build())
+        .build();
   }
 
   @Override
