@@ -216,6 +216,16 @@ std::string companionFunctionSuffix(const TypePtr& type) {
   return result;
 }
 
+std::string collectSetTemplateMergeExtractName(const std::string& baseName, const TypePtr& resultType) {
+  if (baseName != "collect_set" || resultType->kind() != TypeKind::ARRAY) {
+    return "";
+  }
+  // collect_set is registered as collect_set(T) -> array(T), so Velox names
+  // the polymorphic companion with the template return type, not the bound
+  // concrete return type (e.g. array_T instead of array_VARCHAR).
+  return baseName + "_merge_extract_array_T";
+}
+
 } // namespace
 
 bool SplitInfo::canUseCudfConnector() {
@@ -315,6 +325,15 @@ std::string SubstraitToVeloxPlanConverter::toAggregationFunctionName(
       // The merge_extract function must be registered with suffix based on result type.
       functionName += ("_" + companionFunctionSuffix(resultType));
       signatures = exec::getAggregateFunctionSignatures(functionName);
+      if (!signatures.has_value() || signatures.value().empty()) {
+        auto templateFunctionName = collectSetTemplateMergeExtractName(baseName, resultType);
+        if (!templateFunctionName.empty()) {
+          auto templateSignatures = exec::getAggregateFunctionSignatures(templateFunctionName);
+          if (templateSignatures.has_value() && !templateSignatures.value().empty()) {
+            return templateFunctionName;
+          }
+        }
+      }
       VELOX_CHECK(
           signatures.has_value() && signatures.value().size() > 0,
           "Cannot find function signature for {} in final aggregation step.",
