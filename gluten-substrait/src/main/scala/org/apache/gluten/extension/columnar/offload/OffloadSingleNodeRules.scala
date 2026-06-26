@@ -276,6 +276,11 @@ object OffloadOthers {
         case plan: LocalLimitExec =>
           val child = plan.child
           LimitExecTransformer(child, 0L, plan.limit)
+        case plan: LocalTableScanExec
+            if plan.rows.length <= LocalTableScanExecTransformer.MaxRows =>
+          LocalTableScanExecTransformer(plan.output, plan.rows)
+        case plan if LocalTableScanExecTransformer.supportsOneRowRelation(plan) =>
+          LocalTableScanExecTransformer.oneRowRelation(plan.output)
         case plan: GenerateExec =>
           val child = plan.child
           BackendsApiManager.getSparkPlanExecApiInstance.genGenerateTransformer(

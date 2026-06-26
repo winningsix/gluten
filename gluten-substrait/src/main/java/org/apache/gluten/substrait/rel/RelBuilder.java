@@ -21,6 +21,7 @@ import org.apache.gluten.expression.ConverterUtils;
 import org.apache.gluten.substrait.SubstraitContext;
 import org.apache.gluten.substrait.expression.AggregateFunctionNode;
 import org.apache.gluten.substrait.expression.ExpressionNode;
+import org.apache.gluten.substrait.expression.LiteralNode;
 import org.apache.gluten.substrait.expression.WindowFunctionNode;
 import org.apache.gluten.substrait.extensions.AdvancedExtensionNode;
 import org.apache.gluten.substrait.extensions.ExtensionBuilder;
@@ -169,6 +170,16 @@ public class RelBuilder {
     context.registerRelToOperator(operatorId);
     Long iteratorIndex = context.nextIteratorIndex();
     return new InputIteratorRelNode(typeList, nameList, iteratorIndex);
+  }
+
+  public static RelNode makeReadRelForVirtualTable(
+      List<TypeNode> typeList,
+      List<String> nameList,
+      List<List<LiteralNode>> rows,
+      SubstraitContext context,
+      Long operatorId) {
+    context.registerRelToOperator(operatorId);
+    return new VirtualTableRelNode(typeList, nameList, rows);
   }
 
   // only used in CHHashAggregateExecTransformer for CH backend
