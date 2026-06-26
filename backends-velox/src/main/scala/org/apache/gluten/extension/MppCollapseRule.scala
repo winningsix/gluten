@@ -18,6 +18,7 @@ package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution._
+import org.apache.gluten.extension.columnar.UnionTransformerRule
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, PlanExpression}
@@ -238,13 +239,14 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    * non-TransformSupport operators that are not exchanges).
    */
   private def tryCollapseMpp(plan: SparkPlan): Option[MppNativeQueryExec] = {
-    if (!isFullyNativeSupported(plan)) {
-      val reason = findFirstUnsupportedOperator(plan).getOrElse("unknown")
+    val unionRewritten = rewriteMppNativeUnion(plan)
+    if (!isFullyNativeSupported(unionRewritten)) {
+      val reason = findFirstUnsupportedOperator(unionRewritten).getOrElse("unknown")
       logWarning(
         s"MppCollapseRule: plan contains non-native operators, " +
           s"cannot collapse to MPP. First blocker: $reason. " +
-          s"Plan root: ${plan.getClass.getSimpleName}. " +
-          s"Plan: ${plan.treeString.take(500)}")
+          s"Plan root: ${unionRewritten.getClass.getSimpleName}. " +
+          s"Plan: ${unionRewritten.treeString.take(500)}")
       return None
     }
 
@@ -254,7 +256,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // of a ScalarSubquery in their expressions) into their transformer counterparts
     // so ColumnarCollapseTransformStages, which runs right after this rule, can
     // absorb them into a WholeStageTransformer like any other native operator.
-    val rewritten = rewriteSubqueryFilterProject(plan)
+    val rewritten = rewriteSubqueryFilterProject(unionRewritten)
 
     // Phase 1: wrap plan with placeholder fragments. The child plan is NOT modified.
     // MppNativeQueryExec.doExecuteColumnar() will delegate to child.executeColumnar()
@@ -277,6 +279,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // shuffle/broadcast validation passes. At execution time, MppNativeQueryExec
     // bypasses child.executeColumnar() and runs via MppQueryCoordinator instead.
     Some(MppNativeQueryExec(child = rewritten, fragments = fragments, exchanges = exchanges))
+  }
+
+  private def rewriteMppNativeUnion(plan: SparkPlan): SparkPlan = {
+    UnionTransformerRule(requireSameNumPartitions = false, requireNativeUnionEnabled = false)(plan)
   }
 
   /**

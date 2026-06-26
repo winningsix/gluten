@@ -163,6 +163,10 @@ case class ColumnarCollapseTransformStages(glutenConf: GlutenConfig) extends Rul
   /** Inserts an InputIteratorTransformer on top of those that do not support transform. */
   private def insertInputIteratorTransformer(plan: SparkPlan): SparkPlan = {
     plan match {
+      case p: LocalTableScanExec if p.rows.length <= LocalTableScanExecTransformer.MaxRows =>
+        LocalTableScanExecTransformer(p.output, p.rows)
+      case p if LocalTableScanExecTransformer.supportsOneRowRelation(p) =>
+        LocalTableScanExecTransformer.oneRowRelation(p.output)
       case p if p.isInstanceOf[WholeStageTransformer] || !supportTransform(p) =>
         // TODO: if p.isInstanceOf[WholeStageTransformer], we can merge two whole stage
         //  transformers.

@@ -16,11 +16,13 @@
  */
 package org.apache.gluten.extension
 
-import org.apache.gluten.execution.MppNativeQueryExec
+import org.apache.gluten.execution.{MppNativeQueryExec, MppPreparedChildExec}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, SparkPlan}
+import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
+import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
 
 /**
  * Mark every ColumnarBroadcastExchangeExec inside an MppNativeQueryExec subtree as superseded by
@@ -53,15 +55,36 @@ case class MppSuppressDeadBroadcastsRule() extends Rule[SparkPlan] with Logging 
       return plan
     }
 
+    def markBroadcasts(plan: SparkPlan): Int = {
+      var marked = 0
+
+      def visit(node: SparkPlan): Unit = {
+        node match {
+          case prepared: MppPreparedChildExec =>
+            visit(prepared.hiddenPlan)
+          case stage: BroadcastQueryStageExec =>
+            visit(stage.plan)
+          case stage: ShuffleQueryStageExec =>
+            visit(stage.plan)
+          case reused: ReusedExchangeExec =>
+            visit(reused.child)
+          case bex: ColumnarBroadcastExchangeExec =>
+            if (bex.suppressForMppNativeExecution()) {
+              marked += 1
+            }
+            visit(bex.child)
+          case other =>
+            other.children.foreach(visit)
+        }
+      }
+
+      visit(plan)
+      marked
+    }
+
     var markedCount = 0
     plan.foreach {
-      case mpp: MppNativeQueryExec =>
-        mpp.child.foreach {
-          case bex: ColumnarBroadcastExchangeExec if !bex.isMppSuppressed =>
-            bex.setTagValue(ColumnarBroadcastExchangeExec.MppSuppressedTag, true)
-            markedCount += 1
-          case _ =>
-        }
+      case mpp: MppNativeQueryExec => markedCount += markBroadcasts(mpp.child)
       case _ =>
     }
 

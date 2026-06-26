@@ -26,6 +26,8 @@ import org.apache.gluten.substrait.rel.{RelBuilder, RelNode}
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.expressions.SortOrder
+import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution.{SparkPlan, UnionExec}
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -43,6 +45,10 @@ case class UnionExecTransformer(children: Seq[SparkPlan]) extends TransformSuppo
     BackendsApiManager.getMetricsApiInstance.genUnionTransformerMetrics(sparkContext)
 
   override def output: Seq[Attribute] = union.output
+
+  override def outputPartitioning: Partitioning = union.outputPartitioning
+
+  override def outputOrdering: Seq[SortOrder] = union.outputOrdering
 
   override def columnarInputRDDs: Seq[RDD[ColumnarBatch]] = children.flatMap(getColumnarInputRDDs)
 

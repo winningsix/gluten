@@ -169,18 +169,12 @@ object VeloxRuleApi {
       .getExtendedColumnarPostRules()
       .foreach(each => injector.injectPost(c => each(c.session)))
     // MPP collapse runs BEFORE BSP collapse: if the plan is fully MPP-eligible,
-    // MppCollapseRule replaces it with a single MppNativeQueryExec and
-    // ColumnarCollapseTransformStages becomes a no-op on that subtree.
-    // If not MPP-eligible, MppCollapseRule passes through unchanged and
-    // ColumnarCollapseTransformStages handles BSP wrapping as usual.
-    // Two opt-in plan-shape rules run BEFORE MppCollapseRule so the
-    // collapse pass sees the rewritten exchanges:
-    //   - MppSinglePartitionSortRule: RANGE -> SINGLE for global sorts (Presto parity)
-    //   - MppRemoveRedundantShuffleRule: drop hash shuffles whose child already satisfies
-    //   - MppParallelSortSplitRule: insert RR-merge between SINGLE gather and producer
-    injector.injectPost(_ => MppSinglePartitionSortRule())
-    injector.injectPost(_ => MppRemoveRedundantShuffleRule())
-    injector.injectPost(_ => MppParallelSortSplitRule())
+    // MppCollapseRule wraps it in MppNativeQueryExec and ColumnarCollapseTransformStages becomes
+    // a no-op on that subtree. Do not run MPP shuffle-shape rewrites as global Spark columnar
+    // rules: AQE verifies that custom columnar rules preserve ShuffleExchange nodes, and these
+    // rules intentionally rewrite or remove them. MppNativeQueryExec re-runs the same opt-in
+    // rewrites inside its wrapped child during fragment extraction, after Spark's shuffle
+    // preservation check has passed.
     injector.injectPost(c => MppCollapseRule(new GlutenConfig(c.sqlConf)))
     injector.injectPost(c => ColumnarCollapseTransformStages(new GlutenConfig(c.sqlConf)))
     injector.injectPost(_ => GenerateTransformStageId())
@@ -288,10 +282,10 @@ object VeloxRuleApi {
     SparkShimLoader.getSparkShims
       .getExtendedColumnarPostRules()
       .foreach(each => injector.injectPostTransform(c => each(c.session)))
-    // MPP collapse runs BEFORE BSP collapse in the RAS path as well.
-    injector.injectPostTransform(_ => MppSinglePartitionSortRule())
-    injector.injectPostTransform(_ => MppRemoveRedundantShuffleRule())
-    injector.injectPostTransform(_ => MppParallelSortSplitRule())
+    // MPP collapse runs BEFORE BSP collapse in the RAS path as well. Keep MPP shuffle-shape
+    // rewrites out of Spark's global post-transform rule list for the same AQE shuffle-node
+    // preservation reason described in injectVanilla(); MppNativeQueryExec applies them locally
+    // during fragment extraction.
     injector.injectPostTransform(c => MppCollapseRule(new GlutenConfig(c.sqlConf)))
     injector.injectPostTransform(c => ColumnarCollapseTransformStages(new GlutenConfig(c.sqlConf)))
     injector.injectPostTransform(_ => GenerateTransformStageId())

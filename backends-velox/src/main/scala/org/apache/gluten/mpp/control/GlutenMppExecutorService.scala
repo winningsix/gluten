@@ -82,8 +82,13 @@ object GlutenMppExecutorService extends Logging {
   private[control] def buildEndpointRecord(
       ctx: PluginContext): Option[MppExecutorEndpointRecord] = {
     val blockManagerId =
-      Option(SparkEnv.get).flatMap(e => Option(e.blockManager)).map(_.blockManagerId)
-    val blockManagerHost = blockManagerId.map(_.host).getOrElse(localHostName())
+      Option(SparkEnv.get)
+        .flatMap(e => Option(e.blockManager))
+        .flatMap(bm => Option(bm.blockManagerId))
+    val blockManagerHost = blockManagerId
+      .flatMap(id => Option(id.host))
+      .filter(_.nonEmpty)
+      .getOrElse(localHostName())
     val blockManagerPort = blockManagerId.map(_.port).getOrElse(-1)
     val advertisedHost = localHostName(blockManagerHost)
     val initializer = NativeBackendInitializer.forBackend(BackendsApiManager.getBackendName)

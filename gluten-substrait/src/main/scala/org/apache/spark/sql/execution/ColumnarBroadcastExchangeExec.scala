@@ -36,7 +36,7 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.SparkFatalException
 
 import java.util.UUID
-import java.util.concurrent.{TimeoutException, TimeUnit}
+import java.util.concurrent.{CompletableFuture, TimeoutException, TimeUnit}
 
 import scala.concurrent.Promise
 import scala.util.control.NonFatal
@@ -74,65 +74,108 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
     promise.future
 
   @transient
+  @volatile
+  private var relationFutureRef: java.util.concurrent.Future[broadcast.Broadcast[Any]] = _
+
+  @transient
   override lazy val relationFuture: java.util.concurrent.Future[broadcast.Broadcast[Any]] = {
-    SQLExecution.withThreadLocalCaptured[broadcast.Broadcast[Any]](
-      session,
-      BroadcastExchangeExec.executionContext) {
-      try {
-        SparkShimLoader.getSparkShims.setJobDescriptionOrTagForBroadcastExchange(sparkContext, this)
-        val relation = GlutenTimeMetric.millis(longMetric("collectTime")) {
-          _ =>
-            // this created relation ignore HashedRelationBroadcastMode isNullAware, because we
-            // cannot get child output rows, then compare the hash key is null, if not null,
-            // compare the isNullAware, so gluten will not generate HashedRelationWithAllNullKeys
-            // or EmptyHashedRelation, this difference will cause performance regression in some
-            // cases.
-            // For the above reason, the same implementation can be used for both
-            // HashedRelationBroadcastMode as well as IdentityBroadcastMode.
-            BackendsApiManager.getSparkPlanExecApiInstance.createBroadcastRelation(
-              mode,
-              child,
-              longMetric("numOutputRows"),
-              longMetric("dataSize"))
+    val future =
+      if (isMppSuppressed) {
+        failedMppSuppressedFuture()
+      } else {
+        SQLExecution.withThreadLocalCaptured[broadcast.Broadcast[Any]](
+          session,
+          BroadcastExchangeExec.executionContext) {
+          try {
+            SparkShimLoader.getSparkShims
+              .setJobDescriptionOrTagForBroadcastExchange(sparkContext, this)
+            val relation = GlutenTimeMetric.millis(longMetric("collectTime")) {
+              _ =>
+                // this created relation ignore HashedRelationBroadcastMode isNullAware, because we
+                // cannot get child output rows, then compare the hash key is null, if not null,
+                // compare the isNullAware, so gluten will not generate
+                // HashedRelationWithAllNullKeys
+                // or EmptyHashedRelation, this difference will cause performance regression in some
+                // cases.
+                // For the above reason, the same implementation can be used for both
+                // HashedRelationBroadcastMode as well as IdentityBroadcastMode.
+                BackendsApiManager.getSparkPlanExecApiInstance.createBroadcastRelation(
+                  mode,
+                  child,
+                  longMetric("numOutputRows"),
+                  longMetric("dataSize"))
+            }
+
+            val broadcasted = GlutenTimeMetric.millis(longMetric("broadcastTime")) {
+              _ =>
+                // Broadcast the relation
+                SparkShimLoader.getSparkShims.broadcastInternal(
+                  sparkContext,
+                  relation.asInstanceOf[Any])
+            }
+
+            // Update driver metrics
+            val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
+            SQLMetrics.postDriverMetricUpdates(sparkContext, executionId, metrics.values.toSeq)
+
+            promise.success(broadcasted)
+            broadcasted
+          } catch {
+            // SPARK-24294: To bypass scala bug: https://github.com/scala/bug/issues/9554, we throw
+            // SparkFatalException, which is a subclass of Exception. ThreadUtils.awaitResult
+            // will catch this exception and re-throw the wrapped fatal throwable.
+            case oe: OutOfMemoryError =>
+              val ex = new SparkFatalException(
+                new OutOfMemoryError(
+                  "Not enough memory to build and broadcast the table to all " +
+                    "worker nodes. As a workaround, you can either disable broadcast by setting " +
+                    s"${SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key} to -1 or increase the spark " +
+                    s"driver memory by setting ${SparkLauncher.DRIVER_MEMORY} to a higher value.")
+                  .initCause(oe.getCause))
+              promise.failure(ex)
+              throw ex
+            case e if !NonFatal(e) =>
+              val ex = new SparkFatalException(e)
+              promise.failure(ex)
+              throw ex
+            case e: Throwable =>
+              promise.failure(e)
+              throw e
+          }
         }
-
-        val broadcasted = GlutenTimeMetric.millis(longMetric("broadcastTime")) {
-          _ =>
-            // Broadcast the relation
-            SparkShimLoader.getSparkShims.broadcastInternal(
-              sparkContext,
-              relation.asInstanceOf[Any])
-        }
-
-        // Update driver metrics
-        val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
-        SQLMetrics.postDriverMetricUpdates(sparkContext, executionId, metrics.values.toSeq)
-
-        promise.success(broadcasted)
-        broadcasted
-      } catch {
-        // SPARK-24294: To bypass scala bug: https://github.com/scala/bug/issues/9554, we throw
-        // SparkFatalException, which is a subclass of Exception. ThreadUtils.awaitResult
-        // will catch this exception and re-throw the wrapped fatal throwable.
-        case oe: OutOfMemoryError =>
-          val ex = new SparkFatalException(
-            new OutOfMemoryError(
-              "Not enough memory to build and broadcast the table to all " +
-                "worker nodes. As a workaround, you can either disable broadcast by setting " +
-                s"${SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key} to -1 or increase the spark " +
-                s"driver memory by setting ${SparkLauncher.DRIVER_MEMORY} to a higher value.")
-              .initCause(oe.getCause))
-          promise.failure(ex)
-          throw ex
-        case e if !NonFatal(e) =>
-          val ex = new SparkFatalException(e)
-          promise.failure(ex)
-          throw ex
-        case e: Throwable =>
-          promise.failure(e)
-          throw e
       }
+    relationFutureRef = future
+    future
+  }
+
+  def suppressForMppNativeExecution(): Boolean = synchronized {
+    val newlyMarked = !isMppSuppressed
+    setTagValue(ColumnarBroadcastExchangeExec.MppSuppressedTag, true)
+
+    val ex = mppSuppressedException
+    promise.tryFailure(ex)
+    Option(relationFutureRef).foreach {
+      future =>
+        if (!future.isDone) {
+          SparkShimLoader.getSparkShims.cancelJobGroupForBroadcastExchange(sparkContext, this)
+          future.cancel(true)
+        }
     }
+    newlyMarked
+  }
+
+  private def failedMppSuppressedFuture(): java.util.concurrent.Future[broadcast.Broadcast[Any]] = {
+    val ex = mppSuppressedException
+    promise.tryFailure(ex)
+    val failed = new CompletableFuture[broadcast.Broadcast[Any]]()
+    failed.completeExceptionally(ex)
+    failed
+  }
+
+  private def mppSuppressedException: IllegalStateException = {
+    new IllegalStateException(
+      "ColumnarBroadcastExchangeExec is marked mppSuppressed and will not start " +
+        "driver-side relationFuture collection.")
   }
 
   override val runId: UUID = UUID.randomUUID

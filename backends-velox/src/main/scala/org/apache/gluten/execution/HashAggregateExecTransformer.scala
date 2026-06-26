@@ -418,7 +418,68 @@ abstract class HashAggregateExecTransformer(
     }
 
     context.registerAggregationParam(operatorId, aggParams)
-    aggRel
+    applyResultProjectionIfNeeded(context, aggRel, validation)
+  }
+
+  private def applyResultProjectionIfNeeded(
+      context: SubstraitContext,
+      aggRel: RelNode,
+      validation: Boolean): RelNode = {
+    val nativeOutputAttributes = nativeAggregateOutputAttributes
+    if (!resultProjectionNeeded(nativeOutputAttributes)) {
+      return aggRel
+    }
+
+    val expressionNodes = ExpressionConverter
+      .replaceWithExpressionTransformer(rewriteAggregateResultExpressions, nativeOutputAttributes)
+      .map(_.doTransform(context))
+      .asJava
+
+    RelBuilder.makeProjectRel(
+      nativeOutputAttributes.asJava,
+      aggRel,
+      expressionNodes,
+      context,
+      context.nextOperatorId(this.nodeName),
+      validation)
+  }
+
+  private def nativeAggregateOutputAttributes: Seq[Attribute] = {
+    BackendsApiManager.getSparkPlanExecApiInstance
+      .genHashAggregateExecPullOutHelper(aggregateExpressions, aggregateAttributes)
+      .allAggregateResultAttributes(groupingExpressions)
+  }
+
+  private def resultProjectionNeeded(nativeOutputAttributes: Seq[Attribute]): Boolean = {
+    resultExpressions.size != nativeOutputAttributes.size ||
+    resultExpressions.zip(nativeOutputAttributes).exists {
+      case (alias: Alias, attr) => !alias.child.semanticEquals(attr)
+      case (exprAttr: Attribute, attr) =>
+        exprAttr.name != attr.name || exprAttr.dataType != attr.dataType
+      case _ => true
+    }
+  }
+
+  private def rewriteAggregateResultExpressions: Seq[NamedExpression] = {
+    resultExpressions.map {
+      expr =>
+        expr
+          .transform {
+            case aggregateExpression: AggregateExpression =>
+              aggregateResultAttribute(aggregateExpression)
+          }
+          .asInstanceOf[NamedExpression]
+    }
+  }
+
+  private def aggregateResultAttribute(aggregateExpression: AggregateExpression): Attribute = {
+    val index = aggregateExpressions.indexWhere(_.semanticEquals(aggregateExpression))
+    if (index < 0) {
+      throw new GlutenNotSupportException(
+        s"Unable to bind aggregate result expression $aggregateExpression " +
+          s"in ${aggregateExpressions.mkString("[", ", ", "]")}")
+    }
+    aggregateAttributes(index)
   }
 
   private def rewriteAggBufferAttributes(

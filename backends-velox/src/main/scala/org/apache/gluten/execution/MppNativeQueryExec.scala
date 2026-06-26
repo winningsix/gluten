@@ -21,7 +21,10 @@ import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.events.{GlutenMppPlanEvent, GlutenMppPlanFragmentEvent}
 import org.apache.gluten.expression.ConverterUtils
 import org.apache.gluten.extension.{ExchangeSpec, FlushableHashAggregateRule, MppFinalAggTopNPartialRule, MppParallelSortSplitRule, MppRemoveRedundantShuffleRule, MppSinglePartitionSortRule, NativeFragment, RewriteUncorrelatedScalarSubquery}
-import org.apache.gluten.extension.columnar.transition.{Convention, ConventionReq}
+import org.apache.gluten.extension.columnar.UnionTransformerRule
+import org.apache.gluten.extension.columnar.heuristic.HeuristicTransform
+import org.apache.gluten.extension.columnar.rewrite.{PullOutPostProject, PullOutPreProject}
+import org.apache.gluten.extension.columnar.transition.{Convention, ConventionReq, InsertTransitions}
 import org.apache.gluten.metrics.MetricsUpdater
 import org.apache.gluten.mpp.control.{GlutenMppPeerResolution, GlutenMppPeerResolver}
 import org.apache.gluten.runtime.Runtimes
@@ -43,7 +46,7 @@ import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide
 import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, InputIteratorTransformer, LeafExecNode, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
+import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeExec, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BuildSideRelation, HashedRelationBroadcastMode, ShuffledHashJoinExec}
@@ -63,6 +66,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
+import scala.util.control.NonFatal
 
 /**
  * A single SparkPlan node that represents the entire MPP query execution.
@@ -132,12 +136,13 @@ private case class MppReplicatedJoinBuildInput(child: SparkPlan) extends UnaryTr
 
 private case class MppPartitioningPreservingWrapper(
     child: SparkPlan,
+    outputAttributes: Seq[Attribute],
     partitioning: Partitioning,
     ordering: Seq[SortOrder],
     exchangeId: Int)
   extends UnaryTransformSupport {
 
-  override def output: Seq[Attribute] = child.output
+  override def output: Seq[Attribute] = outputAttributes
 
   override def outputPartitioning: Partitioning = partitioning
 
@@ -213,6 +218,9 @@ case class MppNativeQueryExec(
   private val SCALAR_SUBQUERY_REWRITE_ENABLED_DEFAULT = "true"
   private val MPP_SINGLE_TASK_MODE_KEY =
     "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode"
+
+  private type FragmentExtractionResult =
+    (Seq[NativeFragment], Seq[ExchangeSpec], Map[Int, Seq[FusedBroadcast]], SparkPlan)
 
   private def isScalarSubqueryRewriteEnabled: Boolean = {
     val conf = SQLConf.get
@@ -309,8 +317,20 @@ case class MppNativeQueryExec(
       // Phase 2: Extract fragments from child BSP plan and generate Substrait plans.
       logDebug(s"MppNativeQueryExec: child plan tree:\n${childForMpp.treeString.take(2000)}")
 
-      val (extractedFragments, extractedExchanges, fusedBroadcastsByConsumer) =
-        extractFragmentsFromChildPlan(childForMpp)
+      val extracted: Either[String, FragmentExtractionResult] =
+        try {
+          Right(extractFragmentsFromChildPlan(childForMpp))
+        } catch {
+          case NonFatal(e) =>
+            Left(
+              s"MppNativeQueryExec: delegating to BSP because MPP fragment extraction failed: " +
+                exceptionSummary(e))
+        }
+      val (extractedFragments, extractedExchanges, fusedBroadcastsByConsumer, extractedPlan) =
+        extracted match {
+          case Right(value) => value
+          case Left(reason) => return delegateToBsp(executionChild, reason)
+        }
       logDebug(
         s"MppNativeQueryExec: Phase 2 extracted ${extractedFragments.size} fragments " +
           s"and ${extractedExchanges.size} exchanges " +
@@ -342,94 +362,118 @@ case class MppNativeQueryExec(
             s"MppNativeQueryExec: delegating to BSP because extracted MPP plan is unsafe: $reason")
       }
 
+      // Once the extracted plan is committed to native MPP, Spark-side broadcast exchange
+      // materialization is dead work. Mark before Substrait generation: some transform paths can
+      // touch broadcast lazy state while building value-stream inputs.
+      suppressDeadBroadcastsForNativeMpp(childForMpp)
+      suppressDeadBroadcastsForNativeMpp(extractedPlan)
+
       // Generate Substrait plan for each fragment
-      val fragmentSubstraitPlans = extractedFragments.map {
-        frag => generateSubstraitForFragment(frag)
-      }
+      val fragmentSubstraitPlans =
+        try {
+          extractedFragments.map(frag => generateSubstraitForFragment(frag))
+        } catch {
+          case NonFatal(e) =>
+            extractedFragments.foreach {
+              frag =>
+                val rootName = Option(frag.rootOperator)
+                  .map(_.getClass.getSimpleName)
+                  .getOrElse("<null>")
+                val rootTree = Option(frag.rootOperator).map(_.treeString).getOrElse("<null>")
+                val outputDescription = describeAttributes(frag.outputAttributes)
+                logWarning(
+                  s"MppNativeQueryExec: Substrait generation failed while extracted " +
+                    s"fragment ${frag.id} root=$rootName " +
+                    s"output=$outputDescription parallelism=${frag.parallelism} " +
+                    s"tree:\n${rootTree.take(8000)}")
+            }
+            return delegateToBsp(
+              executionChild,
+              s"MppNativeQueryExec: delegating to BSP because MPP Substrait generation failed: " +
+                exceptionSummary(e))
+        }
 
       logDebug(
         s"MppNativeQueryExec: generated ${fragmentSubstraitPlans.size} Substrait plans " +
           s"(sizes: ${fragmentSubstraitPlans.map(_.length).mkString("[", ", ", "]")} bytes)")
 
-      if (extractedFragments.size >= 2 && extractedExchanges.nonEmpty) {
-        // We have real fragments with exchanges -- use MPP streaming execution!
-        logDebug(
-          s"MppNativeQueryExec: *** PHASE 3 MPP EXECUTION *** " +
-            s"${extractedFragments.size} fragments, ${extractedExchanges.size} exchanges")
-        suppressDeadBroadcastsForNativeMpp(childForMpp)
-
-        val fragmentPlans = fragmentSubstraitPlans.toArray
-        val numDriversPerFragment = extractedFragments.map(_.parallelism).toArray
-        val exchangeSpecsJson = serializeExchangeSpecs(extractedExchanges, extractedFragments)
-        val mppQueryId = newNativeMppQueryId()
-        val broadcastProducerFragmentIds = broadcastProducerIds(extractedExchanges)
-
-        val requestedSparkPartitionCount = mppSparkPartitionCount
-        val sparkPartitionCount =
-          effectiveMppSparkPartitionCount(
-            requestedSparkPartitionCount,
-            extractedExchanges,
-            childForMpp.find(_.isInstanceOf[WriteFilesExecTransformer]).isDefined)
-        val peerResolution = resolveMppPeers(sparkPartitionCount)
-        val peerInfos = peerResolution.peerInfos
-        val peerEndpointsJson = peerResolution.peerEndpointsJson
-        metrics("numSparkPartitions") += sparkPartitionCount
-
-        // Extract scan split infos only after endpoint discovery. Some Spark exchange
-        // wrappers can lazily start shuffle work while split metadata is inspected; probing first
-        // keeps the UCX endpoint job from racing those regular Spark stages.
-        val fragmentSplitInfos: Array[Array[Array[Byte]]] =
-          extractedFragments.map(extractSplitInfosForFragment).toArray
-
-        logDebug(
-          s"MppNativeQueryExec: split infos per fragment: " +
-            s"${fragmentSplitInfos.map(_.length).mkString("[", ", ", "]")}")
-
-        // Optional dump-to-disk of the multi-fragment plan for offline C++ replay
-        // (spark.gluten.mpp.substraitDumpDir). No-op when the config is empty.
-        dumpPlanIfEnabled(
-          fragmentPlans,
-          numDriversPerFragment,
-          extractedFragments,
-          extractedExchanges,
-          exchangeSpecsJson,
-          fragmentSplitInfos)
-        postMppPlanEvent(
-          fragmentPlans,
-          numDriversPerFragment,
-          extractedFragments,
-          extractedExchanges,
-          exchangeSpecsJson,
-          fragmentSplitInfos,
-          fusedBroadcastsByConsumer)
-
-        return new MppNativeQueryRDD(
-          sparkContext,
-          fragmentPlans,
-          numDriversPerFragment,
-          exchangeSpecsJson,
-          mppQueryId,
-          peerEndpointsJson,
-          peerInfos,
-          fragmentSplitInfos,
-          fusedBroadcastsByConsumer,
-          sparkPartitionCount,
-          broadcastProducerFragmentIds,
-          longMetric("totalQueryTimeMs"),
-          longMetric("outputRows"),
-          longMetric("outputBatches")
-        )
-      } else {
-        // Single fragment or no exchanges -- BSP is fine
-        logDebug(
-          s"MppNativeQueryExec: single fragment (${extractedFragments.size} fragments, " +
-            s"${extractedExchanges.size} exchanges), delegating to BSP")
-        if (childForMpp.supportsColumnar) {
-          return childForMpp.executeColumnar()
-        } else {
-          return childForMpp.execute().mapPartitions(rows => Iterator.empty)
-        }
+      validateMppStreamInputs(
+        fragmentSubstraitPlans,
+        extractedFragments,
+        extractedExchanges,
+        fusedBroadcastsByConsumer).foreach {
+        reason =>
+          return delegateToBsp(
+            executionChild,
+            s"MppNativeQueryExec: delegating to BSP because extracted MPP plan is unsafe: " +
+              reason)
       }
+
+      logDebug(
+        s"MppNativeQueryExec: *** PHASE 3 MPP EXECUTION *** " +
+          s"${extractedFragments.size} fragments, ${extractedExchanges.size} exchanges")
+
+      val fragmentPlans = fragmentSubstraitPlans.toArray
+      val numDriversPerFragment = extractedFragments.map(_.parallelism).toArray
+      val exchangeSpecsJson = serializeExchangeSpecs(extractedExchanges, extractedFragments)
+      val mppQueryId = newNativeMppQueryId()
+      val broadcastProducerFragmentIds = broadcastProducerIds(extractedExchanges)
+
+      val requestedSparkPartitionCount = mppSparkPartitionCount
+      val sparkPartitionCount =
+        effectiveMppSparkPartitionCount(
+          requestedSparkPartitionCount,
+          extractedExchanges,
+          childForMpp.find(_.isInstanceOf[WriteFilesExecTransformer]).isDefined)
+      val peerResolution = resolveMppPeers(sparkPartitionCount)
+      val peerInfos = peerResolution.peerInfos
+      val peerEndpointsJson = peerResolution.peerEndpointsJson
+      metrics("numSparkPartitions") += sparkPartitionCount
+
+      // Extract scan split infos only after endpoint discovery. Some Spark exchange
+      // wrappers can lazily start shuffle work while split metadata is inspected; probing first
+      // keeps the UCX endpoint job from racing those regular Spark stages.
+      val fragmentSplitInfos: Array[Array[Array[Byte]]] =
+        extractedFragments.map(extractSplitInfosForFragment).toArray
+
+      logDebug(
+        s"MppNativeQueryExec: split infos per fragment: " +
+          s"${fragmentSplitInfos.map(_.length).mkString("[", ", ", "]")}")
+
+      // Optional dump-to-disk of the multi-fragment plan for offline C++ replay
+      // (spark.gluten.mpp.substraitDumpDir). No-op when the config is empty.
+      dumpPlanIfEnabled(
+        fragmentPlans,
+        numDriversPerFragment,
+        extractedFragments,
+        extractedExchanges,
+        exchangeSpecsJson,
+        fragmentSplitInfos)
+      postMppPlanEvent(
+        fragmentPlans,
+        numDriversPerFragment,
+        extractedFragments,
+        extractedExchanges,
+        exchangeSpecsJson,
+        fragmentSplitInfos,
+        fusedBroadcastsByConsumer)
+
+      return new MppNativeQueryRDD(
+        sparkContext,
+        fragmentPlans,
+        numDriversPerFragment,
+        exchangeSpecsJson,
+        mppQueryId,
+        peerEndpointsJson,
+        peerInfos,
+        fragmentSplitInfos,
+        fusedBroadcastsByConsumer,
+        sparkPartitionCount,
+        broadcastProducerFragmentIds,
+        longMetric("totalQueryTimeMs"),
+        longMetric("outputRows"),
+        longMetric("outputBatches")
+      )
     }
 
     nativeMppFallbackReason(fragments, exchanges).foreach {
@@ -447,9 +491,16 @@ case class MppNativeQueryExec(
     metrics("numExchanges") += exchanges.size
 
     // Generate Substrait plans on the DRIVER side where sparkContext is available.
-    val fragmentPlans: Array[Array[Byte]] = fragments.map {
-      frag => generateSubstraitPlan(frag)
-    }.toArray
+    val fragmentPlans: Array[Array[Byte]] =
+      try {
+        fragments.map(frag => generateSubstraitPlan(frag)).toArray
+      } catch {
+        case NonFatal(e) =>
+          return delegateToBsp(
+            executionChild,
+            s"MppNativeQueryExec: delegating to BSP because MPP Substrait generation failed: " +
+              exceptionSummary(e))
+      }
 
     val numDriversPerFragment = fragments.map(_.parallelism).toArray
     val exchangeSpecsJson = serializeExchangeSpecs(exchanges, fragments)
@@ -457,6 +508,14 @@ case class MppNativeQueryExec(
     val broadcastProducerFragmentIds = broadcastProducerIds(exchanges)
 
     logDebug(s"MppNativeQueryExec: generated ${fragmentPlans.length} Substrait plans on driver")
+
+    validateMppStreamInputs(fragmentPlans.toSeq, fragments, exchanges, Map.empty).foreach {
+      reason =>
+        return delegateToBsp(
+          executionChild,
+          "MppNativeQueryExec: delegating to BSP because pre-extracted MPP plan is unsafe: " +
+            reason)
+    }
 
     val requestedSparkPartitionCount = mppSparkPartitionCount
     val sparkPartitionCount =
@@ -535,11 +594,21 @@ case class MppNativeQueryExec(
 
   private def delegateToBsp(plan: SparkPlan, reason: String): RDD[ColumnarBatch] = {
     logWarning(reason)
-    if (plan.supportsColumnar) {
-      plan.executeColumnar()
-    } else {
-      plan.execute().mapPartitions(_ => Iterator.empty)
-    }
+    val bspPlan = prepareColumnarBspFallbackPlan(plan)
+    bspPlan.executeColumnar()
+  }
+
+  private def prepareColumnarBspFallbackPlan(plan: SparkPlan): SparkPlan = {
+    val withTransitions =
+      InsertTransitions
+        .create(outputsColumnar = true, BackendsApiManager.getSettings.primaryBatchType)
+        .apply(plan)
+    ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(withTransitions)
+  }
+
+  private def exceptionSummary(t: Throwable): String = {
+    val message = Option(t.getMessage).filter(_.nonEmpty).getOrElse(t.getClass.getName)
+    s"${t.getClass.getSimpleName}: $message"
   }
 
   private def maybeHidePreparedMppChild(plan: SparkPlan): SparkPlan = {
@@ -588,8 +657,7 @@ case class MppNativeQueryExec(
    *
    * We do NOT modify the child plan tree -- only read it.
    */
-  private def extractFragmentsFromChildPlan(
-      plan: SparkPlan): (Seq[NativeFragment], Seq[ExchangeSpec], Map[Int, Seq[FusedBroadcast]]) = {
+  private def extractFragmentsFromChildPlan(plan: SparkPlan): FragmentExtractionResult = {
     val extractedFragments = mutable.ArrayBuffer[NativeFragment]()
     val extractedExchanges = mutable.ArrayBuffer[ExchangeSpec]()
     val fragmentCounter = new AtomicInteger(0)
@@ -864,7 +932,7 @@ case class MppNativeQueryExec(
     val frozenBroadcasts = broadcastsByConsumer.iterator.map {
       case (consumerId, buf) => consumerId -> buf.toSeq
     }.toMap
-    (adjustedFragments, sortedExchanges, frozenBroadcasts)
+    (adjustedFragments, sortedExchanges, frozenBroadcasts, rewrittenChild)
   }
 
   /**
@@ -877,7 +945,14 @@ case class MppNativeQueryExec(
     val skipShuffleRule = MppRemoveRedundantShuffleRule()
     val parallelSortSplitRule = MppParallelSortSplitRule()
     val finalAggTopNPartialRule = MppFinalAggTopNPartialRule()
-    val afterSort = sortRule(plan)
+    val afterHeuristicTransform = HeuristicTransform.static()(plan)
+    val afterPostProject =
+      afterHeuristicTransform.transformUp { case node => PullOutPostProject.rewrite(node) }
+    val afterNativePostProject = rewriteNativePostProjects(afterPostProject)
+    val afterNativeUnion =
+      UnionTransformerRule(requireSameNumPartitions = false, requireNativeUnionEnabled = false)(
+        afterNativePostProject)
+    val afterSort = sortRule(afterNativeUnion)
     val afterSkipShuffle = skipShuffleRule(afterSort)
     // parallelSortSplit must run AFTER MppSinglePartitionSortRule so the
     // RangePartitioning -> SinglePartition rewrite has already happened.
@@ -904,6 +979,13 @@ case class MppNativeQueryExec(
       FlushableHashAggregateRule(org.apache.spark.sql.SparkSession.active)(afterBroadcastJoin)
     normalizeInputIteratorTransformers(
       ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(afterFlushableAgg))
+  }
+
+  private def rewriteNativePostProjects(plan: SparkPlan): SparkPlan = {
+    plan.transformUp {
+      case project: ProjectExec if project.child.isInstanceOf[TransformSupport] =>
+        ProjectExecTransformer(project.projectList, project.child)
+    }
   }
 
   private def splitPostJoinFinalAgg(plan: SparkPlan): SparkPlan = {
@@ -1212,6 +1294,14 @@ case class MppNativeQueryExec(
         case InputIteratorTransformer(ColumnarInputAdapter(wst: WholeStageTransformer)) =>
           changed = true
           wst.child
+        case InputIteratorTransformer(ColumnarInputAdapter(scan: LocalTableScanExec))
+            if scan.rows.length <= LocalTableScanExecTransformer.MaxRows =>
+          changed = true
+          LocalTableScanExecTransformer(scan.output, scan.rows)
+        case InputIteratorTransformer(ColumnarInputAdapter(scan))
+            if LocalTableScanExecTransformer.supportsOneRowRelation(scan) =>
+          changed = true
+          LocalTableScanExecTransformer.oneRowRelation(scan.output)
         case InputIteratorTransformer(ColumnarInputAdapter(ts: TransformSupport)) =>
           changed = true
           ts
@@ -1221,10 +1311,24 @@ case class MppNativeQueryExec(
   }
 
   private def offloadLocalSorts(plan: SparkPlan): SparkPlan = {
-    plan.transformUp {
+    val withSortPreProjects = plan.transformUp {
+      case sort: SortExec if !sort.global =>
+        PullOutPreProject.rewrite(sort)
+    }
+
+    val withNativePreProjects = withSortPreProjects.transformUp {
+      case project: ProjectExec if unwrapToExchange(project.child).isDefined =>
+        val nativeChild =
+          ColumnarCollapseTransformStages.wrapInputIteratorTransformer(project.child)
+        ProjectExecTransformer(project.projectList, nativeChild)
+    }
+
+    val withNativeSorts = withNativePreProjects.transformUp {
       case sort: SortExec if !sort.global =>
         SortExecTransformer(sort.sortOrder, global = false, sort.child, sort.testSpillFrequency)
     }
+
+    rewriteNativePostProjects(withNativeSorts)
   }
 
   private def offloadLocalHashJoins(plan: SparkPlan): SparkPlan = {
@@ -1334,8 +1438,122 @@ case class MppNativeQueryExec(
   private def nativeMppFallbackReason(
       fragments: Seq[NativeFragment],
       exchanges: Seq[ExchangeSpec]): Option[String] = {
-    overloadedFragmentFallbackReason(fragments, exchanges)
+    rootOutputMismatchFallbackReason(fragments, exchanges)
+      .orElse(overloadedFragmentFallbackReason(fragments, exchanges))
       .orElse(duplicateAggregateFragmentFallbackReason(fragments, exchanges))
+  }
+
+  private def rootOutputMismatchFallbackReason(
+      fragments: Seq[NativeFragment],
+      exchanges: Seq[ExchangeSpec]): Option[String] = {
+    if (fragments.isEmpty) {
+      return Some("no native MPP fragments were extracted")
+    }
+
+    val producerFragmentIds = exchanges.map(_.producerFragmentId).filter(_ >= 0).toSet
+    val rootFragments = fragments.filterNot(fragment => producerFragmentIds.contains(fragment.id))
+    if (rootFragments.size != 1) {
+      val rootIds = rootFragments.map(_.id).sorted.mkString("[", ",", "]")
+      return Some(s"expected exactly one root fragment but found ${rootFragments.size}: $rootIds")
+    }
+
+    val root = rootFragments.head
+    if (sameOutputSchema(root.outputAttributes, output)) {
+      None
+    } else {
+      Some(
+        s"root fragment ${root.id} output ${describeAttributes(root.outputAttributes)} " +
+          s"does not match Spark output ${describeAttributes(output)}")
+    }
+  }
+
+  private def sameOutputSchema(left: Seq[Attribute], right: Seq[Attribute]): Boolean = {
+    left.length == right.length &&
+    left.zip(right).forall { case (l, r) => l.name == r.name && l.dataType == r.dataType }
+  }
+
+  private def validateMppStreamInputs(
+      fragmentPlans: Seq[Array[Byte]],
+      fragments: Seq[NativeFragment],
+      exchanges: Seq[ExchangeSpec],
+      fusedBroadcastsByConsumer: Map[Int, Seq[FusedBroadcast]]): Option[String] = {
+    fragments.zip(fragmentPlans).foreach {
+      case (fragment, planBytes) =>
+        val slots =
+          try {
+            inputIteratorSlots(planBytes)
+          } catch {
+            case NonFatal(e) =>
+              return Some(
+                s"fragment ${fragment.id} Substrait iterator inspection failed: " +
+                  exceptionSummary(e))
+          }
+        if (slots.nonEmpty) {
+          val inboundExchangeCount = exchanges.count(_.consumerFragmentId == fragment.id)
+          val fusedBroadcastCount = fusedBroadcastsByConsumer.getOrElse(fragment.id, Nil).size
+          val preparedInputCount = inboundExchangeCount + fusedBroadcastCount
+          val requiredInputCount = slots.max + 1
+          if (requiredInputCount > preparedInputCount) {
+            return Some(
+              s"fragment ${fragment.id} Substrait has ReadRel iterator slot(s) " +
+                s"${slots.toSeq.sorted.mkString("[", ", ", "]")} but Spark prepared only " +
+                s"$preparedInputCount MPP stream input(s): $inboundExchangeCount inbound " +
+                s"exchange(s) + $fusedBroadcastCount fused broadcast(s)")
+          }
+        }
+    }
+    None
+  }
+
+  private def inputIteratorSlots(planBytes: Array[Byte]): Set[Int] = {
+    val plan = io.substrait.proto.Plan.parseFrom(planBytes)
+    val slots = mutable.Set[Int]()
+
+    def visit(message: com.google.protobuf.Message): Unit = {
+      message match {
+        case read: ReadRel if read.hasLocalFiles =>
+          read.getLocalFiles.getItemsList.asScala.foreach {
+            item =>
+              if (item.hasUriFile) {
+                parseIteratorSlot(item.getUriFile).foreach(slots += _)
+              }
+          }
+        case _ =>
+      }
+
+      message.getAllFields.asScala.foreach {
+        case (field, value)
+            if field.getJavaType ==
+              com.google.protobuf.Descriptors.FieldDescriptor.JavaType.MESSAGE =>
+          if (field.isRepeated) {
+            value.asInstanceOf[java.util.List[_]].asScala.foreach {
+              case nested: com.google.protobuf.Message => visit(nested)
+              case _ =>
+            }
+          } else {
+            value match {
+              case nested: com.google.protobuf.Message => visit(nested)
+              case _ =>
+            }
+          }
+        case _ =>
+      }
+    }
+
+    visit(plan)
+    slots.toSet
+  }
+
+  private def parseIteratorSlot(uri: String): Option[Int] = {
+    if (!uri.startsWith(ConverterUtils.ITERATOR_PREFIX)) {
+      return None
+    }
+    val raw = uri.stripPrefix(ConverterUtils.ITERATOR_PREFIX)
+    try {
+      Some(raw.toInt)
+    } catch {
+      case _: NumberFormatException => None
+    }
   }
 
   /**
@@ -1698,7 +1916,15 @@ case class MppNativeQueryExec(
       buildSide: BuildSide,
       streamedExchange: Exchange,
       buildExchange: Exchange): T = {
-    val inlinedStreamed = inlineExchangeProducer(streamedExchange)
+    val inlinedStreamed = inlineBoundaryExchange(join.streamedPlan, streamedExchange)
+    if (!sameOutputExprIds(join.streamedPlan.output, inlinedStreamed.output)) {
+      logWarning(
+        s"MppNativeQueryExec: not co-locating hash join probe side; " +
+          s"join=${join.nodeName} streamedExchange=${streamedExchange.id} " +
+          s"output changed from ${describeAttributes(join.streamedPlan.output)} " +
+          s"to ${describeAttributes(inlinedStreamed.output)}")
+      return join
+    }
     logInfo(
       s"MppNativeQueryExec: co-locating hash join probe side " +
         s"join=${join.nodeName} buildSide=$buildSide " +
@@ -1711,6 +1937,10 @@ case class MppNativeQueryExec(
         join.withNewChildren(Array(inlinedStreamed, MppReplicatedJoinBuildInput(join.right)))
     }
     relocated.asInstanceOf[T]
+  }
+
+  private def sameOutputExprIds(left: Seq[Attribute], right: Seq[Attribute]): Boolean = {
+    left.map(_.exprId) == right.map(_.exprId)
   }
 
   private def shouldCoLocateBroadcastJoinProbe(
@@ -1849,9 +2079,23 @@ case class MppNativeQueryExec(
     }
     MppPartitioningPreservingWrapper(
       inlined,
+      exchange.output,
       exchange.outputPartitioning,
       exchange.outputOrdering,
       exchange.id)
+  }
+
+  private def inlineBoundaryExchange(plan: SparkPlan, exchange: Exchange): SparkPlan = {
+    plan.transformDown {
+      case iit: InputIteratorTransformer if boundaryExchange(iit).exists(_.id == exchange.id) =>
+        inlineExchangeProducer(exchange)
+      case cia: ColumnarInputAdapter if boundaryExchange(cia).exists(_.id == exchange.id) =>
+        inlineExchangeProducer(exchange)
+      case ex: ShuffleExchangeLike if ex.asInstanceOf[Exchange].id == exchange.id =>
+        inlineExchangeProducer(exchange)
+      case ex: BroadcastExchangeLike if ex.asInstanceOf[Exchange].id == exchange.id =>
+        inlineExchangeProducer(exchange)
+    }
   }
 
   private def joinSideStats(
@@ -2856,12 +3100,28 @@ case class MppNativeQueryExec(
 
   private def suppressDeadBroadcastsForNativeMpp(plan: SparkPlan): Unit = {
     var markedCount = 0
-    plan.foreach {
-      case broadcast: ColumnarBroadcastExchangeExec if !broadcast.isMppSuppressed =>
-        broadcast.setTagValue(ColumnarBroadcastExchangeExec.MppSuppressedTag, true)
-        markedCount += 1
-      case _ =>
+
+    def mark(plan: SparkPlan): Unit = {
+      plan match {
+        case prepared: MppPreparedChildExec =>
+          mark(prepared.hiddenPlan)
+        case stage: BroadcastQueryStageExec =>
+          mark(stage.plan)
+        case stage: ShuffleQueryStageExec =>
+          mark(stage.plan)
+        case reused: ReusedExchangeExec =>
+          mark(reused.child)
+        case broadcast: ColumnarBroadcastExchangeExec =>
+          if (broadcast.suppressForMppNativeExecution()) {
+            markedCount += 1
+          }
+          mark(broadcast.child)
+        case other =>
+          other.children.foreach(mark)
+      }
     }
+
+    mark(plan)
     if (markedCount > 0) {
       logDebug(
         s"MppNativeQueryExec: suppressed $markedCount ColumnarBroadcastExchangeExec " +
@@ -3192,6 +3452,12 @@ case class MppNativeQueryExec(
         logWarning(s"MppNativeQueryExec: invalid integer for $key=$raw; using $defaultValue")
         defaultValue
     }
+  }
+
+  private def describeAttributes(attributes: Seq[Attribute]): String = {
+    attributes
+      .map(attr => s"${attr.name}#${attr.exprId.id}:${attr.dataType.simpleString}")
+      .mkString("[", ",", "]")
   }
 
   /**

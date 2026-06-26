@@ -30,15 +30,21 @@ import org.apache.spark.sql.execution.SparkPlan
  * or [[org.apache.gluten.extension.columnar.enumerated.EnumeratedTransform]] because it relies on
  * children's output partitioning to be fully provided.
  */
-case class UnionTransformerRule() extends Rule[SparkPlan] {
+case class UnionTransformerRule(
+    requireSameNumPartitions: Boolean = true,
+    requireNativeUnionEnabled: Boolean = true)
+  extends Rule[SparkPlan] {
   override def apply(plan: SparkPlan): SparkPlan = {
-    if (!GlutenConfig.get.enableNativeUnion) {
+    if (requireNativeUnionEnabled && !GlutenConfig.get.enableNativeUnion) {
       return plan
     }
     plan.transformUp {
       case plan: ColumnarUnionExec =>
         val transformer = UnionExecTransformer(plan.children)
-        if (sameNumPartitions(plan.children) && validate(transformer)) {
+        if (
+          (!requireSameNumPartitions || sameNumPartitions(plan.children)) &&
+          validate(transformer)
+        ) {
           transformer
         } else {
           plan
