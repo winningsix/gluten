@@ -23,6 +23,7 @@
 #include "utils/ConfigExtractor.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
+#include "velox/connectors/hive/iceberg/IcebergSplit.h"
 #include "velox/exec/PlanNodeStats.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include <cudf/io/types.hpp>
@@ -172,9 +173,23 @@ WholeStageResultIterator::WholeStageResultIterator(
       if (auto icebergSplitInfo = std::dynamic_pointer_cast<IcebergSplitInfo>(scanInfo)) {
         // Set Iceberg split (never coalesced).
         std::unordered_map<std::string, std::string> customSplitInfo{{"table_format", "hive-iceberg"}};
-        auto deleteFiles = icebergSplitInfo->deleteFilesVec[idx];
+        std::vector<velox::connector::hive::iceberg::IcebergDeleteFile> deleteFiles;
+        if (idx < icebergSplitInfo->deleteFilesVec.size()) {
+          const auto& splitDeleteFiles = icebergSplitInfo->deleteFilesVec[idx];
+          deleteFiles.reserve(splitDeleteFiles.size());
+          for (const auto& deleteFile : splitDeleteFiles) {
+            deleteFiles.emplace_back(deleteFile);
+          }
+        }
+        auto connectorId = kHiveConnectorId;
+#ifdef GLUTEN_ENABLE_GPU
+        if (canUseCudfConnector && enableCudf_ &&
+            veloxCfg_->get<bool>(kCudfEnableTableScan, kCudfEnableTableScanDefault)) {
+          connectorId = kCudfIcebergConnectorId;
+        }
+#endif
         split = std::make_shared<velox::connector::hive::iceberg::HiveIcebergSplit>(
-            kHiveConnectorId,
+            connectorId,
             paths[idx],
             format,
             starts[idx],
@@ -184,7 +199,7 @@ WholeStageResultIterator::WholeStageResultIterator(
             customSplitInfo,
             nullptr,
             true,
-            deleteFiles,
+            std::move(deleteFiles),
             std::unordered_map<std::string, std::string>(),
             properties[idx]);
         connectorSplits.emplace_back(split);
@@ -273,6 +288,7 @@ std::shared_ptr<velox::core::QueryCtx> WholeStageResultIterator::createNewVeloxQ
   connectorConfigs[kHiveConnectorId] = hiveConnectorSessionConfig;
 #ifdef GLUTEN_ENABLE_GPU
   connectorConfigs[kCudfHiveConnectorId] = hiveConnectorSessionConfig;
+  connectorConfigs[kCudfIcebergConnectorId] = hiveConnectorSessionConfig;
 #endif
   std::shared_ptr<velox::core::QueryCtx> ctx = velox::core::QueryCtx::create(
       nullptr,

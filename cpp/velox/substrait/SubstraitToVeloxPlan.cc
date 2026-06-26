@@ -43,12 +43,12 @@ using namespace cudf_velox::connector::hive;
 namespace gluten {
 namespace {
 
-bool useCudfTableHandle(const std::vector<std::shared_ptr<SplitInfo>>& splitInfos) {
+bool useCudfTableHandle(const std::shared_ptr<SplitInfo>& splitInfo) {
 #ifdef GLUTEN_ENABLE_GPU
-  if (splitInfos.empty()) {
+  if (splitInfo == nullptr) {
     return false;
   }
-  return splitInfos[0]->canUseCudfConnector();
+  return splitInfo->canUseCudfConnector();
 #else
   return false;
 #endif
@@ -1507,10 +1507,10 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   connector::ConnectorTableHandlePtr tableHandle;
   auto remainingFilter = readRel.has_filter() ? exprConverter_->toVeloxExpr(readRel.filter(), baseSchema) : nullptr;
   auto connectorId = kHiveConnectorId;
-  if (useCudfTableHandle(splitInfos_) && veloxCfg_->get<bool>(kCudfEnableTableScan, kCudfEnableTableScanDefault) &&
+  if (useCudfTableHandle(splitInfo) && veloxCfg_->get<bool>(kCudfEnableTableScan, kCudfEnableTableScanDefault) &&
       veloxCfg_->get<bool>(kCudfEnabled, kCudfEnabledDefault)) {
 #ifdef GLUTEN_ENABLE_GPU
-    connectorId = kCudfHiveConnectorId;
+    connectorId = splitInfo->isIceberg ? kCudfIcebergConnectorId : kCudfHiveConnectorId;
 #endif
   }
   common::SubfieldFilters subfieldFilters;

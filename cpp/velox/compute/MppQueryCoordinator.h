@@ -60,7 +60,8 @@ struct MppFragmentSpec {
   /// Only populated for scan-containing (leaf) fragments.
   std::vector<std::shared_ptr<SplitInfo>> scanInfos;
   std::vector<facebook::velox::core::PlanNodeId> scanNodeIds;
-  /// Connector IDs for each scan node (e.g., "test-hive" or "cudf-hive").
+  /// Connector IDs for each scan node, e.g. "test-hive", "cudf-hive", or
+  /// "cudf-iceberg".
   /// Must match the TableScanNode's connector ID in the plan.
   std::vector<std::string> scanConnectorIds;
 };

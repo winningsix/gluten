@@ -31,6 +31,7 @@
 #include "operators/plannodes/CudfVectorStream.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
+#include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #endif
@@ -428,6 +429,10 @@ void VeloxBackend::initConnector(const std::shared_ptr<velox::config::ConfigBase
     facebook::velox::cudf_velox::connector::hive::CudfHiveConnectorFactory factory;
     auto hiveConnector = factory.newConnector(kCudfHiveConnectorId, hiveConf, ioExecutor_.get());
     facebook::velox::connector::registerConnector(hiveConnector);
+
+    facebook::velox::cudf_velox::connector::hive::iceberg::CudfIcebergConnectorFactory icebergFactory;
+    auto icebergConnector = icebergFactory.newConnector(kCudfIcebergConnectorId, hiveConf, ioExecutor_.get());
+    facebook::velox::connector::registerConnector(icebergConnector);
   }
 #endif
 }

@@ -2019,15 +2019,15 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     fragSpec.scanInfos = std::move(fragScanInfos);
     fragSpec.scanNodeIds = std::move(fragScanNodeIds);
     // Determine connector IDs for scan nodes.
-    // When cuDF is enabled, the plan may still have "test-hive" due to
-    // useCudfTableHandle() logic. Override to "cudf-hive" when cudf config
-    // is fully enabled, since MPP needs the GPU connector for type coercion.
+    // When cuDF is enabled, the plan may still have "test-hive" for regular
+    // Hive scans. Override those to "cudf-hive", but preserve "cudf-iceberg"
+    // so Iceberg scans use the Iceberg-aware cuDF data source.
     for (const auto& scanNodeId : fragSpec.scanNodeIds) {
-      // For MPP, always use cudf-hive connector when GPU is enabled.
-      // The plan may have "test-hive" due to SubstraitToVeloxPlanConverter
-      // logic, but CudfHiveConnectorSplit needs cudf-hive connector ID.
 #ifdef GLUTEN_ENABLE_GPU
-      auto connectorId = std::string(kCudfHiveConnectorId);
+      const auto planConnectorId = getTableScanConnectorId(veloxPlanNode, scanNodeId);
+      auto connectorId = planConnectorId == kCudfIcebergConnectorId
+          ? planConnectorId
+          : std::string(kCudfHiveConnectorId);
 #else
       auto connectorId = getTableScanConnectorId(veloxPlanNode, scanNodeId);
 #endif
@@ -2099,6 +2099,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   connectorConfigs[kHiveConnectorId] = hiveConnectorSessionConfig;
 #ifdef GLUTEN_ENABLE_GPU
   connectorConfigs[kCudfHiveConnectorId] = hiveConnectorSessionConfig;
+  connectorConfigs[kCudfIcebergConnectorId] = hiveConnectorSessionConfig;
 #endif
   // Velox's OutputBuffer.bufferedBytes_ is a single scalar shared across ALL
   // destinations of a Task; enqueue blocks when it exceeds max_*_buffer_size.

@@ -19,6 +19,23 @@
 
 namespace gluten {
 
+namespace {
+
+using SubstraitIcebergDeleteMap =
+    substrait::ReadRel_LocalFiles_FileOrFiles_IcebergReadOptions_DeleteFile_Map;
+
+std::unordered_map<int32_t, std::string> parseBoundMap(
+    const SubstraitIcebergDeleteMap& map) {
+  std::unordered_map<int32_t, std::string> out;
+  out.reserve(map.key_values_size());
+  for (const auto& kv : map.key_values()) {
+    out.emplace(kv.key(), kv.value());
+  }
+  return out;
+}
+
+} // namespace
+
 std::shared_ptr<IcebergSplitInfo> IcebergPlanConverter::parseIcebergSplitInfo(
     substrait::ReadRel_LocalFiles_FileOrFiles file,
     std::shared_ptr<SplitInfo> splitInfo) {
@@ -28,6 +45,7 @@ std::shared_ptr<IcebergSplitInfo> IcebergPlanConverter::parseIcebergSplitInfo(
   auto icebergSplitInfo = std::dynamic_pointer_cast<IcebergSplitInfo>(splitInfo)
       ? std::dynamic_pointer_cast<IcebergSplitInfo>(splitInfo)
       : std::make_shared<IcebergSplitInfo>(*splitInfo);
+  icebergSplitInfo->isIceberg = true;
   auto icebergReadOption = file.iceberg();
   switch (icebergReadOption.file_format_case()) {
     case SubstraitFileFormatCase::kParquet:
@@ -69,8 +87,26 @@ std::shared_ptr<IcebergSplitInfo> IcebergPlanConverter::parseIcebergSplitInfo(
           fileContent = FileContent::kData;
           break;
       }
+      std::vector<int32_t> equalityFieldIds;
+      equalityFieldIds.reserve(deleteFile.equalityfieldids_size());
+      for (const auto fieldId : deleteFile.equalityfieldids()) {
+        equalityFieldIds.emplace_back(fieldId);
+      }
+      auto lowerBounds = deleteFile.has_lowerbounds()
+          ? parseBoundMap(deleteFile.lowerbounds())
+          : std::unordered_map<int32_t, std::string>{};
+      auto upperBounds = deleteFile.has_upperbounds()
+          ? parseBoundMap(deleteFile.upperbounds())
+          : std::unordered_map<int32_t, std::string>{};
       deletes.emplace_back(IcebergDeleteFile(
-          fileContent, deleteFile.filepath(), format, deleteFile.recordcount(), deleteFile.filesize()));
+          fileContent,
+          deleteFile.filepath(),
+          format,
+          deleteFile.recordcount(),
+          deleteFile.filesize(),
+          std::move(equalityFieldIds),
+          std::move(lowerBounds),
+          std::move(upperBounds)));
     }
     icebergSplitInfo->deleteFilesVec.emplace_back(deletes);
   } else {

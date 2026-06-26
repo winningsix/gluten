@@ -222,6 +222,7 @@ const std::string kVeloxPreferredBatchBytes = "spark.gluten.sql.columnar.backend
 const std::string kCudfEnableTableScan = "spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan";
 const bool kCudfEnableTableScanDefault = false;
 const std::string kCudfHiveConnectorId = "cudf-hive";
+const std::string kCudfIcebergConnectorId = "cudf-iceberg";
 
 // Forward to IBM CudfConfig::kCudfJitExpressionEnabled. When false, NVRTC JIT
 // compilation of cudf::ast expressions is skipped and the AST/standalone-cudf

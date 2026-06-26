@@ -592,7 +592,10 @@ MppDumpLoadResult loadMppQueryFromDump(
 
     for (const auto& scanNodeId : spec.scanNodeIds) {
 #ifdef GLUTEN_ENABLE_GPU
-      auto connectorId = std::string(kCudfHiveConnectorId);
+      const auto planConnectorId = getTableScanConnectorId(veloxPlanNode, scanNodeId);
+      auto connectorId = planConnectorId == kCudfIcebergConnectorId
+          ? planConnectorId
+          : std::string(kCudfHiveConnectorId);
 #else
       auto connectorId = getTableScanConnectorId(veloxPlanNode, scanNodeId);
 #endif

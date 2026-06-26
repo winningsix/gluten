@@ -67,6 +67,10 @@ struct SplitInfo {
   /// The schema of the table being scanned.
   RowTypePtr tableSchema;
 
+  /// True if this split info came from Iceberg read options and must be routed
+  /// through an Iceberg-aware connector.
+  bool isIceberg = false;
+
   /// Make SplitInfo polymorphic
   virtual ~SplitInfo() = default;
 

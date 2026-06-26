@@ -42,9 +42,11 @@
 
 #include "config/VeloxConfig.h"
 #include "cudf/GpuMemoryTracker.h"
+#include "iceberg/IcebergPlanConverter.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/memory/ByteStream.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
+#include "velox/connectors/hive/iceberg/IcebergSplit.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/OutputBuffer.h"
@@ -987,6 +989,39 @@ void MppQueryCoordinator::start() {
         }
 
         std::shared_ptr<connector::ConnectorSplit> connectorSplit;
+        if (auto icebergSplitInfo =
+                std::dynamic_pointer_cast<IcebergSplitInfo>(scanInfo)) {
+          std::unordered_map<std::string, std::string> metadataColumn;
+          if (j < scanInfo->metadataColumns.size()) {
+            metadataColumn = scanInfo->metadataColumns[j];
+          }
+          std::vector<connector::hive::iceberg::IcebergDeleteFile> deleteFiles;
+          if (j < icebergSplitInfo->deleteFilesVec.size()) {
+            const auto& splitDeleteFiles = icebergSplitInfo->deleteFilesVec[j];
+            deleteFiles.reserve(splitDeleteFiles.size());
+            for (const auto& deleteFile : splitDeleteFiles) {
+              deleteFiles.emplace_back(deleteFile);
+            }
+          }
+          std::unordered_map<std::string, std::string> customSplitInfo{
+              {"table_format", "hive-iceberg"}};
+          connectorSplit =
+              std::make_shared<connector::hive::iceberg::HiveIcebergSplit>(
+                  connectorId,
+                  scanInfo->paths[j],
+                  scanInfo->format,
+                  scanInfo->starts[j],
+                  scanInfo->lengths[j],
+                  partitionKeys,
+                  std::nullopt,
+                  customSplitInfo,
+                  nullptr,
+                  true,
+                  std::move(deleteFiles),
+                  metadataColumn,
+                  j < scanInfo->properties.size() ? scanInfo->properties[j]
+                                                   : std::nullopt);
+        } else
 #ifdef GLUTEN_ENABLE_GPU
         if (connectorId == kCudfHiveConnectorId && scanInfo->canUseCudfConnector()) {
           std::unordered_map<std::string, std::string> metadataColumn;
