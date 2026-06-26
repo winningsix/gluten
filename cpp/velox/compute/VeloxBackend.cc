@@ -189,6 +189,8 @@ void VeloxBackend::init(
          backendConf_->get(kCudfMemoryResource, kCudfMemoryResourceDefault)},
         {velox::cudf_velox::CudfConfig::kCudfMemoryPercent,
          backendConf_->get(kCudfMemoryPercent, kCudfMemoryPercentDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfTimestampUnit,
+         backendConf_->get(kCudfTimestampUnit, kCudfTimestampUnitDefault)},
         {velox::cudf_velox::CudfConfig::kCudfAllowCpuFallback,
          backendConf_->get(kCudfAllowCpuFallback, kCudfAllowCpuFallbackDefault)},
         // NOTE: kCudfGpuTargetBatchRows/Bytes, kCudfPinnedPoolSize,

@@ -32,6 +32,10 @@ namespace gluten {
 
 namespace {
 
+// cudf::type_id::TIMESTAMP_MICROSECONDS. Keep this in sync with
+// spark.gluten.sql.columnar.backend.velox.cudf.timestampUnit's "us" default.
+constexpr const char* kCudfTimestampMicrosecondsTypeId = "15";
+
 void getS3HiveConfig(
     std::shared_ptr<facebook::velox::config::ConfigBase> conf,
     FileSystemType fsType,
@@ -230,6 +234,9 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorSessionC
   configs[facebook::velox::connector::hive::HiveConfig::kPartitionPathAsLowerCaseSession] = "false";
   configs[std::string(facebook::velox::parquet::ParquetConfig::kWriterTimestampUnitSession)] = std::string("6");
   configs[facebook::velox::connector::hive::HiveConfig::kReadTimestampUnitSession] = std::string("6");
+  if (conf->get<bool>(kCudfEnabled, kCudfEnabledDefault)) {
+    configs["parquet.reader.timestamp_type"] = kCudfTimestampMicrosecondsTypeId;
+  }
   configs[facebook::velox::connector::hive::HiveConfig::kMaxPartitionsPerWritersSession] =
       conf->get<std::string>(kMaxPartitions, "10000");
   configs[facebook::velox::connector::hive::HiveConfig::kIgnoreMissingFilesSession] =
@@ -318,6 +325,9 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorConfig(
 
   // read as UTC
   hiveConfMap[facebook::velox::connector::hive::HiveConfig::kReadTimestampPartitionValueAsLocalTime] = "false";
+  if (conf->get<bool>(kCudfEnabled, kCudfEnabledDefault)) {
+    hiveConfMap["parquet.reader.timestamp-type"] = kCudfTimestampMicrosecondsTypeId;
+  }
 
   const auto forwardDynamicToHive = [&](const std::string& sparkKey, const std::string& hiveKey) {
     const auto value = conf->get<std::string>(sparkKey);

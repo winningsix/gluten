@@ -215,6 +215,9 @@ const std::string kCudfMemoryResourceDefault =
 const std::string kCudfMemoryPercent = "spark.gluten.sql.columnar.backend.velox.cudf.memoryPercent";
 const std::string kCudfMemoryPercentDefault = "50";
 
+const std::string kCudfTimestampUnit = "spark.gluten.sql.columnar.backend.velox.cudf.timestampUnit";
+const std::string kCudfTimestampUnitDefault = "us";
+
 const std::string kCudfAllowCpuFallback =
     "spark.gluten.sql.columnar.backend.velox.cudf.allow_cpu_fallback";
 const std::string kCudfAllowCpuFallbackDefault = "true";

@@ -682,6 +682,13 @@ object VeloxConfig extends ConfigRegistry {
       .intConf
       .createWithDefault(50)
 
+  val CUDF_TIMESTAMP_UNIT =
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.timestampUnit")
+      .doc("cuDF timestamp unit. Spark timestamps use microseconds by default.")
+      .stringConf
+      .checkValues(Set("s", "ms", "us", "ns"))
+      .createWithDefault("us")
+
   val CUDF_ENABLE_TABLE_SCAN =
     buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan")
       .doc("Enable cudf table scan")
