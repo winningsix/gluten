@@ -43,7 +43,7 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expre
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Complete, Final, Partial}
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide, JoinSelectionHelper}
-import org.apache.spark.sql.catalyst.plans.{Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi, RightOuter}
+import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
 import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
@@ -966,7 +966,8 @@ case class MppNativeQueryExec(
     val afterExistenceSplit = splitExistenceFinalBeforeJoinHub(afterFinalAggSplit)
     val afterNativeLocalSorts = offloadLocalSorts(afterExistenceSplit)
     val afterNativeHashJoins = offloadLocalHashJoins(afterNativeLocalSorts)
-    val afterBuildSideNormalization = normalizeMppJoinBuildSide(afterNativeHashJoins)
+    val afterSmjHashJoinRewrite = rewriteMppSortMergeJoinToHashJoin(afterNativeHashJoins)
+    val afterBuildSideNormalization = normalizeMppJoinBuildSide(afterSmjHashJoinRewrite)
     val afterBroadcastPushdown =
       pushBroadcastJoinIntoProbeExchange(afterBuildSideNormalization)
     val afterReplicatedJoin =
@@ -1381,6 +1382,68 @@ case class MppNativeQueryExec(
           s"from hash join inputs")
     }
     rewritten
+  }
+
+  private def rewriteMppSortMergeJoinToHashJoin(plan: SparkPlan): SparkPlan = {
+    if (!rewriteMppSortMergeJoinToHashJoinEnabled) {
+      return plan
+    }
+
+    var rewrittenJoins = 0
+    var strippedSorts = 0
+
+    def stripHashJoinInputSort(child: SparkPlan): SparkPlan = child match {
+      case sort: SortExec if !sort.global =>
+        strippedSorts += 1
+        sort.child
+      case sort: SortExecTransformer if !sort.global =>
+        strippedSorts += 1
+        sort.child
+      case other =>
+        other
+    }
+
+    val rewritten = plan.transformUp {
+      case join: SortMergeJoinExecTransformer =>
+        mppSortMergeJoinHashBuildSide(join) match {
+          case Some(buildSide) =>
+            rewrittenJoins += 1
+            logInfo(
+              s"MppNativeQueryExec: rewriting sort-merge join to shuffled hash join " +
+                s"for MPP native execution joinType=${join.joinType} buildSide=$buildSide")
+            ShuffledHashJoinExecTransformer(
+              join.leftKeys,
+              join.rightKeys,
+              join.joinType,
+              buildSide,
+              join.condition,
+              stripHashJoinInputSort(join.left),
+              stripHashJoinInputSort(join.right),
+              join.isSkewJoin
+            )
+          case None =>
+            join
+        }
+    }
+
+    if (rewrittenJoins > 0) {
+      logInfo(
+        s"MppNativeQueryExec: rewrote $rewrittenJoins sort-merge join(s) to shuffled hash join " +
+          s"and stripped $strippedSorts local sort(s)")
+    }
+    rewritten
+  }
+
+  private def mppSortMergeJoinHashBuildSide(
+      join: SortMergeJoinExecTransformer): Option[BuildSide] = {
+    join.joinType match {
+      case _: InnerLike =>
+        Some(BuildRight)
+      case LeftOuter | RightOuter | FullOuter | LeftSemi | LeftAnti =>
+        Some(BuildRight)
+      case _ =>
+        None
+    }
   }
 
   /**
@@ -2714,6 +2777,12 @@ case class MppNativeQueryExec(
 
   private def pushBroadcastJoinIntoProbeExchangeEnabled: Boolean = {
     booleanConf("spark.gluten.mpp.pushBroadcastJoinIntoProbeExchange", defaultValue = true)
+  }
+
+  private def rewriteMppSortMergeJoinToHashJoinEnabled: Boolean = {
+    booleanConf(
+      "spark.gluten.mpp.rewriteSortMergeJoinToHashJoin",
+      defaultValue = GlutenConfig.get.forceShuffledHashJoin)
   }
 
   private def smallRawDimensionBuildSideEnabled: Boolean = {
