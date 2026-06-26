@@ -37,7 +37,7 @@
 #endif
 
 #ifdef GLUTEN_ENABLE_GPU
-DECLARE_bool(velox_ucx_exchange);
+DEFINE_bool(velox_ucx_exchange, false, "Enable Velox UCX exchange.");
 #endif
 
 #include "compute/VeloxRuntime.h"
@@ -189,6 +189,8 @@ void VeloxBackend::init(
          backendConf_->get(kCudfMemoryResource, kCudfMemoryResourceDefault)},
         {velox::cudf_velox::CudfConfig::kCudfMemoryPercent,
          backendConf_->get(kCudfMemoryPercent, kCudfMemoryPercentDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfAllowCpuFallback,
+         backendConf_->get(kCudfAllowCpuFallback, kCudfAllowCpuFallbackDefault)},
         // NOTE: kCudfGpuTargetBatchRows/Bytes, kCudfPinnedPoolSize,
         // kCudfHostAsPinnedThreshold, kCudfPackedDtoH were dropped from IBM
         // baseline CudfConfig.h. Hard-coded fallbacks are applied in the
@@ -268,16 +270,17 @@ void VeloxBackend::init(
     // coordinator. The Communicator owns a dedicated worker thread.
     FLAGS_velox_ucx_exchange = true;
     velox::ContinueFuture commReady;
-    auto comm = velox::ucx_exchange::Communicator::initAndGet(
+    ucxCommunicator_ = velox::ucx_exchange::Communicator::initAndGet(
         /*port=*/0, /*coordinatorURL=*/"", &commReady);
-    if (comm) {
-      std::thread([comm]() { comm->run(); }).detach();
+    if (ucxCommunicator_) {
+      ucxCommunicatorThread_ =
+          std::thread([comm = ucxCommunicator_]() { comm->run(); });
       std::move(commReady).wait();
       // WARNING (not INFO) so it survives the default kGlogSeverityLevel=1
       // filter; this single line is the canonical proof that the per-process
       // Communicator started, and we want it in every run log.
       LOG(WARNING) << "VeloxBackend: UCX Communicator running on port "
-                   << comm->getListenerPort()
+                   << ucxCommunicator_->getListenerPort()
                    << " (intra-node-bypass enabled)";
     } else {
       LOG(WARNING) << "VeloxBackend: UCX Communicator init returned null "
@@ -463,6 +466,16 @@ VeloxBackend* VeloxBackend::get() {
 }
 
 void VeloxBackend::tearDown() {
+#ifdef GLUTEN_ENABLE_GPU
+  if (ucxCommunicator_) {
+    ucxCommunicator_->stop();
+  }
+  if (ucxCommunicatorThread_.joinable()) {
+    ucxCommunicatorThread_.join();
+  }
+  ucxCommunicator_.reset();
+#endif
+
 #ifdef ENABLE_HDFS
   for (const auto& [_, filesystem] : facebook::velox::filesystems::registeredFilesystems) {
     filesystem->close();

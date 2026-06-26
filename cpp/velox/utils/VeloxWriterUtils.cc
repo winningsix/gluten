@@ -30,7 +30,6 @@
 namespace gluten {
 
 using namespace facebook::velox;
-using namespace facebook::velox::parquet;
 using namespace facebook::velox::common;
 
 namespace {
@@ -38,7 +37,8 @@ const int32_t kGzipWindowBits4k = 12;
 const int32_t kZSTDDefaultCompressionLevel = 3;
 } // namespace
 
-std::unique_ptr<WriterOptions> makeParquetWriteOption(const std::unordered_map<std::string, std::string>& sparkConfs) {
+std::unique_ptr<dwio::common::WriterOptions> makeParquetWriteOption(
+    const std::unordered_map<std::string, std::string>& sparkConfs) {
   int64_t maxRowGroupBytes = 134217728; // 128MB
   int64_t maxRowGroupRows = 100000000; // 100M
   if (auto it = sparkConfs.find(kParquetBlockSize); it != sparkConfs.end()) {
@@ -47,8 +47,9 @@ std::unique_ptr<WriterOptions> makeParquetWriteOption(const std::unordered_map<s
   if (auto it = sparkConfs.find(kParquetBlockRows); it != sparkConfs.end()) {
     maxRowGroupRows = std::stoll(it->second);
   }
-  auto writeOption = std::make_unique<WriterOptions>();
-  writeOption->parquetWriteTimestampUnit = TimestampPrecision::kMicroseconds /*micro*/;
+  auto writeOption = std::make_unique<dwio::common::WriterOptions>();
+  auto parquetOptions = std::make_shared<parquet::ParquetWriterOptions>();
+  parquetOptions->parquetWriteTimestampUnit = TimestampPrecision::kMicroseconds /*micro*/;
   auto compressionCodec = CompressionKind::CompressionKind_SNAPPY;
   if (auto it = sparkConfs.find(kParquetCompressionCodec); it != sparkConfs.end()) {
     auto compressionCodecStr = it->second;
@@ -62,7 +63,7 @@ std::unique_ptr<WriterOptions> makeParquetWriteOption(const std::unordered_map<s
         if (parquetGzipWindowSizeStr == kGzipWindowSize4k) {
           auto codecOptions = std::make_shared<parquet::arrow::util::GZipCodecOptions>();
           codecOptions->windowBits = kGzipWindowBits4k;
-          writeOption->codecOptions = std::move(codecOptions);
+          parquetOptions->codecOptions = std::move(codecOptions);
         }
       }
     } else if (boost::iequals(compressionCodecStr, "lzo")) {
@@ -78,7 +79,7 @@ std::unique_ptr<WriterOptions> makeParquetWriteOption(const std::unordered_map<s
       auto it = sparkConfs.find(kParquetZSTDCompressionLevel);
       auto compressionLevel = it != sparkConfs.end() ? std::stoi(it->second) : kZSTDDefaultCompressionLevel;
       codecOptions->compressionLevel = compressionLevel;
-      writeOption->codecOptions = std::move(codecOptions);
+      parquetOptions->codecOptions = std::move(codecOptions);
     } else if (boost::iequals(compressionCodecStr, "uncompressed")) {
       compressionCodec = CompressionKind::CompressionKind_NONE;
     } else if (boost::iequals(compressionCodecStr, "none")) {
@@ -87,29 +88,30 @@ std::unique_ptr<WriterOptions> makeParquetWriteOption(const std::unordered_map<s
   }
   writeOption->compressionKind = compressionCodec;
   writeOption->flushPolicyFactory = [maxRowGroupRows, maxRowGroupBytes]() {
-    return std::make_unique<LambdaFlushPolicy>(maxRowGroupRows, maxRowGroupBytes, [&]() { return false; });
+    return std::make_unique<parquet::LambdaFlushPolicy>(maxRowGroupRows, maxRowGroupBytes, [&]() { return false; });
   };
-  writeOption->parquetWriteTimestampTimeZone = getConfigValue(sparkConfs, kSessionTimezone, std::nullopt);
-  writeOption->arrowMemoryPool =
+  parquetOptions->parquetWriteTimestampTimeZone = getConfigValue(sparkConfs, kSessionTimezone, std::nullopt);
+  parquetOptions->arrowMemoryPool =
       getDefaultMemoryManager()->getOrCreateArrowMemoryPool("VeloxParquetWrite.ArrowMemoryPool");
   if (auto it = sparkConfs.find(kParquetDataPageSize); it != sparkConfs.end()) {
     auto dataPageSize = std::stoll(it->second);
-    writeOption->dataPageSize = dataPageSize;
+    parquetOptions->dataPageSize = dataPageSize;
   }
   if (auto it = sparkConfs.find(kParquetWriterVersion); it != sparkConfs.end()) {
     auto parquetVersion = it->second;
     if (boost::iequals(parquetVersion, "v2")) {
-      writeOption->useParquetDataPageV2 = true;
+      parquetOptions->useParquetDataPageV2 = true;
     }
   }
   if (auto it = sparkConfs.find(kParquetEnableDictionary); it != sparkConfs.end()) {
     auto enableDictionary = it->second;
     if (boost::iequals(enableDictionary, "true")) {
-      writeOption->enableDictionary = true;
+      parquetOptions->enableDictionary = true;
     } else {
-      writeOption->enableDictionary = false;
+      parquetOptions->enableDictionary = false;
     }
   }
+  writeOption->formatSpecificOptions = std::move(parquetOptions);
   return writeOption;
 }
 

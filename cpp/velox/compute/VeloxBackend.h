@@ -23,12 +23,17 @@
 #include <boost/uuid/uuid_io.hpp>
 #include <folly/executors/IOThreadPoolExecutor.h>
 #include <filesystem>
+#include <thread>
 
 #include "velox/common/caching/AsyncDataCache.h"
 #include "velox/common/config/Config.h"
 #include "velox/common/memory/MmapAllocator.h"
 
 #include "memory/VeloxMemoryManager.h"
+
+namespace facebook::velox::ucx_exchange {
+class Communicator;
+}
 
 namespace gluten {
 
@@ -92,6 +97,11 @@ class VeloxBackend {
   std::string cacheFilePrefix_;
 
   std::shared_ptr<facebook::velox::config::ConfigBase> backendConf_;
+
+#ifdef GLUTEN_ENABLE_GPU
+  std::shared_ptr<facebook::velox::ucx_exchange::Communicator> ucxCommunicator_;
+  std::thread ucxCommunicatorThread_;
+#endif
 };
 
 } // namespace gluten

@@ -194,6 +194,7 @@ set(VELOX_SRCS
     utils/ArrowAbiCompat.cc
     utils/Common.cc
     utils/ConfigExtractor.cc
+    utils/GccFloat128ToCharsShim.cc
     utils/VeloxArrowUtils.cc
     utils/VeloxBatchResizer.cc
     utils/VeloxWholeStageDumper.cc
@@ -261,6 +262,21 @@ add_dependencies(velox_jni_proto protobuf::libprotobuf)
 
 add_dependencies(velox velox_jni_proto)
 
+set(GLUTEN_UCX_INCLUDE_DIR "")
+set(GLUTEN_UCX_LIBRARIES /usr/lib64/libucp.so /usr/lib64/libuct.so
+                         /usr/lib64/libucs.so)
+if(DEFINED GLUTEN_UCX_HOME AND NOT "${GLUTEN_UCX_HOME}" STREQUAL "")
+  set(GLUTEN_UCX_INCLUDE_DIR ${GLUTEN_UCX_HOME})
+  set(GLUTEN_UCX_LIBRARIES ${GLUTEN_UCX_HOME}/libucp.so
+                           ${GLUTEN_UCX_HOME}/libuct.so
+                           ${GLUTEN_UCX_HOME}/libucs.so)
+  if(EXISTS "${GLUTEN_UCX_HOME}/libucm.so")
+    list(APPEND GLUTEN_UCX_LIBRARIES ${GLUTEN_UCX_HOME}/libucm.so)
+  endif()
+elseif(EXISTS /usr/lib64/libucm.so)
+  list(APPEND GLUTEN_UCX_LIBRARIES /usr/lib64/libucm.so)
+endif()
+
 target_include_directories(
   velox
   PUBLIC ${CMAKE_SYSTEM_INCLUDE_PATH}
@@ -290,6 +306,7 @@ target_include_directories(
          # CUDA runtime headers (cuda_runtime_api.h etc.) used transitively
          # by rmm/cuda_stream_view.hpp.
          /usr/local/cuda/include
+         ${GLUTEN_UCX_INCLUDE_DIR}
          ${CMAKE_CURRENT_SOURCE_DIR}
          ${VELOX_HOME}
          ${PROTO_OUTPUT_DIR}
@@ -340,6 +357,14 @@ import_library(facebook::velox ${VELOX_BUILD_PATH}/lib/libvelox.a)
 import_library(facebook::velox::dbgen
                ${VELOX_BUILD_PATH}/velox/tpch/gen/dbgen/libdbgen.a)
 add_duckdb()
+
+import_library(
+  facebook::velox::dwio_parquet_thrift_raw
+  ${VELOX_BUILD_PATH}/velox/dwio/parquet/thrift/libvelox_dwio_parquet_thrift_raw.a
+)
+import_library(external::s2 ${VELOX_BUILD_PATH}/_deps/s2geometry-build/libs2.a)
+file(GLOB GLUTEN_ABSL_LIBRARIES "/usr/local/lib64/libabsl*.a")
+list(SORT GLUTEN_ABSL_LIBRARIES)
 
 if(BUILD_TESTS)
   target_link_libraries(facebook::velox INTERFACE facebook::velox::dbgen)
@@ -525,10 +550,20 @@ if(ENABLE_GPU)
     facebook::velox::velox_cudf_hive_connector
     ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/libvelox_cudf_hive_connector.a
   )
+  import_library(
+    facebook::velox::velox_cudf_iceberg_connector
+    ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/iceberg/libvelox_cudf_iceberg_connector.a
+  )
   # IBM-baseline velox dropped velox/experimental/cudf/exchange/. The
   # equivalent functionality is in IBM's UcxExchange/UcxPartitionedOutput
   # which live under velox/experimental/ucx-exchange/, linked transitively
   # via velox_cudf_exec.
+  file(
+    GLOB GLUTEN_UCX_EXCHANGE_OBJECTS
+    "${VELOX_BUILD_PATH}/velox/experimental/ucx-exchange/CMakeFiles/velox_ucx_exchange.dir/*.cpp.o")
+  if(NOT GLUTEN_UCX_EXCHANGE_OBJECTS)
+    message(FATAL_ERROR "Cannot find Velox UCX exchange object files under ${VELOX_BUILD_PATH}")
+  endif()
 
   target_compile_definitions(
     velox PRIVATE LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
@@ -548,8 +583,10 @@ if(ENABLE_GPU)
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/exec/libvelox_cudf_exec.a
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/vector/libvelox_cudf_vector.a
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/libvelox_cudf_hive_connector.a
+            ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/iceberg/libvelox_cudf_iceberg_connector.a
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/expression/libvelox_cudf_expression.a
             -Wl,--no-whole-archive)
+  target_link_libraries(velox PRIVATE ${GLUTEN_UCX_EXCHANGE_OBJECTS})
   # Shared libs consumers need at link time (cudf::cudf, libcurl): PUBLIC.
   target_link_libraries(velox PUBLIC cudf::cudf velox_curl)
   # IBM baseline brings in apache thrift symbols transitively (Presto serde
@@ -568,9 +605,7 @@ if(ENABLE_GPU)
     ${VELOX_BUILD_PATH}/_deps/kvikio-build/libkvikio.so
     ${VELOX_BUILD_PATH}/_deps/ucxx-build/libucxx.so
     ${GLUTEN_CUDART_LIBRARY}
-    /usr/lib64/libucp.so
-    /usr/lib64/libuct.so
-    /usr/lib64/libucs.so)
+    ${GLUTEN_UCX_LIBRARIES})
 endif()
 
 # Keep these at the end of libgluten.so's link line. `facebook::velox` and the
@@ -578,7 +613,24 @@ endif()
 # dependencies must appear after the archives that reference them.
 target_link_libraries(velox PRIVATE
   duckdb_static
-  -Wl,--start-group Arrow::arrow Arrow::arrow_bundled_dependencies -Wl,--end-group)
+  -Wl,--start-group
+  Arrow::arrow
+  Arrow::arrow_bundled_dependencies
+  facebook::velox::dwio_parquet_thrift_raw
+  external::s2
+  /usr/local/lib/libthrift.a
+  /usr/local/lib/libthriftcpp2.a
+  /usr/local/lib/libthriftprotocol.a
+  /usr/local/lib/libthrift-core.a
+  /usr/local/lib/libthrifttyperep.a
+  /usr/local/lib/libthriftannotation.a
+  /usr/local/lib/libthrifttype.a
+  /usr/local/lib/libthriftanyrep.a
+  /usr/local/lib/libthriftmetadata.a
+  /usr/local/lib/libthriftfrozen2.a
+  ${GLUTEN_ABSL_LIBRARIES}
+  /usr/lib64/libquadmath.so.0
+  -Wl,--end-group)
 
 add_custom_command(
   TARGET velox

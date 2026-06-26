@@ -255,8 +255,15 @@ std::string collectSetTemplateMergeExtractName(const std::string& baseName, cons
 } // namespace
 
 bool SplitInfo::canUseCudfConnector() {
-  bool isEmpty = partitionColumns.empty();
+  if (format != dwio::common::FileFormat::PARQUET) {
+    return false;
+  }
 
+  if (isIceberg) {
+    return true;
+  }
+
+  bool isEmpty = partitionColumns.empty();
   if (!isEmpty) {
     // Check if all maps are empty
     bool allMapsEmpty = true;
@@ -268,7 +275,7 @@ bool SplitInfo::canUseCudfConnector() {
     }
     isEmpty = allMapsEmpty;
   }
-  return isEmpty && format == dwio::common::FileFormat::PARQUET;
+  return isEmpty;
 }
 
 core::PlanNodePtr SubstraitToVeloxPlanConverter::processEmit(
@@ -761,7 +768,7 @@ std::shared_ptr<CudfHiveInsertTableHandle> makeCudfHiveInsertTableHandle(
     columnHandles.push_back(std::make_shared<CudfHiveColumnHandle>(
         tableColumnNames.at(i),
         tableColumnTypes.at(i),
-        cudf::data_type{cudf_velox::veloxToCudfTypeId(tableColumnTypes.at(i))}));
+        cudf_velox::veloxToCudfDataType(tableColumnTypes.at(i))));
   }
 
   return std::make_shared<CudfHiveInsertTableHandle>(
@@ -858,7 +865,7 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   GLUTEN_CHECK(formatShortName == "parquet", "Unsupported file write format: " + formatShortName);
   dwio::common::FileFormat fileFormat = dwio::common::FileFormat::PARQUET;
 
-  const std::shared_ptr<facebook::velox::parquet::WriterOptions> writerOptions = makeParquetWriteOption(writeConfs);
+  const std::shared_ptr<dwio::common::WriterOptions> writerOptions = makeParquetWriteOption(writeConfs);
   // Spark's default compression code is snappy.
   const auto& compressionKind =
       writerOptions->compressionKind.value_or(common::CompressionKind::CompressionKind_SNAPPY);
@@ -1280,7 +1287,7 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
       const RowTypePtr outRowType = asRowType(children[0]->outputType());
       std::vector<std::string> outNames;
       for (int32_t colIdx = 0; colIdx < outRowType->size(); ++colIdx) {
-        const auto name = outRowType->childAt(colIdx)->name();
+        const auto name = outRowType->nameOf(colIdx);
         outNames.push_back(name);
       }
 
@@ -1628,7 +1635,11 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(
     vectors.emplace_back(std::make_shared<RowVector>(pool_, type, nullptr, batchSize, children));
   }
 
-  return std::make_shared<core::ValuesNode>(nextPlanNodeId(), std::move(vectors));
+  auto valuesNode = std::make_shared<core::ValuesNode>(nextPlanNodeId(), std::move(vectors));
+  auto splitInfo = std::make_shared<SplitInfo>();
+  splitInfo->leafType = SplitInfo::LeafType::TRIVIAL_LEAF;
+  splitInfoMap_[valuesNode->id()] = splitInfo;
+  return valuesNode;
 }
 
 core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::Rel& rel) {

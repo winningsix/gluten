@@ -25,6 +25,7 @@
 #include "utils/Macros.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/storage_adapters/s3fs/S3Config.h"
+#include "velox/dwio/parquet/common/ParquetConfig.h"
 #include "velox/dwio/parquet/writer/Writer.h"
 
 namespace gluten {
@@ -227,7 +228,7 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorSessionC
   configs[facebook::velox::connector::hive::HiveConfig::kFileColumnNamesReadAsLowerCaseSession] =
       !conf->get<bool>(kCaseSensitive, false) ? "true" : "false";
   configs[facebook::velox::connector::hive::HiveConfig::kPartitionPathAsLowerCaseSession] = "false";
-  configs[facebook::velox::parquet::WriterOptions::kParquetSessionWriteTimestampUnit] = std::string("6");
+  configs[std::string(facebook::velox::parquet::ParquetConfig::kWriterTimestampUnitSession)] = std::string("6");
   configs[facebook::velox::connector::hive::HiveConfig::kReadTimestampUnitSession] = std::string("6");
   configs[facebook::velox::connector::hive::HiveConfig::kMaxPartitionsPerWritersSession] =
       conf->get<std::string>(kMaxPartitions, "10000");

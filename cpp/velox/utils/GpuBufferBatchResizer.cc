@@ -139,7 +139,7 @@ struct DispatchColumn {
   }
 
   template <TypeKind Kind, typename T = typename TypeTraits<Kind>::NativeType>
-  std::unique_ptr<cudf::column> readFlatColumn(cudf::type_id typeId) {
+  std::unique_ptr<cudf::column> readFlatColumn(cudf::data_type cudfType) {
     auto nulls = buffers[bufferIdx++];
     auto values = buffers[bufferIdx++];
 
@@ -149,7 +149,6 @@ struct DispatchColumn {
 
     auto nullBuf = getMaskBuffer(nulls);
 
-    cudf::data_type cudfType{typeId};
     cudf::size_type nullCount = (nulls == nullptr || nulls->size() == 0)
         ? 0
         : cpuNullCount(nulls->data(), numRows);
@@ -172,7 +171,7 @@ struct DispatchColumn {
         0);
   }
 
-  std::unique_ptr<cudf::column> readFlatColumnStringView(cudf::type_id /*typeId*/) {
+  std::unique_ptr<cudf::column> readFlatColumnStringView(cudf::data_type /*cudfType*/) {
     auto nulls = buffers[bufferIdx++];
     auto offsets = buffers[bufferIdx++];
     auto valueBuffer = buffers[bufferIdx++];
@@ -208,13 +207,13 @@ struct DispatchColumn {
 };
 
 template <>
-std::unique_ptr<cudf::column> DispatchColumn::readFlatColumn<TypeKind::VARCHAR>(cudf::type_id typeId) {
-  return readFlatColumnStringView(typeId);
+std::unique_ptr<cudf::column> DispatchColumn::readFlatColumn<TypeKind::VARCHAR>(cudf::data_type cudfType) {
+  return readFlatColumnStringView(cudfType);
 }
 
 template <>
-std::unique_ptr<cudf::column> DispatchColumn::readFlatColumn<TypeKind::VARBINARY>(cudf::type_id typeId) {
-  return readFlatColumnStringView(typeId);
+std::unique_ptr<cudf::column> DispatchColumn::readFlatColumn<TypeKind::VARBINARY>(cudf::data_type cudfType) {
+  return readFlatColumnStringView(cudfType);
 }
 
 } // namespace
@@ -231,7 +230,7 @@ std::shared_ptr<VeloxColumnarBatch> gpuBuffersToCudfVector(
   DispatchColumn dispatch{stream, cudf::get_current_device_resource_ref(), buffers, numRows};
   for (const auto& colType : type->children()) {
     auto res = VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
-        dispatch.readFlatColumn, colType->kind(), cudf_velox::veloxToCudfTypeId(colType));
+        dispatch.readFlatColumn, colType->kind(), cudf_velox::veloxToCudfDataType(colType));
     cudfColumns.emplace_back(std::move(res));
   }
   auto cudfTable = std::make_unique<cudf::table>(std::move(cudfColumns));

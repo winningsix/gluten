@@ -422,7 +422,7 @@ object VeloxBackendSettings extends BackendSettingsApi {
 
   override def supportWindowGroupLimitExec(rankLikeFunction: Expression): Boolean = {
     rankLikeFunction match {
-      case _: RowNumber => true
+      case _: RowNumber | _: Rank | _: DenseRank => true
       case _ => false
     }
   }

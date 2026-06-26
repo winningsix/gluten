@@ -55,6 +55,7 @@
 #include "velox/exec/Task.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+#include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #endif
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/vector/VectorStream.h"
@@ -91,6 +92,47 @@ int envIntOrDefault(const char* name, int defaultValue) {
   return static_cast<int>(parsed);
 }
 
+void removeTaskOutputState(
+    const std::shared_ptr<Task>& task,
+    const std::shared_ptr<OutputBufferManager>& bufferManager,
+    std::string_view queryId,
+    std::string_view reason) {
+  if (task == nullptr) {
+    return;
+  }
+  const auto tid = task->taskId();
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId << "]: removeTask(" << tid
+               << ") reason=" << reason
+               << " state=" << static_cast<int>(task->state());
+  if (bufferManager != nullptr) {
+    try {
+      bufferManager->removeTask(tid);
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "MppQueryCoordinator[" << queryId
+                 << "]: OutputBufferManager::removeTask(" << tid
+                 << ") threw: " << e.what();
+    } catch (...) {
+      LOG(ERROR) << "MppQueryCoordinator[" << queryId
+                 << "]: OutputBufferManager::removeTask(" << tid
+                 << ") threw unknown exception";
+    }
+  }
+#ifdef GLUTEN_ENABLE_GPU
+  try {
+    auto queueMgr =
+        facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+    queueMgr->removeTask(tid);
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "MppQueryCoordinator[" << queryId
+               << "]: UcxOutputQueueManager::removeTask(" << tid
+               << ") threw: " << e.what();
+  } catch (...) {
+    LOG(ERROR) << "MppQueryCoordinator[" << queryId
+               << "]: UcxOutputQueueManager::removeTask(" << tid
+               << ") threw unknown exception";
+  }
+#endif
+}
 
 bool isSafeTaskIdComponent(const std::string& value) {
   return !value.empty() && value.find('/') == std::string::npos &&
@@ -321,17 +363,8 @@ MppQueryCoordinator::~MppQueryCoordinator() {
           "coordinator::~destructor:removeTaskFromOutputBuffer"};
       for (auto& replicas : fragmentTasks_) {
         for (auto& task : replicas) {
-          if (task == nullptr) {
-            continue;
-          }
-          const auto& tid = task->taskId();
-          LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                       << "]: removeTask(" << tid
-                       << ") state=" << static_cast<int>(task->state());
-          try {
-            bufferManager_->removeTask(tid);
-          } catch (...) {
-          }
+          removeTaskOutputState(
+              task, bufferManager_, queryId_, "coordinator-destructor");
         }
       }
     }
@@ -911,6 +944,16 @@ void MppQueryCoordinator::start() {
       // Bootstrap producers are started before their splits are added, so this
       // still happens before any enqueue.
       task->updateOutputBuffers(bcastN, /*noMoreBuffers=*/true);
+#ifdef GLUTEN_ENABLE_GPU
+      const auto ucxQueueUpdated =
+          facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef()
+              ->updateOutputBuffersIfExists(
+                  task->taskId(), bcastN, /*noMoreBuffers=*/true);
+      VLOG(1) << "MppQueryCoordinator[" << queryId_
+              << "]: broadcast fanout taskId=" << task->taskId()
+              << " destinations=" << bcastN
+              << " ucxQueueUpdated=" << ucxQueueUpdated;
+#endif
     }
   };
 
@@ -2124,7 +2167,7 @@ void MppQueryCoordinator::waitForCompletion() {
   // Clean up output buffer entries for all tasks.
   for (auto& replicas : fragmentTasks_) {
     for (auto& task : replicas) {
-      bufferManager_->removeTask(task->taskId());
+      removeTaskOutputState(task, bufferManager_, queryId_, "waitForCompletion");
     }
   }
 }

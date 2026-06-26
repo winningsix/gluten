@@ -681,6 +681,18 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
   // The Builder(existingNode) constructor copies all fields, then we
   // override the source.
 
+  // LocalPartitionNode (N-to-1 gather or N-to-M local repartition). Native
+  // union is translated to a gather LocalPartition, and single-task MPP merge
+  // inserts repartition LocalPartitions, so ValueStream replacement must be
+  // able to preserve these nodes while rewriting descendants.
+  if (auto localPartitionNode =
+          std::dynamic_pointer_cast<const velox::core::LocalPartitionNode>(
+              node)) {
+    return velox::core::LocalPartitionNode::Builder(*localPartitionNode)
+        .sources(std::move(newSources))
+        .build();
+  }
+
   // FilterNode
   if (auto filterNode =
           std::dynamic_pointer_cast<const velox::core::FilterNode>(node)) {
@@ -2018,19 +2030,11 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     fragSpec.numDrivers = mergedNumDrivers;
     fragSpec.scanInfos = std::move(fragScanInfos);
     fragSpec.scanNodeIds = std::move(fragScanNodeIds);
-    // Determine connector IDs for scan nodes.
-    // When cuDF is enabled, the plan may still have "test-hive" for regular
-    // Hive scans. Override those to "cudf-hive", but preserve "cudf-iceberg"
-    // so Iceberg scans use the Iceberg-aware cuDF data source.
+    // Determine connector IDs for scan nodes from the converted Velox plan.
+    // Split connector IDs must match the TableScan table handle connector.
+    // cuDF eligibility is decided during Substrait -> Velox conversion.
     for (const auto& scanNodeId : fragSpec.scanNodeIds) {
-#ifdef GLUTEN_ENABLE_GPU
-      const auto planConnectorId = getTableScanConnectorId(veloxPlanNode, scanNodeId);
-      auto connectorId = planConnectorId == kCudfIcebergConnectorId
-          ? planConnectorId
-          : std::string(kCudfHiveConnectorId);
-#else
       auto connectorId = getTableScanConnectorId(veloxPlanNode, scanNodeId);
-#endif
       LOG(WARNING) << "MppJniWrapper: fragment " << i
                    << " scan node " << scanNodeId
                    << " connector: '" << connectorId << "'";

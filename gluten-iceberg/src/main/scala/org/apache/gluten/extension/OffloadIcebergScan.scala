@@ -20,10 +20,11 @@ import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution.IcebergScanTransformer
 import org.apache.gluten.extension.columnar.enumerated.RasOffload
 import org.apache.gluten.extension.columnar.heuristic.HeuristicTransform
-import org.apache.gluten.extension.columnar.offload.OffloadSingleNode
+import org.apache.gluten.extension.columnar.offload.{OffloadExchange, OffloadJoin, OffloadOthers, OffloadSingleNode}
 import org.apache.gluten.extension.columnar.validator.Validators
 import org.apache.gluten.extension.injector.Injector
 
+import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 
@@ -36,15 +37,32 @@ case class OffloadIcebergScan() extends OffloadSingleNode {
 }
 
 object OffloadIcebergScan {
+  private def containsIcebergScan(plan: SparkPlan): Boolean = {
+    plan.exists {
+      case _: IcebergScanTransformer => true
+      case scan: BatchScanExec => IcebergScanTransformer.supportsBatchScan(scan.scan)
+      case _ => false
+    }
+  }
+
   def inject(injector: Injector): Unit = {
     // Inject legacy rule.
     injector.gluten.legacy.injectTransform {
       c =>
-        val offload = Seq(OffloadIcebergScan())
-        HeuristicTransform.Simple(
+        val offload = Seq(OffloadIcebergScan(), OffloadOthers(), OffloadExchange(), OffloadJoin())
+        val transform = HeuristicTransform.Simple(
           Validators.newValidator(new GlutenConfig(c.sqlConf), offload),
           offload
         )
+        new Rule[SparkPlan] {
+          override def apply(plan: SparkPlan): SparkPlan = {
+            if (containsIcebergScan(plan)) {
+              transform(plan)
+            } else {
+              plan
+            }
+          }
+        }
     }
 
     // Inject RAS rule.

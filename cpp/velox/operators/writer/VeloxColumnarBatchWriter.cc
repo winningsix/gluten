@@ -33,10 +33,12 @@ arrow::Status VeloxColumnarBatchWriter::initWriter(const facebook::velox::RowTyp
   auto localWriteFile = std::make_unique<facebook::velox::LocalWriteFile>(path_, false, true);
   auto sink = std::make_unique<facebook::velox::dwio::common::WriteFileSink>(std::move(localWriteFile), path_);
 
-  facebook::velox::parquet::WriterOptions writerOptions;
+  facebook::velox::dwio::common::WriterOptions writerOptions;
+  auto parquetOptions = std::make_shared<facebook::velox::parquet::ParquetWriterOptions>();
   writerOptions.memoryPool = pool_.get();
   writerOptions.compressionKind = facebook::velox::common::CompressionKind::CompressionKind_SNAPPY;
-  writerOptions.batchSize = batchSize_;
+  parquetOptions->batchSize = batchSize_;
+  writerOptions.formatSpecificOptions = std::move(parquetOptions);
 
   writer_ = std::make_unique<facebook::velox::parquet::Writer>(std::move(sink), writerOptions, rowType);
   return arrow::Status::OK();

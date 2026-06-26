@@ -158,6 +158,13 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
     return node;
   }
 
+  if (auto n = std::dynamic_pointer_cast<
+          const velox::core::LocalPartitionNode>(node)) {
+    return velox::core::LocalPartitionNode::Builder(*n)
+        .sources(std::move(newSources))
+        .build();
+  }
+
 #define REBUILD_SINGLE(NodeT)                                                 \
   if (auto n = std::dynamic_pointer_cast<const velox::core::NodeT>(node)) {   \
     return velox::core::NodeT::Builder(*n).source(newSources[0]).build();     \
@@ -591,14 +598,7 @@ MppDumpLoadResult loadMppQueryFromDump(
     spec.scanNodeIds = std::move(fragScanNodeIds);
 
     for (const auto& scanNodeId : spec.scanNodeIds) {
-#ifdef GLUTEN_ENABLE_GPU
-      const auto planConnectorId = getTableScanConnectorId(veloxPlanNode, scanNodeId);
-      auto connectorId = planConnectorId == kCudfIcebergConnectorId
-          ? planConnectorId
-          : std::string(kCudfHiveConnectorId);
-#else
       auto connectorId = getTableScanConnectorId(veloxPlanNode, scanNodeId);
-#endif
       spec.scanConnectorIds.push_back(std::move(connectorId));
     }
 

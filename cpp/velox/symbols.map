@@ -37,6 +37,10 @@
         *cudf::*;
     };
 
+    _ZSt8to_charsPcS_DF128_;
+    _ZSt8to_charsPcS_DF128_St12chars_format;
+    _ZSt8to_charsPcS_DF128_St12chars_formati;
+
     Java_org_apache_gluten_*;
     JNI_OnLoad;
     JNI_OnUnload;

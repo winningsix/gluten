@@ -215,6 +215,10 @@ const std::string kCudfMemoryResourceDefault =
 const std::string kCudfMemoryPercent = "spark.gluten.sql.columnar.backend.velox.cudf.memoryPercent";
 const std::string kCudfMemoryPercentDefault = "50";
 
+const std::string kCudfAllowCpuFallback =
+    "spark.gluten.sql.columnar.backend.velox.cudf.allow_cpu_fallback";
+const std::string kCudfAllowCpuFallbackDefault = "true";
+
 /// Preferred size of batches in bytes to be returned by operators.
 const std::string kVeloxPreferredBatchBytes = "spark.gluten.sql.columnar.backend.velox.preferredBatchBytes";
 
