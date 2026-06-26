@@ -146,6 +146,12 @@ class MppNativeQueryRDD(
     val jniWrapper = MppQueryJniWrapper.create(runtime)
     val actualExecutorId = Option(SparkEnv.get).map(_.executorId).getOrElse("unknown")
     val localPeerId = mppPartition.peerInfo.map(_.peerId).getOrElse(actualExecutorId)
+    val nativeMppQueryId =
+      if (mppPartition.peerInfo.isEmpty && mppPartition.totalPartitions == 1) {
+        s"$mppQueryId-t${context.taskAttemptId()}"
+      } else {
+        mppQueryId
+      }
     mppPartition.peerInfo.foreach {
       expected =>
         if (expected.peerId != actualExecutorId) {
@@ -156,7 +162,7 @@ class MppNativeQueryRDD(
     }
     val mppPeerSpecJson =
       MppNativeQueryRDD.buildPeerSpecJson(
-        mppQueryId,
+        nativeMppQueryId,
         localPeerId,
         configuredPeerEndpointsJson,
         mppPartition.index,
@@ -213,7 +219,7 @@ class MppNativeQueryRDD(
         MppNativeQueryRDD.runtimeTimingProbeLine(
           "native_start",
           Seq(
-            "queryId" -> MppNativeQueryRDD.quotedJson(mppQueryId),
+            "queryId" -> MppNativeQueryRDD.quotedJson(nativeMppQueryId),
             "sparkPartition" -> mppPartition.index.toString,
             "sparkPartitions" -> mppPartition.totalPartitions.toString,
             "fragments" -> fragmentPlans.length.toString,
@@ -320,7 +326,7 @@ class MppNativeQueryRDD(
               MppNativeQueryRDD.runtimeTimingProbeLine(
                 "native_output_complete",
                 Seq(
-                  "queryId" -> MppNativeQueryRDD.quotedJson(mppQueryId),
+                  "queryId" -> MppNativeQueryRDD.quotedJson(nativeMppQueryId),
                   "sparkPartition" -> mppPartition.index.toString,
                   "sparkPartitions" -> mppPartition.totalPartitions.toString,
                   "fragments" -> fragmentPlans.length.toString,
