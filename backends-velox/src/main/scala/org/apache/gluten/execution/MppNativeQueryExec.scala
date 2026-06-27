@@ -1620,8 +1620,26 @@ case class MppNativeQueryExec(
           val preparedInputCount = inboundExchangeCount + fusedBroadcastCount
           val requiredInputCount = slots.max + 1
           if (requiredInputCount > preparedInputCount) {
+            val rootName = Option(fragment.rootOperator)
+              .map(_.getClass.getSimpleName)
+              .getOrElse("<null>")
+            val rootTree = Option(fragment.rootOperator)
+              .map(_.treeString)
+              .getOrElse("<null>")
+            logWarning(
+              s"MppNativeQueryExec: fragment ${fragment.id} has unresolved iterator inputs. " +
+                s"root=$rootName output=${describeAttributes(fragment.outputAttributes)} " +
+                s"slots=${slots.toSeq.sorted.mkString("[", ", ", "]")} " +
+                s"prepared=$preparedInputCount inboundExchanges=$inboundExchangeCount " +
+                s"fusedBroadcasts=$fusedBroadcastCount tree:\n${rootTree.take(6000)}")
+            val slotKind =
+              if (rootTree.contains("Scan ExistingRDD")) {
+                "Spark ExistingRDD iterator slot(s)"
+              } else {
+                "ReadRel iterator slot(s)"
+              }
             return Some(
-              s"fragment ${fragment.id} Substrait has ReadRel iterator slot(s) " +
+              s"fragment ${fragment.id} Substrait has $slotKind " +
                 s"${slots.toSeq.sorted.mkString("[", ", ", "]")} but Spark prepared only " +
                 s"$preparedInputCount MPP stream input(s): $inboundExchangeCount inbound " +
                 s"exchange(s) + $fusedBroadcastCount fused broadcast(s)")
