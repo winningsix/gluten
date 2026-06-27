@@ -544,15 +544,50 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   core::AggregationNode::Step aggStep = toAggregationStep(aggRel);
   const auto& inputType = childNode->outputType();
   std::vector<core::FieldAccessTypedExprPtr> veloxGroupingExprs;
+  std::vector<std::string> groupingProjectNames;
+  std::vector<core::TypedExprPtr> groupingProjectExprs;
+
+  auto ensureGroupingProject = [&]() {
+    if (!groupingProjectNames.empty()) {
+      return;
+    }
+    groupingProjectNames.reserve(inputType->size() + aggRel.groupings()[0].grouping_expressions().size());
+    groupingProjectExprs.reserve(inputType->size() + aggRel.groupings()[0].grouping_expressions().size());
+    for (uint32_t idx = 0; idx < inputType->size(); ++idx) {
+      const auto& fieldName = inputType->nameOf(idx);
+      groupingProjectNames.emplace_back(fieldName);
+      groupingProjectExprs.emplace_back(std::make_shared<core::FieldAccessTypedExpr>(inputType->childAt(idx), fieldName));
+    }
+  };
 
   // Get the grouping expressions.
   VELOX_CHECK(
       aggRel.groupings().size() <= 1, "At most one grouping is supported, but got {}.", aggRel.groupings().size());
   if (aggRel.groupings().size() == 1) {
+    int32_t groupingExprIndex = 0;
     for (const auto& groupingExpr : aggRel.groupings()[0].grouping_expressions()) {
-      // Velox's groupings are limited to be Field.
-      veloxGroupingExprs.emplace_back(exprConverter_->toVeloxExpr(groupingExpr.selection(), inputType));
+      auto veloxGroupingExpr = groupingExpr.has_selection()
+          ? exprConverter_->toVeloxExpr(groupingExpr.selection(), inputType)
+          : exprConverter_->toVeloxExpr(groupingExpr, inputType);
+      if (auto field = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(veloxGroupingExpr)) {
+        veloxGroupingExprs.emplace_back(std::move(field));
+      } else {
+        // Velox groupings are field-only. Materialize literal or computed grouping
+        // expressions in a project while preserving original input columns first.
+        ensureGroupingProject();
+        auto groupingName = fmt::format("__gluten_grouping_key_{}_{}", planNodeId_, groupingExprIndex);
+        groupingProjectNames.emplace_back(groupingName);
+        groupingProjectExprs.emplace_back(std::move(veloxGroupingExpr));
+        veloxGroupingExprs.emplace_back(
+            std::make_shared<core::FieldAccessTypedExpr>(groupingProjectExprs.back()->type(), groupingName));
+      }
+      ++groupingExprIndex;
     }
+  }
+
+  if (!groupingProjectNames.empty()) {
+    childNode = std::make_shared<core::ProjectNode>(
+        nextPlanNodeId(), std::move(groupingProjectNames), std::move(groupingProjectExprs), childNode);
   }
 
   // Parse measures and get the aggregate expressions.
