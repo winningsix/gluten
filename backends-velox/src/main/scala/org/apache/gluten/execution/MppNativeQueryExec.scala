@@ -1307,6 +1307,15 @@ case class MppNativeQueryExec(
         case InputIteratorTransformer(ColumnarInputAdapter(wst: WholeStageTransformer)) =>
           changed = true
           wst.child
+        case ts: TransformSupport
+            if !ts.isInstanceOf[InputIteratorTransformer] &&
+              ts.children.exists(_.isInstanceOf[WholeStageTransformer]) =>
+          changed = true
+          ts.withNewChildren(
+            ts.children.map {
+              case wst: WholeStageTransformer => wst.child
+              case other => other
+            })
         case InputIteratorTransformer(ColumnarInputAdapter(scan: LocalTableScanExec))
             if scan.rows.length <= LocalTableScanExecTransformer.MaxRows =>
           changed = true
@@ -1346,6 +1355,8 @@ case class MppNativeQueryExec(
     }
 
     plan match {
+      case wst: WholeStageTransformer =>
+        localNativeInputIteratorChild(wst.child)
       case cia: ColumnarInputAdapter =>
         localNativeInputIteratorChild(cia.child)
       case c2c: ColumnarToColumnarExec =>
@@ -3075,9 +3086,8 @@ case class MppNativeQueryExec(
     val result = mutable.ArrayBuffer[SparkPlan]()
     def collect(plan: SparkPlan): Unit = {
       plan match {
-        case _: WholeStageTransformer =>
-          // Stop: this is a nested WST (shouldn't happen in normal BSP plans)
-          ()
+        case wst: WholeStageTransformer =>
+          collect(wst.child)
         case join: HashJoinLikeExecTransformer =>
           // HashJoinLikeExecTransformer emits Substrait inputs in streamed/build order, which may
           // differ from Spark's left/right child order when the build side is switched. Keep MPP
