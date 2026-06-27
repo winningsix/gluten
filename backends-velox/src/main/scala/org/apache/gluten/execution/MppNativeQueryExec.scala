@@ -46,7 +46,7 @@ import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide
 import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
+import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, FilterExec, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeExec, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BuildSideRelation, HashedRelationBroadcastMode, ShuffledHashJoinExec}
@@ -978,12 +978,23 @@ case class MppNativeQueryExec(
     // partial-aggregate flushing behavior as the regular Velox path.
     val afterFlushableAgg =
       FlushableHashAggregateRule(org.apache.spark.sql.SparkSession.active)(afterBroadcastJoin)
+    val collapsed =
+      normalizeInputIteratorTransformers(
+        ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(afterFlushableAgg))
+
+    // Some outer Spark ProjectExec/FilterExec nodes only become native-rewritable after the child
+    // subtree has been collapsed into WholeStageTransformer. Run the post-project rewrite once
+    // more, then collapse again so the rewritten tail operators become part of the root native
+    // fragment.
+    val afterLateNativePostProject = rewriteNativePostProjects(collapsed)
     normalizeInputIteratorTransformers(
-      ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(afterFlushableAgg))
+      ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(afterLateNativePostProject))
   }
 
   private def rewriteNativePostProjects(plan: SparkPlan): SparkPlan = {
     plan.transformUp {
+      case filter: FilterExec if filter.child.isInstanceOf[TransformSupport] =>
+        FilterExecTransformer(filter.condition, filter.child)
       case project: ProjectExec if project.child.isInstanceOf[TransformSupport] =>
         ProjectExecTransformer(project.projectList, project.child)
     }
