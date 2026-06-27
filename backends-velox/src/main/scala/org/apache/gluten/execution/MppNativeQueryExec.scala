@@ -46,7 +46,7 @@ import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide
 import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, FilterExec, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
+import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, FilterExec, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeExec, ShuffleExchangeLike}
@@ -112,6 +112,13 @@ import scala.util.control.NonFatal
  * uses to assign `iterator:0, iterator:1, ...` in substrait.
  */
 case class FusedBroadcast(slotIdx: Int, broadcast: Broadcast[BuildSideRelation])
+
+private[execution] case class MppLocalStreamInput(
+    fragmentId: Int,
+    slotIdx: Int,
+    rdd: RDD[ColumnarBatch])
+
+private[execution] case class MppLocalStreamSlot(fragmentId: Int, slotIdx: Int)
 
 private case class MppReplicatedJoinBuildInput(child: SparkPlan) extends UnaryTransformSupport {
 
@@ -221,7 +228,12 @@ case class MppNativeQueryExec(
     "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode"
 
   private type FragmentExtractionResult =
-    (Seq[NativeFragment], Seq[ExchangeSpec], Map[Int, Seq[FusedBroadcast]], SparkPlan)
+    (
+        Seq[NativeFragment],
+        Seq[ExchangeSpec],
+        Map[Int, Seq[FusedBroadcast]],
+        Seq[MppLocalStreamInput],
+        SparkPlan)
 
   private def isScalarSubqueryRewriteEnabled: Boolean = {
     val conf = SQLConf.get
@@ -327,7 +339,12 @@ case class MppNativeQueryExec(
               s"MppNativeQueryExec: delegating to BSP because MPP fragment extraction failed: " +
                 exceptionSummary(e))
         }
-      val (extractedFragments, extractedExchanges, fusedBroadcastsByConsumer, extractedPlan) =
+      val (
+        extractedFragments,
+        extractedExchanges,
+        fusedBroadcastsByConsumer,
+        localStreamInputs,
+        extractedPlan) =
         extracted match {
           case Right(value) => value
           case Left(reason) => return delegateToBsp(executionChild, reason)
@@ -335,8 +352,8 @@ case class MppNativeQueryExec(
       logDebug(
         s"MppNativeQueryExec: Phase 2 extracted ${extractedFragments.size} fragments " +
           s"and ${extractedExchanges.size} exchanges " +
-          s"and ${fusedBroadcastsByConsumer.values.map(_.size).sum} fused " +
-          s"broadcasts from child plan")
+          s"and ${fusedBroadcastsByConsumer.values.map(_.size).sum} fused broadcasts " +
+          s"and ${localStreamInputs.size} local stream inputs from child plan")
 
       // Log each fragment for debugging
       extractedFragments.foreach {
@@ -402,7 +419,8 @@ case class MppNativeQueryExec(
         fragmentSubstraitPlans,
         extractedFragments,
         extractedExchanges,
-        fusedBroadcastsByConsumer).foreach {
+        fusedBroadcastsByConsumer,
+        localStreamInputs).foreach {
         reason =>
           return delegateToBsp(
             executionChild,
@@ -430,6 +448,7 @@ case class MppNativeQueryExec(
       val peerInfos = peerResolution.peerInfos
       val peerEndpointsJson = peerResolution.peerEndpointsJson
       metrics("numSparkPartitions") += sparkPartitionCount
+      val alignedLocalStreamInputs = alignLocalStreamInputs(localStreamInputs, sparkPartitionCount)
 
       // Extract scan split infos only after endpoint discovery. Some Spark exchange
       // wrappers can lazily start shuffle work while split metadata is inspected; probing first
@@ -469,6 +488,8 @@ case class MppNativeQueryExec(
         peerInfos,
         fragmentSplitInfos,
         fusedBroadcastsByConsumer,
+        alignedLocalStreamInputs.map(input => MppLocalStreamSlot(input.fragmentId, input.slotIdx)),
+        new ColumnarInputRDDsWrapper(alignedLocalStreamInputs.map(_.rdd)),
         sparkPartitionCount,
         broadcastProducerFragmentIds,
         longMetric("totalQueryTimeMs"),
@@ -510,7 +531,12 @@ case class MppNativeQueryExec(
 
     logDebug(s"MppNativeQueryExec: generated ${fragmentPlans.length} Substrait plans on driver")
 
-    validateMppStreamInputs(fragmentPlans.toSeq, fragments, exchanges, Map.empty).foreach {
+    validateMppStreamInputs(
+      fragmentPlans.toSeq,
+      fragments,
+      exchanges,
+      Map.empty,
+      Seq.empty).foreach {
       reason =>
         return delegateToBsp(
           executionChild,
@@ -565,6 +591,8 @@ case class MppNativeQueryExec(
       peerInfos,
       fragmentSplitInfos,
       Map.empty[Int, Seq[FusedBroadcast]],
+      Seq.empty[MppLocalStreamSlot],
+      new ColumnarInputRDDsWrapper(Seq.empty),
       sparkPartitionCount,
       broadcastProducerFragmentIds,
       longMetric("totalQueryTimeMs"),
@@ -669,6 +697,7 @@ case class MppNativeQueryExec(
     // iterator:N indexing emitted by InputIteratorTransformer.
     val broadcastsByConsumer =
       mutable.HashMap[Int, mutable.ArrayBuffer[FusedBroadcast]]()
+    val localStreamInputs = mutable.ArrayBuffer[MppLocalStreamInput]()
 
     /**
      * Walk the plan tree depth-first. Returns the fragment ID of the subtree rooted at `plan`. At
@@ -738,6 +767,14 @@ case class MppNativeQueryExec(
                         t
                       )
                   }
+                case None if producerFragId < 0 && isExistingRddStreamInput(child) =>
+                  localStreamInputs += MppLocalStreamInput(
+                    fragmentId = fragId,
+                    slotIdx = slotIdx,
+                    rdd = executeExistingRddColumnar(child))
+                  logInfo(
+                    s"MppNativeQueryExec: captured local ExistingRDD stream at " +
+                      s"consumerF=$fragId slot=$slotIdx")
                 case _ if producerFragId < 0 =>
                   // Non-broadcast collapse (e.g. collapseSingleGather sentinel).
                   ()
@@ -933,7 +970,24 @@ case class MppNativeQueryExec(
     val frozenBroadcasts = broadcastsByConsumer.iterator.map {
       case (consumerId, buf) => consumerId -> buf.toSeq
     }.toMap
-    (adjustedFragments, sortedExchanges, frozenBroadcasts, rewrittenChild)
+    val localInputFragmentIds = localStreamInputs.iterator.map(_.fragmentId).toSet
+    val streamSafeFragments = adjustedFragments.map {
+      fragment =>
+        if (localInputFragmentIds.nonEmpty && fragment.parallelism != 1) {
+          logInfo(
+            s"MppNativeQueryExec: forcing fragment ${fragment.id} to one driver because the " +
+              "query consumes a JVM-backed local stream")
+          fragment.copy(parallelism = 1)
+        } else {
+          fragment
+        }
+    }
+    (
+      streamSafeFragments,
+      sortedExchanges,
+      frozenBroadcasts,
+      localStreamInputs.toSeq,
+      rewrittenChild)
   }
 
   /**
@@ -1374,6 +1428,39 @@ case class MppNativeQueryExec(
     }
   }
 
+  private def isExistingRddStreamInput(plan: SparkPlan): Boolean = {
+    existingRddScan(plan).isDefined
+  }
+
+  private def existingRddScan(plan: SparkPlan): Option[RDDScanExec] = {
+    plan match {
+      case scan: RDDScanExec => Some(scan)
+      case wst: WholeStageTransformer => existingRddScan(wst.child)
+      case cia: ColumnarInputAdapter => existingRddScan(cia.child)
+      case c2c: ColumnarToColumnarExec => existingRddScan(c2c.child)
+      case c2r: ColumnarToRowExecBase => existingRddScan(c2r.child)
+      case r2c: RowToColumnarExecBase => existingRddScan(r2c.child)
+      case _ => None
+    }
+  }
+
+  private def executeExistingRddColumnar(plan: SparkPlan): RDD[ColumnarBatch] = {
+    val scan = existingRddScan(plan).getOrElse {
+      throw new IllegalArgumentException(
+        s"Expected an ExistingRDD stream input, got ${plan.getClass.getSimpleName}")
+    }
+    RowToVeloxColumnarExec(scan).executeColumnar()
+  }
+
+  private def alignLocalStreamInputs(
+      inputs: Seq[MppLocalStreamInput],
+      sparkPartitionCount: Int): Seq[MppLocalStreamInput] = {
+    inputs.map {
+      input =>
+        input.copy(rdd = MppNativeQueryRDD.alignInputRDD(input.rdd, sparkPartitionCount))
+    }
+  }
+
   private def offloadLocalSorts(plan: SparkPlan): SparkPlan = {
     val withSortPreProjects = plan.transformUp {
       case sort: SortExec if !sort.global =>
@@ -1602,7 +1689,8 @@ case class MppNativeQueryExec(
       fragmentPlans: Seq[Array[Byte]],
       fragments: Seq[NativeFragment],
       exchanges: Seq[ExchangeSpec],
-      fusedBroadcastsByConsumer: Map[Int, Seq[FusedBroadcast]]): Option[String] = {
+      fusedBroadcastsByConsumer: Map[Int, Seq[FusedBroadcast]],
+      localStreamInputs: Seq[MppLocalStreamInput]): Option[String] = {
     fragments.zip(fragmentPlans).foreach {
       case (fragment, planBytes) =>
         val slots =
@@ -1617,7 +1705,9 @@ case class MppNativeQueryExec(
         if (slots.nonEmpty) {
           val inboundExchangeCount = exchanges.count(_.consumerFragmentId == fragment.id)
           val fusedBroadcastCount = fusedBroadcastsByConsumer.getOrElse(fragment.id, Nil).size
-          val preparedInputCount = inboundExchangeCount + fusedBroadcastCount
+          val localStreamInputCount = localStreamInputs.count(_.fragmentId == fragment.id)
+          val preparedInputCount =
+            inboundExchangeCount + fusedBroadcastCount + localStreamInputCount
           val requiredInputCount = slots.max + 1
           if (requiredInputCount > preparedInputCount) {
             val rootName = Option(fragment.rootOperator)
@@ -1631,7 +1721,8 @@ case class MppNativeQueryExec(
                 s"root=$rootName output=${describeAttributes(fragment.outputAttributes)} " +
                 s"slots=${slots.toSeq.sorted.mkString("[", ", ", "]")} " +
                 s"prepared=$preparedInputCount inboundExchanges=$inboundExchangeCount " +
-                s"fusedBroadcasts=$fusedBroadcastCount tree:\n${rootTree.take(6000)}")
+                s"fusedBroadcasts=$fusedBroadcastCount localStreams=$localStreamInputCount " +
+                s"tree:\n${rootTree.take(6000)}")
             val slotKind =
               if (rootTree.contains("Scan ExistingRDD")) {
                 "Spark ExistingRDD iterator slot(s)"
@@ -1641,8 +1732,9 @@ case class MppNativeQueryExec(
             return Some(
               s"fragment ${fragment.id} Substrait has $slotKind " +
                 s"${slots.toSeq.sorted.mkString("[", ", ", "]")} but Spark prepared only " +
-                s"$preparedInputCount MPP stream input(s): $inboundExchangeCount inbound " +
-                s"exchange(s) + $fusedBroadcastCount fused broadcast(s)")
+                    s"$preparedInputCount MPP stream input(s): $inboundExchangeCount inbound " +
+                    s"exchange(s) + $fusedBroadcastCount fused broadcast(s) + " +
+                    s"$localStreamInputCount local stream(s)")
           }
         }
     }

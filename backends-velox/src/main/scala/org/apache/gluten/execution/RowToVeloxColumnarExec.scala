@@ -165,77 +165,76 @@ object RowToVeloxColumnarExec {
 
       override def next(): ColumnarBatch = {
         var arrowBuf: ArrowBuf = null
-        TaskResources.addRecycler("RowToColumnar_arrowBuf", 100) {
-          if (arrowBuf != null && arrowBuf.refCnt() != 0) {
-            arrowBuf.close()
-          }
-        }
-        val rowLength = new ListBuffer[Long]()
-        var rowCount = 0
-        var offset = 0L
-        while (rowCount < columnBatchSize && offset < columnBatchBytes && !finished) {
-          if (!it.hasNext) {
-            finished = true
-          } else {
-            val row = it.next()
-            val start = System.currentTimeMillis()
-            val unsafeRow = convertToUnsafeRow(row)
-            val sizeInBytes = unsafeRow.getSizeInBytes
-
-            // allocate buffer based on first row
-            if (rowCount == 0) {
-              // allocate buffer based on 1st row, but if first row is very big, this will cause OOM
-              // maybe we should optimize to list ArrayBuf to native to avoid buf close and allocate
-              // 31760L origins from BaseVariableWidthVector.lastValueAllocationSizeInBytes
-              // experimental value
-              val estimatedBufSize = Math.min(
-                Math.max(
-                  Math.min(sizeInBytes.toDouble * columnBatchSize * 1.2, 31760L * columnBatchSize),
-                  sizeInBytes.toDouble * 10),
-                // Limit the size of the buffer to columnBatchBytes or the size of the first row,
-                // whichever is greater so we always have enough space for the first row.
-                Math.max(columnBatchBytes, sizeInBytes)
-              )
-              arrowBuf = arrowAllocator.buffer(estimatedBufSize.toLong)
-            }
-
-            if ((offset + sizeInBytes) > arrowBuf.capacity()) {
-              val bufSize = if (offset + sizeInBytes > columnBatchBytes) {
-                // If adding the current row causes the batch size to exceed columnBatchBytes add
-                // just enough space to add the current row.
-                offset + sizeInBytes
-              } else {
-                Math.min((offset + sizeInBytes * 2), columnBatchBytes)
-              }
-              val tmpBuf = arrowAllocator.buffer(bufSize)
-              tmpBuf.setBytes(0, arrowBuf, 0, offset)
-              arrowBuf.close()
-              arrowBuf = tmpBuf
-            }
-            Platform.copyMemory(
-              unsafeRow.getBaseObject,
-              unsafeRow.getBaseOffset,
-              null,
-              arrowBuf.memoryAddress() + offset,
-              sizeInBytes)
-            offset += sizeInBytes
-            rowLength += sizeInBytes.toLong
-            rowCount += 1
-            convertTime += System.currentTimeMillis() - start
-          }
-        }
-        numInputRows += rowCount
-        numOutputBatches += 1
-        val startNative = System.currentTimeMillis()
         try {
+          val rowLength = new ListBuffer[Long]()
+          var rowCount = 0
+          var offset = 0L
+          while (rowCount < columnBatchSize && offset < columnBatchBytes && !finished) {
+            if (!it.hasNext) {
+              finished = true
+            } else {
+              val row = it.next()
+              val start = System.currentTimeMillis()
+              val unsafeRow = convertToUnsafeRow(row)
+              val sizeInBytes = unsafeRow.getSizeInBytes
+
+              // allocate buffer based on first row
+              if (rowCount == 0) {
+                // Estimate from the first row, capped to avoid over-allocation.
+                // 31760L origins from BaseVariableWidthVector.lastValueAllocationSizeInBytes
+                // experimental value
+                val estimatedBufSize = Math.min(
+                  Math.max(
+                    Math.min(
+                      sizeInBytes.toDouble * columnBatchSize * 1.2,
+                      31760L * columnBatchSize),
+                    sizeInBytes.toDouble * 10),
+                  // Limit the size of the buffer to columnBatchBytes or the size of the first row,
+                  // whichever is greater so we always have enough space for the first row.
+                  Math.max(columnBatchBytes, sizeInBytes)
+                )
+                arrowBuf = arrowAllocator.buffer(estimatedBufSize.toLong)
+              }
+
+              if ((offset + sizeInBytes) > arrowBuf.capacity()) {
+                val bufSize = if (offset + sizeInBytes > columnBatchBytes) {
+                  // If adding the current row causes the batch size to exceed columnBatchBytes add
+                  // just enough space to add the current row.
+                  offset + sizeInBytes
+                } else {
+                  Math.min((offset + sizeInBytes * 2), columnBatchBytes)
+                }
+                val tmpBuf = arrowAllocator.buffer(bufSize)
+                tmpBuf.setBytes(0, arrowBuf, 0, offset)
+                arrowBuf.close()
+                arrowBuf = tmpBuf
+              }
+              Platform.copyMemory(
+                unsafeRow.getBaseObject,
+                unsafeRow.getBaseOffset,
+                null,
+                arrowBuf.memoryAddress() + offset,
+                sizeInBytes)
+              offset += sizeInBytes
+              rowLength += sizeInBytes.toLong
+              rowCount += 1
+              convertTime += System.currentTimeMillis() - start
+            }
+          }
+          numInputRows += rowCount
+          numOutputBatches += 1
+          val startNative = System.currentTimeMillis()
           val handle = jniWrapper
             .nativeConvertRowToColumnar(r2cHandle, rowLength.toArray, arrowBuf.memoryAddress())
-          val cb = ColumnarBatches.create(handle)
+          val cb = TaskResources.runUnsafe {
+            ColumnarBatches.create(handle)
+          }
           convertTime += System.currentTimeMillis() - startNative
           cb
         } finally {
-          arrowBuf.close()
-          arrowBuf = null
+          if (arrowBuf != null && arrowBuf.refCnt() != 0) {
+            arrowBuf.close()
+          }
         }
       }
     }

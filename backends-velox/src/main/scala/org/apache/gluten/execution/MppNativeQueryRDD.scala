@@ -19,9 +19,9 @@ package org.apache.gluten.execution
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.iterator.Iterators
 import org.apache.gluten.runtime.Runtimes
-import org.apache.gluten.vectorized.MppQueryJniWrapper
+import org.apache.gluten.vectorized.{ColumnarBatchInIterator, MppQueryJniWrapper}
 
-import org.apache.spark.{Partition, SparkContext, SparkEnv, TaskContext}
+import org.apache.spark.{NarrowDependency, Partition, SparkContext, SparkEnv, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.execution.metric.SQLMetric
@@ -30,6 +30,8 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import java.util.{HashMap => JHashMap, Iterator => JIterator}
 
+import scala.collection.JavaConverters._
+import scala.collection.mutable
 import scala.util.control.NonFatal
 
 /**
@@ -83,12 +85,14 @@ class MppNativeQueryRDD(
     peerInfos: Array[MppPeerInfo],
     fragmentSplitInfos: Array[Array[Array[Byte]]],
     fusedBroadcastsByConsumer: Map[Int, Seq[FusedBroadcast]],
+    localStreamSlots: Seq[MppLocalStreamSlot],
+    var localInputRDDs: ColumnarInputRDDsWrapper,
     sparkPartitionCount: Int,
     broadcastProducerFragmentIds: Set[Int],
     pipelineTime: SQLMetric,
     outputRows: SQLMetric,
     outputBatches: SQLMetric
-) extends RDD[ColumnarBatch](sc, Nil)
+  ) extends RDD[ColumnarBatch](sc, localInputRDDs.getDependencies)
   with Logging {
 
   private val numSparkPartitions: Int =
@@ -100,7 +104,10 @@ class MppNativeQueryRDD(
         MppPartition(
           index = partitionIndex,
           totalPartitions = numSparkPartitions,
-          peerInfo = peerInfos.lift(partitionIndex))
+          peerInfo = peerInfos.lift(partitionIndex),
+          localInputPartitions =
+            if (localStreamSlots.nonEmpty) localInputRDDs.getPartitions(partitionIndex)
+            else Seq.empty)
     }
   }
 
@@ -175,27 +182,66 @@ class MppNativeQueryRDD(
       mppPartition.totalPartitions,
       broadcastProducerFragmentIds)
 
-    // For each consumer fragment that has fused broadcasts, materialize the
-    // build side as Iterator[ColumnarBatch] (one iterator per fused broadcast)
-    // and pack into parallel int[] / Object[] arrays the JNI side can iterate.
-    // numFragments is implied by fragmentPlans.length; we emit ragged arrays
-    // (entries are null for fragments with no fused broadcasts).
+    // Pack every JVM-backed ValueStream input into parallel slot/iterator arrays. Fused broadcasts
+    // materialize from their broadcast relation; local streams read the aligned parent RDD
+    // partition owned by this Spark task.
     val numFragments = fragmentPlans.length
-    val broadcastSlotIndicesPerFrag = new Array[Array[Int]](numFragments)
-    val broadcastIteratorsPerFrag = new Array[Array[JIterator[ColumnarBatch]]](numFragments)
+    val jvmStreamsByConsumer =
+      mutable.HashMap[Int, mutable.ArrayBuffer[(Int, JIterator[ColumnarBatch])]]()
     fusedBroadcastsByConsumer.foreach {
       case (consumerId, fusedList) =>
         if (consumerId >= 0 && consumerId < numFragments) {
           val sortedBySlot = fusedList.sortBy(_.slotIdx)
-          broadcastSlotIndicesPerFrag(consumerId) = sortedBySlot.map(_.slotIdx).toArray
-          broadcastIteratorsPerFrag(consumerId) = sortedBySlot
-            .map(MppNativeQueryRDD.materializeFusedBroadcastIteratorImpl)
-            .toArray
+          val streams = jvmStreamsByConsumer.getOrElseUpdate(consumerId, mutable.ArrayBuffer.empty)
+          sortedBySlot.foreach {
+            fused =>
+              streams += fused.slotIdx ->
+                MppNativeQueryRDD.materializeFusedBroadcastIteratorImpl(fused)
+          }
           logInfo(
             s"MppNativeQueryRDD: fragment $consumerId has " +
               s"${sortedBySlot.size} fused broadcast(s) at slots " +
               sortedBySlot.map(_.slotIdx).mkString("[", ",", "]"))
         }
+    }
+
+    if (localStreamSlots.nonEmpty) {
+      val localIterators =
+        localInputRDDs.getIterators(mppPartition.localInputPartitions, context)
+      require(
+        localIterators.size == localStreamSlots.size,
+        s"MPP local stream iterator count ${localIterators.size} did not match slot count " +
+          s"${localStreamSlots.size}")
+      localStreamSlots.zip(localIterators).foreach {
+        case (slot, iterator) =>
+          val streams =
+            jvmStreamsByConsumer.getOrElseUpdate(slot.fragmentId, mutable.ArrayBuffer.empty)
+          streams += slot.slotIdx -> iterator.asJava
+      }
+    }
+
+    val jvmStreamSlotIndicesPerFrag = new Array[Array[Int]](numFragments)
+    val jvmStreamIteratorsPerFrag = new Array[Array[Object]](numFragments)
+    jvmStreamsByConsumer.foreach {
+      case (consumerId, streams) =>
+        val sortedBySlot = streams.sortBy(_._1)
+        val duplicateSlots = sortedBySlot.groupBy(_._1).collect {
+          case (slot, occurrences) if occurrences.size > 1 => slot
+        }
+        require(
+          duplicateSlots.isEmpty,
+          s"MPP fragment $consumerId has duplicate JVM stream slot(s): " +
+            duplicateSlots.toSeq.sorted.mkString("[", ",", "]"))
+        jvmStreamSlotIndicesPerFrag(consumerId) = sortedBySlot.map(_._1).toArray
+        jvmStreamIteratorsPerFrag(consumerId) = sortedBySlot
+          .map {
+            case (_, iterator) =>
+              new ColumnarBatchInIterator(BackendsApiManager.getBackendName, iterator): Object
+          }
+          .toArray
+        logInfo(
+          s"MppNativeQueryRDD: fragment $consumerId has ${sortedBySlot.size} JVM stream(s) " +
+            s"at slots ${sortedBySlot.map(_._1).mkString("[", ",", "]")}")
     }
 
     val mppHandle = jniWrapper.nativeCreateMppQuery(
@@ -204,8 +250,8 @@ class MppNativeQueryRDD(
       exchangeSpecsJson.getBytes("UTF-8"),
       mppPeerSpecJson.getBytes("UTF-8"),
       localFragmentSplitInfos,
-      broadcastSlotIndicesPerFrag,
-      broadcastIteratorsPerFrag.asInstanceOf[Array[Array[Object]]]
+      jvmStreamSlotIndicesPerFrag,
+      jvmStreamIteratorsPerFrag
     )
     val tCreateDoneStartBegin = System.nanoTime()
     jniWrapper.nativeStartMppQuery(mppHandle)
@@ -372,14 +418,65 @@ class MppNativeQueryRDD(
       .create()
   }
 
+  override protected def clearDependencies(): Unit = {
+    super.clearDependencies()
+    localInputRDDs = null
+  }
+
 }
 
 /** Spark partition descriptor for one native MPP query. */
 private[execution] case class MppPartition(
     override val index: Int,
     totalPartitions: Int,
-    peerInfo: Option[MppPeerInfo])
+    peerInfo: Option[MppPeerInfo],
+    localInputPartitions: Seq[Partition])
   extends Partition
+
+private[execution] case class MppAlignedInputPartition(
+    override val index: Int,
+    parentPartitions: Array[Partition])
+  extends Partition
+
+private[execution] class MppAlignedInputRDD(
+    var parentRDD: RDD[ColumnarBatch],
+    parentGroups: Array[Array[Int]])
+  extends RDD[ColumnarBatch](
+    parentRDD.sparkContext,
+    Seq(
+      new NarrowDependency[ColumnarBatch](parentRDD) {
+        override def getParents(partitionId: Int): Seq[Int] = parentGroups(partitionId).toSeq
+      })) {
+
+  override protected def getPartitions: Array[Partition] = {
+    val parentPartitions = parentRDD.partitions
+    parentGroups.zipWithIndex.map {
+      case (parentIndices, index) =>
+        MppAlignedInputPartition(index, parentIndices.map(parentPartitions))
+    }
+  }
+
+  override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
+    val parentIterators = split
+      .asInstanceOf[MppAlignedInputPartition]
+      .parentPartitions
+      .map(parentRDD.iterator(_, context))
+    parentIterators.iterator.flatten
+  }
+
+  override protected def getPreferredLocations(split: Partition): Seq[String] = {
+    split
+      .asInstanceOf[MppAlignedInputPartition]
+      .parentPartitions
+      .flatMap(parentRDD.preferredLocations)
+      .distinct
+  }
+
+  override protected def clearDependencies(): Unit = {
+    super.clearDependencies()
+    parentRDD = null
+  }
+}
 
 private[gluten] case class MppPeerInfo(
     peerId: String,
@@ -388,6 +485,30 @@ private[gluten] case class MppPeerInfo(
     preferredLocation: String)
 
 private[execution] object MppNativeQueryRDD {
+
+  def alignInputRDD(rdd: RDD[ColumnarBatch], targetPartitions: Int): RDD[ColumnarBatch] = {
+    require(targetPartitions > 0, s"targetPartitions must be positive, got $targetPartitions")
+    val sourcePartitions = rdd.partitions.length
+    if (sourcePartitions == targetPartitions) {
+      return rdd
+    }
+
+    val parentGroups =
+      if (sourcePartitions >= targetPartitions) {
+        Array.tabulate(targetPartitions) {
+          targetIndex =>
+            val start = (targetIndex.toLong * sourcePartitions / targetPartitions).toInt
+            val end = ((targetIndex + 1L) * sourcePartitions / targetPartitions).toInt
+            (start until end).toArray
+        }
+      } else {
+        Array.tabulate(targetPartitions) {
+          targetIndex =>
+            if (targetIndex < sourcePartitions) Array(targetIndex) else Array.emptyIntArray
+        }
+      }
+    new MppAlignedInputRDD(rdd, parentGroups)
+  }
 
   /** Opt-in: raise cuDF parquet chunk/pass read limits for MPP table scans. */
   val largeParquetScanChunksKey: String = "spark.gluten.mpp.largeParquetScanChunks"
