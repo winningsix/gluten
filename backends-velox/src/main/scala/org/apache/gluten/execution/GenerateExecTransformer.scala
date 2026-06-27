@@ -185,7 +185,7 @@ object PullOutGenerateProjectHelper extends PullOutProjectHelper {
           val expressionMap = new mutable.HashMap[Expression, NamedExpression]()
           // The new child should be either the original Attribute,
           // or an Alias to other expressions.
-          replaceExpressionWithAttribute(
+          val newGeneratorChild = replaceExpressionWithAttribute(
             generate.generator.asInstanceOf[UnaryExpression].child,
             expressionMap,
             replaceBoundReference = true)
@@ -193,14 +193,14 @@ object PullOutGenerateProjectHelper extends PullOutProjectHelper {
           if (!expressionMap.isEmpty) {
             // generator.child is not an Attribute reference, e.g Literal/CreateArray/CreateMap.
             // We plug in a Project to make it an Attribute reference.
-            // NOTE: DO NOT use eliminateProjectList to create the project list because
-            // newGeneratorChild can be a duplicated Attribute in generate.child.output. The native
-            // side identifies the last field of projection as generator's input.
-            val newGeneratorChildren = Seq(expressionMap.values.head)
+            // Keep the generator bound to the projected attribute so the native side resolves the
+            // input field type directly instead of relying on the last projected field.
+            val newGeneratorChildren = Seq(newGeneratorChild)
+            val newProjectExpressions = expressionMap.values.toSeq
             generate.copy(
               generator =
                 generate.generator.withNewChildren(newGeneratorChildren).asInstanceOf[Generator],
-              child = ProjectExec(generate.child.output ++ newGeneratorChildren, generate.child)
+              child = ProjectExec(generate.child.output ++ newProjectExpressions, generate.child)
             )
           } else {
             // generator.child is Attribute, no need to introduce a Project.

@@ -1006,9 +1006,46 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
       //  Generate explode([1,2,3] AS _pre_0#129), false, [col#126]
       //  +- Project [fake_column#128, [1,2,3] AS _pre_0#129]
       //   +- RewrittenNodeWall Scan OneRowRelation[fake_column#128]
-      // The last projection column in GeneratorRel's child(Project) is the column we need to unnest
-      auto index = childNode->outputType()->size() - 1;
-      extractUnnestFieldExpr(childNode, index, unnest);
+      //
+      // Prefer the generator argument when it is already a field reference.
+      // Planning rules can inject additional child projections after the
+      // generator input, so relying on the last child output can pick an
+      // unrelated helper column.
+      auto generatorFunc = generator.scalar_function();
+      if (generatorFunc.arguments_size() > 0 && generatorFunc.arguments(0).has_value()) {
+        auto unnestExpr =
+            exprConverter_->toVeloxExpr(generatorFunc.arguments(0).value(), inputType);
+        if (auto unnestFieldExpr =
+                std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(unnestExpr)) {
+          if (unnestFieldExpr->type()->isArray() || unnestFieldExpr->type()->isMap()) {
+            unnest.emplace_back(unnestFieldExpr);
+          }
+        } else if (unnestExpr->type()->isArray() || unnestExpr->type()->isMap()) {
+          const auto& childType = childNode->outputType();
+          std::vector<std::string> projectNames;
+          std::vector<core::TypedExprPtr> projectExpressions;
+          projectNames.reserve(childType->size() + 1);
+          projectExpressions.reserve(childType->size() + 1);
+          for (int32_t i = 0; i < childType->size(); ++i) {
+            const auto name = childType->nameOf(i);
+            projectNames.emplace_back(name);
+            projectExpressions.emplace_back(
+                std::make_shared<core::FieldAccessTypedExpr>(childType->childAt(i), name));
+          }
+          const auto unnestInputName = "__gluten_unnest_" + std::to_string(planNodeId_);
+          const auto unnestType = unnestExpr->type();
+          projectNames.emplace_back(unnestInputName);
+          projectExpressions.emplace_back(std::move(unnestExpr));
+          childNode = std::make_shared<core::ProjectNode>(
+              nextPlanNodeId(), std::move(projectNames), std::move(projectExpressions), childNode);
+          unnest.emplace_back(std::make_shared<core::FieldAccessTypedExpr>(unnestType, unnestInputName));
+        }
+      }
+      if (unnest.empty()) {
+        // Historical fallback for generated non-field inputs.
+        auto index = childNode->outputType()->size() - 1;
+        extractUnnestFieldExpr(childNode, index, unnest);
+      }
     } else {
       // For stack function, e.g. stack(2, 1,2,3), a sample
       // input substrait plan is like the following:

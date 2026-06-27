@@ -824,6 +824,24 @@ class MiscOperatorSuite extends VeloxWholeStageTransformerSuite with AdaptiveSpa
     }
   }
 
+  test("Support Generate with projected from_json array input") {
+    withTempView("json_input") {
+      Seq("""{"items":["a","b"]}""", """{"items":[]}""", """{"items":["c"]}""", null)
+        .toDF("payload")
+        .createOrReplaceTempView("json_input")
+
+      runQueryAndCompare("""
+                           |SELECT item
+                           |FROM json_input
+                           |LATERAL VIEW explode(
+                           |  from_json(get_json_object(payload, '$.items'), 'array<string>')
+                           |) exploded AS item
+                           |""".stripMargin) {
+        checkGlutenPlan[GenerateExecTransformer]
+      }
+    }
+  }
+
   test("Validation should fail if unsupported expression is used for Generate.") {
     withTable("t") {
       spark
