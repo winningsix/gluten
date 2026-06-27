@@ -48,6 +48,7 @@ import org.apache.spark.sql.catalyst.plans.logical.{Join, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
 import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, FilterExec, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
+import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeExec, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BuildSideRelation, HashedRelationBroadcastMode, ShuffledHashJoinExec}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
@@ -1314,12 +1315,52 @@ case class MppNativeQueryExec(
             if LocalTableScanExecTransformer.supportsOneRowRelation(scan) =>
           changed = true
           LocalTableScanExecTransformer.oneRowRelation(scan.output)
-        case InputIteratorTransformer(ColumnarInputAdapter(ts: TransformSupport)) =>
-          changed = true
-          ts
+        case iit: InputIteratorTransformer =>
+          localNativeInputIteratorChild(iit.child) match {
+            case Some(nativeChild) =>
+              changed = true
+              nativeChild
+            case None =>
+              iit
+          }
       }
     }
     current
+  }
+
+  /**
+   * Return the native subtree behind an InputIterator slot when the slot is only an artifact of
+   * ColumnarCollapseTransformStages wrapping an already-local native plan.
+   *
+   * Real MPP inputs still stay behind the iterator boundary: exchanges, TopN gather slots,
+   * replicated join build markers, Python/RDD/row-only plans, and Cartesian bridge inputs all
+   * return None and keep the existing safety fallback behavior.
+   */
+  private def localNativeInputIteratorChild(plan: SparkPlan): Option[SparkPlan] = {
+    if (
+      unwrapToExchange(plan).isDefined ||
+      unwrapToTopN(plan).isDefined ||
+      isReplicatedJoinBuildInput(plan)
+    ) {
+      return None
+    }
+
+    plan match {
+      case cia: ColumnarInputAdapter =>
+        localNativeInputIteratorChild(cia.child)
+      case c2c: ColumnarToColumnarExec =>
+        localNativeInputIteratorChild(c2c.child)
+      case agg: BaseAggregateExec if agg.child.isInstanceOf[TransformSupport] =>
+        Some(HashAggregateExecBaseTransformer.from(agg))
+      case scan: LocalTableScanExec if scan.rows.length <= LocalTableScanExecTransformer.MaxRows =>
+        Some(LocalTableScanExecTransformer(scan.output, scan.rows))
+      case scan if LocalTableScanExecTransformer.supportsOneRowRelation(scan) =>
+        Some(LocalTableScanExecTransformer.oneRowRelation(scan.output))
+      case ts: TransformSupport if !ts.isInstanceOf[InputIteratorTransformer] =>
+        Some(ts)
+      case _ =>
+        None
+    }
   }
 
   private def offloadLocalSorts(plan: SparkPlan): SparkPlan = {
@@ -3049,9 +3090,17 @@ case class MppNativeQueryExec(
           // reuse that object in another consumer via ReusedExchangeExec.
           result += marker
         case iit: InputIteratorTransformer =>
-          // InputIteratorTransformer marks a fragment boundary.
-          // Its child (ColumnarInputAdapter -> Exchange) is the exchange child.
-          result += iit.child
+          localNativeInputIteratorChild(iit.child) match {
+            case Some(nativeChild) =>
+              // This iterator wraps a local native subtree, not an exchange input. Keep walking so
+              // nested real boundaries are still discovered and the subtree remains in this
+              // fragment.
+              collect(nativeChild)
+            case None =>
+              // InputIteratorTransformer marks a fragment boundary.
+              // Its child (ColumnarInputAdapter -> Exchange) is the exchange child.
+              result += iit.child
+          }
         case other =>
           other.children.foreach(collect)
       }
