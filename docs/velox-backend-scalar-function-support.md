@@ -1,6 +1,6 @@
 # Scalar Functions Support Status
 
-**Out of 357 scalar functions in Spark 3.5, Gluten currently fully supports 241 functions and partially supports 25 functions.**
+**Out of 357 scalar functions in Spark 3.5, Gluten currently fully supports 242 functions and partially supports 25 functions.**
 
 ## Array Functions
 
@@ -311,7 +311,7 @@
 | input_file_block_start      | InputFileBlockStart       |          |                |
 | input_file_name             | InputFileName             |          |                |
 | java_method                 | CallMethodViaReflection   |          |                |
-| monotonically_increasing_id | MonotonicallyIncreasingID |          |                |
+| monotonically_increasing_id | MonotonicallyIncreasingID | S        |                |
 | reflect                     | CallMethodViaReflection   |          |                |
 | spark_partition_id          | SparkPartitionID          | S        |                |
 | try_aes_decrypt             | TryAesDecrypt             |          |                |
@@ -448,4 +448,3 @@
 | xpath_number      | XPathDouble         |          |                |
 | xpath_short       | XPathShort          |          |                |
 | xpath_string      | XPathString         |          |                |
-
