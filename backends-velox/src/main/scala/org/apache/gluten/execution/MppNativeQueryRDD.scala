@@ -18,10 +18,11 @@ package org.apache.gluten.execution
 
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.iterator.Iterators
+import org.apache.gluten.mpp.control.{GlutenMppExecutorService, MppPeerState, MppQueryRunId}
 import org.apache.gluten.runtime.Runtimes
 import org.apache.gluten.vectorized.{ColumnarBatchInIterator, MppQueryJniWrapper}
 
-import org.apache.spark.{NarrowDependency, Partition, SparkContext, SparkEnv, TaskContext}
+import org.apache.spark.{NarrowDependency, Partition, SparkContext, SparkEnv, TaskContext, TaskKilledException}
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.execution.metric.SQLMetric
@@ -253,8 +254,77 @@ class MppNativeQueryRDD(
       jvmStreamSlotIndicesPerFrag,
       jvmStreamIteratorsPerFrag
     )
+    @volatile var mppClosed = false
+    def closeMppHandle(): Long = this.synchronized {
+      if (mppClosed) {
+        0L
+      } else {
+        val tCloseStart = System.nanoTime()
+        try {
+          jniWrapper.nativeCloseMppQuery(mppHandle)
+        } finally {
+          mppClosed = true
+        }
+        System.nanoTime() - tCloseStart
+      }
+    }
+
+    val runId = MppQueryRunId(mppQueryId, context.stageId(), context.stageAttemptNumber())
+    val activeQuery = GlutenMppExecutorService.registerQuery(
+      runId,
+      mppPartition.index,
+      mppPartition.totalPartitions,
+      context,
+      () => jniWrapper.nativeAbortMppQuery(mppHandle))
+
+    def reportTerminal(state: String): Unit =
+      activeQuery.foreach(GlutenMppExecutorService.reportTerminal(_, state))
+
+    context.addTaskCompletionListener[Unit] {
+      taskContext =>
+        if (!mppClosed) {
+          try {
+            closeMppHandle()
+          } catch {
+            case NonFatal(e) =>
+              logWarning("MppNativeQueryRDD: failed to close MPP query at task completion", e)
+          }
+        }
+        val terminalState =
+          if (taskContext.isInterrupted() || activeQuery.exists(_.isAbortRequested)) {
+            MppPeerState.Aborted
+          } else {
+            MppPeerState.Succeeded
+          }
+        reportTerminal(terminalState)
+    }
+
     val tCreateDoneStartBegin = System.nanoTime()
-    jniWrapper.nativeStartMppQuery(mppHandle)
+    if (activeQuery.exists(query => !query.beginNativeStart())) {
+      try {
+        closeMppHandle()
+      } finally {
+        reportTerminal(MppPeerState.Aborted)
+      }
+      throw new TaskKilledException("MPP task interrupted before native query start")
+    }
+    try {
+      jniWrapper.nativeStartMppQuery(mppHandle)
+      activeQuery.foreach(_.finishNativeStart(succeeded = true))
+    } catch {
+      case NonFatal(e) =>
+        activeQuery.foreach {
+          query =>
+            query.finishNativeStart(succeeded = false)
+            GlutenMppExecutorService.reportFailure(query, e)
+        }
+        try {
+          closeMppHandle()
+        } finally {
+          reportTerminal(MppPeerState.Failed)
+        }
+        throw e
+    }
     val tStartDone = System.nanoTime()
     logWarning(
       f"MppNativeQueryRDD: TIMING " +
@@ -281,33 +351,6 @@ class MppNativeQueryRDD(
     val tracker = org.apache.gluten.metrics.TaskWallTimeTracker.get()
     tracker.planBuildNanos += (System.nanoTime() - planBuildStart)
 
-    @volatile var mppClosed = false
-    def closeMppHandle(): Long = this.synchronized {
-      if (mppClosed) {
-        0L
-      } else {
-        val tCloseStart = System.nanoTime()
-        try {
-          jniWrapper.nativeCloseMppQuery(mppHandle)
-        } finally {
-          mppClosed = true
-        }
-        System.nanoTime() - tCloseStart
-      }
-    }
-
-    context.addTaskCompletionListener[Unit] {
-      _ =>
-        if (!mppClosed) {
-          try {
-            closeMppHandle()
-          } catch {
-            case NonFatal(e) =>
-              logWarning("MppNativeQueryRDD: failed to close MPP query at task completion", e)
-          }
-        }
-    }
-
     // 4. Create iterator that pulls batches from MppQueryCoordinator via JNI.
     val mppIter = new Iterator[ColumnarBatch] {
       private var nextHandle: Long = -1L
@@ -332,6 +375,9 @@ class MppNativeQueryRDD(
         } catch {
           case NonFatal(e) =>
             finished = true
+            activeQuery.filterNot(_.isAbortRequested).foreach {
+              query => GlutenMppExecutorService.reportFailure(query, e)
+            }
             try {
               closeMppHandle()
             } catch {
@@ -339,6 +385,11 @@ class MppNativeQueryRDD(
                 logWarning(
                   "MppNativeQueryRDD: failed to close MPP query after native error",
                   closeError)
+            } finally {
+              val terminalState =
+                if (activeQuery.exists(_.isAbortRequested)) MppPeerState.Aborted
+                else MppPeerState.Failed
+              reportTerminal(terminalState)
             }
             throw e
         }
@@ -387,6 +438,7 @@ class MppNativeQueryRDD(
                 )
               ))
           }
+          reportTerminal(MppPeerState.Succeeded)
           logInfo("MppNativeQueryRDD: MPP execution complete, all fragments finished")
           false
         } else {

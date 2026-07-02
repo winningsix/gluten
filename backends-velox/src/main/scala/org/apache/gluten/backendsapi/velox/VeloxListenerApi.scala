@@ -32,6 +32,7 @@ import org.apache.gluten.memory.memtarget.MemoryTarget
 import org.apache.gluten.monitor.VeloxMemoryProfiler
 import org.apache.gluten.mpp.control.GlutenMppDriverService
 import org.apache.gluten.mpp.control.GlutenMppExecutorService
+import org.apache.gluten.mpp.control.GlutenMppQueryControlListener
 import org.apache.gluten.udf.UdfJniWrapper
 import org.apache.gluten.utils._
 
@@ -141,6 +142,9 @@ class VeloxListenerApi extends ListenerApi with Logging {
       initializeGpuConcurrency(conf)
     }
     GlutenMppDriverService.init(conf)
+    GlutenMppDriverService.get().foreach {
+      service => sc.addSparkListener(new GlutenMppQueryControlListener(service))
+    }
   }
 
   override def onDriverShutdown(): Unit = {

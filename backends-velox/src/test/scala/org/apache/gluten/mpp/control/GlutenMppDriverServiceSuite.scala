@@ -96,7 +96,9 @@ class GlutenMppDriverServiceSuite extends AnyFunSuite {
   test("init creates the always-on driver service") {
     GlutenMppDriverService.shutdown()
     try {
-      GlutenMppDriverService.init(new SparkConf(loadDefaults = false))
+      GlutenMppDriverService.init(
+        new SparkConf(loadDefaults = false)
+          .set(GlutenMppControlPlaneConfig.MppEnabledKey, "true"))
       assert(GlutenMppDriverService.get().isDefined)
     } finally {
       GlutenMppDriverService.shutdown()

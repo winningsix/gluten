@@ -32,6 +32,7 @@ import org.apache.gluten.runtime.RuntimeAware;
  *   <li>{@link #nativeCreateMppQuery} — parse Substrait plans, build fragments, create coordinator
  *   <li>{@link #nativeStartMppQuery} — launch all fragments concurrently (all-stages-up)
  *   <li>{@link #nativeGetMppOutput} — pull output batches from root fragment (blocking)
+ *   <li>{@link #nativeAbortMppQuery} — optionally request cooperative abort without releasing handle
  *   <li>{@link #nativeCloseMppQuery} — abort remaining tasks and release resources
  * </ol>
  *
@@ -124,6 +125,14 @@ public class MppQueryJniWrapper implements RuntimeAware {
    * @throws RuntimeException if a fragment has failed.
    */
   public native long nativeGetMppOutput(long handle);
+
+  /**
+   * Request cooperative abort of every Velox task owned by this MPP coordinator. This does not
+   * release {@code handle}; the Spark task thread must still call {@link #nativeCloseMppQuery}.
+   *
+   * @param handle native handle returned by {@link #nativeCreateMppQuery}.
+   */
+  public native void nativeAbortMppQuery(long handle);
 
   /**
    * Close the MPP query: abort any running fragments and release native resources. Must be called

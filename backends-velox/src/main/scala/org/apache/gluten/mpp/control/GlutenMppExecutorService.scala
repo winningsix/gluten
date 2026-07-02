@@ -19,7 +19,7 @@ package org.apache.gluten.mpp.control
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.init.NativeBackendInitializer
 
-import org.apache.spark.SparkEnv
+import org.apache.spark.{SparkEnv, TaskContext}
 import org.apache.spark.api.plugin.PluginContext
 import org.apache.spark.internal.Logging
 
@@ -28,10 +28,33 @@ import java.net.{Inet4Address, InetAddress, NetworkInterface, URI}
 import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
 
+/**
+ * Executor-plugin entry point for endpoint discovery and MPP query cancellation.
+ *
+ * Endpoint registration and query cancellation are initialized independently. In particular, a
+ * missing or failed UCX endpoint registration must not disable the local interruption watcher or
+ * peer-failure propagation. Query lifecycle calls delegate to the process-wide
+ * [[GlutenMppExecutorControlAgent]] created for the current executor session.
+ */
 object GlutenMppExecutorService extends Logging {
   @volatile private var registeredContext: Option[PluginContext] = None
+  @volatile private var controlAgent: Option[GlutenMppExecutorControlAgent] = None
 
   def onExecutorStart(ctx: PluginContext): Unit = {
+    controlAgent.foreach(_.shutdown())
+    controlAgent = None
+    registeredContext = None
+    if (GlutenMppControlPlaneConfig.queryCancellationEnabled(ctx.conf())) {
+      val agent = GlutenMppExecutorControlAgent(
+        executorIdOf(ctx),
+        msg => ctx.ask(msg),
+        GlutenMppControlPlaneConfig.interruptPollMs(ctx.conf()),
+        GlutenMppControlPlaneConfig.heartbeatMs(ctx.conf()))
+      controlAgent = Some(agent)
+      logInfo(
+        s"GlutenMppExecutorService: query cancellation initialized " +
+          s"executorId=${executorIdOf(ctx)} session=${agent.executorSessionId}")
+    }
     if (!GlutenMppControlPlaneConfig.endpointRegistryEnabled(ctx.conf())) {
       logInfo("GlutenMppExecutorService: endpoint registry disabled; skip register")
       return
@@ -58,6 +81,9 @@ object GlutenMppExecutorService extends Logging {
   }
 
   def onExecutorShutdown(): Unit = {
+    val agent = controlAgent
+    controlAgent = None
+    agent.foreach(_.shutdown())
     val context = registeredContext
     registeredContext = None
     context.foreach {
@@ -78,6 +104,23 @@ object GlutenMppExecutorService extends Logging {
         }
     }
   }
+
+  /** Register a peer immediately after native create and before native start. */
+  def registerQuery(
+      runId: MppQueryRunId,
+      peerIndex: Int,
+      expectedPeerCount: Int,
+      taskContext: TaskContext,
+      abortNative: () => Unit): Option[ActiveMppQuery] =
+    controlAgent.map(_.register(runId, peerIndex, expectedPeerCount, taskContext, abortNative))
+
+  /** Retain the first local native failure until the driver acknowledges its event ID. */
+  def reportFailure(query: ActiveMppQuery, error: Throwable): Unit =
+    controlAgent.foreach(_.reportFailure(query, error))
+
+  /** Report task-thread cleanup separately from abort-command acceptance. */
+  def reportTerminal(query: ActiveMppQuery, state: String): Unit =
+    controlAgent.foreach(_.reportTerminal(query, state))
 
   private[control] def buildEndpointRecord(
       ctx: PluginContext): Option[MppExecutorEndpointRecord] = {

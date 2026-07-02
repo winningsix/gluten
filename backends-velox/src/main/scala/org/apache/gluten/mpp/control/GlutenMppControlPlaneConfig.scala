@@ -19,7 +19,7 @@ package org.apache.gluten.mpp.control
 import org.apache.spark.SparkConf
 
 /**
- * Spark configuration keys + defaults for the driver-side MPP control plane.
+ * Spark configuration keys and defaults for endpoint discovery and query cancellation.
  *
  * UcxEndpointProbeRDD has been removed: the driver endpoint registry is the sole endpoint-discovery
  * path when native MPP is enabled. Driver-only sessions and non-MPP runs must not initialize or
@@ -34,7 +34,7 @@ object GlutenMppControlPlaneConfig {
     "spark.gluten.mpp.controlPlane.endpointRegistry.enabled"
   val EndpointRegistryEnabledDefault: Boolean = true
 
-  // ---- Phase 1 (active) ----
+  // ---- Endpoint discovery ----
 
   /** When true, the resolver blocks until at least `requestedCount` endpoints are LIVE. */
   val AwaitMinExecutorsKey: String =
@@ -45,6 +45,31 @@ object GlutenMppControlPlaneConfig {
   val AwaitTimeoutMsKey: String =
     "spark.gluten.mpp.controlPlane.endpointRegistry.awaitTimeoutMs"
   val AwaitTimeoutMsDefault: Long = 10000L
+
+  // ---- Query cancellation ----
+
+  /** Enables executor interruption watching and driver-mediated peer abort while MPP is enabled. */
+  val QueryCancellationEnabledKey: String =
+    "spark.gluten.mpp.controlPlane.queryCancellation.enabled"
+  val QueryCancellationEnabledDefault: Boolean = true
+
+  /** Interval for scanning active Spark TaskContexts for local interruption. */
+  val InterruptPollMsKey: String =
+    "spark.gluten.mpp.controlPlane.queryCancellation.interruptPollMs"
+  val InterruptPollMsDefault: Long = 50L
+
+  /** Interval for sending active-peer state and retryable events to the driver. */
+  val HeartbeatMsKey: String =
+    "spark.gluten.mpp.controlPlane.queryCancellation.heartbeatMs"
+  val HeartbeatMsDefault: Long = 250L
+
+  /** Maximum peer heartbeat silence after a run reaches RUNNING. */
+  val PeerTimeoutMsKey: String =
+    "spark.gluten.mpp.controlPlane.queryCancellation.peerTimeoutMs"
+  val PeerTimeoutMsDefault: Long = 5000L
+
+  /** Duration for retaining terminal run tombstones against late heartbeat recreation. */
+  val TerminalRetentionMsDefault: Long = 60000L
 
   // ---- Accessors ----
 
@@ -57,4 +82,20 @@ object GlutenMppControlPlaneConfig {
 
   def awaitTimeoutMs(conf: SparkConf): Long =
     conf.getLong(AwaitTimeoutMsKey, AwaitTimeoutMsDefault)
+
+  def queryCancellationEnabled(conf: SparkConf): Boolean =
+    conf.getBoolean(MppEnabledKey, MppEnabledDefault) &&
+      conf.getBoolean(QueryCancellationEnabledKey, QueryCancellationEnabledDefault)
+
+  def interruptPollMs(conf: SparkConf): Long =
+    positive(conf.getLong(InterruptPollMsKey, InterruptPollMsDefault), InterruptPollMsDefault)
+
+  def heartbeatMs(conf: SparkConf): Long =
+    positive(conf.getLong(HeartbeatMsKey, HeartbeatMsDefault), HeartbeatMsDefault)
+
+  def peerTimeoutMs(conf: SparkConf): Long =
+    positive(conf.getLong(PeerTimeoutMsKey, PeerTimeoutMsDefault), PeerTimeoutMsDefault)
+
+  private def positive(value: Long, defaultValue: Long): Long =
+    if (value > 0L) value else defaultValue
 }
