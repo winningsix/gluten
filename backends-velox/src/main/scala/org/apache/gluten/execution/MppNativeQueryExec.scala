@@ -300,9 +300,10 @@ case class MppNativeQueryExec(
         s"and ${exchanges.size} exchanges")
 
     // Fold uncorrelated scalar subqueries into the native plan as broadcast inputs before any
-    // driver-side scalar materialization. Plan D already applies this rewrite in MppCollapseRule,
-    // but Plan C wraps a child plan before the post-rule pass can see it. Keep this configurable
-    // because singleton scalar broadcasts can be slower than Spark's materialized-literal path.
+    // driver-side scalar materialization. Plan D applies this rewrite earlier in MppCollapseRule so
+    // ColumnarCollapseTransformStages can normalize newly introduced broadcast/shuffle boundaries;
+    // Plan C can still reach this execution-time safety net. Keep this configurable because
+    // singleton scalar broadcasts can be slower than Spark's materialized-literal path.
     val childForMpp =
       if (isScalarSubqueryRewriteEnabled) {
         RewriteUncorrelatedScalarSubquery(executionChild)
@@ -3371,6 +3372,7 @@ case class MppNativeQueryExec(
     // outer MPP graph and can deadlock the 2-GPU task slots.
 
     var materializedCount = 0
+    var materializedExecSubqueryCount = 0
     plan.foreach {
       node =>
         node.expressions.foreach {
@@ -3378,6 +3380,11 @@ case class MppNativeQueryExec(
             expr.foreach {
               case sub: ExecSubqueryExpression =>
                 materializedCount += 1
+                materializedExecSubqueryCount += 1
+                logInfo(
+                  s"MppNativeQueryExec: materializing residual " +
+                    s"${sub.getClass.getSimpleName} owned by ${node.nodeName} after native " +
+                    s"scalar rewrite; subquery=${sub.plan.simpleString(50)}")
                 materializeExecSubquery(sub)
               case other =>
                 // Runtime-DPP bloom filters extend PlanExpression but NOT
@@ -3402,6 +3409,10 @@ case class MppNativeQueryExec(
       logDebug(
         "materializeScalarSubqueries: no remaining executable subquery expressions; " +
           "rewritten scalars will be supplied by native MPP exchanges")
+    } else if (materializedExecSubqueryCount > 0) {
+      logInfo(
+        s"MppNativeQueryExec: materialized $materializedExecSubqueryCount residual " +
+          "ExecSubqueryExpression node(s) after native scalar rewrite")
     }
   }
 

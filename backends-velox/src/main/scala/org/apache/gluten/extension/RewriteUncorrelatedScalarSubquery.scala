@@ -17,7 +17,7 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.backendsapi.BackendsApiManager
-import org.apache.gluten.execution.{ColumnarToColumnarExec, ColumnarToRowExecBase, FilterExecTransformer, FilterExecTransformerBase, MppNativeQueryExec, MppPreparedChildExec, ProjectExecTransformer, TransformSupport}
+import org.apache.gluten.execution.{BasicScanExecTransformer, ColumnarToColumnarExec, ColumnarToRowExecBase, FilterExecTransformer, FilterExecTransformerBase, MppNativeQueryExec, MppPreparedChildExec, ProjectExecTransformer, TransformSupport}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression, NamedExpression}
@@ -98,7 +98,8 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
       filter: FilterExecTransformerBase,
       cache: BroadcastCache): SparkPlan = {
     val subqueries = collectUncorrelatedScalarSubqueries(filter.cond)
-    val (joinedChild, replacements) = buildBroadcastStack(filter.child, subqueries, cache)
+    val scalarFreeChild = stripRewrittenScalarPushdowns(filter.child, subqueries)
+    val (joinedChild, replacements) = buildBroadcastStack(scalarFreeChild, subqueries, cache)
     if (replacements.isEmpty) return filter
     val rewrittenCondition = replaceScalarSubqueries(filter.cond, replacements)
     val newFilter = FilterExecTransformer(rewrittenCondition, joinedChild)
@@ -125,7 +126,8 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
    */
   private def rewriteFilter(filter: FilterExec, cache: BroadcastCache): SparkPlan = {
     val subqueries = collectUncorrelatedScalarSubqueries(filter.condition)
-    val (joinedChild, replacements) = buildBroadcastStack(filter.child, subqueries, cache)
+    val scalarFreeChild = stripRewrittenScalarPushdowns(filter.child, subqueries)
+    val (joinedChild, replacements) = buildBroadcastStack(scalarFreeChild, subqueries, cache)
     if (replacements.isEmpty) {
       // All subqueries were correlated / unsupported; leave the node for the fallback path.
       return filter
@@ -137,6 +139,44 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
     // absorb it into the native fragment alongside the filter and the BNLJ.
     val restoringProjectList: Seq[NamedExpression] = filter.output.map(a => a: NamedExpression)
     ProjectExecTransformer(restoringProjectList, newFilter)
+  }
+
+  /**
+   * Gluten's PushDownFilterToScan copies every FilterExecTransformer conjunct into the scan's
+   * pushDownFilters. When this rule later replaces a ScalarSubquery conjunct with a broadcast
+   * attribute, the copied scan predicate otherwise keeps the original ScalarSubquery alive. Spark
+   * then materializes that stale copy even though the rewritten filter computes the same predicate
+   * inside the main MPP graph.
+   *
+   * Remove only pushdown predicates containing a scalar that this filter is about to rewrite. The
+   * enclosing filter remains in place with the equivalent broadcast-attribute predicate, so this
+   * only gives up a redundant scan pushdown; it does not remove the query predicate.
+   */
+  private def stripRewrittenScalarPushdowns(
+      child: SparkPlan,
+      rewrittenSubqueries: Seq[ScalarSubquery]): SparkPlan = {
+    val rewrittenExprIds = rewrittenSubqueries.map(_.exprId).toSet
+    if (rewrittenExprIds.isEmpty) return child
+
+    child.transformUp {
+      case scan: BasicScanExecTransformer if scan.pushDownFilters.nonEmpty =>
+        val original = scan.pushDownFilters.get
+        val retained = original.filterNot {
+          filter =>
+            filter.exists {
+              case sq: ScalarSubquery => rewrittenExprIds.contains(sq.exprId)
+              case _ => false
+            }
+        }
+        if (retained.size == original.size) {
+          scan
+        } else {
+          logDebug(
+            s"RewriteUncorrelatedScalarSubquery: removed " +
+              s"${original.size - retained.size} stale scalar scan pushdown predicate(s)")
+          scan.withNewPushdownFilters(retained)
+        }
+    }
   }
 
   /**
