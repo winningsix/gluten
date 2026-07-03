@@ -24,7 +24,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, PlanExpression}
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ScalarSubquery, SparkPlan}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, FilterExec, ProjectExec, ScalarSubquery, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.command.DataWritingCommandExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, ShuffleExchangeLike}
@@ -343,6 +343,13 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case c2c: ColumnarToColumnarExec =>
         c2c.children.forall(isFullyNativeSupported)
 
+      // ColumnarCollapseTransformStages places this convention adapter below an
+      // InputIteratorTransformer at exchange boundaries. It is transparent to MPP fragment
+      // extraction, so validate the wrapped exchange/native subtree instead of rejecting the
+      // adapter itself. This is also the shape produced by the scalar-subquery broadcast rewrite.
+      case cia: ColumnarInputAdapter =>
+        isFullyNativeSupported(cia.child)
+
       // TakeOrderedAndProjectExecTransformer wraps a sort+limit+project over a
       // TransformSupport child; treat it as a transparent wrapper and recurse.
       case topk: TakeOrderedAndProjectExecTransformer =>
@@ -401,6 +408,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         plan.children.flatMap(findFirstUnsupportedOperator).headOption
       case _: ColumnarToColumnarExec =>
         plan.children.flatMap(findFirstUnsupportedOperator).headOption
+      case cia: ColumnarInputAdapter =>
+        findFirstUnsupportedOperator(cia.child)
       case _: TakeOrderedAndProjectExecTransformer =>
         plan.children.flatMap(findFirstUnsupportedOperator).headOption
       case f: FilterExec if containsScalarSubquery(f.condition) =>

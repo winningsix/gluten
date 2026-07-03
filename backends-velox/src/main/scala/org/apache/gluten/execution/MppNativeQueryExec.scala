@@ -699,6 +699,27 @@ case class MppNativeQueryExec(
       mutable.HashMap[Int, mutable.ArrayBuffer[FusedBroadcast]]()
     val localStreamInputs = mutable.ArrayBuffer[MppLocalStreamInput]()
 
+    // Apply the columnar/cross-cut rewrites before allocating any synthetic whole-stage IDs.
+    // Scalar-subquery broadcast builds can contain a raw TransformSupport producer below an
+    // exchange (not wrapped in WholeStageTransformer), so fragment extraction may need to add a
+    // whole-stage shell for that producer.
+    val rewrittenChild = applyCrossCutRules(plan)
+    val transformStageCounter =
+      ColumnarCollapseTransformStages.getTransformStageCounter(rewrittenChild)
+
+    def ensureWholeStageFragmentRoot(node: SparkPlan): SparkPlan = {
+      node match {
+        case wst: WholeStageTransformer => wst
+        case ts: TransformSupport if !ts.isInstanceOf[InputIteratorTransformer] =>
+          val stageId = transformStageCounter.incrementAndGet()
+          logInfo(
+            s"MppNativeQueryExec: wrapping raw ${ts.getClass.getSimpleName} exchange producer " +
+              s"in WholeStageTransformer stage $stageId")
+          WholeStageTransformer(ts)(stageId)
+        case other => other
+      }
+    }
+
     /**
      * Walk the plan tree depth-first. Returns the fragment ID of the subtree rooted at `plan`. At
      * WholeStageTransformer: creates a new fragment. At ShuffleExchangeLike: creates an exchange
@@ -863,14 +884,16 @@ case class MppNativeQueryExec(
             // (MppJniWrapper.cc), and Velox's PartitionedOutputNode partitions BEFORE
             // the strip -- misrouting Q1's partial-agg states to all 4 F1 drivers and
             // producing 4 keys * 4 drivers = 16 rows instead of 4.
-            walk(stripSyntheticHashProject(unwrapTransparent(exchange.child)))
+            walk(
+              ensureWholeStageFragmentRoot(
+                stripSyntheticHashProject(unwrapTransparent(exchange.child))))
           }
 
         case bex: BroadcastExchangeLike =>
           // Keep broadcast builds behind a native producer fragment. The old fused path
           // shared one JNI iterator across fanout drivers and is not safe for MPP.
           rejectUnsafeBroadcastFusionIfRequested("MppNativeQueryExec")
-          walk(unwrapTransparent(bex.child))
+          walk(ensureWholeStageFragmentRoot(unwrapTransparent(bex.child)))
 
         case reused: ReusedExchangeExec =>
           // Spark reuses the same Exchange JVM object here, but native MPP cannot
@@ -958,8 +981,6 @@ case class MppNativeQueryExec(
     // `child` ensures plan-shape parity (range->single sort, redundant-shuffle
     // elimination) regardless of injection ordering. Each rule is gated by its
     // own conf key, so this is a no-op when the user hasn't opted in.
-    val rewrittenChild = applyCrossCutRules(plan)
-
     walk(rewrittenChild)
 
     // Sort fragments by ID (ensures topological order: producers before consumers)
