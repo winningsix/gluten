@@ -2152,7 +2152,16 @@ case class MppNativeQueryExec(
       buildSide: BuildSide,
       streamedExchange: Exchange,
       buildExchange: Exchange): T = {
-    val inlinedStreamed = inlineBoundaryExchange(join.streamedPlan, streamedExchange)
+    val inlinedStreamed = inlineBoundaryExchange(join.streamedPlan, streamedExchange) match {
+      case Some(inlined) => inlined
+      case None =>
+        logWarning(
+          s"MppNativeQueryExec: not co-locating hash join probe side; " +
+            s"join=${join.nodeName}#${join.id} streamedExchange=${streamedExchange.id} " +
+            s"buildExchange=${buildExchange.id} could not be safely inlined; " +
+            s"keeping the exchange boundary")
+        return join
+    }
     if (!sameOutputExprIds(join.streamedPlan.output, inlinedStreamed.output)) {
       logWarning(
         s"MppNativeQueryExec: not co-locating hash join probe side; " +
@@ -2307,30 +2316,58 @@ case class MppNativeQueryExec(
     eligible
   }
 
-  private def inlineExchangeProducer(exchange: Exchange): SparkPlan = {
+  private def inlineExchangeProducer(exchange: Exchange): Option[SparkPlan] = {
     val producer = stripSyntheticHashProject(unwrapTransparent(exchange.child))
-    val inlined = producer match {
-      case wst: WholeStageTransformer => wst.child
-      case other => other
+    val inlined = stripSyntheticHashProject(
+      producer match {
+        case wst: WholeStageTransformer => wst.child
+        case other => other
+      })
+    if (!sameOutputExprIds(inlined.output, exchange.output)) {
+      logWarning(
+        s"MppNativeQueryExec: exchange ${exchange.id} producer output " +
+          s"${describeAttributes(inlined.output)} does not match exchange output " +
+          s"${describeAttributes(exchange.output)} after inlining")
+      None
+    } else {
+      Some(
+        MppPartitioningPreservingWrapper(
+          inlined,
+          exchange.output,
+          exchange.outputPartitioning,
+          exchange.outputOrdering,
+          exchange.id))
     }
-    MppPartitioningPreservingWrapper(
-      inlined,
-      exchange.output,
-      exchange.outputPartitioning,
-      exchange.outputOrdering,
-      exchange.id)
   }
 
-  private def inlineBoundaryExchange(plan: SparkPlan, exchange: Exchange): SparkPlan = {
-    plan.transformDown {
-      case iit: InputIteratorTransformer if boundaryExchange(iit).exists(_.id == exchange.id) =>
-        inlineExchangeProducer(exchange)
-      case cia: ColumnarInputAdapter if boundaryExchange(cia).exists(_.id == exchange.id) =>
-        inlineExchangeProducer(exchange)
-      case ex: ShuffleExchangeLike if ex.asInstanceOf[Exchange].id == exchange.id =>
-        inlineExchangeProducer(exchange)
-      case ex: BroadcastExchangeLike if ex.asInstanceOf[Exchange].id == exchange.id =>
-        inlineExchangeProducer(exchange)
+  private def inlineBoundaryExchange(plan: SparkPlan, exchange: Exchange): Option[SparkPlan] = {
+    inlineExchangeProducer(exchange).flatMap {
+      inlinedProducer =>
+        var replacements = 0
+        val rewritten = plan.transformDown {
+          case iit: InputIteratorTransformer
+              if boundaryExchange(iit).exists(_.id == exchange.id) =>
+            replacements += 1
+            inlinedProducer
+          case cia: ColumnarInputAdapter
+              if boundaryExchange(cia).exists(_.id == exchange.id) =>
+            replacements += 1
+            inlinedProducer
+          case ex: ShuffleExchangeLike if ex.asInstanceOf[Exchange].id == exchange.id =>
+            replacements += 1
+            inlinedProducer
+          case ex: BroadcastExchangeLike if ex.asInstanceOf[Exchange].id == exchange.id =>
+            replacements += 1
+            inlinedProducer
+        }
+        if (replacements == 1) {
+          Some(rewritten)
+        } else {
+          logWarning(
+            s"MppNativeQueryExec: expected exactly one boundary for exchange ${exchange.id} " +
+              s"while inlining, found $replacements")
+          None
+        }
     }
   }
 
