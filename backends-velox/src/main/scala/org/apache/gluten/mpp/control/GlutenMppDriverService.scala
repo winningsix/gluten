@@ -38,7 +38,7 @@ import scala.util.control.NonFatal
  * @param startSweeper
  *   Whether this service instance owns a background lease-sweeper thread.
  */
-private[control] final case class QueryControlRuntime(
+final private[control] case class QueryControlRuntime(
     registry: GlutenMppQueryControlRegistry,
     heartbeatMs: Long,
     startSweeper: Boolean)
@@ -69,27 +69,29 @@ class GlutenMppDriverService private[control] (
 
   private var sweeper: ScheduledExecutorService = _
 
-  queryControl.filter(_.startSweeper).foreach { control =>
-    sweeper = Executors.newSingleThreadScheduledExecutor(new ThreadFactory {
-      override def newThread(r: Runnable): Thread = {
-        val thread = new Thread(r, "gluten-mpp-query-control-sweeper")
-        thread.setDaemon(true)
-        thread
-      }
-    })
-    sweeper.scheduleWithFixedDelay(
-      new Runnable {
-        override def run(): Unit = {
-          try {
-            control.registry.expirePeers()
-          } catch {
-            case NonFatal(e) => logWarning("MPP query-control lease sweep failed", e)
-          }
+  queryControl.filter(_.startSweeper).foreach {
+    control =>
+      sweeper = Executors.newSingleThreadScheduledExecutor(new ThreadFactory {
+        override def newThread(r: Runnable): Thread = {
+          val thread = new Thread(r, "gluten-mpp-query-control-sweeper")
+          thread.setDaemon(true)
+          thread
         }
-      },
-      control.heartbeatMs,
-      control.heartbeatMs,
-      TimeUnit.MILLISECONDS)
+      })
+      sweeper.scheduleWithFixedDelay(
+        new Runnable {
+          override def run(): Unit = {
+            try {
+              control.registry.expirePeers()
+            } catch {
+              case NonFatal(e) => logWarning("MPP query-control lease sweep failed", e)
+            }
+          }
+        },
+        control.heartbeatMs,
+        control.heartbeatMs,
+        TimeUnit.MILLISECONDS
+      )
   }
 
   def endpointRegistry: GlutenMppEndpointRegistry = endpointRegistryRef
@@ -125,11 +127,7 @@ class GlutenMppDriverService private[control] (
     queryControl.foreach(_.registry.onExecutorRemoved(executorId, reason))
   }
 
-  def onTaskEnd(
-      taskAttemptId: Long,
-      executorId: String,
-      failed: Boolean,
-      reason: String): Unit = {
+  def onTaskEnd(taskAttemptId: Long, executorId: String, failed: Boolean, reason: String): Unit = {
     queryControl.foreach(_.registry.onTaskEnd(taskAttemptId, executorId, failed, reason))
   }
 
@@ -159,18 +157,14 @@ object GlutenMppDriverService extends Logging {
       if (queryEnabled) {
         Some(
           QueryControlRuntime(
-            new GlutenMppQueryControlRegistry(
-              GlutenMppControlPlaneConfig.peerTimeoutMs(conf)),
+            new GlutenMppQueryControlRegistry(GlutenMppControlPlaneConfig.peerTimeoutMs(conf)),
             GlutenMppControlPlaneConfig.heartbeatMs(conf),
             startSweeper = true))
       } else {
         None
       }
-    instance = Some(
-      new GlutenMppDriverService(
-        GlutenMppEndpointRegistry(),
-        endpointEnabled,
-        queryControl))
+    instance =
+      Some(new GlutenMppDriverService(GlutenMppEndpointRegistry(), endpointEnabled, queryControl))
     logInfo(
       s"GlutenMppDriverService initialized: endpointRegistry=$endpointEnabled " +
         s"queryCancellation=$queryEnabled")
@@ -213,8 +207,8 @@ object GlutenMppDriverService extends Logging {
 /**
  * Spark scheduler fallbacks for failures that may arrive before or without an executor heartbeat.
  *
- * Executor removal immediately fails affected runs. Task completion is a secondary signal for
- * peers that cannot report their own terminal event.
+ * Executor removal immediately fails affected runs. Task completion is a secondary signal for peers
+ * that cannot report their own terminal event.
  */
 class GlutenMppQueryControlListener(service: GlutenMppDriverService) extends SparkListener {
   override def onExecutorRemoved(event: SparkListenerExecutorRemoved): Unit = {

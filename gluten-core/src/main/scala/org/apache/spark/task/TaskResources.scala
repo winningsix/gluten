@@ -220,24 +220,37 @@ object TaskResources extends TaskListener with Logging {
       tc.addTaskCompletionListener(new TaskCompletionListener {
         override def onTaskCompletion(context: TaskContext): Unit = {
           val cleanupStart = System.nanoTime()
+          var cleaned = false
           RESOURCE_REGISTRIES.synchronized {
             val currentTaskRegistries =
-              RESOURCE_REGISTRIES.get(context)
+              // BarrierTaskContext delegates to the original TaskContext but
+              // has a different object identity.  The registry was created
+              // against `tc` in onTaskStart, so always use that captured
+              // context for lookup/removal when a barrier task completes.
+              RESOURCE_REGISTRIES.get(tc)
             if (currentTaskRegistries == null) {
-              throw new IllegalStateException(
-                "TaskResourceRegistry is not initialized" +
-                  ", this should not happen")
+              // BarrierTaskContext can forward completion to the underlying
+              // TaskContext after that context has already invoked this
+              // listener. Resource cleanup must be idempotent: the first
+              // callback released and removed the registry successfully.
+              logDebug(
+                s"TaskResourceRegistry already cleaned for task " +
+                  s"${context.taskAttemptId()}; ignoring duplicate completion")
+            } else {
+              currentTaskRegistries.releaseAll()
+              context
+                .taskMetrics()
+                .incPeakExecutionMemory(registry.getSharedUsage().peak())
+              RESOURCE_REGISTRIES.remove(tc)
+              cleaned = true
             }
-            currentTaskRegistries.releaseAll()
-            context
-              .taskMetrics()
-              .incPeakExecutionMemory(registry.getSharedUsage().peak())
-            RESOURCE_REGISTRIES.remove(context)
           }
-          val tracker = org.apache.gluten.metrics.TaskWallTimeTracker.get()
-          tracker.taskCleanupNanos +=
-            (System.nanoTime() - cleanupStart)
-          tracker.logAndReset(context.stageId(), context.taskAttemptId())
+          if (cleaned) {
+            val tracker = org.apache.gluten.metrics.TaskWallTimeTracker.get()
+            tracker.taskCleanupNanos +=
+              (System.nanoTime() - cleanupStart)
+            tracker.logAndReset(context.stageId(), context.taskAttemptId())
+          }
         }
       })
     }

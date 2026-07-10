@@ -231,6 +231,13 @@ class MppQueryCoordinator {
       std::vector<std::unique_ptr<facebook::velox::exec::SerializedPageBase>>&
           pages);
 
+#ifdef GLUTEN_ENABLE_GPU
+  /// Fetch one packed root output directly from the UCX device queue and
+  /// rebuild a zero-copy CudfVector. Used only by an explicitly enabled GPU
+  /// sink; regular MPP query results continue through the HTTP/Presto path.
+  facebook::velox::RowVectorPtr fetchNextDeviceOutput();
+#endif
+
   std::string queryId_;
   std::vector<MppFragmentSpec> fragmentSpecs_;
   std::vector<MppExchangeSpec> exchangeSpecs_;
@@ -279,6 +286,7 @@ class MppQueryCoordinator {
       pendingRootPages_;
   int32_t rootFetchCursor_{0};
   bool rootProducesOutput_{true};
+  bool deviceRootOutput_{false};
   /// True for RANGE (order-preserving) drain; false for round-robin.
   bool rootDrainSequential_{false};
 

@@ -24,18 +24,20 @@ import scala.collection.mutable
  * Driver-owned aggregate lifecycle for all peers in one [[MppQueryRunId]].
  *
  * This must not be confused with [[MppPeerState]], which is reported independently by each
- * executor. A run stays `Starting` until all expected peer indices join, moves to `Aborting` on the
- * first failure, and becomes `Terminal` after every known peer is terminal.
+ * executor. A run stays `Starting` until all expected peer indices join, moves to `Completing` once
+ * every peer reports output EOS, moves to `Aborting` on the first failure, and becomes `Terminal`
+ * after every known peer is terminal.
  */
 private[control] object MppQueryRunState {
   val Starting: String = "STARTING"
   val Running: String = "RUNNING"
+  val Completing: String = "COMPLETING"
   val Aborting: String = "ABORTING"
   val Terminal: String = "TERMINAL"
 }
 
 /** Immutable test/debug view of one peer binding held by the driver registry. */
-private[control] final case class MppPeerControlSnapshot(
+final private[control] case class MppPeerControlSnapshot(
     peerIndex: Int,
     taskAttemptId: Long,
     executorId: String,
@@ -43,10 +45,11 @@ private[control] final case class MppPeerControlSnapshot(
     state: String,
     lastHeartbeatMs: Long,
     acceptedAbortSequence: Long,
-    terminal: Boolean)
+    terminal: Boolean,
+    outputComplete: Boolean)
 
 /** Immutable test/debug view of one driver-owned MPP run record. */
-private[control] final case class MppQueryRunSnapshot(
+final private[control] case class MppQueryRunSnapshot(
     runId: MppQueryRunId,
     expectedPeerCount: Int,
     state: String,
@@ -63,9 +66,8 @@ private[control] final case class MppQueryRunSnapshot(
  * allocates attempt-bound abort commands for all non-terminal peers. Commands are replayed until a
  * matching peer reports the sequence as accepted.
  *
- * All mutation is serialized on this registry instance. Terminal records are retained as
- * tombstones so late heartbeats cannot recreate a completed run or deliver stale commands to a
- * retry.
+ * All mutation is serialized on this registry instance. Terminal records are retained as tombstones
+ * so late heartbeats cannot recreate a completed run or deliver stale commands to a retry.
  *
  * @param peerTimeoutMs
  *   Maximum heartbeat silence for a peer after its run starts.
@@ -80,7 +82,7 @@ class GlutenMppQueryControlRegistry(
     clock: () => Long = () => System.currentTimeMillis())
   extends Logging {
 
-  private final class PeerBinding(
+  final private class PeerBinding(
       val peerIndex: Int,
       val taskAttemptId: Long,
       val executorId: String,
@@ -88,9 +90,10 @@ class GlutenMppQueryControlRegistry(
       var state: String,
       var lastHeartbeatMs: Long,
       var acceptedAbortSequence: Long,
-      var terminal: Boolean)
+      var terminal: Boolean,
+      var outputComplete: Boolean)
 
-  private final class RunRecord(
+  final private class RunRecord(
       val runId: MppQueryRunId,
       val expectedPeerCount: Int,
       var state: String,
@@ -110,16 +113,22 @@ class GlutenMppQueryControlRegistry(
     heartbeat.failures.foreach {
       failure =>
         acknowledgedEvents += failure.eventId
-        withMatchingPeerLocked(failure.runId, failure.peerIndex, failure.taskAttemptId,
-          failure.executorId, failure.executorSessionId) {
-          run => failRunLocked(run, failure.reason, now)
-        }
+        withMatchingPeerLocked(
+          failure.runId,
+          failure.peerIndex,
+          failure.taskAttemptId,
+          failure.executorId,
+          failure.executorSessionId)(run => failRunLocked(run, failure.reason, now))
     }
     heartbeat.terminals.foreach {
       terminal =>
         acknowledgedEvents += terminal.eventId
-        withMatchingPeerLocked(terminal.runId, terminal.peerIndex, terminal.taskAttemptId,
-          terminal.executorId, terminal.executorSessionId) {
+        withMatchingPeerLocked(
+          terminal.runId,
+          terminal.peerIndex,
+          terminal.taskAttemptId,
+          terminal.executorId,
+          terminal.executorSessionId) {
           run =>
             val peer = run.peers(terminal.peerIndex)
             peer.state = terminal.terminalState
@@ -147,7 +156,33 @@ class GlutenMppQueryControlRegistry(
         }
     }.distinct
 
-    MppQueryHeartbeatAck(commands, acknowledgedEvents.distinct.toSeq, now)
+    val peerCompletions = heartbeat.peers.flatMap {
+      snapshot =>
+        runs.get(snapshot.runId).toSeq.flatMap {
+          run =>
+            run.peers
+              .get(snapshot.peerIndex)
+              .filter {
+                peer =>
+                  run.state == MppQueryRunState.Completing &&
+                  !peer.terminal &&
+                  peer.taskAttemptId == snapshot.taskAttemptId &&
+                  peer.executorId == snapshot.executorId &&
+                  peer.executorSessionId == snapshot.executorSessionId
+              }
+              .map {
+                peer =>
+                  MppPeerCompletion(
+                    run.runId,
+                    peer.peerIndex,
+                    peer.taskAttemptId,
+                    peer.executorId,
+                    peer.executorSessionId)
+              }
+        }
+    }.distinct
+
+    MppQueryHeartbeatAck(commands, acknowledgedEvents.distinct.toSeq, now, peerCompletions)
   }
 
   def onExecutorRemoved(executorId: String, reason: String): Unit = synchronized {
@@ -167,29 +202,33 @@ class GlutenMppQueryControlRegistry(
     }
   }
 
-  def onTaskEnd(
-      taskAttemptId: Long,
-      executorId: String,
-      failed: Boolean,
-      reason: String): Unit = synchronized {
-    val now = clock()
-    runs.values.foreach {
-      run =>
-        run.peers.values
-          .find(p => p.taskAttemptId == taskAttemptId && p.executorId == executorId && !p.terminal)
-          .foreach {
-            peer =>
-              if (failed) {
-                failRunLocked(run, s"Spark task $taskAttemptId failed: $reason", now)
-                peer.state = MppPeerState.Failed
-              } else {
-                peer.state = MppPeerState.Succeeded
-              }
-              peer.terminal = true
-              maybeFinishRunLocked(run, now)
-          }
+  def onTaskEnd(taskAttemptId: Long, executorId: String, failed: Boolean, reason: String): Unit =
+    synchronized {
+      val now = clock()
+      runs.values.foreach {
+        run =>
+          run.peers.values
+            .find(
+              p => p.taskAttemptId == taskAttemptId && p.executorId == executorId && !p.terminal)
+            .foreach {
+              peer =>
+                if (failed) {
+                  failRunLocked(run, s"Spark task $taskAttemptId failed: $reason", now)
+                  peer.state = MppPeerState.Failed
+                } else {
+                  if (run.expectedPeerCount > 1 && !peer.outputComplete) {
+                    failRunLocked(
+                      run,
+                      s"Spark task $taskAttemptId completed before output EOS",
+                      now)
+                  }
+                  peer.state = MppPeerState.Succeeded
+                }
+                peer.terminal = true
+                maybeFinishRunLocked(run, now)
+            }
+      }
     }
-  }
 
   /** Invoked by the service sweeper and exposed for deterministic tests. */
   def expirePeers(): Unit = synchronized {
@@ -213,15 +252,18 @@ class GlutenMppQueryControlRegistry(
                 peer.state,
                 peer.lastHeartbeatMs,
                 peer.acceptedAbortSequence,
-                peer.terminal)
+                peer.terminal,
+                peer.outputComplete
+              )
           },
           run.firstFailure,
           run.abortSequence,
-          run.terminalAtMs)
+          run.terminalAtMs
+        )
     }
   }
 
-  private[control] def size: Int = synchronized { runs.size }
+  private[control] def size: Int = synchronized(runs.size)
 
   private def registerPeerLocked(
       snapshot: MppPeerSnapshot,
@@ -274,6 +316,7 @@ class GlutenMppQueryControlRegistry(
         peer.lastHeartbeatMs = now
         peer.acceptedAbortSequence =
           math.max(peer.acceptedAbortSequence, snapshot.acceptedAbortSequence)
+        peer.outputComplete = peer.outputComplete || snapshot.state == MppPeerState.OutputComplete
         peer.terminal = MppPeerState.isTerminal(snapshot.state)
       case Some(peer) =>
         failRunLocked(
@@ -281,7 +324,8 @@ class GlutenMppQueryControlRegistry(
           s"Duplicate attempt for peer ${snapshot.peerIndex}: existing task=" +
             s"${peer.taskAttemptId}@${peer.executorId}/${peer.executorSessionId}, new task=" +
             s"${snapshot.taskAttemptId}@${snapshot.executorId}/${snapshot.executorSessionId}",
-          now)
+          now
+        )
         addAbortCommandLocked(
           run,
           snapshot.peerIndex,
@@ -300,7 +344,24 @@ class GlutenMppQueryControlRegistry(
             snapshot.state,
             now,
             snapshot.acceptedAbortSequence,
-            MppPeerState.isTerminal(snapshot.state)))
+            MppPeerState.isTerminal(snapshot.state),
+            snapshot.state == MppPeerState.OutputComplete
+          )
+        )
+    }
+
+    val peer = run.peers(snapshot.peerIndex)
+    if (
+      run.expectedPeerCount > 1 && peer.terminal &&
+      (!peer.outputComplete || peer.state != MppPeerState.Succeeded)
+    ) {
+      val reason =
+        if (!peer.outputComplete) {
+          s"Peer ${peer.peerIndex} terminated before output EOS"
+        } else {
+          s"Peer ${peer.peerIndex} terminated with state ${peer.state}"
+        }
+      failRunLocked(run, reason, now)
     }
 
     if (
@@ -310,6 +371,7 @@ class GlutenMppQueryControlRegistry(
       run.state = MppQueryRunState.Running
       logInfo(s"MPP query run ${run.runId.logId} entered RUNNING")
     }
+    maybeAuthorizeCompletionLocked(run)
     if (run.state == MppQueryRunState.Aborting) {
       ensureAbortCommandsLocked(run, now)
     }
@@ -324,12 +386,15 @@ class GlutenMppQueryControlRegistry(
       executorSessionId: String)(f: RunRecord => Unit): Unit = {
     runs.get(runId).foreach {
       run =>
-        run.peers.get(peerIndex).filter {
-          peer =>
-            peer.taskAttemptId == taskAttemptId &&
-            peer.executorId == executorId &&
-            peer.executorSessionId == executorSessionId
-        }.foreach(_ => f(run))
+        run.peers
+          .get(peerIndex)
+          .filter {
+            peer =>
+              peer.taskAttemptId == taskAttemptId &&
+              peer.executorId == executorId &&
+              peer.executorSessionId == executorSessionId
+          }
+          .foreach(_ => f(run))
     }
   }
 
@@ -365,13 +430,15 @@ class GlutenMppQueryControlRegistry(
       executorId: String,
       executorSessionId: String,
       now: Long): Unit = {
-    if (!run.commands.exists {
+    if (
+      !run.commands.exists {
         command =>
           command.peerIndex == peerIndex &&
           command.taskAttemptId == taskAttemptId &&
           command.executorId == executorId &&
           command.executorSessionId == executorSessionId
-      }) {
+      }
+    ) {
       run.abortSequence += 1L
       run.commands += MppAbortQuery(
         run.runId,
@@ -388,7 +455,11 @@ class GlutenMppQueryControlRegistry(
   private def expirePeersLocked(now: Long): Unit = {
     runs.values.toSeq.foreach {
       run =>
-        if (run.state == MppQueryRunState.Running || run.state == MppQueryRunState.Aborting) {
+        if (
+          run.state == MppQueryRunState.Running ||
+          run.state == MppQueryRunState.Completing ||
+          run.state == MppQueryRunState.Aborting
+        ) {
           val expired = run.peers.values.filter {
             peer => !peer.terminal && now - peer.lastHeartbeatMs >= peerTimeoutMs
           }.toSeq
@@ -408,6 +479,17 @@ class GlutenMppQueryControlRegistry(
     runs.retain {
       case (_, run) =>
         run.terminalAtMs.forall(terminalAt => now - terminalAt < terminalRetentionMs)
+    }
+  }
+
+  private def maybeAuthorizeCompletionLocked(run: RunRecord): Unit = {
+    if (
+      run.state == MppQueryRunState.Running &&
+      run.peers.size == run.expectedPeerCount &&
+      run.peers.values.forall(peer => peer.outputComplete && !peer.terminal)
+    ) {
+      run.state = MppQueryRunState.Completing
+      logInfo(s"MPP query run ${run.runId.logId} authorized all peers to close")
     }
   }
 

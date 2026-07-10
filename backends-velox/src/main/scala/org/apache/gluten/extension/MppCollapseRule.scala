@@ -19,14 +19,17 @@ package org.apache.gluten.extension
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution._
 import org.apache.gluten.extension.columnar.UnionTransformerRule
+import org.apache.gluten.extension.columnar.rewrite.PullOutPreProject
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, PlanExpression}
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.execution.{ColumnarInputAdapter, FilterExec, ProjectExec, ScalarSubquery, SparkPlan}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, CommandResultExec, FilterExec, ProjectExec, ScalarSubquery, SortExec, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
-import org.apache.spark.sql.execution.command.DataWritingCommandExec
+import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
+import org.apache.spark.sql.execution.command.{DataWritingCommandExec, ExecutedCommandExec}
+import org.apache.spark.sql.execution.datasources.v2.{V2CommandExec, V2TableWriteExec}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, ShuffleExchangeLike}
 import org.apache.spark.sql.internal.SQLConf
 
@@ -158,11 +161,14 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // would interfere with subqueries and cause "cannot transform shuffle node".
     val strategyEnabled =
       SQLConf.get.getConfString("spark.gluten.mpp.strategy.enabled", "false").toBoolean
-    if (strategyEnabled && !plan.isInstanceOf[DataWritingCommandExec]) {
+    if (
+      strategyEnabled &&
+      !plan.isInstanceOf[DataWritingCommandExec] &&
+      !plan.isInstanceOf[V2TableWriteExec]
+    ) {
       // Plan C (MppStrategy) handles non-write queries at the strategy level. But it
-      // SKIPS write commands (InsertIntoHadoopFsRelationCommand / Command), so for a
-      // write we let Plan D collapse the write's child into MPP (DataWritingCommandExec
-      // case below) instead of letting the whole write subtree fall back to BSP.
+      // skips write commands, so Plan D must collapse the child of both V1 and V2
+      // writes instead of letting the write subtree fall back to BSP.
       return plan
     }
     // Plan C check: if MppStrategy already claimed this plan
@@ -185,6 +191,27 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         plan
       }
     preRewritten match {
+      case v2: V2TableWriteExec if !alreadyHandledByMppStrategy(v2.query) =>
+        // DataSource V2 owns the external transaction/commit protocol (Iceberg in
+        // particular), so the command node itself is deliberately not a native
+        // operator.  That must not force its whole query back to Spark BSP.  Keep
+        // the V2 writer as the thin commit boundary and collapse its query child;
+        // all scans, relational operators, and exchanges still execute in one MPP
+        // query and feed the V2 writer through the normal columnar transition.
+        tryCollapseMpp(v2.query) match {
+          case Some(mppQuery) =>
+            logWarning(
+              s"MppCollapseRule: *** MPP MODE ACTIVE UNDER V2 WRITE *** " +
+                s"writer=${v2.getClass.getSimpleName}")
+            v2.withNewChildren(Seq(mppQuery))
+          case None =>
+            val reason =
+              s"MppCollapseRule: FALLBACK TO BSP under V2 write " +
+                s"${v2.getClass.getSimpleName}"
+            logWarning(reason)
+            if (failOnFallback) throw new IllegalStateException(reason)
+            plan
+        }
       case dwce: DataWritingCommandExec =>
         // Collapse the whole WriteFilesExecTransformer subtree (write + query) INTO MPP: the
         // write becomes the final fragment root, and each pinned peer's native task runs the
@@ -209,12 +236,33 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         if (collapsedWrite) {
           rewrittenWrite
         } else {
-          logWarning("MppCollapseRule: FALLBACK TO BSP (inside DataWritingCommandExec)")
+          val reason = "MppCollapseRule: FALLBACK TO BSP (inside DataWritingCommandExec)"
+          logWarning(reason)
+          if (failOnFallback) throw new IllegalStateException(reason)
           plan
         }
+      case _: ExecutedCommandExec =>
+        // CREATE OR REPLACE TEMP VIEW and similar command wrappers only mutate
+        // driver-side catalog/session metadata; they do not execute their logical
+        // query child.  Strict MPP fallback applies to data execution, not to this
+        // zero-row command boundary.  The first action against the registered view
+        // is planned independently and must still collapse to MPP.
+        preRewritten
+      case _: CommandResultExec =>
+        // Spark replaces an eagerly executed command with CommandResultExec. Its
+        // commandPhysicalPlan is not exposed through children, so a second plan
+        // inspection cannot discover the MPP query that already ran. No data
+        // execution remains at this boundary.
+        preRewritten
+      case _: V2CommandExec =>
+        // Namespace/property/catalog commands are metadata-only. V2 data writes
+        // were handled above by the more specific V2TableWriteExec case.
+        preRewritten
       case _ =>
         tryCollapseMpp(preRewritten).getOrElse {
-          logWarning("MppCollapseRule: FALLBACK TO BSP")
+          val reason = "MppCollapseRule: FALLBACK TO BSP"
+          logWarning(reason)
+          if (failOnFallback) throw new IllegalStateException(reason)
           plan
         }
     }
@@ -232,6 +280,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     SQLConf.get.getConfString(MPP_ENABLED_KEY, MPP_ENABLED_DEFAULT).toBoolean
   }
 
+  private def failOnFallback: Boolean = {
+    SQLConf.get.getConfString("spark.gluten.mpp.failOnFallback", "false").toBoolean
+  }
+
   /**
    * Attempt to collapse the entire plan into a single MppNativeQueryExec.
    *
@@ -239,7 +291,38 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    * non-TransformSupport operators that are not exchanges).
    */
   private def tryCollapseMpp(plan: SparkPlan): Option[MppNativeQueryExec] = {
-    val unionRewritten = rewriteMppNativeUnion(plan)
+    // Spark's DataFrame.coalesce(N>1) is only a narrow RDD/file-count hint; it
+    // neither changes rows nor establishes a semantic distribution.  Keeping
+    // ColumnarCoalesceExec would create a Spark scheduling island inside an
+    // otherwise native query when applications request more output files than physical peers.
+    // MPP owns peer parallelism and the Iceberg-required exchange immediately
+    // above this node still enforces the actual write partitioning.
+    val coalesceElided = plan.transformUp {
+      case coalesce: ColumnarCoalesceExec if coalesce.numPartitions > 1 =>
+        logInfo(
+          s"MppCollapseRule: eliding non-semantic ColumnarCoalesceExec(" +
+            s"${coalesce.numPartitions}) inside MPP query")
+        coalesce.child
+    }
+    // RAS may leave a vanilla Spark aggregate behind when its generic
+    // profitability/validation pass declines a very wide aggregate. MPP has a
+    // stricter end-to-end contract and validates the generated native/cuDF plan
+    // later, so materialize the native aggregate transformer here instead of
+    // accepting a row/BSP island.
+    val aggregateRewritten = coalesceElided.transformUp {
+      case agg: BaseAggregateExec if !agg.isInstanceOf[HashAggregateExecBaseTransformer] =>
+        HashAggregateExecBaseTransformer.from(agg)
+    }
+    val sortProjected = aggregateRewritten.transformUp {
+      case sort: SortExec if !sort.global => PullOutPreProject.rewrite(sort)
+    }
+    val lateOffloaded = sortProjected.transformUp {
+      case project: ProjectExec => ProjectExecTransformer(project.projectList, project.child)
+      case filter: FilterExec => FilterExecTransformer(filter.condition, filter.child)
+      case sort: SortExec if !sort.global =>
+        SortExecTransformer(sort.sortOrder, global = false, sort.child, sort.testSpillFrequency)
+    }
+    val unionRewritten = rewriteMppNativeUnion(lateOffloaded)
     if (!isFullyNativeSupported(unionRewritten)) {
       val reason = findFirstUnsupportedOperator(unionRewritten).getOrElse("unknown")
       logWarning(
@@ -339,6 +422,13 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case c2r: ColumnarToRowExecBase =>
         c2r.children.forall(isFullyNativeSupported)
 
+      // Spark/Gluten inserts RowToVeloxColumnar below a ColumnarExchange and
+      // VeloxColumnarToRow above it to satisfy convention requirements. MPP
+      // absorbs that exchange, so the conversion pair is transparent. Recurse
+      // to ensure an actual row-only child is still rejected.
+      case r2c: RowToColumnarExecBase =>
+        r2c.children.forall(isFullyNativeSupported)
+
       // Gluten-internal columnar-to-columnar nodes (batch resize, etc.) - look through
       case c2c: ColumnarToColumnarExec =>
         c2c.children.forall(isFullyNativeSupported)
@@ -405,6 +495,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case _: TransformSupport =>
         plan.children.flatMap(findFirstUnsupportedOperator).headOption
       case _: ColumnarToRowExecBase =>
+        plan.children.flatMap(findFirstUnsupportedOperator).headOption
+      case _: RowToColumnarExecBase =>
         plan.children.flatMap(findFirstUnsupportedOperator).headOption
       case _: ColumnarToColumnarExec =>
         plan.children.flatMap(findFirstUnsupportedOperator).headOption
@@ -511,6 +603,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         case _: ShuffleQueryStageExec | _: BroadcastQueryStageExec => true
         case c2c: ColumnarToColumnarExec => isExchangeBoundary(c2c.child)
         case c2r: ColumnarToRowExecBase => isExchangeBoundary(c2r.child)
+        case r2c: RowToColumnarExecBase => isExchangeBoundary(r2c.child)
         case _ => false
       }
     }
@@ -523,6 +616,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       node match {
         case c2c: ColumnarToColumnarExec => unwrapToExchange(c2c.child)
         case c2r: ColumnarToRowExecBase => unwrapToExchange(c2r.child)
+        case r2c: RowToColumnarExecBase => unwrapToExchange(r2c.child)
         case stage: ShuffleQueryStageExec => unwrapToExchange(stage.plan)
         case stage: BroadcastQueryStageExec => unwrapToExchange(stage.plan)
         case other => other
@@ -542,7 +636,13 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     def stripSyntheticHashProject(node: SparkPlan): SparkPlan = node match {
       case p: org.apache.gluten.execution.ProjectExecTransformer
           if p.projectList.nonEmpty && p.projectList.head.name == "hash_partition_key" =>
-        p.child
+        // Preserve the meaningful projection expressions and remove only the
+        // synthetic prefix inserted for Spark's shuffle implementation.
+        p.copy(projectList = p.projectList.tail)
+      case wst: WholeStageTransformer =>
+        val strippedChild = stripSyntheticHashProject(wst.child)
+        if (strippedChild eq wst.child) wst
+        else wst.withNewChildren(Seq(strippedChild))
       case other => other
     }
 
@@ -648,6 +748,9 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         // Look through transparent wrapper nodes to reach the actual operator
         case c2r: ColumnarToRowExecBase =>
           walk(c2r.child)
+
+        case r2c: RowToColumnarExecBase =>
+          walk(r2c.child)
 
         case c2c: ColumnarToColumnarExec =>
           walk(c2c.child)

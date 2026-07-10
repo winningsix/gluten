@@ -64,9 +64,11 @@ trait ColumnarV2TableWriteExec extends V2TableWriteExec with ValidatablePlan {
 
   private def writingTaskBatch: WritingColumnarBatchSparkTask[_] = DataWritingColumnarBatchSparkTask
 
+  protected def executeColumnarForWrite(): RDD[ColumnarBatch] = query.executeColumnar()
+
   private def writeColumnarBatchWithV2(batchWrite: BatchWrite): Unit = {
     val rdd: RDD[ColumnarBatch] = {
-      val tempRdd = query.executeColumnar()
+      val tempRdd = executeColumnarForWrite()
       // SPARK-23271 If we are attempting to write a zero partition rdd, create a dummy single
       // partition rdd to make sure we at least set up one write task to write the metadata.
       if (tempRdd.partitions.length == 0) {

@@ -585,15 +585,15 @@ object VeloxBackendSettings extends BackendSettingsApi {
 
   override def enableEnhancedFeatures(): Boolean = VeloxConfig.get.enableEnhancedFeatures()
 
-  override def supportAppendDataExec(): Boolean = enableEnhancedFeatures()
+  override def supportAppendDataExec(): Boolean = true
 
-  override def supportReplaceDataExec(): Boolean = enableEnhancedFeatures()
+  override def supportReplaceDataExec(): Boolean = true
 
-  override def supportOverwriteByExpression(): Boolean = enableEnhancedFeatures()
+  override def supportOverwriteByExpression(): Boolean = true
 
-  override def supportOverwritePartitionsDynamic(): Boolean = enableEnhancedFeatures()
+  override def supportOverwritePartitionsDynamic(): Boolean = true
 
-  override def supportWriteToDataSourceV2(): Boolean = enableEnhancedFeatures()
+  override def supportWriteToDataSourceV2(): Boolean = true
 
   /** Velox does not support columnar shuffle with empty schema. */
   override def supportEmptySchemaColumnarShuffle(): Boolean = false

@@ -1020,16 +1020,11 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
       SubstraitParser::configSetInOptimization(generateRel.advanced_extension(), "injectedProject=");
 
   if (injectedProject) {
-    // Child should be either ProjectNode or CudfValueStreamNode (GPU) in case of project fallback.
-    VELOX_CHECK(
-        (std::dynamic_pointer_cast<const core::ProjectNode>(childNode) != nullptr ||
-        std::dynamic_pointer_cast<const core::TableScanNode>(childNode) != nullptr
-#ifdef GLUTEN_ENABLE_GPU
-            || std::dynamic_pointer_cast<const CudfValueStreamNode>(childNode) != nullptr
-#endif
-        ) && childNode->outputType()->size() > requiredChildOutput.size(),
-        "injectedProject is true, but the ProjectNode or TableScanNode or CudfValueStreamNode (in case of projection fallback)"
-        " is missing or does not have the corresponding projection field");
+    // Optimizer rules may either retain the injected helper in child_output or
+    // place other nodes between it and GenerateRel, so output-count arithmetic
+    // cannot reliably identify the helper.  Resolve the generator argument
+    // itself below and inject a Velox ProjectNode when it is not already a
+    // field reference; the ARRAY/MAP validation remains authoritative.
 
     bool isStack = generateRel.has_advanced_extension() &&
         SubstraitParser::configSetInOptimization(generateRel.advanced_extension(), "isStack=");
@@ -1269,6 +1264,20 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
     }
   }
 
+  // Spark normally places a Sort immediately below Window.  Velox Window can
+  // consume unsorted input and owns the partition/order semantics itself.  In
+  // particular, the cuDF implementation uses this form to hash-spill complete
+  // partitions before sorting each spill bucket.  Keeping the standalone
+  // OrderBy here would first materialize the whole relation on the device and
+  // defeat the bounded-memory Window implementation.
+  bool inputsSorted = true;
+  if (auto orderBy =
+          std::dynamic_pointer_cast<const core::OrderByNode>(childNode)) {
+    VELOX_CHECK_EQ(orderBy->sources().size(), 1);
+    childNode = orderBy->sources().front();
+    inputsSorted = false;
+  }
+
   return std::make_shared<core::WindowNode>(
       nextPlanNodeId(),
       partitionKeys,
@@ -1276,7 +1285,7 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
       sortingOrders,
       windowColumnNames,
       windowNodeFunctions,
-      true /*inputsSorted*/,
+      inputsSorted,
       childNode);
 }
 

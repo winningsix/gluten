@@ -28,6 +28,7 @@ import org.apache.gluten.extension.columnar.transition.{Convention, ConventionRe
 import org.apache.gluten.metrics.MetricsUpdater
 import org.apache.gluten.mpp.control.{GlutenMppPeerResolution, GlutenMppPeerResolver}
 import org.apache.gluten.runtime.Runtimes
+import org.apache.gluten.sql.shims.SparkShimLoader
 import org.apache.gluten.substrait.SubstraitContext
 import org.apache.gluten.substrait.plan.PlanBuilder
 import org.apache.gluten.substrait.rel.{LocalFilesNode, SplitInfo}
@@ -39,14 +40,14 @@ import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression, NamedExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeSet, DenseRank, Expression, Literal, NamedExpression, Rank, RowNumber, WindowExpression}
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Complete, Final, Partial}
-import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide, JoinSelectionHelper}
+import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
 import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ExecSubqueryExpression, FilterExec, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
+import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ColumnarShuffleExchangeExec, ExecSubqueryExpression, FilterExec, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeExec, ShuffleExchangeLike}
@@ -293,7 +294,13 @@ case class MppNativeQueryExec(
 
   // supportsColumnar is already true via GlutenPlan
 
-  override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {
+  override protected def doExecuteColumnar(): RDD[ColumnarBatch] =
+    executeColumnarInternal(keepDeviceOutput = false)
+
+  private[execution] def executeColumnarForGpuSink(): RDD[ColumnarBatch] =
+    executeColumnarInternal(keepDeviceOutput = true)
+
+  private def executeColumnarInternal(keepDeviceOutput: Boolean): RDD[ColumnarBatch] = {
     val executionChild = preparedChildPlan
     logDebug(
       s"MppNativeQueryExec: executing with ${fragments.size} fragments " +
@@ -336,6 +343,7 @@ case class MppNativeQueryExec(
           Right(extractFragmentsFromChildPlan(childForMpp))
         } catch {
           case NonFatal(e) =>
+            logWarning("MppNativeQueryExec: MPP fragment extraction failed", e)
             Left(
               s"MppNativeQueryExec: delegating to BSP because MPP fragment extraction failed: " +
                 exceptionSummary(e))
@@ -479,7 +487,7 @@ case class MppNativeQueryExec(
         fragmentSplitInfos,
         fusedBroadcastsByConsumer)
 
-      return new MppNativeQueryRDD(
+      val mppRdd = new MppNativeQueryRDD(
         sparkContext,
         fragmentPlans,
         numDriversPerFragment,
@@ -493,10 +501,12 @@ case class MppNativeQueryExec(
         new ColumnarInputRDDsWrapper(alignedLocalStreamInputs.map(_.rdd)),
         sparkPartitionCount,
         broadcastProducerFragmentIds,
+        keepDeviceOutput,
         longMetric("totalQueryTimeMs"),
         longMetric("outputRows"),
         longMetric("outputBatches")
       )
+      return mppRdd
     }
 
     nativeMppFallbackReason(fragments, exchanges).foreach {
@@ -532,18 +542,14 @@ case class MppNativeQueryExec(
 
     logDebug(s"MppNativeQueryExec: generated ${fragmentPlans.length} Substrait plans on driver")
 
-    validateMppStreamInputs(
-      fragmentPlans.toSeq,
-      fragments,
-      exchanges,
-      Map.empty,
-      Seq.empty).foreach {
-      reason =>
-        return delegateToBsp(
-          executionChild,
-          "MppNativeQueryExec: delegating to BSP because pre-extracted MPP plan is unsafe: " +
-            reason)
-    }
+    validateMppStreamInputs(fragmentPlans.toSeq, fragments, exchanges, Map.empty, Seq.empty)
+      .foreach {
+        reason =>
+          return delegateToBsp(
+            executionChild,
+            "MppNativeQueryExec: delegating to BSP because pre-extracted MPP plan is unsafe: " +
+              reason)
+      }
 
     val requestedSparkPartitionCount = mppSparkPartitionCount
     val sparkPartitionCount =
@@ -582,7 +588,7 @@ case class MppNativeQueryExec(
     // RDD only receives serialized bytes - no SparkPlan references.
     // Pre-built fragments path doesn't fuse broadcasts (legacy MppCollapseRule
     // path materializes them as separate fragments via BROADCAST exchange).
-    new MppNativeQueryRDD(
+    val mppRdd = new MppNativeQueryRDD(
       sparkContext,
       fragmentPlans,
       numDriversPerFragment,
@@ -596,10 +602,12 @@ case class MppNativeQueryExec(
       new ColumnarInputRDDsWrapper(Seq.empty),
       sparkPartitionCount,
       broadcastProducerFragmentIds,
+      keepDeviceOutput,
       longMetric("totalQueryTimeMs"),
       longMetric("outputRows"),
       longMetric("outputBatches")
     )
+    mppRdd
   }
 
   // --- Explain / toString ---
@@ -624,6 +632,9 @@ case class MppNativeQueryExec(
 
   private def delegateToBsp(plan: SparkPlan, reason: String): RDD[ColumnarBatch] = {
     logWarning(reason)
+    if (SQLConf.get.getConfString("spark.gluten.mpp.failOnFallback", "false").toBoolean) {
+      throw new IllegalStateException(reason)
+    }
     val bspPlan = prepareColumnarBspFallbackPlan(plan)
     bspPlan.executeColumnar()
   }
@@ -730,11 +741,26 @@ case class MppNativeQueryExec(
     def walk(plan: SparkPlan): Int = {
       plan match {
         case wst: WholeStageTransformer =>
+          // Velox's shuffle preparation can leave its private hash prefix on the terminal WST
+          // even though there is no downstream Spark exchange to consume it.  Strip it only when
+          // the remaining schema is exactly the MPP query output; producer-side hash projects are
+          // handled separately at exchange boundaries below.
+          val fragmentWst =
+            if (
+              wst.output.headOption.exists(_.name == "hash_partition_key") &&
+              sameOutputSchema(wst.output.drop(1), output)
+            ) {
+              wst
+                .withNewChildren(Seq(stripSyntheticHashProject(wst.child)))
+                .asInstanceOf[WholeStageTransformer]
+            } else {
+              wst
+            }
           // This WholeStageTransformer is a fragment. First, walk its children
           // to discover any exchange boundaries below it. The WST's doTransform()
           // stops at InputIteratorTransformer boundaries, which is exactly what
           // we want: each fragment's Substrait covers operators between exchanges.
-          val exchangeChildren = findExchangeChildren(wst)
+          val exchangeChildren = findExchangeChildren(fragmentWst)
           val childExchangeFragIds = exchangeChildren.map(walk)
 
           val fragId = fragmentCounter.getAndIncrement()
@@ -744,17 +770,17 @@ case class MppNativeQueryExec(
           // second hits LocalWriteFile "File exists" (Spark's per-task write model is inherently
           // single-writer; local/BSP write never has >1 writer per attempt dir).
           val parallelism =
-            if (wst.find(_.isInstanceOf[WriteFilesExecTransformer]).isDefined) {
+            if (fragmentWst.find(_.isInstanceOf[WriteFilesExecTransformer]).isDefined) {
               logInfo(
                 s"MppNativeQueryExec: write fragment $fragId -> parallelism=1 (1 writer/task)")
               1
             } else {
-              inferParallelism(wst)
+              inferParallelism(fragmentWst)
             }
           extractedFragments += NativeFragment(
             id = fragId,
-            rootOperator = wst,
-            outputAttributes = wst.output,
+            rootOperator = fragmentWst,
+            outputAttributes = fragmentWst.output,
             parallelism = parallelism
           )
 
@@ -951,6 +977,22 @@ case class MppNativeQueryExec(
           )
           topkFragId
 
+        case project: ProjectExec if project.child.isInstanceOf[WholeStageTransformer] =>
+          // V2 writers can add a final schema-alignment project after Gluten's
+          // columnar collapse (for example, Iceberg static partition columns or
+          // missing nullable target fields).  Treating an unknown unary node as
+          // transparent below silently drops those expressions and makes the
+          // native root schema shorter than the writer schema.  Fold the project
+          // into the existing native stage so the alignment remains fully native.
+          val childWst = project.child.asInstanceOf[WholeStageTransformer]
+          val mergedProject = ProjectExecTransformer(project.projectList, childWst.child)
+          walk(WholeStageTransformer(mergedProject, childWst.materializeInput)(childWst.stageId))
+
+        case project: ProjectExecTransformer if project.child.isInstanceOf[WholeStageTransformer] =>
+          val childWst = project.child.asInstanceOf[WholeStageTransformer]
+          val mergedProject = project.copy(child = childWst.child)
+          walk(WholeStageTransformer(mergedProject, childWst.materializeInput)(childWst.stageId))
+
         case c2r: ColumnarToRowExecBase =>
           walk(c2r.child)
 
@@ -1042,7 +1084,9 @@ case class MppNativeQueryExec(
     val afterFinalAggSplit = splitFinalAggBeforeJoinHub(afterFinalAggTopNPartial)
     val afterExistenceSplit = splitExistenceFinalBeforeJoinHub(afterFinalAggSplit)
     val afterNativeLocalSorts = offloadLocalSorts(afterExistenceSplit)
-    val afterNativeHashJoins = offloadLocalHashJoins(afterNativeLocalSorts)
+    val afterRedundantRankWindow =
+      eliminateRankWindowAfterFinalGroupLimit(afterNativeLocalSorts)
+    val afterNativeHashJoins = offloadLocalHashJoins(afterRedundantRankWindow)
     val afterSmjHashJoinRewrite = rewriteMppSortMergeJoinToHashJoin(afterNativeHashJoins)
     val afterBuildSideNormalization = normalizeMppJoinBuildSide(afterSmjHashJoinRewrite)
     val afterBroadcastPushdown =
@@ -1055,9 +1099,10 @@ case class MppNativeQueryExec(
     // partial-aggregate flushing behavior as the regular Velox path.
     val afterFlushableAgg =
       FlushableHashAggregateRule(org.apache.spark.sql.SparkSession.active)(afterBroadcastJoin)
+    val afterWriteRootSplit = splitWriteRoot(afterFlushableAgg)
     val collapsed =
       normalizeInputIteratorTransformers(
-        ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(afterFlushableAgg))
+        ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(afterWriteRootSplit))
 
     // Some outer Spark ProjectExec/FilterExec nodes only become native-rewritable after the child
     // subtree has been collapsed into WholeStageTransformer. Run the post-project rewrite once
@@ -1068,12 +1113,125 @@ case class MppNativeQueryExec(
       ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(afterLateNativePostProject))
   }
 
+  /**
+   * Put a native hash-exchange boundary immediately below a native writer.
+   *
+   * A write fragment is deliberately limited to one driver per Spark peer because multiple
+   * TableWrite drivers share Spark's task-attempt output directory. If a wide, high-cardinality
+   * final aggregate is fused into that fragment, the same one-driver restriction also forces the
+   * whole aggregate state onto one GPU. Wide, high-cardinality final aggregates can exhaust a GPU
+   * even when the input scan and partial aggregate are bounded.
+   *
+   * This optional split leaves TableWrite single-driver, but moves its child pipeline into a
+   * producer fragment. Combined with more local HASH destinations/drivers, each final aggregate
+   * replica owns a smaller disjoint key range. The writer only drains their already-final rows, so
+   * no extra aggregation or CPU fallback is introduced.
+   */
+  private def splitWriteRoot(plan: SparkPlan): SparkPlan = {
+    if (!booleanConf("spark.gluten.mpp.splitWriteRoot.enabled", defaultValue = false)) {
+      return plan
+    }
+    val partitions = positiveIntConf("spark.gluten.mpp.splitWriteRoot.partitions")
+      .getOrElse(math.max(1, mppSparkPartitionCount * 2))
+    val maxHashColumns = positiveIntConf("spark.gluten.mpp.splitWriteRoot.maxHashColumns")
+      .getOrElse(8)
+    var splitCount = 0
+    val rewritten = plan.transformUp {
+      case write: WriteFilesExecTransformer
+          if !write.child.isInstanceOf[ShuffleExchangeLike] && write.child.output.nonEmpty =>
+        val hashColumns = write.child.output.take(maxHashColumns)
+        val exchange = ColumnarShuffleExchangeExec(
+          HashPartitioning(hashColumns, partitions),
+          write.child,
+          org.apache.spark.sql.execution.exchange.ENSURE_REQUIREMENTS,
+          write.child.output,
+          None)
+        splitCount += 1
+        write.copy(child = exchange)
+    }
+    if (splitCount > 0) {
+      logInfo(
+        s"MppNativeQueryExec: split $splitCount native write root(s) with $partitions HASH " +
+          s"destinations and up to $maxHashColumns distribution columns")
+    }
+    rewritten
+  }
+
   private def rewriteNativePostProjects(plan: SparkPlan): SparkPlan = {
     plan.transformUp {
       case filter: FilterExec if filter.child.isInstanceOf[TransformSupport] =>
         FilterExecTransformer(filter.condition, filter.child)
       case project: ProjectExec if project.child.isInstanceOf[TransformSupport] =>
         ProjectExecTransformer(project.projectList, project.child)
+    }
+  }
+
+  /**
+   * Spark keeps WindowGroupLimit(Final, limit=1) as a pruning operator below the original
+   * Window(row_number/rank/dense_rank) and Filter(rank=1). After the final group limit every
+   * remaining row is already in the first peer group, so the required local Sort and Window are
+   * redundant: the rank column is exactly one. Keeping the Sort defeats the bounded cuDF
+   * TopNRowNumber implementation by buffering every emitted spill bucket again.
+   *
+   * Preserve the rank attribute's ExprId so the existing Filter and upper Project remain valid;
+   * later native project/filter folding removes the now-constant predicate.
+   */
+  private def eliminateRankWindowAfterFinalGroupLimit(plan: SparkPlan): SparkPlan = {
+    def findFinalLimitOneGroupLimit(child: SparkPlan): Option[WindowGroupLimitExecTransformer] = {
+      child match {
+        case groupLimit: WindowGroupLimitExecTransformer
+            if groupLimit.limit == 1 &&
+              groupLimit.mode == org.apache.spark.sql.execution.window.GlutenFinal =>
+          Some(groupLimit)
+        // PullOutPreProject materializes non-trivial partition/order expressions
+        // between Sort and WindowGroupLimit.  The project must remain in the
+        // output path, but it must not hide the bounded ranking operator from
+        // this rewrite.
+        case project: ProjectExecTransformer =>
+          findFinalLimitOneGroupLimit(project.child)
+        case project: ProjectExec =>
+          findFinalLimitOneGroupLimit(project.child)
+        case _ => None
+      }
+    }
+
+    plan.transformUp {
+      case window: WindowExecTransformer
+          if window.child.isInstanceOf[SortExecTransformer] &&
+            isLimitOneRankWindow(window) =>
+        val sort = window.child.asInstanceOf[SortExecTransformer]
+        findFinalLimitOneGroupLimit(sort.child) match {
+          case Some(groupLimit)
+              if sameExpressions(groupLimit.partitionSpec, window.partitionSpec) &&
+                sameExpressions(groupLimit.orderSpec, window.orderSpec) =>
+            val rankOnes = window.windowExpression.map {
+              expression =>
+                Alias(Literal.create(1, expression.dataType), expression.name)(
+                  exprId = expression.exprId,
+                  qualifier = expression.qualifier,
+                  explicitMetadata = Some(expression.metadata))
+            }
+            logInfo(
+              "MppNativeQueryExec: eliminated redundant Sort+rank Window above " +
+                "WindowGroupLimit(Final, limit=1)")
+            ProjectExecTransformer(sort.child.output ++ rankOnes, sort.child)
+          case _ => window
+        }
+    }
+  }
+
+  private def isLimitOneRankWindow(window: WindowExecTransformer): Boolean = {
+    window.windowExpression.nonEmpty && window.windowExpression.forall {
+      case Alias(WindowExpression(_: RowNumber, _), _) => true
+      case Alias(WindowExpression(_: Rank, _), _) => true
+      case Alias(WindowExpression(_: DenseRank, _), _) => true
+      case _ => false
+    }
+  }
+
+  private def sameExpressions(left: Seq[Expression], right: Seq[Expression]): Boolean = {
+    left.length == right.length && left.zip(right).forall {
+      case (leftExpression, rightExpression) => leftExpression.semanticEquals(rightExpression)
     }
   }
 
@@ -1387,11 +1545,10 @@ case class MppNativeQueryExec(
             if !ts.isInstanceOf[InputIteratorTransformer] &&
               ts.children.exists(_.isInstanceOf[WholeStageTransformer]) =>
           changed = true
-          ts.withNewChildren(
-            ts.children.map {
-              case wst: WholeStageTransformer => wst.child
-              case other => other
-            })
+          ts.withNewChildren(ts.children.map {
+            case wst: WholeStageTransformer => wst.child
+            case other => other
+          })
         case InputIteratorTransformer(ColumnarInputAdapter(scan: LocalTableScanExec))
             if scan.rows.length <= LocalTableScanExecTransformer.MaxRows =>
           changed = true
@@ -1437,7 +1594,12 @@ case class MppNativeQueryExec(
         localNativeInputIteratorChild(cia.child)
       case c2c: ColumnarToColumnarExec =>
         localNativeInputIteratorChild(c2c.child)
-      case agg: BaseAggregateExec if agg.child.isInstanceOf[TransformSupport] =>
+      case c2r: ColumnarToRowExecBase =>
+        localNativeInputIteratorChild(c2r.child)
+      case r2c: RowToColumnarExecBase =>
+        localNativeInputIteratorChild(r2c.child)
+      case agg: BaseAggregateExec
+          if !agg.isInstanceOf[TransformSupport] && agg.child.isInstanceOf[TransformSupport] =>
         Some(HashAggregateExecBaseTransformer.from(agg))
       case scan: LocalTableScanExec if scan.rows.length <= LocalTableScanExecTransformer.MaxRows =>
         Some(LocalTableScanExecTransformer(scan.output, scan.rows))
@@ -1478,8 +1640,7 @@ case class MppNativeQueryExec(
       inputs: Seq[MppLocalStreamInput],
       sparkPartitionCount: Int): Seq[MppLocalStreamInput] = {
     inputs.map {
-      input =>
-        input.copy(rdd = MppNativeQueryRDD.alignInputRDD(input.rdd, sparkPartitionCount))
+      input => input.copy(rdd = MppNativeQueryRDD.alignInputRDD(input.rdd, sparkPartitionCount))
     }
   }
 
@@ -1754,9 +1915,9 @@ case class MppNativeQueryExec(
             return Some(
               s"fragment ${fragment.id} Substrait has $slotKind " +
                 s"${slots.toSeq.sorted.mkString("[", ", ", "]")} but Spark prepared only " +
-                    s"$preparedInputCount MPP stream input(s): $inboundExchangeCount inbound " +
-                    s"exchange(s) + $fusedBroadcastCount fused broadcast(s) + " +
-                    s"$localStreamInputCount local stream(s)")
+                s"$preparedInputCount MPP stream input(s): $inboundExchangeCount inbound " +
+                s"exchange(s) + $fusedBroadcastCount fused broadcast(s) + " +
+                s"$localStreamInputCount local stream(s)")
           }
         }
     }
@@ -1884,8 +2045,6 @@ case class MppNativeQueryExec(
   private case class BuildSideChoice(side: BuildSide, reason: String)
 
   private case class JoinSideStats(sizeInBytes: BigInt, rowCount: Option[BigInt], source: String)
-
-  private object MppJoinSelectionHelper extends JoinSelectionHelper
 
   /**
    * Align MPP hash-join fragmenting with Presto's replicated join shape. When one side is small
@@ -2340,11 +2499,10 @@ case class MppNativeQueryExec(
 
   private def inlineExchangeProducer(exchange: Exchange): Option[SparkPlan] = {
     val producer = stripSyntheticHashProject(unwrapTransparent(exchange.child))
-    val inlined = stripSyntheticHashProject(
-      producer match {
-        case wst: WholeStageTransformer => wst.child
-        case other => other
-      })
+    val inlined = stripSyntheticHashProject(producer match {
+      case wst: WholeStageTransformer => wst.child
+      case other => other
+    })
     if (!sameOutputExprIds(inlined.output, exchange.output)) {
       logWarning(
         s"MppNativeQueryExec: exchange ${exchange.id} producer output " +
@@ -2367,12 +2525,10 @@ case class MppNativeQueryExec(
       inlinedProducer =>
         var replacements = 0
         val rewritten = plan.transformDown {
-          case iit: InputIteratorTransformer
-              if boundaryExchange(iit).exists(_.id == exchange.id) =>
+          case iit: InputIteratorTransformer if boundaryExchange(iit).exists(_.id == exchange.id) =>
             replacements += 1
             inlinedProducer
-          case cia: ColumnarInputAdapter
-              if boundaryExchange(cia).exists(_.id == exchange.id) =>
+          case cia: ColumnarInputAdapter if boundaryExchange(cia).exists(_.id == exchange.id) =>
             replacements += 1
             inlinedProducer
           case ex: ShuffleExchangeLike if ex.asInstanceOf[Exchange].id == exchange.id =>
@@ -2860,20 +3016,14 @@ case class MppNativeQueryExec(
       join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
     join.logicalLink.flatMap {
       case logicalJoin: Join =>
-        MppJoinSelectionHelper
+        SparkShimLoader.getSparkShims
           .getBroadcastBuildSide(
-            logicalJoin.left,
-            logicalJoin.right,
-            logicalJoin.joinType,
-            logicalJoin.hint,
+            logicalJoin,
             hintOnly = false,
             SQLConf.get)
           .orElse {
-            MppJoinSelectionHelper.getShuffleHashJoinBuildSide(
-              logicalJoin.left,
-              logicalJoin.right,
-              logicalJoin.joinType,
-              logicalJoin.hint,
+            SparkShimLoader.getSparkShims.getShuffleHashJoinBuildSide(
+              logicalJoin,
               hintOnly = false,
               SQLConf.get)
           }
@@ -2997,7 +3147,15 @@ case class MppNativeQueryExec(
   }
 
   private def coLocateReplicatedJoinProbeEnabled: Boolean = {
-    booleanConf("spark.gluten.mpp.coLocateReplicatedJoinProbe", defaultValue = true)
+    // Inlining a Spark hash-shuffle producer does not preserve its physical
+    // distribution in native MPP: scan splits are assigned independently to
+    // each peer.  MppPartitioningPreservingWrapper only carries Catalyst
+    // metadata and cannot make that distribution true.  Keeping this rewrite
+    // enabled can therefore violate a downstream WindowExec's clustered
+    // distribution (otherwise each peer can emit its own row_number=1). Retain
+    // the real streaming HASH exchange unless a caller explicitly opts into
+    // the experimental co-location rewrite.
+    booleanConf("spark.gluten.mpp.coLocateReplicatedJoinProbe", defaultValue = false)
   }
 
   private def coLocateBroadcastJoinProbeConfig: (Boolean, Boolean) = {
@@ -3485,7 +3643,14 @@ case class MppNativeQueryExec(
   private def stripSyntheticHashProject(plan: SparkPlan): SparkPlan = plan match {
     case p: ProjectExecTransformer
         if p.projectList.nonEmpty && p.projectList.head.name == "hash_partition_key" =>
-      p.child
+      // Shuffle preparation prepends the synthetic hash to an existing projection.
+      // Preserve all real expressions (including writer/partition columns) and
+      // remove only Gluten's private prefix.
+      p.copy(projectList = p.projectList.tail)
+    case wst: WholeStageTransformer =>
+      val strippedChild = stripSyntheticHashProject(wst.child)
+      if (strippedChild eq wst.child) wst
+      else wst.withNewChildren(Seq(strippedChild))
     case other => other
   }
 
@@ -4028,6 +4193,7 @@ case class MppNativeQueryExec(
   private def mergeSplitInfosToBytes(splitInfos: Seq[SplitInfo]): Array[Byte] = {
     val builder = ReadRel.LocalFiles.newBuilder()
     var emptyScanExtension: Option[io.substrait.proto.AdvancedExtension] = None
+    val rawItems = mutable.ArrayBuffer[ReadRel.LocalFiles.FileOrFiles]()
     splitInfos.foreach {
       si =>
         val localFiles = si match {
@@ -4043,15 +4209,20 @@ case class MppNativeQueryExec(
         ) {
           emptyScanExtension = Some(localFiles.getAdvancedExtension)
         }
-        builder.addAllItems(localFiles.getItemsList)
+        rawItems ++= localFiles.getItemsList.asScala
     }
+    // Preserve Spark/Iceberg's row-group-aligned byte ranges. The cuDF Iceberg
+    // reader accepts these ranges and uses them to bound each decoded GPU
+    // batch; coalescing them back to whole files can exhaust a 32 GiB GPU on
+    // wide, high-cardinality inputs.
+    builder.addAllItems(rawItems.asJava)
     if (builder.getItemsCount == 0) {
       emptyScanExtension.foreach(builder.setAdvancedExtension)
     }
     val merged = builder.build()
     logDebug(
       s"mergeSplitInfosToBytes: merged ${splitInfos.size} partitions " +
-        s"into ${merged.getItemsCount} file items")
+        s"with ${merged.getItemsCount} row-group/file items")
     merged.toByteArray
   }
 

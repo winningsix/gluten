@@ -53,8 +53,9 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
   private def hasOptimizedExistenceAggregate(plan: LogicalPlan): Boolean = {
     plan.collect {
       case join @ Join(_, _, LeftSemi | LeftAnti, _, _) if join.right.exists {
-            case Aggregate(groupingExpressions, aggregateExpressions, _) =>
-              groupingExpressions.length == 1 && aggregateExpressions.length == 3
+            case aggregate: Aggregate =>
+              aggregate.groupingExpressions.length == 1 &&
+              aggregate.aggregateExpressions.length == 3
             case _ => false
           } =>
         true
@@ -64,8 +65,9 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
   private def optimizedExistenceAggregateCount(plan: LogicalPlan): Int = {
     plan.collect {
       case join @ Join(_, _, LeftSemi | LeftAnti, _, _) if join.right.exists {
-            case Aggregate(groupingExpressions, aggregateExpressions, _) =>
-              groupingExpressions.length == 1 && aggregateExpressions.length == 3
+            case aggregate: Aggregate =>
+              aggregate.groupingExpressions.length == 1 &&
+              aggregate.aggregateExpressions.length == 3
             case _ => false
           } =>
         true
@@ -74,10 +76,10 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
 
   private def hasExistenceSummary(plan: LogicalPlan): Boolean = {
     plan match {
-      case Aggregate(_, aggregateExpressions, _) =>
-        aggregateExpressions.exists(_.name.startsWith("_existence_min_")) &&
-        (aggregateExpressions.exists(_.name.startsWith("_existence_max_")) ||
-          aggregateExpressions.exists(_.name.startsWith("_existence_count_")))
+      case aggregate: Aggregate =>
+        aggregate.aggregateExpressions.exists(_.name.startsWith("_existence_min_")) &&
+        (aggregate.aggregateExpressions.exists(_.name.startsWith("_existence_max_")) ||
+          aggregate.aggregateExpressions.exists(_.name.startsWith("_existence_count_")))
       case Project(_, child) => hasExistenceSummary(child)
       case Filter(_, child) => hasExistenceSummary(child)
       case _ => false
@@ -87,10 +89,10 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
   private def redundantDedupOverExistenceSummaryCount(plan: LogicalPlan): Int = {
     plan.collect {
       case join @ Join(_, _, LeftSemi | LeftAnti, _, _) if join.right.exists {
-            case Aggregate(groupingExpressions, aggregateExpressions, child)
-                if groupingExpressions.nonEmpty &&
-                  groupingExpressions.length == aggregateExpressions.length &&
-                  hasExistenceSummary(child) =>
+            case aggregate: Aggregate
+                if aggregate.groupingExpressions.nonEmpty &&
+                  aggregate.groupingExpressions.length == aggregate.aggregateExpressions.length &&
+                  hasExistenceSummary(aggregate.child) =>
               true
             case _ => false
           } =>

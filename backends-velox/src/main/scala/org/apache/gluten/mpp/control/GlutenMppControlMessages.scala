@@ -69,6 +69,7 @@ object MppPeerState {
   val Created: String = "CREATED"
   val Starting: String = "STARTING"
   val Running: String = "RUNNING"
+  val OutputComplete: String = "OUTPUT_COMPLETE"
   val AbortRequested: String = "ABORT_REQUESTED"
   val Succeeded: String = "SUCCEEDED"
   val Failed: String = "FAILED"
@@ -142,8 +143,8 @@ final case class MppTerminalEvent(
 /**
  * Periodic executor-to-driver control request.
  *
- * A heartbeat contains all active peer snapshots and any unacknowledged failure or terminal
- * events owned by this executor session.
+ * A heartbeat contains all active peer snapshots and any unacknowledged failure or terminal events
+ * owned by this executor session.
  */
 final case class MppQueryHeartbeat(
     executorId: String,
@@ -172,14 +173,30 @@ final case class MppAbortQuery(
   extends Serializable
 
 /**
+ * Driver authorization for one peer to close its native coordinator after global end-of-stream.
+ *
+ * Every expected peer must first report [[MppPeerState.OutputComplete]]. The driver then returns
+ * this attempt-bound authorization on heartbeats until the task closes and reports terminal state.
+ * Keeping the identity fields aligned with [[MppAbortQuery]] prevents a late authorization from a
+ * previous task or executor incarnation from releasing a retried peer.
+ */
+final case class MppPeerCompletion(
+    runId: MppQueryRunId,
+    peerIndex: Int,
+    taskAttemptId: Long,
+    executorId: String,
+    executorSessionId: String)
+  extends Serializable
+
+/**
  * Driver response containing pending abort commands and acknowledged event IDs.
  *
- * Acknowledging a failure or terminal event allows the executor to remove it from its retry
- * buffer. Abort commands remain in driver state until the matching peer reports their sequence as
- * accepted.
+ * Acknowledging a failure or terminal event allows the executor to remove it from its retry buffer.
+ * Abort commands remain in driver state until the matching peer reports their sequence as accepted.
  */
 final case class MppQueryHeartbeatAck(
     abortCommands: Seq[MppAbortQuery],
     acknowledgedEventIds: Seq[String],
-    driverTimeMs: Long)
+    driverTimeMs: Long,
+    peerCompletions: Seq[MppPeerCompletion] = Nil)
   extends GlutenMppControlMessage

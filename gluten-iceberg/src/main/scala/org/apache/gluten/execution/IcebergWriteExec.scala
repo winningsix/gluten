@@ -55,8 +55,15 @@ trait IcebergWriteExec extends ColumnarV2TableWriteExec {
 
   private def validatePartitionType(schema: Schema, field: PartitionField): Boolean = {
     val partitionType = schema.findType(field.sourceId())
-    val unSupportType = Seq(TypeID.DOUBLE, TypeID.FLOAT)
-    !unSupportType.contains(partitionType.typeId())
+    val supportedTypes = Seq(
+      TypeID.BOOLEAN,
+      TypeID.INTEGER,
+      TypeID.LONG,
+      TypeID.DATE,
+      TypeID.TIME,
+      TypeID.TIMESTAMP,
+      TypeID.STRING)
+    supportedTypes.contains(partitionType.typeId())
   }
 
   override def doValidateInternal(): ValidationResult = {
@@ -79,11 +86,12 @@ trait IcebergWriteExec extends ColumnarV2TableWriteExec {
           .stream()
           .anyMatch(
             f =>
-              !validatePartitionType(spec.schema(), f) || !topIds
+              f.transform().toString != "identity" ||
+                !validatePartitionType(spec.schema(), f) || !topIds
                 .contains(f.sourceId()) || f.transform().isVoid)
       ) {
         return ValidationResult.failed(
-          "Not support write unsupported partition type, or is nested partition column")
+          "GPU write supports top-level identity partitions with primitive partition types only")
       }
     }
     if (IcebergWriteUtil.getTable(write).sortOrder().isSorted) {
@@ -95,7 +103,7 @@ trait IcebergWriteExec extends ColumnarV2TableWriteExec {
     }
 
     val codec = getCodec
-    if (Seq("brotli, lzo").contains(codec)) {
+    if (Seq("brotli", "lzo").contains(codec.toLowerCase(java.util.Locale.ROOT))) {
       return ValidationResult.failed("Not support this codec " + codec)
     }
     if (query.output.exists(a => !AvroSchemaUtil.makeCompatibleName(a.name).equals(a.name))) {

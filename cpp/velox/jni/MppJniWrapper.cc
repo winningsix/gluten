@@ -60,6 +60,7 @@
 #include "operators/plannodes/RowVectorStream.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include "operators/plannodes/CudfVectorStream.h"
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #endif
 
@@ -323,6 +324,10 @@ std::unordered_map<std::string, std::string> buildMppQueryConfig(
 #ifdef GLUTEN_ENABLE_GPU
     configs[velox::cudf_velox::CudfConfig::kCudfEnabled] =
         std::to_string(veloxCfg->get<bool>(kCudfEnabled, false));
+    configs[velox::cudf_velox::CudfConfig::kCudfSkipOutputToVelox] =
+        std::to_string(veloxCfg->get<bool>(
+            kCudfSkipOutputToVelox,
+            kCudfSkipOutputToVeloxDefault));
 #endif
 
     const auto setIfExists = [&](const std::string& glutenKey, const std::string& veloxKey) {
@@ -343,9 +348,16 @@ std::unordered_map<std::string, std::string> buildMppQueryConfig(
     throw std::runtime_error("Invalid MPP query conf arg: " + errDetails);
   }
 
-  // Keep the MPP-specific exchange buffer override after dynamic config copy.
-  configs[velox::core::QueryConfig::kMaxOutputBufferSize] = "1073741824";
-  configs[velox::core::QueryConfig::kMaxPartitionedOutputBufferSize] = "1073741824";
+  // Apply MPP exchange backpressure per fragment.  This must stay after the
+  // dynamic config copy so both Velox output-buffer limits use one explicit
+  // value.  The previous fixed 1 GiB per fragment allowed a 72-fragment query
+  // to retain far more than a single GPU's memory.
+  const auto mppMaxOutputBufferSize = veloxCfg->get<uint64_t>(
+      kMppMaxOutputBufferSize, kMppMaxOutputBufferSizeDefault);
+  configs[velox::core::QueryConfig::kMaxOutputBufferSize] =
+      std::to_string(mppMaxOutputBufferSize);
+  configs[velox::core::QueryConfig::kMaxPartitionedOutputBufferSize] =
+      std::to_string(mppMaxOutputBufferSize);
   return configs;
 }
 
@@ -586,6 +598,21 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
       }
       if (namesEqual) {
         return exchange;
+      }
+      if (producerPlanForMerge == nullptr) {
+        // UCX exchange payloads are positional.  When width and child types
+        // already match, expose the consumer names directly on ExchangeNode
+        // instead of inserting an identity Project solely to rename fields.
+        // Velox deliberately leaves such a no-op Project on CPU, which strict
+        // cuDF mode would otherwise (incorrectly) report as fallback.
+        LOG(WARNING) << "MppJniWrapper: applying wire->consumer names directly "
+                     << "on Exchange " << exchangeNodeId;
+        return velox::core::ExchangeNode::Builder()
+            .id(exchangeNodeId)
+            .outputType(consumerType)
+            .serdeKind("Presto")
+            .transportType(velox::core::ExchangeNode::TransportType::kUcx)
+            .build();
       }
       // Names differ - inject identity Project that just renames cols.
       std::vector<velox::core::TypedExprPtr> projections;
@@ -1319,6 +1346,12 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       std::make_shared<velox::config::ConfigBase>(std::move(preLoopMergedMap));
   const bool singleTaskModeRequested = preLoopSessionCfg->get<bool>(
       kMppSingleTaskMode, kMppSingleTaskModeDefault);
+#ifdef GLUTEN_ENABLE_GPU
+  const bool keepDeviceRootOutput = preLoopSessionCfg->get<bool>(
+      kCudfSkipOutputToVelox, kCudfSkipOutputToVeloxDefault);
+#else
+  const bool keepDeviceRootOutput = false;
+#endif
   bool singleTaskMode = singleTaskModeRequested;
   if (singleTaskMode) {
     // All known partition types are supported in single-task mode:
@@ -1871,11 +1904,12 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       //      PartitionedOutputAdapter -> UcxPartitionedOutput so the
       //      consumer fragment's UcxExchange can pull GPU pages via the
       //      IntraNodeTransferRegistry fast path.
-      //   2. Root fragment (outboundExchange == nullptr, output goes to
-      //      the coordinator) -> keep the default kHttp transport so
-      //      OutputBufferManager receives pages; MppQueryCoordinator
-      //      polls OBM for the final result.
-      const auto transportType = (outboundExchange != nullptr)
+      //   2. Root fragment (outboundExchange == nullptr) normally uses kHttp
+      //      so the coordinator receives CPU Presto pages. A GPU write sink
+      //      opts into kUcx so the coordinator receives packed device columns
+      //      and hands a CudfVector directly to the libcudf writer.
+      const auto transportType =
+          (outboundExchange != nullptr || keepDeviceRootOutput)
           ? velox::core::PartitionedOutputNode::TransportType::kUcx
           : velox::core::PartitionedOutputNode::TransportType::kHttp;
       wrappedPlan = velox::core::PartitionedOutputNode::single(
@@ -2466,7 +2500,16 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeGetMppOutput( // NOLI
 
   // Wrap the RowVector in a VeloxColumnarBatch and save it in the
   // ObjectStore so Java can reference it by handle.
+#ifdef GLUTEN_ENABLE_GPU
+  // CudfVector intentionally has no Velox child vectors. Preserve the logical
+  // column count so ColumnarBatches.create() keeps the native handle instead
+  // of misclassifying this as a zero-column batch.
+  auto batch = std::make_shared<VeloxColumnarBatch>(
+      rowVector,
+      static_cast<int32_t>(rowVector->type()->size()));
+#else
   auto batch = std::make_shared<VeloxColumnarBatch>(rowVector);
+#endif
   return ctx->saveObject(batch);
 
   JNI_METHOD_END(kInvalidObjectHandle)

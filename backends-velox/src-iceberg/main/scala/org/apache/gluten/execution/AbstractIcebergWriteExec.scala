@@ -20,11 +20,19 @@ import org.apache.gluten.IcebergNestedFieldVisitor
 import org.apache.gluten.connector.write.{ColumnarBatchDataWriterFactory, ColumnarStreamingDataWriterFactory, IcebergDataWriteFactory}
 
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.vectorized.ColumnarBatch
 
+import org.apache.iceberg.SerializableTable
 import org.apache.iceberg.spark.source.IcebergWriteUtil
 import org.apache.iceberg.types.TypeUtil
 
 abstract class AbstractIcebergWriteExec extends IcebergWriteExec {
+
+  override protected def executeColumnarForWrite(): RDD[ColumnarBatch] = query match {
+    case mpp: MppNativeQueryExec => mpp.executeColumnarForGpuSink()
+    case _ => query.executeColumnar()
+  }
 
   // the writer factory works for both batch and streaming
   private def createIcebergDataWriteFactory(schema: StructType): IcebergDataWriteFactory = {
@@ -34,6 +42,7 @@ abstract class AbstractIcebergWriteExec extends IcebergWriteExec {
       schema,
       getFileFormat(IcebergWriteUtil.getFileFormat(write)),
       IcebergWriteUtil.getDirectory(write),
+      SerializableTable.copyOf(IcebergWriteUtil.getTable(write)),
       getCodec,
       getPartitionSpec,
       IcebergWriteUtil.getSortOrder(write),

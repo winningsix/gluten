@@ -12,6 +12,7 @@
 #include <arrow/type_fwd.h>
 #include <arrow/util/key_value_metadata.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -25,7 +26,9 @@ extern "C" int arrowKeyValueMetadataFindKeyString(
 extern "C" int arrowKeyValueMetadataFindKeyString(
     const arrow::KeyValueMetadata* metadata,
     const std::string& key) {
-  return metadata->FindKey(key);
+  const auto& keys = metadata->keys();
+  const auto it = std::find(keys.begin(), keys.end(), key);
+  return it == keys.end() ? -1 : static_cast<int>(it - keys.begin());
 }
 
 extern "C" const uint8_t* arrowFixedSizeBinaryArrayGetValue(
@@ -35,7 +38,7 @@ extern "C" const uint8_t* arrowFixedSizeBinaryArrayGetValue(
 extern "C" const uint8_t* arrowFixedSizeBinaryArrayGetValue(
     const arrow::FixedSizeBinaryArray* array,
     int64_t index) {
-  return array->GetValue(index);
+  return array->raw_values() + index * array->byte_width();
 }
 
 extern "C" std::shared_ptr<arrow::DataType> arrowListField(

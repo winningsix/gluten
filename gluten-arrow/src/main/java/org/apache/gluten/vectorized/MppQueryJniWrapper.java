@@ -32,7 +32,8 @@ import org.apache.gluten.runtime.RuntimeAware;
  *   <li>{@link #nativeCreateMppQuery} — parse Substrait plans, build fragments, create coordinator
  *   <li>{@link #nativeStartMppQuery} — launch all fragments concurrently (all-stages-up)
  *   <li>{@link #nativeGetMppOutput} — pull output batches from root fragment (blocking)
- *   <li>{@link #nativeAbortMppQuery} — optionally request cooperative abort without releasing handle
+ *   <li>{@link #nativeAbortMppQuery} — optionally request cooperative abort without releasing
+ *       handle
  *   <li>{@link #nativeCloseMppQuery} — abort remaining tasks and release resources
  * </ol>
  *

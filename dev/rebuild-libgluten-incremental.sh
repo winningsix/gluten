@@ -51,7 +51,8 @@ cd /opt/gluten/cpp
 
 BUILD_DIR=/opt/gluten/cpp/build
 OUT_LIB=$BUILD_DIR/releases/libgluten.so
-TARGET_LIB=/opt/gluten/backends-velox/target/scala-2.12/classes/linux/amd64/libgluten.so
+SCALA_BINARY_VERSION=${SCALA_BINARY_VERSION:-2.12}
+TARGET_LIB=/opt/gluten/backends-velox/target/scala-${SCALA_BINARY_VERSION}/classes/linux/amd64/libgluten.so
 
 if [[ -n "$LOGFILE" ]]; then
   exec > >(tee "$LOGFILE") 2>&1

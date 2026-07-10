@@ -21,9 +21,16 @@
 #include "memory/VeloxColumnarBatch.h"
 #include "utils/Metrics.h"
 #include "velox/connectors/hive/iceberg/IcebergColumnHandle.h"
+#include "velox/connectors/hive/iceberg/IcebergConfig.h"
 #include "velox/connectors/hive/iceberg/IcebergDataSink.h"
+#include "velox/core/QueryCtx.h"
+#include "velox/dwio/common/ParquetFieldId.h"
 
 namespace gluten {
+
+#ifdef GLUTEN_ENABLE_GPU
+class CudfIcebergWriter;
+#endif
 
 struct WriteStats {
   uint64_t numWrittenBytes{0};
@@ -52,26 +59,37 @@ class IcebergWriter {
       std::shared_ptr<facebook::velox::memory::MemoryPool> memoryPool,
       std::shared_ptr<facebook::velox::memory::MemoryPool> connectorPool);
 
+  ~IcebergWriter();
+
   void write(const VeloxColumnarBatch& batch);
 
   std::vector<std::string> commit();
+
+  void abort();
 
   WriteStats writeStats() const;
 
  private:
   facebook::velox::RowTypePtr rowType_;
-  const facebook::velox::connector::hive::iceberg::IcebergNestedField field_;
+  const facebook::velox::parquet::ParquetFieldId field_;
   int32_t partitionId_;
   int64_t taskId_;
   std::string operationId_;
   std::shared_ptr<facebook::velox::memory::MemoryPool> pool_;
   std::shared_ptr<facebook::velox::memory::MemoryPool> connectorPool_;
   std::shared_ptr<facebook::velox::connector::hive::HiveConfig> connectorConfig_;
+  std::shared_ptr<const facebook::velox::connector::hive::iceberg::IcebergConfig>
+      icebergConfig_;
   std::shared_ptr<facebook::velox::config::ConfigBase> connectorSessionProperties_;
 
+  std::shared_ptr<facebook::velox::core::QueryCtx> queryCtx_;
   std::unique_ptr<facebook::velox::connector::ConnectorQueryCtx> connectorQueryCtx_;
 
   std::unique_ptr<facebook::velox::connector::hive::iceberg::IcebergDataSink> dataSink_;
+
+#ifdef GLUTEN_ENABLE_GPU
+  std::unique_ptr<CudfIcebergWriter> cudfWriter_;
+#endif
 
   // Records the writer creation time in ns.
   const uint64_t createTimeNs_{0};

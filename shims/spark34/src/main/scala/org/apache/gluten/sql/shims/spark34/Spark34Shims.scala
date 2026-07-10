@@ -30,12 +30,13 @@ import org.apache.spark.shuffle.ShuffleHandle
 import org.apache.spark.sql.{AnalysisException, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis.DecimalPrecision
-import org.apache.spark.sql.catalyst.catalog.BucketSpec
+import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogTable}
 import org.apache.spark.sql.catalyst.csv.CSVOptions
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate._
+import org.apache.spark.sql.catalyst.optimizer.{BuildSide, JoinSelectionHelper}
 import org.apache.spark.sql.catalyst.plans.QueryPlan
-import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.plans.logical.{Join, LogicalPlan}
 import org.apache.spark.sql.catalyst.plans.physical.{ClusteredDistribution, Distribution, KeyGroupedPartitioning, Partitioning}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, InternalRowComparableWrapper, TimestampFormatter}
@@ -54,6 +55,7 @@ import org.apache.spark.sql.execution.exchange.BroadcastExchangeLike
 import org.apache.spark.sql.extension.RewriteCreateTableAsSelect
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.LegacyBehaviorPolicy
+import org.apache.spark.sql.sources.BaseRelation
 import org.apache.spark.sql.types.{DecimalType, IntegerType, LongType, StructField, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.apache.spark.storage.{BlockId, BlockManagerId}
@@ -69,10 +71,46 @@ import scala.collection.mutable
 import scala.reflect.ClassTag
 
 class Spark34Shims extends SparkShims {
+  private object ShimJoinSelectionHelper extends JoinSelectionHelper
+
   override def getDistribution(
       leftKeys: Seq[Expression],
       rightKeys: Seq[Expression]): Seq[Distribution] = {
     ClusteredDistribution(leftKeys) :: ClusteredDistribution(rightKeys) :: Nil
+  }
+
+  override def getBroadcastBuildSide(
+      join: Join,
+      hintOnly: Boolean,
+      conf: SQLConf): Option[BuildSide] = {
+    ShimJoinSelectionHelper.getBroadcastBuildSide(
+      join.left,
+      join.right,
+      join.joinType,
+      join.hint,
+      hintOnly,
+      conf)
+  }
+
+  override def getShuffleHashJoinBuildSide(
+      join: Join,
+      hintOnly: Boolean,
+      conf: SQLConf): Option[BuildSide] = {
+    ShimJoinSelectionHelper.getShuffleHashJoinBuildSide(
+      join.left,
+      join.right,
+      join.joinType,
+      join.hint,
+      hintOnly,
+      conf)
+  }
+
+  override def createLogicalRelation(
+      relation: BaseRelation,
+      output: Seq[AttributeReference],
+      catalogTable: Option[CatalogTable],
+      isStreaming: Boolean): LogicalRelation = {
+    LogicalRelation(relation, output, catalogTable, isStreaming)
   }
 
   override def scalarExpressionMappings: Seq[Sig] = {

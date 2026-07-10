@@ -216,13 +216,15 @@ if(ENABLE_GPU)
     shuffle/VeloxGpuShuffleWriter.cc
     operators/serializer/VeloxGpuColumnarBatchSerializer.cc
     utils/GpuBufferBatchResizer.cc
-    memory/GpuBufferColumnarBatch.cc)
+    memory/GpuBufferColumnarBatch.cc
+    compute/iceberg/CudfIcebergWriter.cc)
 endif()
 
-if(ENABLE_ENHANCED_FEATURES)
-  list(APPEND VELOX_SRCS compute/iceberg/IcebergFormat.cc
-       compute/iceberg/IcebergWriter.cc)
-endif()
+# Iceberg V2 data writing is an independent OSS capability.  Keep it available
+# in regular builds instead of coupling it to the unrelated enhanced-features
+# bundle; the Spark-side Iceberg component still controls whether it is used.
+list(APPEND VELOX_SRCS compute/iceberg/IcebergFormat.cc
+     compute/iceberg/IcebergWriter.cc)
 
 if(BUILD_TESTS OR BUILD_BENCHMARKS)
   set(BUILD_TEST_UTILS ON)
@@ -534,6 +536,20 @@ if(ENABLE_GPU)
   # can use #ifdef GLUTEN_ENABLE_GPU for GPU-specific code paths.
   target_compile_definitions(velox PRIVATE GLUTEN_ENABLE_GPU)
 
+  # A cuDF build-tree package config resolves transitive RAPIDS dependencies
+  # through CPMFindPackage.  Standalone Gluten reconfiguration does not load
+  # Velox's top-level CPM bootstrap, so load the already-generated CPM module
+  # before importing cuDF.
+  if(NOT COMMAND CPMFindPackage)
+    if(DEFINED CPM_FILE AND EXISTS "${CPM_FILE}")
+      include("${CPM_FILE}")
+    elseif(EXISTS "${VELOX_BUILD_PATH}/cmake/CPM_0.42.0.cmake")
+      include("${VELOX_BUILD_PATH}/cmake/CPM_0.42.0.cmake")
+    else()
+      message(FATAL_ERROR "CPMFindPackage is required to import the cuDF build tree")
+    endif()
+  endif()
+
   find_package(cudf CONFIG REQUIRED)
 
   import_library(
@@ -573,6 +589,12 @@ if(ENABLE_GPU)
     velox_curl PROPERTIES IMPORTED_LOCATION
                           ${VELOX_BUILD_PATH}/_deps/curl-build/lib/libcurl.so)
 
+  # velox_cudf_exec also embeds these object-library members.  libgluten uses
+  # --allow-multiple-definition, so the linker keeps the first definition.
+  # Put the standalone objects first so an incremental UCX rebuild cannot be
+  # shadowed by stale copies in the aggregate archive.
+  target_link_libraries(velox PRIVATE ${GLUTEN_UCX_EXCHANGE_OBJECTS})
+
   # Static cuDF integration archives: PRIVATE + whole-archive. Like
   # facebook::velox, these need every .o pulled in so consumer-used APIs
   # end up exported from libgluten.so. Use full paths instead of imported
@@ -586,7 +608,6 @@ if(ENABLE_GPU)
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/iceberg/libvelox_cudf_iceberg_connector.a
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/expression/libvelox_cudf_expression.a
             -Wl,--no-whole-archive)
-  target_link_libraries(velox PRIVATE ${GLUTEN_UCX_EXCHANGE_OBJECTS})
   # Shared libs consumers need at link time (cudf::cudf, libcurl): PUBLIC.
   target_link_libraries(velox PUBLIC cudf::cudf velox_curl)
   # IBM baseline brings in apache thrift symbols transitively (Presto serde

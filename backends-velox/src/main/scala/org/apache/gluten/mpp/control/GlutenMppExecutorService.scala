@@ -122,6 +122,10 @@ object GlutenMppExecutorService extends Logging {
   def reportTerminal(query: ActiveMppQuery, state: String): Unit =
     controlAgent.foreach(_.reportTerminal(query, state))
 
+  /** Keep the native coordinator alive until every peer reports output EOS. */
+  def awaitPeerCompletion(query: ActiveMppQuery): Boolean =
+    controlAgent.exists(_.awaitPeerCompletion(query))
+
   private[control] def buildEndpointRecord(
       ctx: PluginContext): Option[MppExecutorEndpointRecord] = {
     val blockManagerId =

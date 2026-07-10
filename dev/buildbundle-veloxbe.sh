@@ -25,12 +25,18 @@ function build_for_spark {
   spark_version=$1
   # Extract major version (e.g., "3.2" -> "3", "4.0" -> "4")
   major_version=$(echo $spark_version | cut -d'.' -f1)
+  maven_profiles="${GLUTEN_BUNDLE_MAVEN_PROFILES:-}"
 
-  if [ "$major_version" -ge 4 ]; then
-    ${MVN_CMD} clean install -Pbackends-velox -Pspark-$spark_version -Pjava-17 -Pscala-2.13 -DskipTests
-  else
-    ${MVN_CMD} clean install -Pbackends-velox -Pspark-$spark_version -DskipTests
+  if [ -z "$maven_profiles" ]; then
+    if [ "$major_version" -ge 4 ]; then
+      maven_profiles="backends-velox,spark-$spark_version,java-17,scala-2.13"
+    else
+      maven_profiles="backends-velox,spark-$spark_version"
+    fi
   fi
+
+  ${MVN_CMD} clean install -P${maven_profiles} -DskipTests -Dmaven.test.skip=true \
+    -Dspotless.check.skip=true
 }
 
 function check_supported {

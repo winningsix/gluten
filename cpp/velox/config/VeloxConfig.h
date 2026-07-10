@@ -141,6 +141,13 @@ const std::string kMppSingleTaskMode =
     "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode";
 const bool kMppSingleTaskModeDefault = true;
 
+// Per-fragment UCX output queue high-water mark.  A multi-fragment query can
+// have dozens of producers alive at once, so the old fixed 1 GiB allowance per
+// fragment can exhaust a GPU long before backpressure engages.
+const std::string kMppMaxOutputBufferSize =
+    "spark.gluten.sql.columnar.backend.velox.mpp.maxOutputBufferSize";
+const uint64_t kMppMaxOutputBufferSizeDefault = 1L << 30;
+
 // Cap on per-task driver count (= local-partition lane count) when single-
 // task mode is active. Mirrors IBM's pbench GPU deployment choice
 // (velox-testing/.../generate_presto_config.sh sets VCPU_PER_WORKER=2 for

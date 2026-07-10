@@ -17,6 +17,7 @@
 package org.apache.gluten.extension.columnar
 
 import org.apache.gluten.config.GlutenConfig
+import org.apache.gluten.sql.shims.SparkShimLoader
 
 import org.apache.spark.sql.{GlutenQueryTest, SQLContext}
 import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeReference}
@@ -26,7 +27,6 @@ import org.apache.spark.sql.catalyst.plans.logical.{BROADCAST, Filter, HintInfo,
 import org.apache.spark.sql.catalyst.plans.logical.{JoinHint, LeafNode, LogicalPlan}
 import org.apache.spark.sql.catalyst.plans.logical.{Project, UnaryNode}
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
-import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.sources.BaseRelation
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{DateType, DoubleType, IntegerType, LongType}
@@ -495,7 +495,7 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
   }
 
   private def sizedLogicalRelation(attrs: Seq[AttributeReference], bytes: Long): LogicalPlan = {
-    LogicalRelation(
+    SparkShimLoader.getSparkShims.createLogicalRelation(
       SizedRelation(
         spark.sqlContext,
         StructType(attrs.map(a => StructField(a.name, a.dataType, a.nullable, a.metadata))),

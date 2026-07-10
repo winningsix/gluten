@@ -20,15 +20,19 @@
 #include <fmt/format.h>
 #include <folly/dynamic.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/InlineExecutor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/json.h>
+#include <nvtx3/nvtx3.hpp>
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <functional>
-#include <nvtx3/nvtx3.hpp>
+#include <numeric>
+#include <sstream>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 #ifdef GLUTEN_ENABLE_GPU
@@ -54,7 +58,9 @@
 #include "velox/exec/SerializedPage.h"
 #include "velox/exec/Task.h"
 #ifdef GLUTEN_ENABLE_GPU
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #endif
 #include "velox/experimental/ucx-exchange/Communicator.h"
@@ -101,42 +107,35 @@ void removeTaskOutputState(
     return;
   }
   const auto tid = task->taskId();
-  LOG(WARNING) << "MppQueryCoordinator[" << queryId << "]: removeTask(" << tid
-               << ") reason=" << reason
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId << "]: removeTask(" << tid << ") reason=" << reason
                << " state=" << static_cast<int>(task->state());
   if (bufferManager != nullptr) {
     try {
       bufferManager->removeTask(tid);
     } catch (const std::exception& e) {
-      LOG(ERROR) << "MppQueryCoordinator[" << queryId
-                 << "]: OutputBufferManager::removeTask(" << tid
+      LOG(ERROR) << "MppQueryCoordinator[" << queryId << "]: OutputBufferManager::removeTask(" << tid
                  << ") threw: " << e.what();
     } catch (...) {
-      LOG(ERROR) << "MppQueryCoordinator[" << queryId
-                 << "]: OutputBufferManager::removeTask(" << tid
+      LOG(ERROR) << "MppQueryCoordinator[" << queryId << "]: OutputBufferManager::removeTask(" << tid
                  << ") threw unknown exception";
     }
   }
 #ifdef GLUTEN_ENABLE_GPU
   try {
-    auto queueMgr =
-        facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+    auto queueMgr = facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
     queueMgr->removeTask(tid);
   } catch (const std::exception& e) {
-    LOG(ERROR) << "MppQueryCoordinator[" << queryId
-               << "]: UcxOutputQueueManager::removeTask(" << tid
+    LOG(ERROR) << "MppQueryCoordinator[" << queryId << "]: UcxOutputQueueManager::removeTask(" << tid
                << ") threw: " << e.what();
   } catch (...) {
-    LOG(ERROR) << "MppQueryCoordinator[" << queryId
-               << "]: UcxOutputQueueManager::removeTask(" << tid
+    LOG(ERROR) << "MppQueryCoordinator[" << queryId << "]: UcxOutputQueueManager::removeTask(" << tid
                << ") threw unknown exception";
   }
 #endif
 }
 
 bool isSafeTaskIdComponent(const std::string& value) {
-  return !value.empty() && value.find('/') == std::string::npos &&
-      value.find("://") == std::string::npos;
+  return !value.empty() && value.find('/') == std::string::npos && value.find("://") == std::string::npos;
 }
 
 bool mppOperatorMetricsEnabled() {
@@ -204,12 +203,7 @@ MppQueryCoordinator::MppQueryCoordinator(
       localPeerId_);
   VELOX_CHECK_GE(peerIndex_, 0, "MPP peer index must be non-negative");
   VELOX_CHECK_GT(peerCount_, 0, "MPP peer count must be positive");
-  VELOX_CHECK_LT(
-      peerIndex_,
-      peerCount_,
-      "MPP peer index {} must be less than peer count {}",
-      peerIndex_,
-      peerCount_);
+  VELOX_CHECK_LT(peerIndex_, peerCount_, "MPP peer index {} must be less than peer count {}", peerIndex_, peerCount_);
 
   // Validate that fragment ids form a contiguous 0-based sequence so we can
   // use them as vector indices.
@@ -229,9 +223,7 @@ MppQueryCoordinator::MppQueryCoordinator(
   std::vector<bool> isProducer(fragmentSpecs_.size(), false);
   for (auto& exchange : exchangeSpecs_) {
     VELOX_CHECK_GE(exchange.producerFragmentId, 0);
-    VELOX_CHECK_LT(
-        static_cast<size_t>(exchange.producerFragmentId),
-        fragmentSpecs_.size());
+    VELOX_CHECK_LT(static_cast<size_t>(exchange.producerFragmentId), fragmentSpecs_.size());
     isProducer[exchange.producerFragmentId] = true;
   }
   for (size_t i = 0; i < fragmentSpecs_.size(); ++i) {
@@ -245,10 +237,12 @@ MppQueryCoordinator::MppQueryCoordinator(
       rootFragmentId_ = fragmentSpecs_[i].id;
     }
   }
-  VELOX_CHECK_NE(
-      rootFragmentId_,
-      -1,
-      "No root fragment (every fragment is a producer; exchange DAG has a cycle)");
+  VELOX_CHECK_NE(rootFragmentId_, -1, "No root fragment (every fragment is a producer; exchange DAG has a cycle)");
+#ifdef GLUTEN_ENABLE_GPU
+  deviceRootOutput_ = queryCtx_->queryConfig().get<bool>(
+      facebook::velox::cudf_velox::CudfConfig::kCudfSkipOutputToVelox,
+      false);
+#endif
 }
 
 std::shared_ptr<MppQueryCoordinator> MppQueryCoordinator::create(
@@ -285,8 +279,7 @@ MppQueryCoordinator::~MppQueryCoordinator() {
   }
   watchdogCv_.notify_all();
   {
-    nvtx3::scoped_range_in<GlutenMppDomain> r{
-        "coordinator::~destructor:watchdog.join"};
+    nvtx3::scoped_range_in<GlutenMppDomain> r{"coordinator::~destructor:watchdog.join"};
     if (watchdogThread_.joinable()) {
       watchdogThread_.join();
     }
@@ -296,9 +289,7 @@ MppQueryCoordinator::~MppQueryCoordinator() {
     totalTasks += replicas.size();
   }
   LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: destructor entry"
-               << " started=" << started_
-               << " fragments=" << fragmentTasks_.size()
-               << " totalTasks=" << totalTasks
+               << " started=" << started_ << " fragments=" << fragmentTasks_.size() << " totalTasks=" << totalTasks
                << " rootFragmentId=" << rootFragmentId_;
   // Per-operator cpu/blocked/peak-mem stats for the surviving tasks, so we
   // can 1:1 compare against pv-cli's plan-with-stats dump. Only print for
@@ -308,14 +299,14 @@ MppQueryCoordinator::~MppQueryCoordinator() {
   if (started_ && VLOG_IS_ON(1)) {
     for (size_t f = 0; f < fragmentTasks_.size(); ++f) {
       for (auto& task : fragmentTasks_[f]) {
-        if (!task) continue;
+        if (!task)
+          continue;
         try {
           const auto ts = task->taskStats();
           if (ts.pipelineStats.size() < 5) {
             continue;
           }
-          VLOG(1) << "MppQueryCoordinator[" << queryId_
-                  << "]: plan-with-stats for fragment " << f
+          VLOG(1) << "MppQueryCoordinator[" << queryId_ << "]: plan-with-stats for fragment " << f
                   << " taskId=" << task->taskId() << " (begin):";
           // Split per-line so glog single-line buffer doesn't truncate
           // the tree below ~64KB; the merged Q8 plan exceeds that.
@@ -323,18 +314,14 @@ MppQueryCoordinator::~MppQueryCoordinator() {
           size_t pos = 0;
           while (pos <= planStr.size()) {
             const auto eol = planStr.find('\n', pos);
-            const auto lineEnd =
-                eol == std::string::npos ? planStr.size() : eol;
-            VLOG(1) << "  STATS["
-                    << task->taskId() << "] "
-                    << planStr.substr(pos, lineEnd - pos);
+            const auto lineEnd = eol == std::string::npos ? planStr.size() : eol;
+            VLOG(1) << "  STATS[" << task->taskId() << "] " << planStr.substr(pos, lineEnd - pos);
             if (eol == std::string::npos) {
               break;
             }
             pos = eol + 1;
           }
-          VLOG(1) << "MppQueryCoordinator[" << queryId_
-                  << "]: plan-with-stats for fragment " << f
+          VLOG(1) << "MppQueryCoordinator[" << queryId_ << "]: plan-with-stats for fragment " << f
                   << " taskId=" << task->taskId() << " (end)";
         } catch (const std::exception& e) {
           VLOG(1) << "  printPlanWithStats failed: " << e.what();
@@ -351,20 +338,17 @@ MppQueryCoordinator::~MppQueryCoordinator() {
     // is not cleanly reset. abort() is idempotent: if the JVM-side close
     // already drove abort, the inner aborted_ guard short-circuits.
     {
-      nvtx3::scoped_range_in<GlutenMppDomain> r{
-          "coordinator::~destructor:abort_call"};
+      nvtx3::scoped_range_in<GlutenMppDomain> r{"coordinator::~destructor:abort_call"};
       try {
         abort();
       } catch (...) {
       }
     }
     {
-      nvtx3::scoped_range_in<GlutenMppDomain> removeTaskRange{
-          "coordinator::~destructor:removeTaskFromOutputBuffer"};
+      nvtx3::scoped_range_in<GlutenMppDomain> removeTaskRange{"coordinator::~destructor:removeTaskFromOutputBuffer"};
       for (auto& replicas : fragmentTasks_) {
         for (auto& task : replicas) {
-          removeTaskOutputState(
-              task, bufferManager_, queryId_, "coordinator-destructor");
+          removeTaskOutputState(task, bufferManager_, queryId_, "coordinator-destructor");
         }
       }
     }
@@ -377,23 +361,19 @@ MppQueryCoordinator::~MppQueryCoordinator() {
   // then OutputBufferManager handle, then per-query deserialize pool,
   // then QueryCtx (which holds the root memory pool).
   {
-    nvtx3::scoped_range_in<GlutenMppDomain> r{
-        "coordinator::~destructor:fragmentTasks.clear"};
+    nvtx3::scoped_range_in<GlutenMppDomain> r{"coordinator::~destructor:fragmentTasks.clear"};
     fragmentTasks_.clear();
   }
   {
-    nvtx3::scoped_range_in<GlutenMppDomain> r{
-        "coordinator::~destructor:bufferManager.reset"};
+    nvtx3::scoped_range_in<GlutenMppDomain> r{"coordinator::~destructor:bufferManager.reset"};
     bufferManager_.reset();
   }
   {
-    nvtx3::scoped_range_in<GlutenMppDomain> r{
-        "coordinator::~destructor:deserializePool.reset"};
+    nvtx3::scoped_range_in<GlutenMppDomain> r{"coordinator::~destructor:deserializePool.reset"};
     deserializePool_.reset();
   }
   {
-    nvtx3::scoped_range_in<GlutenMppDomain> r{
-        "coordinator::~destructor:queryCtx.reset"};
+    nvtx3::scoped_range_in<GlutenMppDomain> r{"coordinator::~destructor:queryCtx.reset"};
     queryCtx_.reset();
   }
   LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: destructor exit";
@@ -403,16 +383,12 @@ MppQueryCoordinator::~MppQueryCoordinator() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-std::string MppQueryCoordinator::makeTaskId(
-    int32_t fragmentId,
-    int32_t replicaIdx) const {
+std::string MppQueryCoordinator::makeTaskId(int32_t fragmentId, int32_t replicaIdx) const {
   return makeTaskIdForPeer(localPeerId_, fragmentId, replicaIdx);
 }
 
-std::string MppQueryCoordinator::makeTaskIdForPeer(
-    const std::string& peerId,
-    int32_t fragmentId,
-    int32_t replicaIdx) const {
+std::string MppQueryCoordinator::makeTaskIdForPeer(const std::string& peerId, int32_t fragmentId, int32_t replicaIdx)
+    const {
   // Root-fragment output is consumed by this coordinator via
   // OutputBufferManager::getData() (kHttp PartitionedOutput).
   // Non-root fragment edges flow through IBM's UCX / IntraNodeTransfer
@@ -422,13 +398,12 @@ std::string MppQueryCoordinator::makeTaskIdForPeer(
       isSafeTaskIdComponent(peerId),
       "MPP peer id must be non-empty and must not contain '/' or '://', got '{}'",
       peerId);
-  return fmt::format(
-      "{}{}-{}-{}-p{}", kTaskIdPrefix, queryId_, peerId, fragmentId, replicaIdx);
+  return fmt::format("{}{}-{}-{}-p{}", kTaskIdPrefix, queryId_, peerId, fragmentId, replicaIdx);
 }
 
 bool MppQueryCoordinator::isTerminalState(TaskState state) {
-  return state == TaskState::kFinished || state == TaskState::kCanceled ||
-      state == TaskState::kAborted || state == TaskState::kFailed;
+  return state == TaskState::kFinished || state == TaskState::kCanceled || state == TaskState::kAborted ||
+      state == TaskState::kFailed;
 }
 
 // ---------------------------------------------------------------------------
@@ -442,21 +417,17 @@ void MppQueryCoordinator::start() {
   lifecycleStartTime_ = std::chrono::steady_clock::now();
   const bool lifecycleLogEnabled = mppLifecycleLogEnabled();
   const auto lifecycleElapsedMs = [this]() -> int64_t {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now() - lifecycleStartTime_)
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - lifecycleStartTime_)
         .count();
   };
   if (lifecycleLogEnabled) {
     LOG(WARNING) << "[MPP_LIFECYCLE] event=query_start elapsedMs=0"
-                 << " queryId=" << queryId_
-                 << " peer=" << peerIndex_ << "/" << peerCount_
-                 << " fragments=" << fragmentSpecs_.size()
-                 << " rootFragment=" << rootFragmentId_;
+                 << " queryId=" << queryId_ << " peer=" << peerIndex_ << "/" << peerCount_
+                 << " fragments=" << fragmentSpecs_.size() << " rootFragment=" << rootFragmentId_;
   }
-  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: start() "
-               << fragmentSpecs_.size() << " fragments, rootFragmentId="
-               << rootFragmentId_ << " peer=" << peerIndex_ << "/"
-               << peerCount_ << " localPeerId=" << localPeerId_;
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: start() " << fragmentSpecs_.size()
+               << " fragments, rootFragmentId=" << rootFragmentId_ << " peer=" << peerIndex_ << "/" << peerCount_
+               << " localPeerId=" << localPeerId_;
 
   // Write-in-MPP: detect whether the root fragment is a distributed TableWrite.
   // When it is, the root must NOT use the SELECT ORDER-BY drain model (one
@@ -466,13 +437,11 @@ void MppQueryCoordinator::start() {
   // SELECT: per-peer replica count (1 writer/peer), destination ownership (fan
   // across peers, not peer0-only), and rootProducesOutput_ (all peers emit).
   const bool rootIsWrite = [&]() {
-    std::function<bool(const core::PlanNodePtr&)> hasTableWrite =
-        [&](const core::PlanNodePtr& node) -> bool {
+    std::function<bool(const core::PlanNodePtr&)> hasTableWrite = [&](const core::PlanNodePtr& node) -> bool {
       if (node == nullptr) {
         return false;
       }
-      if (std::dynamic_pointer_cast<const core::TableWriteNode>(node) !=
-          nullptr) {
+      if (std::dynamic_pointer_cast<const core::TableWriteNode>(node) != nullptr) {
         return true;
       }
       for (const auto& source : node->sources()) {
@@ -485,8 +454,7 @@ void MppQueryCoordinator::start() {
     return hasTableWrite(fragmentSpecs_[rootFragmentId_].planFragment.planNode);
   }();
   if (rootIsWrite) {
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: root fragment "
-                 << rootFragmentId_
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: root fragment " << rootFragmentId_
                  << " is a distributed TableWrite (1 writer/peer, fan "
                  << "destinations across peers, all peers emit commit)";
   }
@@ -559,11 +527,9 @@ void MppQueryCoordinator::start() {
       const auto logicalDestinations = std::max(1, consumerInboundPartitions[i]);
       const auto localTaskBudget = std::max(1, fragmentSpecs_[i].numDrivers);
       fragmentReplicaCount_[i] = std::min(logicalDestinations, localTaskBudget);
-      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: HASH fragment " << i
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: HASH fragment " << i
                    << " logicalDestinations=" << logicalDestinations
-                   << " localConsumerTasks=" << fragmentReplicaCount_[i]
-                   << " taskBudget=" << localTaskBudget;
+                   << " localConsumerTasks=" << fragmentReplicaCount_[i] << " taskBudget=" << localTaskBudget;
     }
   }
 
@@ -576,10 +542,8 @@ void MppQueryCoordinator::start() {
   // drains them (identical to the numDrivers=1 budget case handled above).
   for (size_t i = 0; i < fragmentSpecs_.size(); ++i) {
     if (!fragmentSpecs_[i].scanNodeIds.empty() && fragmentReplicaCount_[i] != 1) {
-      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: scan-bearing fragment " << i << " replicaCount "
-                   << fragmentReplicaCount_[i]
-                   << " -> 1 (scans wired to single-replica tasks)";
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: scan-bearing fragment " << i << " replicaCount "
+                   << fragmentReplicaCount_[i] << " -> 1 (scans wired to single-replica tasks)";
       fragmentReplicaCount_[i] = 1;
     }
   }
@@ -591,10 +555,8 @@ void MppQueryCoordinator::start() {
   // destination this peer owns to that single task, so it gathers the peer's
   // whole slice into one output file.
   if (rootIsWrite && fragmentReplicaCount_[rootFragmentId_] != 1) {
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                 << "]: write root fragment " << rootFragmentId_
-                 << " replicaCount " << fragmentReplicaCount_[rootFragmentId_]
-                 << " -> 1 (single writer per peer)";
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: write root fragment " << rootFragmentId_
+                 << " replicaCount " << fragmentReplicaCount_[rootFragmentId_] << " -> 1 (single writer per peer)";
     fragmentReplicaCount_[rootFragmentId_] = 1;
   }
 
@@ -604,91 +566,151 @@ void MppQueryCoordinator::start() {
   for (const auto& exchange : exchangeSpecs_) {
     if (exchange.partitionType == "BROADCAST") {
       const auto producer = exchange.producerFragmentId;
-      if (producer >= 0 &&
-          static_cast<size_t>(producer) < isBroadcastProducer.size()) {
+      if (producer >= 0 && static_cast<size_t>(producer) < isBroadcastProducer.size()) {
         isBroadcastProducer[producer] = true;
       }
     }
   }
 
   const auto peerSlots = std::max(1, peerCount_);
-  std::vector<std::vector<size_t>> scanSplitsByPeer(
-      fragmentSpecs_.size(), std::vector<size_t>(peerSlots, 0));
+  std::vector<double> peerWeights(peerSlots, 1.0);
+  if (const auto* weightsEnv = std::getenv("GLUTEN_MPP_PEER_WEIGHTS")) {
+    std::stringstream weightsStream(weightsEnv);
+    std::string token;
+    size_t index = 0;
+    while (std::getline(weightsStream, token, ',') && index < peerWeights.size()) {
+      try {
+        peerWeights[index] = std::max(0.01, std::stod(token));
+      } catch (...) {
+        VELOX_FAIL("Invalid GLUTEN_MPP_PEER_WEIGHTS value '{}' at index {}", token, index);
+      }
+      ++index;
+    }
+    VELOX_CHECK_EQ(
+        index,
+        peerWeights.size(),
+        "GLUTEN_MPP_PEER_WEIGHTS must contain exactly {} comma-separated weights",
+        peerWeights.size());
+  }
+  const auto destinationOwner = [&](int32_t destination, int32_t total) {
+    VELOX_CHECK_GT(total, 0);
+    const auto totalWeight = std::accumulate(peerWeights.begin(), peerWeights.end(), 0.0);
+    const auto target = (static_cast<double>(destination) + 0.5) * totalWeight / total;
+    double cumulative = 0;
+    for (int32_t peer = 0; peer < peerSlots; ++peer) {
+      cumulative += peerWeights[peer];
+      if (target < cumulative) {
+        return peer;
+      }
+    }
+    return peerSlots - 1;
+  };
+  // Assign scan splits by estimated bytes, not by file ordinal.  Iceberg
+  // tables commonly contain files with very different sizes; j % peerCount
+  // gives every peer the same number of files but can leave one GPU processing
+  // minutes after the others have gone idle.  Build the same deterministic
+  // longest-processing-time schedule in every peer coordinator, then use it
+  // both for locality decisions and for actual split wiring below.
+  std::unordered_map<const SplitInfo*, std::vector<int32_t>> scanSplitOwners;
+  for (const auto& spec : fragmentSpecs_) {
+    for (const auto& scanInfo : spec.scanInfos) {
+      std::vector<int32_t> owners(scanInfo->paths.size(), 0);
+      if (peerCount_ > 1 && !owners.empty()) {
+        std::vector<size_t> order(owners.size());
+        std::iota(order.begin(), order.end(), 0);
+        const auto splitBytes = [&](size_t index) -> uint64_t {
+          return index < scanInfo->lengths.size() ? std::max<uint64_t>(1, scanInfo->lengths[index]) : 1;
+        };
+        std::stable_sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+          return splitBytes(left) > splitBytes(right);
+        });
+        std::vector<uint64_t> assignedBytes(peerSlots, 0);
+        for (const auto index : order) {
+          int32_t leastLoaded = 0;
+          for (int32_t peer = 1; peer < peerSlots; ++peer) {
+            if (assignedBytes[peer] / peerWeights[peer] < assignedBytes[leastLoaded] / peerWeights[leastLoaded]) {
+              leastLoaded = peer;
+            }
+          }
+          owners[index] = leastLoaded;
+          assignedBytes[leastLoaded] += splitBytes(index);
+        }
+      }
+      scanSplitOwners.emplace(scanInfo.get(), std::move(owners));
+    }
+  }
+  std::vector<std::vector<size_t>> scanSplitsByPeer(fragmentSpecs_.size(), std::vector<size_t>(peerSlots, 0));
   std::vector<size_t> totalScanSplits(fragmentSpecs_.size(), 0);
   for (const auto& spec : fragmentSpecs_) {
     if (spec.scanInfos.empty()) {
       continue;
     }
     for (const auto& scanInfo : spec.scanInfos) {
+      const auto& owners = scanSplitOwners.at(scanInfo.get());
       for (size_t j = 0; j < scanInfo->paths.size(); ++j) {
-        const auto splitPeer = peerCount_ > 1
-            ? static_cast<int32_t>(j % static_cast<size_t>(peerCount_))
-            : 0;
+        const auto splitPeer = owners[j];
         scanSplitsByPeer[spec.id][splitPeer]++;
         totalScanSplits[spec.id]++;
       }
     }
     if (isBroadcastProducer[spec.id]) {
-      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: broadcast scan producer fragment " << spec.id
-                   << " split ownership total=" << totalScanSplits[spec.id]
-                   << " peer=" << peerIndex_ << "/" << peerCount_
-                   << " localSplits="
-                   << scanSplitsByPeer[spec.id][peerIndex_];
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: broadcast scan producer fragment " << spec.id
+                   << " split ownership total=" << totalScanSplits[spec.id] << " peer=" << peerIndex_ << "/"
+                   << peerCount_ << " localSplits=" << scanSplitsByPeer[spec.id][peerIndex_];
     }
   }
 
   std::vector<bool> bootstrapBroadcastProducer(fragmentSpecs_.size(), false);
   for (const auto& spec : fragmentSpecs_) {
-    bootstrapBroadcastProducer[spec.id] =
-        isBroadcastProducer[spec.id] && !spec.scanInfos.empty() &&
+    bootstrapBroadcastProducer[spec.id] = isBroadcastProducer[spec.id] && !spec.scanInfos.empty() &&
         totalScanSplits[spec.id] <= static_cast<size_t>(peerSlots);
     if (bootstrapBroadcastProducer[spec.id]) {
-      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: bootstrap broadcast scan producer fragment "
-                   << spec.id << " before bulk scans (totalSplits="
-                   << totalScanSplits[spec.id] << ", peer=" << peerIndex_
-                   << "/" << peerCount_ << ", localSplits="
-                   << scanSplitsByPeer[spec.id][peerIndex_] << ")";
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: bootstrap broadcast scan producer fragment " << spec.id
+                   << " before bulk scans (totalSplits=" << totalScanSplits[spec.id] << ", peer=" << peerIndex_ << "/"
+                   << peerCount_ << ", localSplits=" << scanSplitsByPeer[spec.id][peerIndex_] << ")";
     }
   }
 
-  const auto peerOwnsExchangeDestination =
-      [&](const MppExchangeSpec& exchange, int32_t peerIndex) {
-        if (peerCount_ <= 1 || exchange.partitionType == "BROADCAST") {
+  const auto peerOwnsExchangeDestination = [&](const MppExchangeSpec& exchange, int32_t peerIndex) {
+    if (peerCount_ <= 1 || exchange.partitionType == "BROADCAST") {
+      return true;
+    }
+    if (exchange.consumerFragmentId == rootFragmentId_ && exchange.partitionType == "RANGE" && !rootIsWrite) {
+      // Preserve final ORDER BY by draining the root RANGE exchange on
+      // peer0 until we implement a k-way merge across Spark partitions.
+      // A distributed write root instead fans destinations across peers
+      // (below), so each peer writes the slice it owns.
+      return peerIndex == 0;
+    }
+    if (exchange.partitionType == "HASH" || exchange.partitionType == "RANGE") {
+      for (int dest = 0; dest < std::max(1, exchange.numPartitions); ++dest) {
+        if (destinationOwner(dest, std::max(1, exchange.numPartitions)) == peerIndex) {
           return true;
         }
-        if (exchange.consumerFragmentId == rootFragmentId_ &&
-            exchange.partitionType == "RANGE" && !rootIsWrite) {
-          // Preserve final ORDER BY by draining the root RANGE exchange on
-          // peer0 until we implement a k-way merge across Spark partitions.
-          // A distributed write root instead fans destinations across peers
-          // (below), so each peer writes the slice it owns.
-          return peerIndex == 0;
-        }
-        if (exchange.partitionType == "HASH" || exchange.partitionType == "RANGE") {
-          for (int dest = 0; dest < std::max(1, exchange.numPartitions); ++dest) {
-            if (dest % peerCount_ == peerIndex) {
-              return true;
-            }
-          }
-          return false;
-        }
-        // SINGLE / ROUND_ROBIN consumers are global singletons in this
-        // multi-peer coordinator. Only peer0 owns them; downstream exchanges
-        // must fetch that producer from peer0 only.
-        return peerIndex == 0;
-      };
+      }
+      return false;
+    }
+    // SINGLE / ROUND_ROBIN consumers are global singletons in this
+    // multi-peer coordinator. Only peer0 owns them; downstream exchanges
+    // must fetch that producer from peer0 only.
+    return peerIndex == 0;
+  };
   const auto peerHasFragment = [&](int32_t fragmentId, int32_t peerIndex) {
     if (peerCount_ <= 1 || peerIndex < 0) {
       return true;
     }
-    if (fragmentId >= 0 &&
-        static_cast<size_t>(fragmentId) < bootstrapBroadcastProducer.size() &&
+    if (fragmentId >= 0 && static_cast<size_t>(fragmentId) < bootstrapBroadcastProducer.size() &&
         bootstrapBroadcastProducer[fragmentId]) {
+      // A broadcast build over an empty Iceberg table still needs one producer
+      // task to publish EOS.  Dropping the zero-split fragment from every peer
+      // leaves its consumer with no exchange endpoint.  Run the empty producer
+      // exactly once on peer 0; non-empty tiny producers remain striped only to
+      // peers that own an input split.
+      if (totalScanSplits[fragmentId] == 0) {
+        return peerIndex == 0;
+      }
       const auto peerSlot = static_cast<size_t>(peerIndex);
-      if (peerSlot >= scanSplitsByPeer[fragmentId].size() ||
-          scanSplitsByPeer[fragmentId][peerSlot] == 0) {
+      if (peerSlot >= scanSplitsByPeer[fragmentId].size() || scanSplitsByPeer[fragmentId][peerSlot] == 0) {
         return false;
       }
     }
@@ -711,8 +733,7 @@ void MppQueryCoordinator::start() {
     // fell through to the inbound-exchange check below and remain gated by
     // whatever non-broadcast (HASH/RANGE/SINGLE) exchange they consume.
     for (const auto& exchange : exchangeSpecs_) {
-      if (exchange.consumerFragmentId != fragmentId ||
-          exchange.partitionType == "BROADCAST") {
+      if (exchange.consumerFragmentId != fragmentId || exchange.partitionType == "BROADCAST") {
         continue;
       }
       if (!peerOwnsExchangeDestination(exchange, peerIndex)) {
@@ -725,10 +746,8 @@ void MppQueryCoordinator::start() {
     for (auto& spec : fragmentSpecs_) {
       if (!peerHasFragment(spec.id, peerIndex_)) {
         fragmentReplicaCount_[spec.id] = 0;
-        LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                     << "]: fragment " << spec.id
-                     << " is not local to peer=" << peerIndex_ << "/"
-                     << peerCount_;
+        LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: fragment " << spec.id
+                     << " is not local to peer=" << peerIndex_ << "/" << peerCount_;
       }
     }
   }
@@ -752,7 +771,7 @@ void MppQueryCoordinator::start() {
         } else if (exchange.partitionType == "HASH") {
           rootProducesOutput_ = false;
           for (int dest = 0; dest < std::max(1, exchange.numPartitions); ++dest) {
-            if (dest % peerCount_ == peerIndex_) {
+            if (destinationOwner(dest, std::max(1, exchange.numPartitions)) == peerIndex_) {
               rootProducesOutput_ = true;
               break;
             }
@@ -780,12 +799,9 @@ void MppQueryCoordinator::start() {
   if (!rootProducesOutput_) {
     fragmentReplicaCount_[rootFragmentId_] = 0;
   }
-  LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-               << "]: rootFragmentId=" << rootFragmentId_
-               << " replicas=" << fragmentReplicaCount_[rootFragmentId_]
-               << " producesOutput=" << rootProducesOutput_
-               << " drain="
-               << (rootDrainSequential_ ? "sequential" : "roundRobin");
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: rootFragmentId=" << rootFragmentId_
+               << " replicas=" << fragmentReplicaCount_[rootFragmentId_] << " producesOutput=" << rootProducesOutput_
+               << " drain=" << (rootDrainSequential_ ? "sequential" : "roundRobin");
 
   // --- Precompute: is fragment `i` a BROADCAST producer, and if so, what is
   // its consumer fragment's replica count? For those, we call
@@ -851,10 +867,10 @@ void MppQueryCoordinator::start() {
     // destinations as splits in a single task; keep their local driver count
     // bounded by the Scala-supplied fragment budget instead of inflating it
     // back to the producer destination count.
-    const auto perReplicaDrivers = (bcastN > 0) ? 1
-        : (rootIsWrite && spec.id == rootFragmentId_) ? 1
+    const auto perReplicaDrivers = (bcastN > 0)                 ? 1
+        : (rootIsWrite && spec.id == rootFragmentId_)           ? 1
         : (isHashConsumer[spec.id] || isRangeConsumer[spec.id]) ? 1
-        : std::max(1, spec.numDrivers);
+                                                                : std::max(1, spec.numDrivers);
     for (int32_t i = 0; i < replicas; ++i) {
       auto taskId = makeTaskId(spec.id, i);
       auto task = Task::create(
@@ -874,13 +890,9 @@ void MppQueryCoordinator::start() {
       fragmentTaskDrivers[spec.id].push_back(perReplicaDrivers);
       fragmentTaskBroadcastFanout[spec.id].push_back(bcastN);
       fragmentTaskStarted[spec.id].push_back(false);
-      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: created fragment " << spec.id << " replica " << i
-                   << "/" << replicas << " taskId=" << taskId
-                   << " drivers=" << perReplicaDrivers
-                   << " inboundN=" << inboundN
-                   << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN)
-                                  : std::string{});
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: created fragment " << spec.id << " replica " << i << "/"
+                   << replicas << " taskId=" << taskId << " drivers=" << perReplicaDrivers << " inboundN=" << inboundN
+                   << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN) : std::string{});
     }
   }
 
@@ -892,28 +904,18 @@ void MppQueryCoordinator::start() {
     const auto perReplicaDrivers = fragmentTaskDrivers[fragmentId][replica];
     const auto bcastN = fragmentTaskBroadcastFanout[fragmentId][replica];
     const auto inboundN = consumerInboundPartitions[fragmentId];
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                 << "]: starting fragment " << fragmentId << " replica "
-                 << replica << "/" << fragmentTasks_[fragmentId].size()
-                 << " taskId=" << task->taskId()
-                 << " drivers=" << perReplicaDrivers
-                 << " inboundN=" << inboundN
-                 << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN)
-                                : std::string{});
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: starting fragment " << fragmentId << " replica "
+                 << replica << "/" << fragmentTasks_[fragmentId].size() << " taskId=" << task->taskId()
+                 << " drivers=" << perReplicaDrivers << " inboundN=" << inboundN
+                 << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN) : std::string{});
     task->start(perReplicaDrivers);
     fragmentTaskStarted[fragmentId][replica] = true;
     if (lifecycleLogEnabled) {
       LOG(WARNING) << "[MPP_LIFECYCLE] event=task_start"
-                   << " elapsedMs=" << lifecycleElapsedMs()
-                   << " queryId=" << queryId_
-                   << " peer=" << peerIndex_ << "/" << peerCount_
-                   << " fragment=" << fragmentId
-                   << " replica=" << replica
-                   << " replicas=" << fragmentTasks_[fragmentId].size()
-                   << " drivers=" << perReplicaDrivers
-                   << " inboundN=" << inboundN
-                   << " bcastFanout=" << bcastN
-                   << " taskId=" << task->taskId();
+                   << " elapsedMs=" << lifecycleElapsedMs() << " queryId=" << queryId_ << " peer=" << peerIndex_ << "/"
+                   << peerCount_ << " fragment=" << fragmentId << " replica=" << replica
+                   << " replicas=" << fragmentTasks_[fragmentId].size() << " drivers=" << perReplicaDrivers
+                   << " inboundN=" << inboundN << " bcastFanout=" << bcastN << " taskId=" << task->taskId();
     }
     // Pipeline structure after Velox LocalPlanner splits the merged plan
     // at LocalPartitionNode boundaries. Used to compare batch
@@ -924,15 +926,11 @@ void MppQueryCoordinator::start() {
     // enable via GLOG_v=1.
     if (VLOG_IS_ON(1)) {
       const auto ts = task->taskStats();
-      VLOG(1) << "MppQueryCoordinator[" << queryId_
-              << "]: task " << task->taskId()
-              << " pipelines=" << ts.pipelineStats.size()
-              << " numTotalDrivers=" << task->numTotalDrivers();
+      VLOG(1) << "MppQueryCoordinator[" << queryId_ << "]: task " << task->taskId()
+              << " pipelines=" << ts.pipelineStats.size() << " numTotalDrivers=" << task->numTotalDrivers();
       for (size_t pid = 0; pid < ts.pipelineStats.size(); ++pid) {
         const auto& ps = ts.pipelineStats[pid];
-        VLOG(1) << "  pipeline[" << pid
-                << "] input=" << ps.inputPipeline
-                << " output=" << ps.outputPipeline;
+        VLOG(1) << "  pipeline[" << pid << "] input=" << ps.inputPipeline << " output=" << ps.outputPipeline;
       }
     }
     if (bcastN > 0) {
@@ -946,13 +944,10 @@ void MppQueryCoordinator::start() {
       task->updateOutputBuffers(bcastN, /*noMoreBuffers=*/true);
 #ifdef GLUTEN_ENABLE_GPU
       const auto ucxQueueUpdated =
-          facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef()
-              ->updateOutputBuffersIfExists(
-                  task->taskId(), bcastN, /*noMoreBuffers=*/true);
-      VLOG(1) << "MppQueryCoordinator[" << queryId_
-              << "]: broadcast fanout taskId=" << task->taskId()
-              << " destinations=" << bcastN
-              << " ucxQueueUpdated=" << ucxQueueUpdated;
+          facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef()->updateOutputBuffersIfExists(
+              task->taskId(), bcastN, /*noMoreBuffers=*/true);
+      VLOG(1) << "MppQueryCoordinator[" << queryId_ << "]: broadcast fanout taskId=" << task->taskId()
+              << " destinations=" << bcastN << " ucxQueueUpdated=" << ucxQueueUpdated;
 #endif
     }
   };
@@ -975,10 +970,8 @@ void MppQueryCoordinator::start() {
     }
     scanSplitsWired[spec.id] = true;
     if (fragmentTasks_[spec.id].empty()) {
-      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: skipping scan split wiring for non-local fragment "
-                   << spec.id << " on peer " << peerIndex_ << "/"
-                   << peerCount_;
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: skipping scan split wiring for non-local fragment "
+                   << spec.id << " on peer " << peerIndex_ << "/" << peerCount_;
       return;
     }
     VELOX_CHECK_EQ(
@@ -1004,8 +997,7 @@ void MppQueryCoordinator::start() {
       // Use the connector ID from the plan's TableScanNode.
       // This is critical: "test-hive" -> Velox Hive connector,
       // "cudf-hive" -> cuDF GPU connector (handles type casting).
-      const auto& connectorId = (i < spec.scanConnectorIds.size() &&
-                                  !spec.scanConnectorIds[i].empty())
+      const auto& connectorId = (i < spec.scanConnectorIds.size() && !spec.scanConnectorIds[i].empty())
           ? spec.scanConnectorIds[i]
           : kHiveConnectorId;
 
@@ -1018,22 +1010,18 @@ void MppQueryCoordinator::start() {
         // and the HashBuild merges them (see peerHasFragment + Phase 3 BROADCAST
         // wiring). The old model pinned the entire build-side scan to peer 0,
         // which then serially scanned + built + broadcast it all.
-        if (peerCount_ > 1) {
-          if (j % static_cast<size_t>(peerCount_) != static_cast<size_t>(peerIndex_)) {
-            continue;
-          }
+        if (scanSplitOwners.at(scanInfo.get())[j] != peerIndex_) {
+          continue;
         }
         std::unordered_map<std::string, std::optional<std::string>> partitionKeys;
-        if (!scanInfo->partitionColumns.empty() &&
-            j < scanInfo->partitionColumns.size()) {
+        if (!scanInfo->partitionColumns.empty() && j < scanInfo->partitionColumns.size()) {
           for (const auto& [key, value] : scanInfo->partitionColumns[j]) {
             partitionKeys[key] = value;
           }
         }
 
         std::shared_ptr<connector::ConnectorSplit> connectorSplit;
-        if (auto icebergSplitInfo =
-                std::dynamic_pointer_cast<IcebergSplitInfo>(scanInfo)) {
+        if (auto icebergSplitInfo = std::dynamic_pointer_cast<IcebergSplitInfo>(scanInfo)) {
           std::unordered_map<std::string, std::string> metadataColumn;
           if (j < scanInfo->metadataColumns.size()) {
             metadataColumn = scanInfo->metadataColumns[j];
@@ -1046,33 +1034,29 @@ void MppQueryCoordinator::start() {
               deleteFiles.emplace_back(deleteFile);
             }
           }
-          std::unordered_map<std::string, std::string> customSplitInfo{
-              {"table_format", "hive-iceberg"}};
-          connectorSplit =
-              std::make_shared<connector::hive::iceberg::HiveIcebergSplit>(
-                  connectorId,
-                  scanInfo->paths[j],
-                  scanInfo->format,
-                  scanInfo->starts[j],
-                  scanInfo->lengths[j],
-                  partitionKeys,
-                  std::nullopt,
-                  customSplitInfo,
-                  nullptr,
-                  true,
-                  std::move(deleteFiles),
-                  metadataColumn,
-                  j < scanInfo->properties.size() ? scanInfo->properties[j]
-                                                   : std::nullopt);
+          std::unordered_map<std::string, std::string> customSplitInfo{{"table_format", "hive-iceberg"}};
+          connectorSplit = std::make_shared<connector::hive::iceberg::HiveIcebergSplit>(
+              connectorId,
+              scanInfo->paths[j],
+              scanInfo->format,
+              scanInfo->starts[j],
+              scanInfo->lengths[j],
+              partitionKeys,
+              std::nullopt,
+              customSplitInfo,
+              nullptr,
+              true,
+              std::move(deleteFiles),
+              metadataColumn,
+              j < scanInfo->properties.size() ? scanInfo->properties[j] : std::nullopt);
         } else
 #ifdef GLUTEN_ENABLE_GPU
-        if (connectorId == kCudfHiveConnectorId && scanInfo->canUseCudfConnector()) {
+            if (connectorId == kCudfHiveConnectorId && scanInfo->canUseCudfConnector()) {
           std::unordered_map<std::string, std::string> metadataColumn;
           if (j < scanInfo->metadataColumns.size()) {
             metadataColumn = scanInfo->metadataColumns[j];
           }
-          connectorSplit = std::make_shared<
-              cudf_velox::connector::hive::CudfHiveConnectorSplit>(
+          connectorSplit = std::make_shared<cudf_velox::connector::hive::CudfHiveConnectorSplit>(
               kCudfHiveConnectorId,
               cleanedCudfPath(scanInfo->paths[j]),
               scanInfo->starts[j],
@@ -1082,14 +1066,13 @@ void MppQueryCoordinator::start() {
         } else
 #endif
         {
-          connectorSplit =
-            std::make_shared<connector::hive::HiveConnectorSplit>(
-                connectorId,
-                scanInfo->paths[j],
-                scanInfo->format,
-                scanInfo->starts[j],
-                scanInfo->lengths[j],
-                partitionKeys);
+          connectorSplit = std::make_shared<connector::hive::HiveConnectorSplit>(
+              connectorId,
+              scanInfo->paths[j],
+              scanInfo->format,
+              scanInfo->starts[j],
+              scanInfo->lengths[j],
+              partitionKeys);
         }
 
         task->addSplit(scanNodeId, Split(std::move(connectorSplit)));
@@ -1097,23 +1080,15 @@ void MppQueryCoordinator::start() {
       }
       task->noMoreSplits(scanNodeId);
 
-      LOG(WARNING) << "MppQueryCoordinator: added " << addedSplits << "/"
-                   << scanInfo->paths.size()
-                   << " scan splits (connector='" << connectorId
-                   << "') to fragment " << spec.id
-                   << " scan node " << scanNodeId << " peer=" << peerIndex_
-                   << "/" << peerCount_
+      LOG(WARNING) << "MppQueryCoordinator: added " << addedSplits << "/" << scanInfo->paths.size()
+                   << " scan splits (connector='" << connectorId << "') to fragment " << spec.id << " scan node "
+                   << scanNodeId << " peer=" << peerIndex_ << "/" << peerCount_
                    << (fragmentIsBroadcastProducer ? " broadcastProducer" : "");
       if (lifecycleLogEnabled) {
         LOG(WARNING) << "[MPP_LIFECYCLE] event=scan_splits"
-                     << " elapsedMs=" << lifecycleElapsedMs()
-                     << " queryId=" << queryId_
-                     << " peer=" << peerIndex_ << "/" << peerCount_
-                     << " fragment=" << spec.id
-                     << " scanNode=" << scanNodeId
-                     << " added=" << addedSplits
-                     << " total=" << scanInfo->paths.size()
-                     << " connector=" << connectorId
+                     << " elapsedMs=" << lifecycleElapsedMs() << " queryId=" << queryId_ << " peer=" << peerIndex_
+                     << "/" << peerCount_ << " fragment=" << spec.id << " scanNode=" << scanNodeId
+                     << " added=" << addedSplits << " total=" << scanInfo->paths.size() << " connector=" << connectorId
                      << " broadcastProducer=" << fragmentIsBroadcastProducer;
       }
     }
@@ -1128,11 +1103,9 @@ void MppQueryCoordinator::start() {
     auto& producerReplicas = fragmentTasks_[exchange.producerFragmentId];
     auto& consumerReplicas = fragmentTasks_[exchange.consumerFragmentId];
     if (consumerReplicas.empty()) {
-      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: skipping exchange " << exchange.id
-                   << " on peer=" << peerIndex_ << "/" << peerCount_
-                   << " because consumer fragment " << exchange.consumerFragmentId
-                   << " is not local to this peer";
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: skipping exchange " << exchange.id
+                   << " on peer=" << peerIndex_ << "/" << peerCount_ << " because consumer fragment "
+                   << exchange.consumerFragmentId << " is not local to this peer";
       return;
     }
 
@@ -1147,26 +1120,19 @@ void MppQueryCoordinator::start() {
     const bool isBroadcast = exchange.partitionType == "BROADCAST";
     std::vector<ProducerEndpointForSplit> producerEndpoints;
     const auto appendProducerEndpoints =
-        [&](const std::string& peerId,
-            const std::string& host,
-            int32_t port,
-            int32_t replicaCount) {
+        [&](const std::string& peerId, const std::string& host, int32_t port, int32_t replicaCount) {
           for (int32_t j = 0; j < replicaCount; ++j) {
-            producerEndpoints.push_back(ProducerEndpointForSplit{
-                peerId == localPeerId_
-                    ? makeTaskId(exchange.producerFragmentId, j)
-                    : makeTaskIdForPeer(peerId, exchange.producerFragmentId, j),
-                host,
-                port});
+            producerEndpoints.push_back(
+                ProducerEndpointForSplit{
+                    peerId == localPeerId_ ? makeTaskId(exchange.producerFragmentId, j)
+                                           : makeTaskIdForPeer(peerId, exchange.producerFragmentId, j),
+                    host,
+                    port});
           }
         };
 
     if (peerHasFragment(exchange.producerFragmentId, peerIndex_)) {
-      appendProducerEndpoints(
-          localPeerId_,
-          "127.0.0.1",
-          urlPort,
-          static_cast<int32_t>(producerReplicas.size()));
+      appendProducerEndpoints(localPeerId_, "127.0.0.1", urlPort, static_cast<int32_t>(producerReplicas.size()));
     }
     for (const auto& peer : exchange.producerEndpoints) {
       if (peer.peerId == localPeerId_) {
@@ -1180,20 +1146,9 @@ void MppQueryCoordinator::start() {
           "MPP peer id must be non-empty and must not contain '/' or '://', got '{}'",
           peer.peerId);
       VELOX_CHECK_GT(
-          peer.port,
-          0,
-          "MPP peer endpoint {} has invalid RemoteConnectorSplit URL port {}",
-          peer.peerId,
-          peer.port);
-      VELOX_CHECK(
-          !peer.host.empty(),
-          "MPP peer endpoint {} has empty host",
-          peer.peerId);
-      appendProducerEndpoints(
-          peer.peerId,
-          peer.host,
-          peer.port,
-          baseFragmentReplicaCount[exchange.producerFragmentId]);
+          peer.port, 0, "MPP peer endpoint {} has invalid RemoteConnectorSplit URL port {}", peer.peerId, peer.port);
+      VELOX_CHECK(!peer.host.empty(), "MPP peer endpoint {} has empty host", peer.peerId);
+      appendProducerEndpoints(peer.peerId, peer.host, peer.port, baseFragmentReplicaCount[exchange.producerFragmentId]);
     }
     VELOX_CHECK(
         !producerEndpoints.empty(),
@@ -1203,12 +1158,10 @@ void MppQueryCoordinator::start() {
         peerIndex_,
         peerCount_);
 
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: wiring exchange "
-                 << exchange.id << " type=" << exchange.partitionType
-                 << " producerF=" << exchange.producerFragmentId << " ("
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: wiring exchange " << exchange.id
+                 << " type=" << exchange.partitionType << " producerF=" << exchange.producerFragmentId << " ("
                  << producerReplicas.size() << " replicas)"
-                 << " -> consumerF=" << exchange.consumerFragmentId << " ("
-                 << consumerReplicas.size() << " replicas)"
+                 << " -> consumerF=" << exchange.consumerFragmentId << " (" << consumerReplicas.size() << " replicas)"
                  << " exchangeNode=" << exchange.exchangeNodeId;
 
     // Build the IBM ucx-exchange URL format expected by
@@ -1229,7 +1182,7 @@ void MppQueryCoordinator::start() {
         return peerIndex_ == 0;
       }
       if (isHash || isRange) {
-        return dest % peerCount_ == peerIndex_;
+        return destinationOwner(dest, totalDestinations) == peerIndex_;
       }
       return peerIndex_ == 0;
     };
@@ -1238,8 +1191,7 @@ void MppQueryCoordinator::start() {
       auto& consumerTask = consumerReplicas[cIdx];
       if (isBroadcast) {
         const auto destination =
-            peerIndex_ * static_cast<int32_t>(consumerReplicas.size()) +
-            static_cast<int32_t>(cIdx);
+            peerIndex_ * static_cast<int32_t>(consumerReplicas.size()) + static_cast<int32_t>(cIdx);
         for (const auto& producerEndpoint : producerEndpoints) {
           const auto url = fmt::format(
               "http://{}:{}/v1/task/{}/results/{}",
@@ -1247,9 +1199,7 @@ void MppQueryCoordinator::start() {
               producerEndpoint.urlPort,
               producerEndpoint.taskId,
               destination);
-          consumerTask->addSplit(
-              exchange.exchangeNodeId,
-              Split(std::make_shared<RemoteConnectorSplit>(url)));
+          consumerTask->addSplit(exchange.exchangeNodeId, Split(std::make_shared<RemoteConnectorSplit>(url)));
           ++splitCount;
         }
         consumerTask->noMoreSplits(exchange.exchangeNodeId);
@@ -1260,14 +1210,10 @@ void MppQueryCoordinator::start() {
         if (!peerOwnsDestination(dest)) {
           continue;
         }
-        const bool assigned = isRange
-            ? dest % static_cast<int>(consumerReplicas.size()) ==
-                  static_cast<int>(cIdx)
-            : isHash
-                ? (consumerReplicas.size() == 1 ||
-                   dest % static_cast<int>(consumerReplicas.size()) ==
-                       static_cast<int>(cIdx))
-                : true;
+        const bool assigned = isRange ? dest % static_cast<int>(consumerReplicas.size()) == static_cast<int>(cIdx)
+            : isHash                  ? (consumerReplicas.size() == 1 ||
+                        dest % static_cast<int>(consumerReplicas.size()) == static_cast<int>(cIdx))
+                                      : true;
         if (!assigned) {
           continue;
         }
@@ -1278,36 +1224,27 @@ void MppQueryCoordinator::start() {
               producerEndpoint.urlPort,
               producerEndpoint.taskId,
               dest);
-          consumerTask->addSplit(
-              exchange.exchangeNodeId,
-              Split(std::make_shared<RemoteConnectorSplit>(url)));
+          consumerTask->addSplit(exchange.exchangeNodeId, Split(std::make_shared<RemoteConnectorSplit>(url)));
           ++splitCount;
         }
       }
       consumerTask->noMoreSplits(exchange.exchangeNodeId);
     }
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: exchange "
-                 << exchange.id << " wired (" << splitCount << " splits across "
-                 << consumerReplicas.size() << " consumer task(s), "
-                 << producerEndpoints.size() << " producer endpoint(s), "
-                 << totalDestinations << " producer destinations, "
-                 << (isHash ? "HASH-striped" : isRange ? "RANGE-fanout" : "single-consumer")
-                 << ", peer=" << peerIndex_ << "/" << peerCount_
-                 << ")";
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: exchange " << exchange.id << " wired (" << splitCount
+                 << " splits across " << consumerReplicas.size() << " consumer task(s), " << producerEndpoints.size()
+                 << " producer endpoint(s), " << totalDestinations << " producer destinations, "
+                 << (isHash        ? "HASH-striped"
+                         : isRange ? "RANGE-fanout"
+                                   : "single-consumer")
+                 << ", peer=" << peerIndex_ << "/" << peerCount_ << ")";
     if (lifecycleLogEnabled) {
       LOG(WARNING) << "[MPP_LIFECYCLE] event=exchange_wired"
-                   << " elapsedMs=" << lifecycleElapsedMs()
-                   << " queryId=" << queryId_
-                   << " peer=" << peerIndex_ << "/" << peerCount_
-                   << " exchange=" << exchange.id
-                   << " type=" << exchange.partitionType
-                   << " producerF=" << exchange.producerFragmentId
-                   << " consumerF=" << exchange.consumerFragmentId
-                   << " consumerTasks=" << consumerReplicas.size()
-                   << " producerEndpoints=" << producerEndpoints.size()
+                   << " elapsedMs=" << lifecycleElapsedMs() << " queryId=" << queryId_ << " peer=" << peerIndex_ << "/"
+                   << peerCount_ << " exchange=" << exchange.id << " type=" << exchange.partitionType
+                   << " producerF=" << exchange.producerFragmentId << " consumerF=" << exchange.consumerFragmentId
+                   << " consumerTasks=" << consumerReplicas.size() << " producerEndpoints=" << producerEndpoints.size()
                    << " prunedEmptyProducerEndpoints=0"
-                   << " splits=" << splitCount
-                   << " totalDestinations=" << totalDestinations;
+                   << " splits=" << splitCount << " totalDestinations=" << totalDestinations;
     }
   };
 
@@ -1315,9 +1252,7 @@ void MppQueryCoordinator::start() {
     if (!bootstrapBroadcastProducer[spec.id]) {
       continue;
     }
-    for (int32_t i = 0;
-         i < static_cast<int32_t>(fragmentTasks_[spec.id].size());
-         ++i) {
+    for (int32_t i = 0; i < static_cast<int32_t>(fragmentTasks_[spec.id].size()); ++i) {
       startFragmentTask(spec.id, i);
     }
   }
@@ -1329,16 +1264,13 @@ void MppQueryCoordinator::start() {
   }
   for (size_t i = 0; i < exchangeSpecs_.size(); ++i) {
     const auto& exchange = exchangeSpecs_[i];
-    if (exchange.partitionType == "BROADCAST" &&
-        bootstrapBroadcastProducer[exchange.producerFragmentId]) {
+    if (exchange.partitionType == "BROADCAST" && bootstrapBroadcastProducer[exchange.producerFragmentId]) {
       wireExchange(i);
     }
   }
 
   for (const auto& spec : fragmentSpecs_) {
-    for (int32_t i = 0;
-         i < static_cast<int32_t>(fragmentTasks_[spec.id].size());
-         ++i) {
+    for (int32_t i = 0; i < static_cast<int32_t>(fragmentTasks_[spec.id].size()); ++i) {
       startFragmentTask(spec.id, i);
     }
   }
@@ -1358,14 +1290,10 @@ void MppQueryCoordinator::start() {
   // per 5s. Stops on destructor.
   watchdogThread_ = std::thread([this]() {
     int tick = 0;
-    const int gpuDiagnosticsIntervalTicks = envIntOrDefault(
-        "GLUTEN_GPU_MEMORY_DIAGNOSTICS_WATCHDOG_INTERVAL_TICKS", 0);
-    const int watchdogIntervalMs =
-        std::max(1, envIntOrDefault("GLUTEN_MPP_WATCHDOG_INTERVAL_MS", 5000));
-    const int planStatsIntervalTicks =
-        envIntOrDefault("GLUTEN_MPP_WATCHDOG_PLAN_STATS_INTERVAL_TICKS", 0);
-    const int planStatsSampleTasks =
-        std::max(1, envIntOrDefault("GLUTEN_MPP_WATCHDOG_PLAN_STATS_SAMPLE_TASKS", 4));
+    const int gpuDiagnosticsIntervalTicks = envIntOrDefault("GLUTEN_GPU_MEMORY_DIAGNOSTICS_WATCHDOG_INTERVAL_TICKS", 0);
+    const int watchdogIntervalMs = std::max(1, envIntOrDefault("GLUTEN_MPP_WATCHDOG_INTERVAL_MS", 5000));
+    const int planStatsIntervalTicks = envIntOrDefault("GLUTEN_MPP_WATCHDOG_PLAN_STATS_INTERVAL_TICKS", 0);
+    const int planStatsSampleTasks = std::max(1, envIntOrDefault("GLUTEN_MPP_WATCHDOG_PLAN_STATS_SAMPLE_TASKS", 4));
     const bool lifecycleLogEnabled = mppLifecycleLogEnabled();
     // Track which failed taskIds we've already logged to avoid repeating the
     // same error message every tick.
@@ -1376,61 +1304,54 @@ void MppQueryCoordinator::start() {
       // condition checks watchdogStop_, so the thread exits within microseconds
       // of notify_all from the destructor instead of waiting up to 5s.
       std::unique_lock<std::mutex> lock(watchdogMutex_);
-      if (watchdogCv_.wait_for(
-              lock, std::chrono::milliseconds(watchdogIntervalMs), [this]() {
-                return watchdogStop_.load(std::memory_order_acquire);
-              })) {
+      if (watchdogCv_.wait_for(lock, std::chrono::milliseconds(watchdogIntervalMs), [this]() {
+            return watchdogStop_.load(std::memory_order_acquire);
+          })) {
         break;
       }
       lock.unlock();
       ++tick;
-      const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 std::chrono::steady_clock::now() -
-                                 lifecycleStartTime_)
-                                 .count();
+      const auto elapsedMs =
+          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - lifecycleStartTime_)
+              .count();
       // Summarize per-fragment state counts (more scannable than per-task).
       for (size_t f = 0; f < fragmentTasks_.size(); ++f) {
         int counts[5] = {0, 0, 0, 0, 0}; // running,finished,canceled,aborted,failed
         for (auto& task : fragmentTasks_[f]) {
-          if (!task) continue;
+          if (!task)
+            continue;
           auto s = static_cast<int>(task->state());
           if (s >= 0 && s < 5) {
             counts[s]++;
           }
         }
-        LOG(WARNING) << "MppWatchdog[" << queryId_ << "] tick=" << tick
-                     << " frag=" << f
-                     << " replicas=" << fragmentTasks_[f].size()
-                     << " running=" << counts[0]
-                     << " finished=" << counts[1]
-                     << " canceled=" << counts[2]
-                     << " aborted=" << counts[3]
+        LOG(WARNING) << "MppWatchdog[" << queryId_ << "] tick=" << tick << " frag=" << f
+                     << " replicas=" << fragmentTasks_[f].size() << " running=" << counts[0]
+                     << " finished=" << counts[1] << " canceled=" << counts[2] << " aborted=" << counts[3]
                      << " failed=" << counts[4];
       }
       // Temporary (LOCAL-01 Q3 OOM diagnosis): dump per-operator memory
       // reservation once per tick so we can see which operator is holding
       // 30 GB on the GPU path.
       if (tick <= 6 || tick % 5 == 0) {
-        std::function<void(memory::MemoryPool*, int)> dumpPool =
-            [&](memory::MemoryPool* pool, int depth) {
-              if (!pool) return;
-              const auto reserved = pool->reservedBytes();
-              const auto peak = pool->peakBytes();
-              if (reserved > 0 || peak > 0) {
-                LOG(WARNING) << "MemPool[" << queryId_ << "] tick=" << tick
-                             << " " << std::string(depth * 2, ' ')
-                             << pool->name()
-                             << " reserved=" << reserved
-                             << " peak=" << peak;
-              }
-              pool->visitChildren([&](memory::MemoryPool* child) {
-                dumpPool(child, depth + 1);
-                return true;
-              });
-            };
+        std::function<void(memory::MemoryPool*, int)> dumpPool = [&](memory::MemoryPool* pool, int depth) {
+          if (!pool)
+            return;
+          const auto reserved = pool->reservedBytes();
+          const auto peak = pool->peakBytes();
+          if (reserved > 0 || peak > 0) {
+            LOG(WARNING) << "MemPool[" << queryId_ << "] tick=" << tick << " " << std::string(depth * 2, ' ')
+                         << pool->name() << " reserved=" << reserved << " peak=" << peak;
+          }
+          pool->visitChildren([&](memory::MemoryPool* child) {
+            dumpPool(child, depth + 1);
+            return true;
+          });
+        };
         for (size_t f = 0; f < fragmentTasks_.size(); ++f) {
           for (auto& task : fragmentTasks_[f]) {
-            if (!task) continue;
+            if (!task)
+              continue;
             if (task->pool() != nullptr) {
               dumpPool(task->pool(), 0);
             }
@@ -1438,11 +1359,9 @@ void MppQueryCoordinator::start() {
         }
       }
 
-      if (gpuDiagnosticsIntervalTicks > 0 &&
-          tick % gpuDiagnosticsIntervalTicks == 0) {
+      if (gpuDiagnosticsIntervalTicks > 0 && tick % gpuDiagnosticsIntervalTicks == 0) {
         GpuMemoryTracker::dumpDiagnosticsToLog(
-            "MppWatchdog[" + queryId_ + "] tick=" + std::to_string(tick) +
-            " periodic");
+            "MppWatchdog[" + queryId_ + "] tick=" + std::to_string(tick) + " periodic");
       }
 
       // Dump error message for any newly-failed task. Velox Task::setError is
@@ -1450,18 +1369,16 @@ void MppQueryCoordinator::start() {
       // visible signal is the watchdog's failed-count going up.
       for (size_t f = 0; f < fragmentTasks_.size(); ++f) {
         for (auto& task : fragmentTasks_[f]) {
-          if (!task) continue;
-          if (task->state() != TaskState::kFailed) continue;
+          if (!task)
+            continue;
+          if (task->state() != TaskState::kFailed)
+            continue;
           const auto& tid = task->taskId();
           if (reportedFailures.insert(tid).second) {
-            LOG(ERROR) << "MppWatchdog[" << queryId_ << "] tick=" << tick
-                       << " FAILED-TASK taskId=" << tid
-                       << " frag=" << f
-                       << " errorMessage={" << task->errorMessage() << "}";
-            GpuMemoryTracker::dumpDiagnosticsToLog(
-                "MppWatchdog[" + queryId_ + "] taskId=" + tid);
-            LOG(ERROR) << "MppWatchdog[" << queryId_ << "] taskId=" << tid
-                       << " planWithStats:\n"
+            LOG(ERROR) << "MppWatchdog[" << queryId_ << "] tick=" << tick << " FAILED-TASK taskId=" << tid
+                       << " frag=" << f << " errorMessage={" << task->errorMessage() << "}";
+            GpuMemoryTracker::dumpDiagnosticsToLog("MppWatchdog[" + queryId_ + "] taskId=" + tid);
+            LOG(ERROR) << "MppWatchdog[" << queryId_ << "] taskId=" << tid << " planWithStats:\n"
                        << task->printPlanWithStats(/*includeCustomStats=*/true);
           }
         }
@@ -1470,15 +1387,14 @@ void MppQueryCoordinator::start() {
       int sampled = 0;
       for (size_t f = 0; f < fragmentTasks_.size() && sampled < 6; ++f) {
         for (auto& task : fragmentTasks_[f]) {
-          if (!task) continue;
+          if (!task)
+            continue;
           if (!isTerminalState(task->state())) {
-            LOG(WARNING) << "MppWatchdog[" << queryId_ << "] tick=" << tick
-                         << " non-terminal taskId=" << task->taskId()
-                         << " state=" << static_cast<int>(task->state())
-                         << " numDrivers=" << task->numTotalDrivers()
-                         << " numFinishedDrivers="
-                         << task->numFinishedDrivers();
-            if (++sampled >= 6) break;
+            LOG(WARNING) << "MppWatchdog[" << queryId_ << "] tick=" << tick << " non-terminal taskId=" << task->taskId()
+                         << " state=" << static_cast<int>(task->state()) << " numDrivers=" << task->numTotalDrivers()
+                         << " numFinishedDrivers=" << task->numFinishedDrivers();
+            if (++sampled >= 6)
+              break;
           }
         }
       }
@@ -1492,61 +1408,36 @@ void MppQueryCoordinator::start() {
             }
             const auto taskStats = task->taskStats();
             LOG(WARNING) << "[MPP_LIFECYCLE] event=task_snapshot"
-                         << " elapsedMs=" << elapsedMs
-                         << " tick=" << tick
-                         << " queryId=" << queryId_
-                         << " peer=" << peerIndex_ << "/" << peerCount_
-                         << " fragment=" << f
-                         << " replica=" << replica
-                         << " state=" << static_cast<int>(task->state())
-                         << " drivers=" << task->numTotalDrivers()
+                         << " elapsedMs=" << elapsedMs << " tick=" << tick << " queryId=" << queryId_
+                         << " peer=" << peerIndex_ << "/" << peerCount_ << " fragment=" << f << " replica=" << replica
+                         << " state=" << static_cast<int>(task->state()) << " drivers=" << task->numTotalDrivers()
                          << " finishedDrivers=" << task->numFinishedDrivers()
-                         << " pipelines=" << taskStats.pipelineStats.size()
-                         << " taskId=" << task->taskId();
-            for (size_t pipelineIdx = 0;
-                 pipelineIdx < taskStats.pipelineStats.size();
-                 ++pipelineIdx) {
+                         << " pipelines=" << taskStats.pipelineStats.size() << " taskId=" << task->taskId();
+            for (size_t pipelineIdx = 0; pipelineIdx < taskStats.pipelineStats.size(); ++pipelineIdx) {
               const auto& pipelineStats = taskStats.pipelineStats[pipelineIdx];
               for (const auto& opStats : pipelineStats.operatorStats) {
-                const auto wallNanos =
-                    opStats.addInputTiming.wallNanos +
-                    opStats.getOutputTiming.wallNanos +
+                const auto wallNanos = opStats.addInputTiming.wallNanos + opStats.getOutputTiming.wallNanos +
                     opStats.finishTiming.wallNanos;
-                const bool interesting =
-                    opStats.blockedWallNanos > 0 || wallNanos > 0 ||
-                    opStats.inputPositions > 0 || opStats.outputPositions > 0 ||
-                    opStats.rawInputPositions > 0 ||
+                const bool interesting = opStats.blockedWallNanos > 0 || wallNanos > 0 || opStats.inputPositions > 0 ||
+                    opStats.outputPositions > 0 || opStats.rawInputPositions > 0 ||
                     opStats.planNodeId.find("mpp_") != std::string::npos ||
                     opStats.operatorType.find("Exchange") != std::string::npos ||
-                    opStats.operatorType.find("PartitionedOutput") !=
-                        std::string::npos ||
-                    opStats.operatorType.find("TableScan") !=
-                        std::string::npos ||
-                    opStats.operatorType.find("HashJoin") !=
-                        std::string::npos;
+                    opStats.operatorType.find("PartitionedOutput") != std::string::npos ||
+                    opStats.operatorType.find("TableScan") != std::string::npos ||
+                    opStats.operatorType.find("HashJoin") != std::string::npos;
                 if (!interesting) {
                   continue;
                 }
                 LOG(WARNING) << "[MPP_LIFECYCLE] event=operator_snapshot"
-                             << " elapsedMs=" << elapsedMs
-                             << " tick=" << tick
-                             << " queryId=" << queryId_
-                             << " peer=" << peerIndex_ << "/" << peerCount_
-                             << " fragment=" << f
-                             << " replica=" << replica
-                             << " pipeline=" << pipelineIdx
-                             << " planNode=" << opStats.planNodeId
-                             << " operator=" << opStats.operatorType
-                             << " drivers=" << opStats.numDrivers
-                             << " splits=" << opStats.numSplits
-                             << " rawInRows=" << opStats.rawInputPositions
-                             << " inRows=" << opStats.inputPositions
+                             << " elapsedMs=" << elapsedMs << " tick=" << tick << " queryId=" << queryId_
+                             << " peer=" << peerIndex_ << "/" << peerCount_ << " fragment=" << f
+                             << " replica=" << replica << " pipeline=" << pipelineIdx
+                             << " planNode=" << opStats.planNodeId << " operator=" << opStats.operatorType
+                             << " drivers=" << opStats.numDrivers << " splits=" << opStats.numSplits
+                             << " rawInRows=" << opStats.rawInputPositions << " inRows=" << opStats.inputPositions
                              << " outRows=" << opStats.outputPositions
-                             << " blockedMs="
-                             << static_cast<int64_t>(
-                                    opStats.blockedWallNanos / 1000000)
-                             << " wallMs="
-                             << static_cast<int64_t>(wallNanos / 1000000);
+                             << " blockedMs=" << static_cast<int64_t>(opStats.blockedWallNanos / 1000000)
+                             << " wallMs=" << static_cast<int64_t>(wallNanos / 1000000);
               }
             }
           }
@@ -1555,22 +1446,19 @@ void MppQueryCoordinator::start() {
 
       if (planStatsIntervalTicks > 0 && tick % planStatsIntervalTicks == 0) {
         int statsSampled = 0;
-        for (size_t f = 0;
-             f < fragmentTasks_.size() && statsSampled < planStatsSampleTasks;
-             ++f) {
+        for (size_t f = 0; f < fragmentTasks_.size() && statsSampled < planStatsSampleTasks; ++f) {
           for (auto& task : fragmentTasks_[f]) {
-            if (!task) continue;
-            if (isTerminalState(task->state())) continue;
+            if (!task)
+              continue;
+            if (isTerminalState(task->state()))
+              continue;
             LOG(ERROR) << "MppWatchdog[" << queryId_ << "] tick=" << tick
-                       << " non-terminal planWithStats taskId="
-                       << task->taskId()
-                       << " frag=" << f
-                       << " state=" << static_cast<int>(task->state())
-                       << " numDrivers=" << task->numTotalDrivers()
-                       << " numFinishedDrivers=" << task->numFinishedDrivers()
-                       << "\n"
+                       << " non-terminal planWithStats taskId=" << task->taskId() << " frag=" << f
+                       << " state=" << static_cast<int>(task->state()) << " numDrivers=" << task->numTotalDrivers()
+                       << " numFinishedDrivers=" << task->numFinishedDrivers() << "\n"
                        << task->printPlanWithStats(/*includeCustomStats=*/true);
-            if (++statsSampled >= planStatsSampleTasks) break;
+            if (++statsSampled >= planStatsSampleTasks)
+              break;
           }
         }
       }
@@ -1582,10 +1470,8 @@ void MppQueryCoordinator::start() {
 // next() - fetch output from the root fragment
 // ---------------------------------------------------------------------------
 
-bool MppQueryCoordinator::fetchNextOutputPage(
-    std::vector<std::unique_ptr<SerializedPageBase>>& pages) {
-  nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{
-      "coordinator::fetchNextOutputPage"};
+bool MppQueryCoordinator::fetchNextOutputPage(std::vector<std::unique_ptr<SerializedPageBase>>& pages) {
+  nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"coordinator::fetchNextOutputPage"};
   const auto rootReplicas = fragmentReplicaCount_[rootFragmentId_];
   constexpr int32_t kDestination = 0; // each root Task gathers to dest 0
   constexpr uint64_t kMaxBytes = std::numeric_limits<uint64_t>::max();
@@ -1645,11 +1531,9 @@ bool MppQueryCoordinator::fetchNextOutputPage(
     auto state = std::make_shared<FetchState>();
     state->inSequence = requestedSeq;
 
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                 << "]: fetchNextOutputPage rootTask=" << rootTaskId
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: fetchNextOutputPage rootTask=" << rootTaskId
                  << " seq=" << requestedSeq
-                 << " rootState="
-                 << static_cast<int>(fragmentTasks_[rootFragmentId_][idx]->state());
+                 << " rootState=" << static_cast<int>(fragmentTasks_[rootFragmentId_][idx]->state());
 
     // IBM-baseline: OutputBufferManager exposes getData (IOBuf-vector
     // callback) instead of getPages (SerializedPageBase-vector callback).
@@ -1664,17 +1548,12 @@ bool MppQueryCoordinator::fetchNextOutputPage(
             std::vector<std::unique_ptr<folly::IOBuf>> gotPages,
             int64_t inSequence,
             std::vector<int64_t> /*remainingBytes*/) {
-          LOG(WARNING) << "MppQueryCoordinator[" << qid
-                       << "]: getData callback fired"
-                       << " replica=" << idx
-                       << " pages=" << gotPages.size()
-                       << " inSeq=" << inSequence;
+          LOG(WARNING) << "MppQueryCoordinator[" << qid << "]: getData callback fired"
+                       << " replica=" << idx << " pages=" << gotPages.size() << " inSeq=" << inSequence;
           for (auto& iobuf : gotPages) {
             if (iobuf != nullptr) {
               ++inSequence;
-              state->pages.push_back(
-                  std::make_unique<PrestoSerializedPage>(
-                      std::move(iobuf)));
+              state->pages.push_back(std::make_unique<PrestoSerializedPage>(std::move(iobuf)));
             } else {
               state->complete = true;
             }
@@ -1689,8 +1568,7 @@ bool MppQueryCoordinator::fetchNextOutputPage(
         });
 
     if (!ok) {
-      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                   << "]: getData returned ok=false for replica=" << idx
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: getData returned ok=false for replica=" << idx
                    << " (task not registered?)";
       rootReplicaAtEnd_[idx] = true;
       continue;
@@ -1713,13 +1591,10 @@ bool MppQueryCoordinator::fetchNextOutputPage(
       // case.
       const auto& rootTask = fragmentTasks_[rootFragmentId_][idx];
       if (rootTask != nullptr &&
-          (rootTask->state() == TaskState::kFailed ||
-           rootTask->state() == TaskState::kAborted ||
+          (rootTask->state() == TaskState::kFailed || rootTask->state() == TaskState::kAborted ||
            rootTask->error() != nullptr)) {
-        LOG(ERROR) << "MppQueryCoordinator[" << queryId_
-                   << "]: root task became non-OK while waiting for output"
-                   << " rootTask=" << rootTaskId
-                   << " state=" << static_cast<int>(rootTask->state());
+        LOG(ERROR) << "MppQueryCoordinator[" << queryId_ << "]: root task became non-OK while waiting for output"
+                   << " rootTask=" << rootTaskId << " state=" << static_cast<int>(rootTask->state());
         rethrowFirstTaskError();
       }
       rethrowFirstTaskError();
@@ -1730,8 +1605,7 @@ bool MppQueryCoordinator::fetchNextOutputPage(
     rootOutputSequence_[idx] = state->inSequence;
     if (state->complete) {
       rootReplicaAtEnd_[idx] = true;
-      bufferManager_->acknowledge(
-          rootTaskId, kDestination, rootOutputSequence_[idx]);
+      bufferManager_->acknowledge(rootTaskId, kDestination, rootOutputSequence_[idx]);
       bufferManager_->deleteResults(rootTaskId, kDestination);
     }
     for (auto& page : state->pages) {
@@ -1746,12 +1620,153 @@ bool MppQueryCoordinator::fetchNextOutputPage(
     // replica again until it reaches end; for round-robin, advance.
   }
 
-  noMoreData_ = std::all_of(
-      rootReplicaAtEnd_.begin(),
-      rootReplicaAtEnd_.end(),
-      [](bool b) { return b; });
+  noMoreData_ = std::all_of(rootReplicaAtEnd_.begin(), rootReplicaAtEnd_.end(), [](bool b) { return b; });
   return false;
 }
+
+#ifdef GLUTEN_ENABLE_GPU
+RowVectorPtr MppQueryCoordinator::fetchNextDeviceOutput() {
+  nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{
+      "coordinator::fetchNextDeviceOutput"};
+  const auto rootReplicas = fragmentReplicaCount_[rootFragmentId_];
+  constexpr int32_t kDestination = 0;
+  constexpr uint64_t kMaxBytes = std::numeric_limits<uint64_t>::max();
+
+  if (rootOutputSequence_.empty()) {
+    rootOutputSequence_.assign(rootReplicas, 0);
+    rootReplicaAtEnd_.assign(rootReplicas, false);
+  }
+
+  const auto pickNext = [&]() -> int32_t {
+    if (rootDrainSequential_) {
+      for (int32_t i = 0; i < rootReplicas; ++i) {
+        if (!rootReplicaAtEnd_[i]) {
+          return i;
+        }
+      }
+      return -1;
+    }
+    for (int32_t attempted = 0; attempted < rootReplicas; ++attempted) {
+      const int32_t idx = rootFetchCursor_ % rootReplicas;
+      rootFetchCursor_ = (rootFetchCursor_ + 1) % rootReplicas;
+      if (!rootReplicaAtEnd_[idx]) {
+        return idx;
+      }
+    }
+    return -1;
+  };
+
+  auto queueManager =
+      facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+  while (!noMoreData_) {
+    const int32_t idx = pickNext();
+    if (idx < 0) {
+      noMoreData_ = true;
+      rethrowFirstTaskError();
+      logOperatorMetrics();
+      return nullptr;
+    }
+
+    struct DeviceFetchState {
+      ContinuePromise promise{
+          "MppQueryCoordinator::fetchNextDeviceOutput"};
+      std::atomic<bool> fulfilled{false};
+      std::shared_ptr<cudf::packed_columns> data;
+      int64_t sequence{0};
+    };
+
+    const auto rootTaskId = makeTaskId(rootFragmentId_, idx);
+    const auto requestedSequence = rootOutputSequence_[idx];
+    auto state = std::make_shared<DeviceFetchState>();
+    state->sequence = requestedSequence;
+
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                 << "]: fetchNextDeviceOutput rootTask=" << rootTaskId
+                 << " seq=" << requestedSequence
+                 << " rootState="
+                 << static_cast<int>(
+                        fragmentTasks_[rootFragmentId_][idx]->state());
+
+    queueManager->getData(
+        rootTaskId,
+        kDestination,
+        kMaxBytes,
+        requestedSequence,
+        [state, idx, qid = queryId_](
+            std::shared_ptr<cudf::packed_columns> data,
+            int64_t sequence,
+            std::vector<int64_t> /*remainingBytes*/) {
+          LOG(WARNING) << "MppQueryCoordinator[" << qid
+                       << "]: device getData callback fired replica=" << idx
+                       << " sequence=" << sequence
+                       << " hasData=" << (data != nullptr);
+          state->data = std::move(data);
+          state->sequence = sequence;
+          bool expected = false;
+          if (state->fulfilled.compare_exchange_strong(expected, true)) {
+            state->promise.setValue();
+          }
+        });
+
+    auto dataFuture = state->promise.getSemiFuture();
+    while (!dataFuture.isReady()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      if (!dataFuture.isReady()) {
+        rethrowFirstTaskError();
+      }
+    }
+
+    rethrowFirstTaskError();
+    VELOX_CHECK_EQ(
+        state->sequence,
+        requestedSequence,
+        "Unexpected UCX root output sequence for task {}",
+        rootTaskId);
+
+    if (state->data == nullptr) {
+      rootReplicaAtEnd_[idx] = true;
+      queueManager->deleteResults(rootTaskId, kDestination);
+      noMoreData_ = std::all_of(
+          rootReplicaAtEnd_.begin(),
+          rootReplicaAtEnd_.end(),
+          [](bool atEnd) { return atEnd; });
+      continue;
+    }
+
+    rootOutputSequence_[idx] = state->sequence + 1;
+    auto packed = std::move(state->data);
+    VELOX_CHECK_EQ(
+        packed.use_count(),
+        1,
+        "GPU sink root output must have unique ownership");
+    cudf::packed_columns packedColumns(
+        std::move(packed->metadata), std::move(packed->gpu_data));
+    packed.reset();
+
+    auto tableView = cudf::unpack(packedColumns);
+    auto packedTable = std::make_unique<cudf::packed_table>(
+        cudf::packed_table{tableView, std::move(packedColumns)});
+    auto outputType = std::dynamic_pointer_cast<const RowType>(
+        fragmentSpecs_[rootFragmentId_]
+            .planFragment.planNode->outputType());
+    VELOX_CHECK_NOT_NULL(outputType, "Root fragment must have RowType output");
+    if (deserializePool_ == nullptr) {
+      deserializePool_ =
+          queryCtx_->pool()->addLeafChild("mpp_device_output");
+    }
+    return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
+        deserializePool_.get(),
+        outputType,
+        tableView.num_rows(),
+        std::move(packedTable),
+        rmm::cuda_stream_default);
+  }
+
+  rethrowFirstTaskError();
+  logOperatorMetrics();
+  return nullptr;
+}
+#endif
 
 void MppQueryCoordinator::rethrowFirstTaskError() const {
   // Scan every tracked Task. If any has FAILED/ABORTED, rethrow the first
@@ -1770,8 +1785,7 @@ void MppQueryCoordinator::rethrowFirstTaskError() const {
         continue;
       }
       const auto state = task->state();
-      const bool nonOkTerminal =
-          state == TaskState::kFailed || state == TaskState::kAborted;
+      const bool nonOkTerminal = state == TaskState::kFailed || state == TaskState::kAborted;
       auto err = task->error();
       if (nonOkTerminal || err) {
         if (!firstError) {
@@ -1784,22 +1798,18 @@ void MppQueryCoordinator::rethrowFirstTaskError() const {
     }
   }
   if (firstError) {
-    LOG(ERROR) << "MppQueryCoordinator[" << queryId_
-               << "]: rethrowFirstTaskError taskId=" << firstFailedTaskId
+    LOG(ERROR) << "MppQueryCoordinator[" << queryId_ << "]: rethrowFirstTaskError taskId=" << firstFailedTaskId
                << " state=" << static_cast<int>(firstFailedState);
     logOperatorMetrics();
-    GpuMemoryTracker::dumpDiagnosticsToLog(
-        "MppQueryCoordinator[" + queryId_ + "] taskId=" + firstFailedTaskId);
+    GpuMemoryTracker::dumpDiagnosticsToLog("MppQueryCoordinator[" + queryId_ + "] taskId=" + firstFailedTaskId);
     if (firstFailedTask != nullptr) {
       try {
-        LOG(ERROR) << "MppQueryCoordinator[" << queryId_
-                   << "]: failed task planWithStats taskId=" << firstFailedTaskId
+        LOG(ERROR) << "MppQueryCoordinator[" << queryId_ << "]: failed task planWithStats taskId=" << firstFailedTaskId
                    << "\n"
                    << firstFailedTask->printPlanWithStats(/*includeCustomStats=*/true);
       } catch (const std::exception& e) {
         LOG(ERROR) << "MppQueryCoordinator[" << queryId_
-                   << "]: failed to print planWithStats for taskId="
-                   << firstFailedTaskId << ": " << e.what();
+                   << "]: failed to print planWithStats for taskId=" << firstFailedTaskId << ": " << e.what();
       }
     }
     std::rethrow_exception(firstError);
@@ -1842,14 +1852,22 @@ RowVectorPtr MppQueryCoordinator::next() {
     return nullptr;
   }
 
-  const auto deserializePage =
-      [&](std::unique_ptr<SerializedPageBase>& page) -> RowVectorPtr {
+#ifdef GLUTEN_ENABLE_GPU
+  if (deviceRootOutput_) {
+    if (noMoreData_) {
+      rethrowFirstTaskError();
+      return nullptr;
+    }
+    return fetchNextDeviceOutput();
+  }
+#endif
+
+  const auto deserializePage = [&](std::unique_ptr<SerializedPageBase>& page) -> RowVectorPtr {
     // Deserialize the CPU page via Presto serde into a RowVector.
     auto inputStream = page->prepareStreamForDeserialize();
-    auto outputType = std::dynamic_pointer_cast<const RowType>(
-        fragmentSpecs_[rootFragmentId_].planFragment.planNode->outputType());
-    VELOX_CHECK(
-        outputType != nullptr, "Root fragment must have RowType output");
+    auto outputType =
+        std::dynamic_pointer_cast<const RowType>(fragmentSpecs_[rootFragmentId_].planFragment.planNode->outputType());
+    VELOX_CHECK(outputType != nullptr, "Root fragment must have RowType output");
     if (deserializePool_ == nullptr) {
       deserializePool_ = queryCtx_->pool()->addLeafChild("mpp_deserialize");
     }
@@ -1946,8 +1964,7 @@ void MppQueryCoordinator::logOperatorMetrics() const {
   }
 
   size_t emitted = 0;
-  for (size_t fragmentId = 0; fragmentId < fragmentTasks_.size();
-       ++fragmentId) {
+  for (size_t fragmentId = 0; fragmentId < fragmentTasks_.size(); ++fragmentId) {
     const auto& replicas = fragmentTasks_[fragmentId];
     for (size_t replicaId = 0; replicaId < replicas.size(); ++replicaId) {
       const auto& task = replicas[replicaId];
@@ -1956,18 +1973,13 @@ void MppQueryCoordinator::logOperatorMetrics() const {
       }
 
       const auto taskStats = task->taskStats();
-      for (size_t pipelineIdx = 0; pipelineIdx < taskStats.pipelineStats.size();
-           ++pipelineIdx) {
+      for (size_t pipelineIdx = 0; pipelineIdx < taskStats.pipelineStats.size(); ++pipelineIdx) {
         const auto& pipelineStats = taskStats.pipelineStats[pipelineIdx];
         for (const auto& opStats : pipelineStats.operatorStats) {
           const auto wallNanos =
-              opStats.addInputTiming.wallNanos +
-              opStats.getOutputTiming.wallNanos +
-              opStats.finishTiming.wallNanos;
+              opStats.addInputTiming.wallNanos + opStats.getOutputTiming.wallNanos + opStats.finishTiming.wallNanos;
           const auto cpuNanos =
-              opStats.addInputTiming.cpuNanos +
-              opStats.getOutputTiming.cpuNanos +
-              opStats.finishTiming.cpuNanos;
+              opStats.addInputTiming.cpuNanos + opStats.getOutputTiming.cpuNanos + opStats.finishTiming.cpuNanos;
 
           folly::dynamic row = folly::dynamic::object;
           row["queryId"] = queryId_;
@@ -1990,27 +2002,17 @@ void MppQueryCoordinator::logOperatorMetrics() const {
           row["outputRows"] = static_cast<int64_t>(opStats.outputPositions);
           row["outputBytes"] = static_cast<int64_t>(opStats.outputBytes);
           row["outputVectors"] = static_cast<int64_t>(opStats.outputVectors);
-          row["blockedWallNanos"] =
-              static_cast<int64_t>(opStats.blockedWallNanos);
-          row["addInputWallNanos"] =
-              static_cast<int64_t>(opStats.addInputTiming.wallNanos);
-          row["getOutputWallNanos"] =
-              static_cast<int64_t>(opStats.getOutputTiming.wallNanos);
-          row["finishWallNanos"] =
-              static_cast<int64_t>(opStats.finishTiming.wallNanos);
+          row["blockedWallNanos"] = static_cast<int64_t>(opStats.blockedWallNanos);
+          row["addInputWallNanos"] = static_cast<int64_t>(opStats.addInputTiming.wallNanos);
+          row["getOutputWallNanos"] = static_cast<int64_t>(opStats.getOutputTiming.wallNanos);
+          row["finishWallNanos"] = static_cast<int64_t>(opStats.finishTiming.wallNanos);
           row["wallNanos"] = static_cast<int64_t>(wallNanos);
-          row["addInputCpuNanos"] =
-              static_cast<int64_t>(opStats.addInputTiming.cpuNanos);
-          row["getOutputCpuNanos"] =
-              static_cast<int64_t>(opStats.getOutputTiming.cpuNanos);
-          row["finishCpuNanos"] =
-              static_cast<int64_t>(opStats.finishTiming.cpuNanos);
+          row["addInputCpuNanos"] = static_cast<int64_t>(opStats.addInputTiming.cpuNanos);
+          row["getOutputCpuNanos"] = static_cast<int64_t>(opStats.getOutputTiming.cpuNanos);
+          row["finishCpuNanos"] = static_cast<int64_t>(opStats.finishTiming.cpuNanos);
           row["cpuNanos"] = static_cast<int64_t>(cpuNanos);
-          row["peakTotalMemoryBytes"] =
-              static_cast<int64_t>(
-                  opStats.memoryStats.peakTotalMemoryReservation);
-          row["numMemoryAllocations"] =
-              static_cast<int64_t>(opStats.memoryStats.numMemoryAllocations);
+          row["peakTotalMemoryBytes"] = static_cast<int64_t>(opStats.memoryStats.peakTotalMemoryReservation);
+          row["numMemoryAllocations"] = static_cast<int64_t>(opStats.memoryStats.numMemoryAllocations);
           row["spilledBytes"] = static_cast<int64_t>(opStats.spilledBytes);
           row["spilledRows"] = static_cast<int64_t>(opStats.spilledRows);
 
@@ -2020,9 +2022,7 @@ void MppQueryCoordinator::logOperatorMetrics() const {
       }
     }
   }
-  LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-               << "]: emitted " << emitted
-               << " MPP operator metric row(s)";
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: emitted " << emitted << " MPP operator metric row(s)";
 }
 
 // ---------------------------------------------------------------------------
@@ -2038,18 +2038,14 @@ void MppQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
   // waits.
   std::lock_guard<std::mutex> lk(abortMutex_);
   if (!started_) {
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                 << "]: abort() called before start(), skipping";
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: abort() called before start(), skipping";
     return;
   }
   if (aborted_) {
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                 << "]: abort() already completed, skipping";
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: abort() already completed, skipping";
     return;
   }
-  LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-               << "]: abort() begin perTaskTimeoutMs="
-               << perTaskTimeout.count();
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: abort() begin perTaskTimeoutMs=" << perTaskTimeout.count();
 
   // Phase 1: fire requestAbort() on every non-terminal task. This is
   // non-blocking; each call returns a future. We don't need those futures
@@ -2066,18 +2062,15 @@ void MppQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
       }
       const auto state = task->state();
       if (!isTerminalState(state)) {
-        LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                     << "]: requestAbort(" << task->taskId()
+        LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: requestAbort(" << task->taskId()
                      << ") state=" << static_cast<int>(state);
         try {
           task->requestAbort();
         } catch (const std::exception& e) {
-          LOG(ERROR) << "MppQueryCoordinator[" << queryId_
-                     << "]: requestAbort threw for " << task->taskId()
-                     << ": " << e.what();
+          LOG(ERROR) << "MppQueryCoordinator[" << queryId_ << "]: requestAbort threw for " << task->taskId() << ": "
+                     << e.what();
         } catch (...) {
-          LOG(ERROR) << "MppQueryCoordinator[" << queryId_
-                     << "]: requestAbort threw unknown exception for "
+          LOG(ERROR) << "MppQueryCoordinator[" << queryId_ << "]: requestAbort threw unknown exception for "
                      << task->taskId();
         }
         ++firedCount;
@@ -2086,17 +2079,15 @@ void MppQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
       }
     }
   }
-  LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-               << "]: abort() requested " << firedCount
-               << " task(s), " << alreadyTerminalCount << " already terminal";
+  LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: abort() requested " << firedCount << " task(s), "
+               << alreadyTerminalCount << " already terminal";
 
   // Phase 2: bounded wait for each task to reach a terminal state. We use
   // taskCompletionFuture() which is realized when the task is no longer
   // running. Cap each wait so a stuck task can't hold up shutdown forever —
   // a leak warning at process exit is strictly better than an infinite hang
   // or a removePool() VELOX_CHECK abort.
-  nvtx3::scoped_range_in<GlutenMppDomain> phase2Range{
-      "coordinator::abort:Phase2-waitTaskTerminal"};
+  nvtx3::scoped_range_in<GlutenMppDomain> phase2Range{"coordinator::abort:Phase2-waitTaskTerminal"};
   size_t terminalAfterWait = 0;
   size_t timedOut = 0;
   for (auto& replicas : fragmentTasks_) {
@@ -2109,8 +2100,7 @@ void MppQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
         continue;
       }
       try {
-        nvtx3::scoped_range_in<GlutenMppDomain> waitRange{
-            "coordinator::abort:taskCompletionFuture.wait"};
+        nvtx3::scoped_range_in<GlutenMppDomain> waitRange{"coordinator::abort:taskCompletionFuture.wait"};
         // Wait blocks up to perTaskTimeout. After the wait, just check the
         // Task's own state; we don't depend on wait()'s return value to
         // sidestep folly Future API drift between Velox versions.
@@ -2119,22 +2109,16 @@ void MppQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
           ++terminalAfterWait;
         } else {
           ++timedOut;
-          LOG(ERROR) << "MppQueryCoordinator[" << queryId_
-                     << "]: abort() TIMEOUT waiting for taskId="
-                     << task->taskId()
-                     << " state=" << static_cast<int>(task->state())
-                     << " numDrivers=" << task->numTotalDrivers()
-                     << " numFinishedDrivers="
-                     << task->numFinishedDrivers()
+          LOG(ERROR) << "MppQueryCoordinator[" << queryId_ << "]: abort() TIMEOUT waiting for taskId=" << task->taskId()
+                     << " state=" << static_cast<int>(task->state()) << " numDrivers=" << task->numTotalDrivers()
+                     << " numFinishedDrivers=" << task->numFinishedDrivers()
                      << " — task may still hold MemoryPool reservations";
         }
       } catch (const std::exception& e) {
-        LOG(ERROR) << "MppQueryCoordinator[" << queryId_
-                   << "]: taskCompletionFuture wait threw for "
-                   << task->taskId() << ": " << e.what();
+        LOG(ERROR) << "MppQueryCoordinator[" << queryId_ << "]: taskCompletionFuture wait threw for " << task->taskId()
+                   << ": " << e.what();
       } catch (...) {
-        LOG(ERROR) << "MppQueryCoordinator[" << queryId_
-                   << "]: taskCompletionFuture wait threw unknown for "
+        LOG(ERROR) << "MppQueryCoordinator[" << queryId_ << "]: taskCompletionFuture wait threw unknown for "
                    << task->taskId();
       }
     }
@@ -2142,8 +2126,7 @@ void MppQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
 
   aborted_ = true;
   LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: abort() end"
-               << " terminal=" << terminalAfterWait
-               << " timedOut=" << timedOut;
+               << " terminal=" << terminalAfterWait << " timedOut=" << timedOut;
 }
 
 // ---------------------------------------------------------------------------
@@ -2153,13 +2136,50 @@ void MppQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
 void MppQueryCoordinator::waitForCompletion() {
   VELOX_CHECK(started_, "Must call start() before waitForCompletion()");
 
-  while (!isFinished()) {
-    // Do not block on tasks in fragment order. In multi-peer mode an
-    // intermediate task can fail while an earlier producer remains running,
-    // and the Spark task must surface that native error instead of waiting
-    // for the external per-query timeout.
+  struct CompletionWaitState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t completed{0};
+  };
+
+  // Surface a task that failed before watcher registration immediately. Its
+  // completion future can remain pending until all task threads have exited.
+  rethrowFirstTaskError();
+
+  auto waitState = std::make_shared<CompletionWaitState>();
+  std::vector<folly::Future<folly::Unit>> completionWatchers;
+  for (auto& replicas : fragmentTasks_) {
+    for (auto& task : replicas) {
+      if (task == nullptr) {
+        continue;
+      }
+      completionWatchers.emplace_back(
+          std::move(task->taskCompletionFuture())
+              .via(&folly::InlineExecutor::instance())
+              .thenTry([waitState](folly::Try<folly::Unit>&&) -> folly::Unit {
+                std::lock_guard<std::mutex> lock(waitState->mutex);
+                ++waitState->completed;
+                waitState->cv.notify_all();
+                return folly::Unit{};
+              }));
+    }
+  }
+
+  // Close the race where a task fails after the first scan but before its
+  // completion watcher is registered.
+  rethrowFirstTaskError();
+
+  size_t observed = 0;
+  while (observed < completionWatchers.size()) {
+    {
+      std::unique_lock<std::mutex> lock(waitState->mutex);
+      waitState->cv.wait(lock, [&]() { return waitState->completed > observed; });
+      observed = waitState->completed;
+    }
+    // Do not block on tasks in fragment order. Any task reaching a terminal
+    // state wakes this waiter so a failed intermediate fragment is surfaced
+    // immediately even if an earlier producer is still running.
     rethrowFirstTaskError();
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
   rethrowFirstTaskError();

@@ -14,6 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cstdlib>
+#include <csignal>
 #include <filesystem>
 
 #include "VeloxBackend.h"
@@ -29,6 +31,8 @@
 #endif
 #ifdef GLUTEN_ENABLE_GPU
 #include "operators/plannodes/CudfVectorStream.h"
+#include "ucs/config/global_opts.h"
+#include "ucs/debug/debug.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
@@ -106,6 +110,23 @@ void VeloxBackend::init(
     const std::unordered_map<std::string, std::string>& conf) {
   backendConf_ =
       std::make_shared<facebook::velox::config::ConfigBase>(std::unordered_map<std::string, std::string>(conf));
+
+#ifdef GLUTEN_ENABLE_GPU
+  // UCX reads its global options while libucs is loaded, before this method
+  // can update the process environment. Override the parsed default directly
+  // so UCX does not consume JVM SIGSEGV-based implicit null checks. Explicit
+  // deployment settings keep precedence.
+  if (std::getenv("UCX_HANDLE_ERRORS") == nullptr) {
+    const auto status = ucs_global_opts_set_value("HANDLE_ERRORS", "none");
+    VELOX_CHECK(
+        status == UCS_OK,
+        "Failed to disable UCX process signal handling in the Spark backend: {}",
+        ucs_status_string(status));
+    for (const auto signal : {SIGILL, SIGSEGV, SIGBUS, SIGFPE}) {
+      ucs_debug_disable_signal(signal);
+    }
+  }
+#endif
 
   globalMemoryManager_ = std::make_unique<VeloxMemoryManager>(kVeloxBackendKind, std::move(listener), *backendConf_);
 
@@ -222,6 +243,10 @@ void VeloxBackend::init(
          backendConf_->get<std::string>(
              "spark.gluten.sql.columnar.backend.velox.cudf.intra_node_exchange",
              "false")},
+        {velox::cudf_velox::CudfConfig::kUcxxErrorHandling,
+         backendConf_->get<std::string>(
+             "spark.gluten.sql.columnar.backend.velox.cudf.ucxx_error_handling",
+             "true")},
         // Tell cuDF expression evaluator to register the Spark function set
         // (might_contain, hash_with_seed, xxhash64_with_seed, ...) instead of
         // the Presto default. Without this, registerSparkFunctions() never

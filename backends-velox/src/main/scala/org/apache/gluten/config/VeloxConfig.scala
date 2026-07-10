@@ -673,7 +673,18 @@ object VeloxConfig extends ConfigRegistry {
     buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.memoryResource")
       .doc("GPU RMM memory resource.")
       .stringConf
-      .checkValues(Set("cuda", "pool", "async", "arena", "managed", "managed_pool"))
+      .checkValues(
+        Set(
+          "cuda",
+          "pool",
+          "async",
+          "arena",
+          "managed",
+          "managed_pool",
+          "managed_async",
+          "prefetch_managed",
+          "prefetch_managed_pool",
+          "prefetch_managed_async"))
       .createWithDefault("async")
 
   val CUDF_MEMORY_PERCENT =

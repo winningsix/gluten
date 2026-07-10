@@ -66,7 +66,8 @@ class GlutenMppQueryControlRegistrySuite extends AnyFunSuite {
       "java.lang.RuntimeException",
       message,
       "stack",
-      0L)
+      0L
+    )
 
   test("run enters RUNNING only after every expected peer joins") {
     var now = 0L
@@ -89,8 +90,8 @@ class GlutenMppQueryControlRegistrySuite extends AnyFunSuite {
     registry.processHeartbeat(heartbeat(p0))
     registry.processHeartbeat(heartbeat(p1))
 
-    val firstAck = registry.processHeartbeat(
-      heartbeat(p0, failures = Seq(failure(p0, "failure-1", "CUDA OOM"))))
+    val firstAck =
+      registry.processHeartbeat(heartbeat(p0, failures = Seq(failure(p0, "failure-1", "CUDA OOM"))))
     assert(firstAck.abortCommands.map(_.peerIndex) == Seq(0))
     val peerOneAck = registry.processHeartbeat(heartbeat(p1))
     assert(peerOneAck.abortCommands.map(_.peerIndex) == Seq(1))
@@ -99,12 +100,11 @@ class GlutenMppQueryControlRegistrySuite extends AnyFunSuite {
     val replay = registry.processHeartbeat(heartbeat(p1))
     assert(replay.abortCommands.map(_.sequence) == Seq(peerOneCommand.sequence))
 
-    val accepted = registry.processHeartbeat(
-      heartbeat(p1.copy(acceptedAbortSequence = peerOneCommand.sequence)))
+    val accepted =
+      registry.processHeartbeat(heartbeat(p1.copy(acceptedAbortSequence = peerOneCommand.sequence)))
     assert(accepted.abortCommands.isEmpty)
 
-    registry.processHeartbeat(
-      heartbeat(p1, failures = Seq(failure(p1, "failure-2", "secondary"))))
+    registry.processHeartbeat(heartbeat(p1, failures = Seq(failure(p1, "failure-2", "secondary"))))
     val snapshot = registry.snapshot(run).get
     assert(snapshot.state == MppQueryRunState.Aborting)
     assert(snapshot.firstFailure.exists(_.contains("CUDA OOM")))
@@ -148,6 +148,42 @@ class GlutenMppQueryControlRegistrySuite extends AnyFunSuite {
     assert(registry.processHeartbeat(heartbeat(p1)).abortCommands.nonEmpty)
   }
 
+  test("driver authorizes close only after every peer reaches output EOS") {
+    val registry = new GlutenMppQueryControlRegistry(5000L)
+    val p0 = peer(0)
+    val p1 = peer(1)
+    registry.processHeartbeat(heartbeat(p0))
+    registry.processHeartbeat(heartbeat(p1))
+
+    val first = registry.processHeartbeat(heartbeat(p0.copy(state = MppPeerState.OutputComplete)))
+    assert(first.peerCompletions.isEmpty)
+    assert(registry.snapshot(run).exists(_.state == MppQueryRunState.Running))
+
+    val last = registry.processHeartbeat(heartbeat(p1.copy(state = MppPeerState.OutputComplete)))
+    assert(last.peerCompletions.map(_.peerIndex) == Seq(1))
+    val completing = registry.snapshot(run).get
+    assert(completing.state == MppQueryRunState.Completing)
+    assert(completing.peers.forall(_.outputComplete))
+    assert(completing.peers.forall(peer => !peer.terminal))
+
+    val retry = registry.processHeartbeat(heartbeat(p0.copy(state = MppPeerState.OutputComplete)))
+    assert(retry.peerCompletions.map(_.peerIndex) == Seq(0))
+  }
+
+  test("peer terminal before output EOS aborts the remaining peers") {
+    val registry = new GlutenMppQueryControlRegistry(5000L)
+    val p0 = peer(0)
+    val p1 = peer(1)
+    registry.processHeartbeat(heartbeat(p0))
+    registry.processHeartbeat(heartbeat(p1))
+
+    registry.processHeartbeat(heartbeat(p0.copy(state = MppPeerState.Succeeded)))
+    val snapshot = registry.snapshot(run).get
+    assert(snapshot.state == MppQueryRunState.Aborting)
+    assert(snapshot.firstFailure.exists(_.contains("before output EOS")))
+    assert(registry.processHeartbeat(heartbeat(p1)).abortCommands.map(_.peerIndex) == Seq(1))
+  }
+
   test("terminal tombstone rejects late traffic and expires after retention") {
     var now = 0L
     val registry = new GlutenMppQueryControlRegistry(
@@ -158,6 +194,8 @@ class GlutenMppQueryControlRegistrySuite extends AnyFunSuite {
     val p1 = peer(1)
     registry.processHeartbeat(heartbeat(p0))
     registry.processHeartbeat(heartbeat(p1))
+    registry.processHeartbeat(heartbeat(p0.copy(state = MppPeerState.OutputComplete)))
+    registry.processHeartbeat(heartbeat(p1.copy(state = MppPeerState.OutputComplete)))
 
     def terminal(snapshot: MppPeerSnapshot): MppTerminalEvent =
       MppTerminalEvent(
@@ -169,7 +207,8 @@ class GlutenMppQueryControlRegistrySuite extends AnyFunSuite {
         snapshot.executorId,
         snapshot.executorSessionId,
         MppPeerState.Succeeded,
-        now)
+        now
+      )
 
     registry.processHeartbeat(heartbeat(p0, terminals = Seq(terminal(p0))))
     registry.processHeartbeat(heartbeat(p1, terminals = Seq(terminal(p1))))

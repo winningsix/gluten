@@ -24,91 +24,24 @@
 #include "utils/ConfigExtractor.h"
 #include "velox/connectors/hive/iceberg/IcebergDataSink.h"
 #include "velox/connectors/hive/iceberg/IcebergDeleteFile.h"
+#include "velox/expression/Expr.h"
+
+#ifdef GLUTEN_ENABLE_GPU
+#include "compute/iceberg/CudfIcebergWriter.h"
+#endif
 
 using namespace facebook::velox;
 using namespace facebook::velox::connector::hive;
 using namespace facebook::velox::connector::hive::iceberg;
 namespace {
-
-// Custom Iceberg file name generator for Gluten
-class GlutenIcebergFileNameGenerator : public connector::hive::FileNameGenerator {
- public:
-  GlutenIcebergFileNameGenerator(
-      int32_t partitionId,
-      int64_t taskId,
-      const std::string& operationId,
-      dwio::common::FileFormat fileFormat)
-      : partitionId_(partitionId),
-        taskId_(taskId),
-        operationId_(operationId),
-        fileFormat_(fileFormat),
-        fileCount_(0) {}
-
-  std::pair<std::string, std::string> gen(
-      std::optional<uint32_t> bucketId,
-      const std::shared_ptr<const connector::hive::HiveInsertTableHandle> insertTableHandle,
-      const connector::ConnectorQueryCtx& connectorQueryCtx,
-      bool commitRequired) const override {
-    auto targetFileName = insertTableHandle->locationHandle()->targetFileName();
-    if (targetFileName.empty()) {
-      // Generate file name following Iceberg format:
-      // {partitionId:05d}-{taskId}-{operationId}-{fileCount:05d}{suffix}
-      fileCount_++;
-
-      std::string fileExtension;
-      switch (fileFormat_) {
-        case dwio::common::FileFormat::PARQUET:
-          fileExtension = ".parquet";
-          break;
-        case dwio::common::FileFormat::ORC:
-          fileExtension = ".orc";
-          break;
-        default:
-          fileExtension = ".parquet";
-      }
-
-      char buffer[256];
-      snprintf(
-          buffer,
-          sizeof(buffer),
-          "%05d-%" PRId64 "-%s-%05d%s",
-          partitionId_,
-          taskId_,
-          operationId_.c_str(),
-          fileCount_,
-          fileExtension.c_str());
-      targetFileName = std::string(buffer);
-    }
-
-    return {targetFileName, targetFileName};
-  }
-
-  folly::dynamic serialize() const override {
-    VELOX_UNREACHABLE("Unexpected code path, implement serialize() first.");
-  }
-
-  std::string toString() const override {
-    return fmt::format(
-        "GlutenIcebergFileNameGenerator(partitionId={}, taskId={}, operationId={})",
-        partitionId_, taskId_, operationId_);
-  }
-
- private:
-  int32_t partitionId_;
-  int64_t taskId_;
-  std::string operationId_;
-  dwio::common::FileFormat fileFormat_;
-  mutable int32_t fileCount_;
-};
-
-iceberg::IcebergNestedField convertToIcebergNestedField(const gluten::IcebergNestedField& protoField) {
-  IcebergNestedField result;
-  result.id = protoField.id();
+parquet::ParquetFieldId convertToParquetFieldId(const gluten::IcebergNestedField& protoField) {
+  parquet::ParquetFieldId result;
+  result.fieldId = protoField.id();
 
   // Recursively convert children
   result.children.reserve(protoField.children_size());
   for (const auto& protoChild : protoField.children()) {
-    result.children.push_back(convertToIcebergNestedField(protoChild));
+    result.children.push_back(convertToParquetFieldId(protoChild));
   }
 
   return result;
@@ -119,12 +52,8 @@ std::shared_ptr<IcebergInsertTableHandle> createIcebergInsertTableHandle(
     const std::string& outputDirectoryPath,
     dwio::common::FileFormat fileFormat,
     facebook::velox::common::CompressionKind compressionKind,
-    int32_t partitionId,
-    int64_t taskId,
-    const std::string& operationId,
     std::shared_ptr<const IcebergPartitionSpec> spec,
-    const iceberg::IcebergNestedField& nestedField,
-    facebook::velox::memory::MemoryPool* pool) {
+    const parquet::ParquetFieldId& nestedField) {
   std::vector<std::shared_ptr<const iceberg::IcebergColumnHandle>> columnHandles;
 
   std::vector<std::string> columnNames = outputRowType->names();
@@ -142,7 +71,6 @@ std::shared_ptr<IcebergInsertTableHandle> createIcebergInsertTableHandle(
               columnNames.at(i),
               connector::hive::HiveColumnHandle::ColumnType::kPartitionKey,
               columnTypes.at(i),
-              columnTypes.at(i),
               nestedField.children[i]));
     } else {
       columnHandles.push_back(
@@ -150,21 +78,16 @@ std::shared_ptr<IcebergInsertTableHandle> createIcebergInsertTableHandle(
               columnNames.at(i),
               connector::hive::HiveColumnHandle::ColumnType::kRegular,
               columnTypes.at(i),
-              columnTypes.at(i),
               nestedField.children[i]));
     }
   }
   
-  auto fileNameGenerator = std::make_shared<const GlutenIcebergFileNameGenerator>(
-      partitionId, taskId, operationId, fileFormat);
-  
   std::shared_ptr<const connector::hive::LocationHandle> locationHandle =
       std::make_shared<connector::hive::LocationHandle>(
           outputDirectoryPath, outputDirectoryPath, connector::hive::LocationHandle::TableType::kExisting);
-  const std::vector<IcebergSortingColumn> sortedBy;
   const std::unordered_map<std::string, std::string> serdeParameters;
   return std::make_shared<connector::hive::iceberg::IcebergInsertTableHandle>(
-      columnHandles, locationHandle, spec, pool, fileFormat, sortedBy, compressionKind, serdeParameters, fileNameGenerator);
+      columnHandles, locationHandle, fileFormat, spec, compressionKind, serdeParameters);
 }
 
 } // namespace
@@ -183,18 +106,50 @@ IcebergWriter::IcebergWriter(
     const std::unordered_map<std::string, std::string>& sparkConfs,
     std::shared_ptr<facebook::velox::memory::MemoryPool> memoryPool,
     std::shared_ptr<facebook::velox::memory::MemoryPool> connectorPool)
-    : rowType_(rowType), field_(convertToIcebergNestedField(field)), partitionId_(partitionId), taskId_(taskId), operationId_(operationId), pool_(memoryPool), connectorPool_(connectorPool), createTimeNs_(getCurrentTimeNano()) {
-  auto veloxCfg =
-      std::make_shared<facebook::velox::config::ConfigBase>(std::unordered_map<std::string, std::string>(sparkConfs));
+    : rowType_(rowType),
+      field_(convertToParquetFieldId(field)),
+      partitionId_(partitionId),
+      taskId_(taskId),
+      operationId_(operationId),
+      pool_(memoryPool),
+      connectorPool_(connectorPool),
+      createTimeNs_(getCurrentTimeNano()) {
+#ifdef GLUTEN_ENABLE_GPU
+  VELOX_USER_CHECK_EQ(
+      icebergFormatToVelox(format),
+      dwio::common::FileFormat::PARQUET,
+      "Iceberg GPU writer supports Parquet only");
+  cudfWriter_ = std::make_unique<CudfIcebergWriter>(
+      rowType_,
+      outputDirectory,
+      compressionKind,
+      partitionId_,
+      taskId_,
+      operationId_,
+      std::move(spec),
+      field_,
+      sparkConfs,
+      pool_);
+#else
+  auto veloxCfg = std::make_shared<facebook::velox::config::ConfigBase>(
+      std::unordered_map<std::string, std::string>(sparkConfs));
   connectorSessionProperties_ = createHiveConnectorSessionConfig(veloxCfg);
-  connectorConfig_ = std::make_shared<facebook::velox::connector::hive::HiveConfig>(createHiveConnectorConfig(veloxCfg));
+  connectorConfig_ =
+      std::make_shared<facebook::velox::connector::hive::HiveConfig>(
+          createHiveConnectorConfig(veloxCfg));
+  icebergConfig_ = std::make_shared<
+      facebook::velox::connector::hive::iceberg::IcebergConfig>(veloxCfg);
+  queryCtx_ = facebook::velox::core::QueryCtx::create(
+      nullptr,
+      facebook::velox::core::QueryConfig(veloxCfg->rawConfigs()));
   connectorQueryCtx_ = std::make_unique<connector::ConnectorQueryCtx>(
       pool_.get(),
       connectorPool_.get(),
       connectorSessionProperties_.get(),
       nullptr,
       common::PrefixSortConfig(),
-      nullptr,
+      std::make_unique<facebook::velox::exec::SimpleExpressionEvaluator>(
+          queryCtx_.get(), pool_.get()),
       nullptr,
       "query.IcebergDataSink",
       "task.IcebergDataSink",
@@ -205,31 +160,83 @@ IcebergWriter::IcebergWriter(
   dataSink_ = std::make_unique<IcebergDataSink>(
       rowType_,
       createIcebergInsertTableHandle(
-          rowType_, outputDirectory, icebergFormatToVelox(format), compressionKind, partitionId_, taskId_, operationId_, spec, field_, pool_.get()),
+          rowType_, outputDirectory, icebergFormatToVelox(format), compressionKind, spec, field_),
       connectorQueryCtx_.get(),
       facebook::velox::connector::CommitStrategy::kNoCommit,
-      connectorConfig_);
+      connectorConfig_,
+      icebergConfig_);
+#endif
 }
 
+IcebergWriter::~IcebergWriter() = default;
+
 void IcebergWriter::write(const VeloxColumnarBatch& batch) {
-  dataSink_->appendData(batch.getRowVector());
+  const auto input = batch.getRowVector();
+#ifdef GLUTEN_ENABLE_GPU
+  cudfWriter_->write(input);
+#else
+  VELOX_USER_CHECK_EQ(
+      input->childrenSize(),
+      rowType_->size(),
+      "Iceberg input column count does not match the table schema");
+  for (auto i = 0; i < input->childrenSize(); ++i) {
+    VELOX_USER_CHECK(
+        input->childAt(i)->type()->kindEquals(rowType_->childAt(i)),
+        "Iceberg input column {} has type {}, expected {}",
+        i,
+        input->childAt(i)->type()->toString(),
+        rowType_->childAt(i)->toString());
+  }
+
+  // Native plans use internal field names (for example, n1_3), while
+  // Iceberg partition transforms bind by table field name. Re-wrap the same
+  // vectors with the table schema without copying their data.
+  auto normalizedInput = std::make_shared<RowVector>(
+      pool_.get(),
+      rowType_,
+      input->nulls(),
+      input->size(),
+      input->children(),
+      input->getNullCount());
+  dataSink_->appendData(std::move(normalizedInput));
+#endif
 }
 
 std::vector<std::string> IcebergWriter::commit() {
+#ifdef GLUTEN_ENABLE_GPU
+  return cudfWriter_->commit();
+#else
   auto finished = dataSink_->finish();
   VELOX_CHECK(finished);
   return dataSink_->close();
+#endif
+}
+
+void IcebergWriter::abort() {
+#ifdef GLUTEN_ENABLE_GPU
+  cudfWriter_->abort();
+#else
+  dataSink_->abort();
+#endif
 }
 
 WriteStats IcebergWriter::writeStats() const {
   const auto currentTimeNs = getCurrentTimeNano();
   VELOX_CHECK_GE(currentTimeNs, createTimeNs_);
+#ifdef GLUTEN_ENABLE_GPU
+  return WriteStats(
+      cudfWriter_->numWrittenBytes(),
+      cudfWriter_->numWrittenFiles(),
+      0,
+      currentTimeNs - createTimeNs_);
+#else
   const auto sinkStats = dataSink_->stats();
   return WriteStats(
-    sinkStats.numWrittenBytes,
-    sinkStats.numWrittenFiles,
-    sinkStats.writeIOTimeUs * 1000,
-    currentTimeNs - createTimeNs_);
+      sinkStats.numWrittenBytes,
+      sinkStats.numWrittenFiles,
+      sinkStats.writeIOTimeUs * 1000,
+      currentTimeNs - createTimeNs_);
+#endif
 }
 
 std::shared_ptr<const iceberg::IcebergPartitionSpec>

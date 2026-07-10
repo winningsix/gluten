@@ -90,10 +90,11 @@ class MppNativeQueryRDD(
     var localInputRDDs: ColumnarInputRDDsWrapper,
     sparkPartitionCount: Int,
     broadcastProducerFragmentIds: Set[Int],
+    keepDeviceOutput: Boolean,
     pipelineTime: SQLMetric,
     outputRows: SQLMetric,
     outputBatches: SQLMetric
-  ) extends RDD[ColumnarBatch](sc, localInputRDDs.getDependencies)
+) extends RDD[ColumnarBatch](sc, localInputRDDs.getDependencies)
   with Logging {
 
   private val numSparkPartitions: Int =
@@ -108,7 +109,8 @@ class MppNativeQueryRDD(
           peerInfo = peerInfos.lift(partitionIndex),
           localInputPartitions =
             if (localStreamSlots.nonEmpty) localInputRDDs.getPartitions(partitionIndex)
-            else Seq.empty)
+            else Seq.empty
+        )
     }
   }
 
@@ -148,6 +150,9 @@ class MppNativeQueryRDD(
     val runtimeExtraConf = new JHashMap[String, String]()
     if (MppNativeQueryRDD.largeParquetScanChunksEnabled) {
       runtimeExtraConf.put(MppNativeQueryRDD.largeParquetScanChunksKey, "true")
+    }
+    if (keepDeviceOutput) {
+      runtimeExtraConf.put("spark.gluten.sql.columnar.cudf.skipOutputToVelox", "true")
     }
     val runtime =
       Runtimes.contextInstance(BackendsApiManager.getBackendName, "MppQuery", runtimeExtraConf)
@@ -212,7 +217,8 @@ class MppNativeQueryRDD(
       require(
         localIterators.size == localStreamSlots.size,
         s"MPP local stream iterator count ${localIterators.size} did not match slot count " +
-          s"${localStreamSlots.size}")
+          s"${localStreamSlots.size}"
+      )
       localStreamSlots.zip(localIterators).foreach {
         case (slot, iterator) =>
           val streams =
@@ -234,12 +240,10 @@ class MppNativeQueryRDD(
           s"MPP fragment $consumerId has duplicate JVM stream slot(s): " +
             duplicateSlots.toSeq.sorted.mkString("[", ",", "]"))
         jvmStreamSlotIndicesPerFrag(consumerId) = sortedBySlot.map(_._1).toArray
-        jvmStreamIteratorsPerFrag(consumerId) = sortedBySlot
-          .map {
-            case (_, iterator) =>
-              new ColumnarBatchInIterator(BackendsApiManager.getBackendName, iterator): Object
-          }
-          .toArray
+        jvmStreamIteratorsPerFrag(consumerId) = sortedBySlot.map {
+          case (_, iterator) =>
+            new ColumnarBatchInIterator(BackendsApiManager.getBackendName, iterator): Object
+        }.toArray
         logInfo(
           s"MppNativeQueryRDD: fragment $consumerId has ${sortedBySlot.size} JVM stream(s) " +
             s"at slots ${sortedBySlot.map(_._1).mkString("[", ",", "]")}")
@@ -403,7 +407,39 @@ class MppNativeQueryRDD(
         }
         if (nextHandle == 0L) {
           finished = true
-          val closeNanos = closeMppHandle()
+          // A peer can exhaust its local root before remote peers have consumed all of the
+          // producers hosted by this executor. Publish output EOS through the MPP control plane
+          // and keep every native coordinator alive until the driver has observed EOS from all
+          // peers. A peer failure releases this wait through the existing abort path.
+          if (mppPartition.totalPartitions > 1) {
+            val completionStart = System.nanoTime()
+            val query = activeQuery.getOrElse {
+              val error = new IllegalStateException(
+                "Multi-peer MPP completion requires the MPP query control plane")
+              try {
+                closeMppHandle()
+              } catch {
+                case NonFatal(closeError) => error.addSuppressed(closeError)
+              }
+              throw error
+            }
+            if (!GlutenMppExecutorService.awaitPeerCompletion(query)) {
+              val closeNanos = closeMppHandle()
+              reportTerminal(MppPeerState.Aborted)
+              logWarning(
+                f"MppNativeQueryRDD: peer completion was aborted; " +
+                  f"nativeCloseMppQuery=${closeNanos / 1e6}%.1fms")
+              throw new TaskKilledException(
+                "MPP peer completion aborted before every peer reached output EOS")
+            }
+            logInfo(
+              f"MppNativeQueryRDD: all-peer output EOS acknowledged in " +
+                f"${(System.nanoTime() - completionStart) / 1e6}%.1fms")
+          }
+          // A downstream consumer may retain a zero-copy view of the final native batch after
+          // exhausting this iterator. Iceberg's Parquet writer does this until commit(), so keep
+          // the coordinator and its output pool alive through the Spark task completion listener.
+          // Error and abort paths still close eagerly above.
           val avgMs =
             totalGetOutputNanos.toDouble / math.max(1L, totalGetOutputCalls) / 1e6
           logWarning(
@@ -414,7 +450,7 @@ class MppNativeQueryRDD(
               f"min=${minGetOutputNanos / 1e6}%.2fms " +
               f"max=${maxGetOutputNanos / 1e6}%.2fms " +
               f"timeToFirstBatch=${firstBatchNanos / 1e6}%.1fms " +
-              f"nativeCloseMppQuery=${closeNanos / 1e6}%.1fms")
+              f"nativeCloseMppQuery=deferred")
           if (runtimeTimingProbeEnabled) {
             val safeMinGetOutputNanos =
               if (totalGetOutputCalls == 0) 0L else minGetOutputNanos
@@ -432,7 +468,7 @@ class MppNativeQueryRDD(
                   "nativeGetMppOutputMinNanos" -> safeMinGetOutputNanos.toString,
                   "nativeGetMppOutputMaxNanos" -> maxGetOutputNanos.toString,
                   "timeToFirstBatchNanos" -> safeFirstBatchNanos.toString,
-                  "nativeCloseMppQueryNanos" -> closeNanos.toString,
+                  "nativeCloseMppQueryDeferred" -> "true",
                   "outputRows" -> totalOutputRows.toString,
                   "outputBatches" -> totalOutputBatches.toString
                 )
@@ -495,10 +531,10 @@ private[execution] class MppAlignedInputRDD(
     parentGroups: Array[Array[Int]])
   extends RDD[ColumnarBatch](
     parentRDD.sparkContext,
-    Seq(
-      new NarrowDependency[ColumnarBatch](parentRDD) {
-        override def getParents(partitionId: Int): Seq[Int] = parentGroups(partitionId).toSeq
-      })) {
+    Seq(new NarrowDependency[ColumnarBatch](parentRDD) {
+      override def getParents(partitionId: Int): Seq[Int] = parentGroups(partitionId).toSeq
+    })
+  ) {
 
   override protected def getPartitions: Array[Partition] = {
     val parentPartitions = parentRDD.partitions

@@ -254,14 +254,16 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
             s"its inner plan root is not TransformSupport: ${innerPlan.getClass.getSimpleName}")
         abort = true
       } else {
-        // The scalar attribute carried by the subquery output. All ScalarSubquery instances in
-        // the group share this attribute (they all resolve to the same SubqueryExec child).
-        val scalarAttr = innerPlan.output.head match {
+        val exchange = cache.getOrBuild(innerPlan)
+        // Use the cached exchange's actual output attribute, not the current subquery plan's
+        // attribute. Spark may create several ScalarSubquery instances with different exprIds for
+        // the same canonicalized plan; the exchange cache intentionally reuses one broadcast for
+        // all of them, so rewritten predicates must bind to that broadcast's output.
+        val scalarAttr = exchange.output.head match {
           case ar: AttributeReference => ar
           case other => other.toAttribute.asInstanceOf[AttributeReference]
         }
-        val broadcast =
-          ColumnarCollapseTransformStages.wrapInputIteratorTransformer(cache.getOrBuild(innerPlan))
+        val broadcast = ColumnarCollapseTransformStages.wrapInputIteratorTransformer(exchange)
         val bnlj = BackendsApiManager.getSparkPlanExecApiInstance
           .genBroadcastNestedLoopJoinExecTransformer(
             left = current,

@@ -245,7 +245,6 @@ std::shared_ptr<RowToColumnarConverter> VeloxRuntime::createRow2ColumnarConverte
   return std::make_shared<VeloxRowToColumnarConverter>(cSchema, veloxPool);
 }
 
-#ifdef GLUTEN_ENABLE_ENHANCED_FEATURES
 std::shared_ptr<IcebergWriter> VeloxRuntime::createIcebergWriter(
     RowTypePtr rowType,
     int32_t format,
@@ -262,7 +261,6 @@ std::shared_ptr<IcebergWriter> VeloxRuntime::createIcebergWriter(
   return std::make_shared<IcebergWriter>(
       rowType, format, outputDirectory, compressionKind, partitionId, taskId, operationId, spec, protoField, sparkConfs, veloxPool, connectorPool);
 }
-#endif
 
 std::shared_ptr<ShuffleWriter> VeloxRuntime::createShuffleWriter(
     int32_t numPartitions,

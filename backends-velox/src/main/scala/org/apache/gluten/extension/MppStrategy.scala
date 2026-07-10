@@ -89,7 +89,10 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
         case other => other
       }
       // After unwrapping, skip commands (DDL, DML) - only queries should go MPP
-      if (queryPlan.isInstanceOf[org.apache.spark.sql.catalyst.plans.logical.Command]) {
+      if (
+        queryPlan.isInstanceOf[org.apache.spark.sql.catalyst.plans.logical.Command] ||
+        queryPlan.isInstanceOf[CommandResult]
+      ) {
         return Nil
       }
       logDebug(

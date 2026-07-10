@@ -21,8 +21,9 @@ import org.apache.spark.TaskContext
 import org.mockito.Mockito.{mock, when}
 import org.scalatest.funsuite.AnyFunSuite
 
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
+import java.io.{ByteArrayOutputStream, ObjectOutputStream}
 import java.util.concurrent.{CountDownLatch, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 
 class ActiveMppQueryRegistrySuite extends AnyFunSuite {
   private val run = MppQueryRunId("q", 3, 0)
@@ -119,7 +120,8 @@ class ActiveMppQueryRegistrySuite extends AnyFunSuite {
       },
       interruptPollMs = 50L,
       heartbeatMs = 250L,
-      startThreads = false)
+      startThreads = false
+    )
     try {
       val query = agent.register(
         run,
@@ -156,12 +158,8 @@ class ActiveMppQueryRegistrySuite extends AnyFunSuite {
       heartbeatMs = 250L,
       startThreads = false)
     try {
-      val query = agent.register(
-        run,
-        peerIndex = 0,
-        expectedPeerCount = 1,
-        taskContext(10L),
-        () => ())
+      val query =
+        agent.register(run, peerIndex = 0, expectedPeerCount = 1, taskContext(10L), () => ())
       assert(query.beginNativeStart())
       query.finishNativeStart(succeeded = true)
 
@@ -175,6 +173,173 @@ class ActiveMppQueryRegistrySuite extends AnyFunSuite {
       agent.sendHeartbeat()
       assert(agent.pendingTerminalCount == 0)
       assert(agent.activeQueries.isEmpty)
+    } finally {
+      agent.shutdown()
+    }
+  }
+
+  test("heartbeat serializes strict peer snapshots without retaining active queries") {
+    val serialized = new AtomicBoolean(false)
+    val agent = new GlutenMppExecutorControlAgent(
+      "e0",
+      "s0",
+      message => {
+        val bytes = new ByteArrayOutputStream()
+        val output = new ObjectOutputStream(bytes)
+        try {
+          output.writeObject(message)
+          output.flush()
+          serialized.set(bytes.size() > 0)
+        } finally {
+          output.close()
+        }
+        MppQueryHeartbeatAck(Nil, Nil, 0L)
+      },
+      interruptPollMs = 50L,
+      heartbeatMs = 250L,
+      startThreads = false
+    )
+    try {
+      val query =
+        agent.register(run, peerIndex = 0, expectedPeerCount = 2, taskContext(10L), () => ())
+      assert(query.beginNativeStart())
+      query.finishNativeStart(succeeded = true)
+
+      agent.sendHeartbeat()
+      assert(serialized.get())
+    } finally {
+      agent.shutdown()
+    }
+  }
+
+  test("output EOS waits for matching driver completion authorization") {
+    val outputCompleteHeartbeat = new CountDownLatch(1)
+    val response = new AtomicReference[AnyRef](MppQueryHeartbeatAck(Nil, Nil, 0L))
+    val agent = new GlutenMppExecutorControlAgent(
+      "e0",
+      "s0",
+      message => {
+        message match {
+          case heartbeat: MppQueryHeartbeat
+              if heartbeat.peers.exists(_.state == MppPeerState.OutputComplete) =>
+            outputCompleteHeartbeat.countDown()
+          case _ =>
+        }
+        response.get()
+      },
+      interruptPollMs = 50L,
+      heartbeatMs = 250L,
+      startThreads = false
+    )
+    try {
+      val query =
+        agent.register(run, peerIndex = 0, expectedPeerCount = 2, taskContext(10L), () => ())
+      assert(query.beginNativeStart())
+      query.finishNativeStart(succeeded = true)
+
+      val completed = new AtomicBoolean(false)
+      val waiter = new Thread(() => completed.set(agent.awaitPeerCompletion(query)))
+      waiter.start()
+      assert(outputCompleteHeartbeat.await(5L, TimeUnit.SECONDS))
+      assert(query.snapshot().state == MppPeerState.OutputComplete)
+      assert(waiter.isAlive)
+
+      val wrongAttempt = MppPeerCompletion(run, 0, 999L, "e0", "s0")
+      response.set(MppQueryHeartbeatAck(Nil, Nil, 0L, Seq(wrongAttempt)))
+      agent.sendHeartbeat()
+      assert(waiter.isAlive)
+
+      val matchingAttempt = MppPeerCompletion(run, 0, 10L, "e0", "s0")
+      response.set(MppQueryHeartbeatAck(Nil, Nil, 0L, Seq(matchingAttempt)))
+      agent.sendHeartbeat()
+      waiter.join(5000L)
+      assert(!waiter.isAlive)
+      assert(completed.get())
+    } finally {
+      agent.shutdown()
+    }
+  }
+
+  test("output EOS fast-polls completion without waiting for the periodic heartbeat") {
+    val outputCompleteHeartbeats = new AtomicInteger(0)
+    val completion = MppPeerCompletion(run, 0, 10L, "e0", "s0")
+    val agent = new GlutenMppExecutorControlAgent(
+      "e0",
+      "s0",
+      message => {
+        val count = message match {
+          case heartbeat: MppQueryHeartbeat
+              if heartbeat.peers.exists(_.state == MppPeerState.OutputComplete) =>
+            outputCompleteHeartbeats.incrementAndGet()
+          case _ =>
+            outputCompleteHeartbeats.get()
+        }
+        MppQueryHeartbeatAck(Nil, Nil, 0L, if (count >= 2) Seq(completion) else Nil)
+      },
+      interruptPollMs = 50L,
+      heartbeatMs = 250L,
+      startThreads = false
+    )
+    try {
+      val query =
+        agent.register(run, peerIndex = 0, expectedPeerCount = 2, taskContext(10L), () => ())
+      assert(query.beginNativeStart())
+      query.finishNativeStart(succeeded = true)
+
+      val completed = new AtomicBoolean(false)
+      val waiter = new Thread(() => completed.set(agent.awaitPeerCompletion(query)))
+      waiter.start()
+      waiter.join(5000L)
+      assert(!waiter.isAlive)
+      assert(completed.get())
+      assert(outputCompleteHeartbeats.get() >= 2)
+    } finally {
+      agent.shutdown()
+    }
+  }
+
+  test("peer abort releases output EOS wait without authorizing close") {
+    val outputCompleteHeartbeat = new CountDownLatch(1)
+    val response = new AtomicReference[AnyRef](MppQueryHeartbeatAck(Nil, Nil, 0L))
+    val nativeAbort = new CountDownLatch(1)
+    val agent = new GlutenMppExecutorControlAgent(
+      "e0",
+      "s0",
+      message => {
+        message match {
+          case heartbeat: MppQueryHeartbeat
+              if heartbeat.peers.exists(_.state == MppPeerState.OutputComplete) =>
+            outputCompleteHeartbeat.countDown()
+          case _ =>
+        }
+        response.get()
+      },
+      interruptPollMs = 50L,
+      heartbeatMs = 250L,
+      startThreads = false
+    )
+    try {
+      val query = agent.register(
+        run,
+        peerIndex = 0,
+        expectedPeerCount = 2,
+        taskContext(10L),
+        () => nativeAbort.countDown())
+      assert(query.beginNativeStart())
+      query.finishNativeStart(succeeded = true)
+
+      val completed = new AtomicBoolean(true)
+      val waiter = new Thread(() => completed.set(agent.awaitPeerCompletion(query)))
+      waiter.start()
+      assert(outputCompleteHeartbeat.await(5L, TimeUnit.SECONDS))
+
+      val abort = MppAbortQuery(run, 0, 10L, "e0", "s0", 1L, "peer failed", 0L)
+      response.set(MppQueryHeartbeatAck(Seq(abort), Nil, 0L))
+      agent.sendHeartbeat()
+      waiter.join(5000L)
+      assert(!waiter.isAlive)
+      assert(!completed.get())
+      assert(nativeAbort.await(5L, TimeUnit.SECONDS))
     } finally {
       agent.shutdown()
     }

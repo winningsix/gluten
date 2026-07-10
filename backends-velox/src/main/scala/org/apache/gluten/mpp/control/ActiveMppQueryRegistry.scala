@@ -20,14 +20,14 @@ import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
 
 import java.util.UUID
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
 import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, Executors, ScheduledExecutorService, ThreadFactory, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
 
 import scala.collection.JavaConverters._
 import scala.util.control.NonFatal
 
 /** Executor-local key for the Spark task attempt that owns one native MPP peer handle. */
-private[control] final case class ActiveMppQueryKey(
+final private[control] case class ActiveMppQueryKey(
     runId: MppQueryRunId,
     peerIndex: Int,
     taskAttemptId: Long)
@@ -42,7 +42,7 @@ private[control] final case class ActiveMppQueryKey(
  * `abortNative` requests cooperative native abort only. The holder deliberately does not own close
  * or the native handle; `MppNativeQueryRDD` remains the sole exactly-once close owner.
  */
-private[gluten] final class ActiveMppQuery private[control] (
+final private[gluten] class ActiveMppQuery private[control] (
     val runId: MppQueryRunId,
     val peerIndex: Int,
     val expectedPeerCount: Int,
@@ -57,7 +57,9 @@ private[gluten] final class ActiveMppQuery private[control] (
   private val abortQueued = new AtomicBoolean(false)
   private val acceptedAbortSeq = new AtomicLong(0L)
   private val startFinished = new CountDownLatch(1)
+  private val peerCompletion = new CountDownLatch(1)
   private val startSucceeded = new AtomicBoolean(false)
+  private val peerCompletionAuthorized = new AtomicBoolean(false)
   private val failureReported = new AtomicBoolean(false)
   private val terminalReported = new AtomicBoolean(false)
 
@@ -104,6 +106,7 @@ private[gluten] final class ActiveMppQuery private[control] (
       firstAbortReason = reason
     }
     abortRequestedFlag.set(true)
+    peerCompletion.countDown()
     if (!isTerminal) {
       currentState.set(MppPeerState.AbortRequested)
       abortQueued.compareAndSet(false, true)
@@ -122,10 +125,44 @@ private[gluten] final class ActiveMppQuery private[control] (
 
   private[control] def markFailureReported(): Boolean = failureReported.compareAndSet(false, true)
 
+  /** Publish local root EOS without closing the native coordinator. */
+  private[control] def markOutputComplete(): Boolean = synchronized {
+    if (abortRequestedFlag.get() || isTerminal || taskContext.isInterrupted()) {
+      false
+    } else {
+      currentState.set(MppPeerState.OutputComplete)
+      true
+    }
+  }
+
+  /** Release the task only when the driver authorizes this exact peer attempt to close. */
+  private[control] def authorizePeerCompletion(): Unit = synchronized {
+    if (!abortRequestedFlag.get() && !isTerminal) {
+      peerCompletionAuthorized.set(true)
+      peerCompletion.countDown()
+    }
+  }
+
+  /**
+   * Wait for completion authorization or abort without depending on the periodic heartbeat phase. A
+   * timeout leaves the latch intact so the caller can publish another output-complete heartbeat.
+   */
+  @throws[InterruptedException]
+  private[control] def awaitPeerCompletion(timeoutMs: Long): Option[Boolean] = {
+    if (peerCompletion.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+      Some(
+        peerCompletionAuthorized.get() && !abortRequestedFlag.get() &&
+          !taskContext.isInterrupted())
+    } else {
+      None
+    }
+  }
+
   private[control] def markTerminal(state: String): Boolean = {
     if (terminalReported.compareAndSet(false, true)) {
       currentState.set(state)
       startFinished.countDown()
+      peerCompletion.countDown()
       true
     } else {
       false
@@ -176,7 +213,19 @@ private[control] class ActiveMppQueryRegistry {
           query.executorSessionId == command.executorSessionId
       }
 
-  def values: Seq[ActiveMppQuery] = entries.values().asScala.toSeq
+  def find(completion: MppPeerCompletion): Option[ActiveMppQuery] =
+    Option(
+      entries.get(
+        ActiveMppQueryKey(completion.runId, completion.peerIndex, completion.taskAttemptId)))
+      .filter {
+        query =>
+          query.executorId == completion.executorId &&
+          query.executorSessionId == completion.executorSessionId
+      }
+
+  // `Iterable.toSeq` is a lazy Stream in Scala 2.12. Keep this snapshot strict: heartbeat mapping
+  // must not serialize a Stream closure that still captures the non-serializable ActiveMppQuery.
+  def values: Seq[ActiveMppQuery] = entries.values().asScala.iterator.toVector
 
   def remove(query: ActiveMppQuery): Unit = entries.remove(query.key, query)
 
@@ -225,6 +274,13 @@ private[control] class GlutenMppExecutorControlAgent(
   private val pendingFailures = new ConcurrentHashMap[String, MppQueryFailure]()
   private val pendingTerminals = new ConcurrentHashMap[String, MppTerminalEvent]()
   private val closed = new AtomicBoolean(false)
+  private val heartbeatFailureLogged = new AtomicBoolean(false)
+
+  // Spark's plugin control channel is pull-only, so a peer that reaches EOS first cannot receive
+  // the authorization produced by the last peer's heartbeat. Poll briefly from the waiting task
+  // to avoid quantizing normal peer skew by the 250 ms periodic heartbeat. After one configured
+  // heartbeat interval, return to the regular cadence to bound failure-path RPC load.
+  private val outputCompletionFastPollMs = math.max(1L, math.min(5L, heartbeatMs))
 
   private var interruptWatcher: ScheduledExecutorService = _
   private var heartbeatPoller: ScheduledExecutorService = _
@@ -232,10 +288,10 @@ private[control] class GlutenMppExecutorControlAgent(
     Executors.newSingleThreadExecutor(threadFactory("gluten-mpp-abort-worker"))
 
   if (startThreads) {
-    interruptWatcher = Executors.newSingleThreadScheduledExecutor(
-      threadFactory("gluten-mpp-interrupt-watcher"))
-    heartbeatPoller = Executors.newSingleThreadScheduledExecutor(
-      threadFactory("gluten-mpp-heartbeat-poller"))
+    interruptWatcher =
+      Executors.newSingleThreadScheduledExecutor(threadFactory("gluten-mpp-interrupt-watcher"))
+    heartbeatPoller =
+      Executors.newSingleThreadScheduledExecutor(threadFactory("gluten-mpp-heartbeat-poller"))
     interruptWatcher.scheduleWithFixedDelay(
       new Runnable {
         override def run(): Unit = safely("interrupt scan")(scanInterrupts())
@@ -286,7 +342,8 @@ private[control] class GlutenMppExecutorControlAgent(
         error.getClass.getName,
         message,
         stack,
-        clock())
+        clock()
+      )
       pendingFailures.put(event.eventId, event)
     }
   }
@@ -307,6 +364,42 @@ private[control] class GlutenMppExecutorControlAgent(
     }
   }
 
+  /**
+   * Publish local root EOS and wait for the driver's all-peer completion authorization. Native
+   * abort remains independent and releases the waiter immediately on peer failure or interruption.
+   */
+  def awaitPeerCompletion(query: ActiveMppQuery): Boolean = {
+    if (!query.markOutputComplete()) {
+      return false
+    }
+    // Do not wait for the next scheduled tick to publish EOS. Periodic heartbeats continue to
+    // retry if this request fails or another peer has not reached EOS yet.
+    try {
+      safely("output-complete heartbeat")(sendHeartbeat())
+      val fastPollStart = System.nanoTime()
+      val fastPollWindowNanos = TimeUnit.MILLISECONDS.toNanos(heartbeatMs)
+      var result = query.awaitPeerCompletion(outputCompletionFastPollMs)
+      while (result.isEmpty) {
+        safely("output-complete heartbeat")(sendHeartbeat())
+        val pollMs =
+          if (System.nanoTime() - fastPollStart < fastPollWindowNanos) {
+            outputCompletionFastPollMs
+          } else {
+            heartbeatMs
+          }
+        result = query.awaitPeerCompletion(pollMs)
+      }
+      result.get
+    } catch {
+      case _: InterruptedException =>
+        val reason = "MPP peer completion wait interrupted"
+        Thread.currentThread().interrupt()
+        reportFailure(query, new InterruptedException(reason))
+        enqueueAbort(query, sequence = 0L, reason)
+        false
+    }
+  }
+
   private[control] def scanInterrupts(): Unit = {
     if (closed.get()) return
     registry.values
@@ -319,7 +412,9 @@ private[control] class GlutenMppExecutorControlAgent(
       }
   }
 
-  private[control] def sendHeartbeat(): Unit = {
+  // The periodic worker and an EOS waiter can both request a heartbeat. Keep snapshot/ask/ack
+  // processing single-flight so an older response cannot be applied after a newer terminal state.
+  private[control] def sendHeartbeat(): Unit = synchronized {
     if (closed.get()) return
     if (!registry.nonEmpty && pendingFailures.isEmpty && pendingTerminals.isEmpty) return
 
@@ -328,8 +423,9 @@ private[control] class GlutenMppExecutorControlAgent(
       executorSessionId,
       clock(),
       registry.values.map(_.snapshot()),
-      pendingFailures.values().asScala.toSeq,
-      pendingTerminals.values().asScala.toSeq)
+      pendingFailures.values().asScala.iterator.toVector,
+      pendingTerminals.values().asScala.iterator.toVector
+    )
     askDriver(heartbeat) match {
       case ack: MppQueryHeartbeatAck =>
         ack.acknowledgedEventIds.foreach {
@@ -337,9 +433,9 @@ private[control] class GlutenMppExecutorControlAgent(
             pendingFailures.remove(eventId)
             val terminal = pendingTerminals.remove(eventId)
             if (terminal != null) {
-              registry.values.find {
-                query => terminalEventId(query) == eventId
-              }.foreach(registry.remove)
+              registry.values
+                .find(query => terminalEventId(query) == eventId)
+                .foreach(registry.remove)
             }
         }
         ack.abortCommands.foreach {
@@ -347,6 +443,9 @@ private[control] class GlutenMppExecutorControlAgent(
             registry
               .find(command)
               .foreach(enqueueAbort(_, command.sequence, command.reason))
+        }
+        ack.peerCompletions.foreach {
+          completion => registry.find(completion).foreach(_.authorizePeerCompletion())
         }
       case other =>
         logWarning(s"Unexpected MPP query heartbeat response: $other")
@@ -403,9 +502,16 @@ private[control] class GlutenMppExecutorControlAgent(
     if (value.length <= maxChars) value else value.substring(0, maxChars)
 
   private def safely(label: String)(body: => Unit): Unit = {
-    try body
-    catch {
+    val isHeartbeat = label.endsWith("heartbeat")
+    try {
+      body
+      if (isHeartbeat) {
+        heartbeatFailureLogged.set(false)
+      }
+    } catch {
       case _: InterruptedException if closed.get() =>
+      case NonFatal(e) if isHeartbeat && heartbeatFailureLogged.compareAndSet(false, true) =>
+        logWarning(s"MPP query-control $label failed; retries will continue", e)
       case NonFatal(e) => logDebug(s"MPP query-control $label failed", e)
     }
   }

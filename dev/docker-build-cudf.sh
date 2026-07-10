@@ -36,10 +36,11 @@ ENABLE_HDFS="OFF"
 ENABLE_S3="OFF"
 REBUILD=false   # if true: skip Arrow, clear cmake cache, re-run velox+cpp+mvn only
 JAVA_HOME_IN_CONTAINER="/usr/lib/jvm/java-1.8.0-openjdk"
+JAVA_HOME_EXPLICIT=false
 GLUTEN_ONLY=false  # if true: reuse existing Velox/cuDF build; rebuild only Gluten C++ + Maven
 JOBS="${JOBS:-16}"
 MAVEN_THREADS="${MAVEN_THREADS:-8}"
-MAVEN_PROFILES="${MAVEN_PROFILES:-backends-velox,spark-${SPARK_VERSION},celeborn,delta,hudi}"
+MAVEN_PROFILES="${MAVEN_PROFILES:-backends-velox,spark-${SPARK_VERSION},celeborn,delta,hudi,iceberg}"
 MAVEN_PROFILES_EXPLICIT=false
 
 # Velox source — only used if VELOX_DIR does not exist (fallback clone).
@@ -100,7 +101,7 @@ for arg in "$@"; do
     --maven_profiles=*|--maven-profiles=*)
                        MAVEN_PROFILES="${arg#*=}"; MAVEN_PROFILES_EXPLICIT=true ;;
     --java_home=*|--java-home=*)
-                       JAVA_HOME_IN_CONTAINER="${arg#*=}" ;;
+                       JAVA_HOME_IN_CONTAINER="${arg#*=}"; JAVA_HOME_EXPLICIT=true ;;
     --container=*)     CONTAINER_NAME="${arg#*=}" ;;
     --image=*)         DOCKER_IMAGE="${arg#*=}"; IMAGE_EXPLICIT=true ;;
     --velox_repo=*)    VELOX_REPO="${arg#*=}" ;;
@@ -129,8 +130,31 @@ if [ "$REBUILD" = true ]; then
   BUILD_ARROW="OFF"
 fi
 
+if [ "${SPARK_VERSION}" = "ALL" ]; then
+  SPARK_MAJOR_VERSION=0
+else
+  SPARK_MAJOR_VERSION=$(echo "${SPARK_VERSION}" | cut -d'.' -f1)
+fi
+if [ "${SPARK_MAJOR_VERSION}" -ge 4 ]; then
+  SCALA_BINARY_VERSION="2.13"
+  if [ "$JAVA_HOME_EXPLICIT" = false ]; then
+    JAVA_HOME_IN_CONTAINER="/usr/lib/jvm/java-17-openjdk"
+  fi
+else
+  SCALA_BINARY_VERSION="2.12"
+fi
+
 if [ "$MAVEN_PROFILES_EXPLICIT" = false ]; then
-  MAVEN_PROFILES="backends-velox,spark-${SPARK_VERSION},celeborn,delta,hudi"
+  MAVEN_PROFILES="backends-velox,spark-${SPARK_VERSION},celeborn,delta,hudi,iceberg"
+  if [ "${SPARK_MAJOR_VERSION}" -ge 4 ]; then
+    MAVEN_PROFILES="${MAVEN_PROFILES},java-17,scala-2.13"
+  fi
+fi
+
+if [ "${SPARK_VERSION}" = "ALL" ]; then
+  BUNDLE_MAVEN_PROFILE_EXPORT="unset GLUTEN_BUNDLE_MAVEN_PROFILES"
+else
+  BUNDLE_MAVEN_PROFILE_EXPORT="export GLUTEN_BUNDLE_MAVEN_PROFILES=${MAVEN_PROFILES}"
 fi
 
 if [ "$GLUTEN_ONLY" = true ] && [ "$CUDA_ARCH_EXPLICIT" = false ]; then
@@ -234,6 +258,7 @@ echo " CUDA arch     : $CUDA_ARCH"
 echo " Docker image  : $DOCKER_IMAGE"
 echo " Container     : $CONTAINER_NAME"
 echo " Spark version : $SPARK_VERSION"
+echo " Scala binary  : $SCALA_BINARY_VERSION"
 echo " Build Arrow   : $BUILD_ARROW"
 echo " Enable HDFS   : $ENABLE_HDFS"
 echo " Rebuild mode  : $REBUILD"
@@ -321,6 +346,7 @@ if [ "$GLUTEN_ONLY" = true ]; then
     fi
     export JAVA_HOME=${JAVA_HOME_IN_CONTAINER}
     export PATH=${JAVA_HOME_IN_CONTAINER}/bin:\$PATH
+    export SCALA_BINARY_VERSION=${SCALA_BINARY_VERSION}
     cd /opt/gluten && \
     bash ./dev/rebuild-libgluten-incremental.sh --jobs ${JOBS} \
       2>&1 | tee ${TEE_FLAG} /opt/gluten/build.log
@@ -333,6 +359,7 @@ else
     fi
     export JAVA_HOME=${JAVA_HOME_IN_CONTAINER}
     export PATH=${JAVA_HOME_IN_CONTAINER}/bin:\$PATH
+    ${BUNDLE_MAVEN_PROFILE_EXPORT}
     if [ -x /opt/rh/gcc-toolset-14/root/usr/bin/gcc ]; then
       export CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc
       export CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
@@ -374,7 +401,7 @@ if [ "$GLUTEN_ONLY" = true ]; then
       MVN_CMD=./build/mvn
     fi
     \"\${MVN_CMD}\" -T ${MAVEN_THREADS} -pl package -am package \
-      -P${MAVEN_PROFILES} -DskipTests \
+      -P${MAVEN_PROFILES} -DskipTests -Dmaven.test.skip=true -Dspotless.check.skip=true \
       2>&1 | tee ${TEE_FLAG} /opt/gluten/maven.log
   "
 else
@@ -393,7 +420,7 @@ fi
 echo ""
 echo "[post] Verifying JAR and native library consistency..."
 
-JAR_PATH="${GLUTEN_DIR}/package/target/gluten-velox-bundle-spark${SPARK_VERSION}_2.12-linux_amd64-1.6.0-SNAPSHOT.jar"
+JAR_PATH="${GLUTEN_DIR}/package/target/gluten-velox-bundle-spark${SPARK_VERSION}_${SCALA_BINARY_VERSION}-linux_amd64-1.6.0-SNAPSHOT.jar"
 # Single combined library: core + backend are now merged into libgluten.so
 CPP_LIBGLUTEN="${GLUTEN_DIR}/cpp/build/releases/libgluten.so"
 
@@ -419,7 +446,7 @@ if [ -f "$JAR_PATH" ] && [ -f "$CPP_LIBGLUTEN" ]; then
       mkdir -p /tmp/_jar_fix/linux/amd64 && \
       cp /opt/gluten/cpp/build/releases/libgluten.so /tmp/_jar_fix/linux/amd64/ && \
       cd /tmp/_jar_fix && \
-      jar uf /opt/gluten/package/target/gluten-velox-bundle-spark${SPARK_VERSION}_2.12-linux_amd64-1.6.0-SNAPSHOT.jar linux/amd64/libgluten.so && \
+      jar uf /opt/gluten/package/target/gluten-velox-bundle-spark${SPARK_VERSION}_${SCALA_BINARY_VERSION}-linux_amd64-1.6.0-SNAPSHOT.jar linux/amd64/libgluten.so && \
       rm -rf /tmp/_jar_fix
     "
     echo "          Native libs injected. New JAR MD5:"

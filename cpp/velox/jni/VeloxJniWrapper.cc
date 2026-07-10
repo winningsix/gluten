@@ -48,9 +48,7 @@
 #include <cuda_runtime.h>
 #endif
 
-#ifdef GLUTEN_ENABLE_ENHANCED_FEATURES
 #include "IcebergNestedField.pb.h"
-#endif
 
 using namespace gluten;
 using namespace facebook;
@@ -992,7 +990,6 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_gpu_GpuMemoryTrackerJniWrapper_ge
 }
 #endif
 
-#ifdef GLUTEN_ENABLE_ENHANCED_FEATURES
 JNIEXPORT jlong JNICALL Java_org_apache_gluten_execution_IcebergWriteJniWrapper_init( // NOLINT
     JNIEnv* env,
     jobject wrapper,
@@ -1062,6 +1059,25 @@ JNIEXPORT jobjectArray JNICALL Java_org_apache_gluten_execution_IcebergWriteJniW
   JNI_METHOD_END(nullptr)
 }
 
+JNIEXPORT void JNICALL Java_org_apache_gluten_execution_IcebergWriteJniWrapper_abort( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jlong writerHandle) {
+  JNI_METHOD_START
+  auto writer = ObjectStore::retrieve<IcebergWriter>(writerHandle);
+  writer->abort();
+  JNI_METHOD_END()
+}
+
+JNIEXPORT void JNICALL Java_org_apache_gluten_execution_IcebergWriteJniWrapper_close( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jlong writerHandle) {
+  JNI_METHOD_START
+  ObjectStore::release(writerHandle);
+  JNI_METHOD_END()
+}
+
 JNIEXPORT jobject JNICALL Java_org_apache_gluten_execution_IcebergWriteJniWrapper_metrics( // NOLINT
     JNIEnv* env,
     jobject wrapper,
@@ -1080,7 +1096,6 @@ JNIEXPORT jobject JNICALL Java_org_apache_gluten_execution_IcebergWriteJniWrappe
 
   JNI_METHOD_END(nullptr)
 }
-#endif
 
 #ifdef __cplusplus
 }

@@ -540,21 +540,21 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
       right: LogicalPlan,
       dedupAttributes: Seq[Attribute]): Boolean = {
     right match {
-      case Aggregate(groupingExpressions, aggregateExpressions, _)
-          if groupingExpressions.length == dedupAttributes.length &&
-            aggregateExpressions.length == dedupAttributes.length =>
-        sameExpressions(groupingExpressions, dedupAttributes) &&
-        sameExpressions(aggregateExpressions, dedupAttributes)
+      case aggregate: Aggregate
+          if aggregate.groupingExpressions.length == dedupAttributes.length &&
+            aggregate.aggregateExpressions.length == dedupAttributes.length =>
+        sameExpressions(aggregate.groupingExpressions, dedupAttributes) &&
+        sameExpressions(aggregate.aggregateExpressions, dedupAttributes)
       case _ => false
     }
   }
 
   private def isExistenceSummary(right: LogicalPlan): Boolean = {
     right match {
-      case Aggregate(_, aggregateExpressions, _) =>
-        aggregateExpressions.exists(_.name.startsWith("_existence_min_")) &&
-        (aggregateExpressions.exists(_.name.startsWith("_existence_max_")) ||
-          aggregateExpressions.exists(_.name.startsWith("_existence_count_")))
+      case aggregate: Aggregate =>
+        aggregate.aggregateExpressions.exists(_.name.startsWith("_existence_min_")) &&
+        (aggregate.aggregateExpressions.exists(_.name.startsWith("_existence_max_")) ||
+          aggregate.aggregateExpressions.exists(_.name.startsWith("_existence_count_")))
       case Project(_, child) => isExistenceSummary(child)
       case Filter(_, child) => isExistenceSummary(child)
       case _ => false

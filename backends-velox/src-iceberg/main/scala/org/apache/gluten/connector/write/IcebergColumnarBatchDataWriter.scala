@@ -27,12 +27,14 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import com.fasterxml.jackson.databind.{DeserializationFeature, ObjectMapper}
 import org.apache.iceberg._
+import org.apache.iceberg.parquet.ParquetUtil
 import org.apache.iceberg.spark.source.IcebergWriteUtil
 
 case class IcebergColumnarBatchDataWriter(
     writer: Long,
     jniWrapper: IcebergWriteJniWrapper,
     format: Int,
+    table: Table,
     partitionSpec: PartitionSpec,
     sortOrder: SortOrder)
   extends DataWriter[ColumnarBatch]
@@ -55,21 +57,35 @@ case class IcebergColumnarBatchDataWriter(
 
   override def abort(): Unit = {
     logInfo("Abort the ColumnarBatchDataWriter")
+    jniWrapper.abort(writer)
   }
 
   override def close(): Unit = {
     logDebug("Close the ColumnarBatchDataWriter")
+    jniWrapper.close(writer)
   }
 
   private def parseDataFile(json: String, spec: PartitionSpec, sortOrder: SortOrder): DataFile = {
     val dataFile = mapper.readValue(json, classOf[DataFileJson])
+    val footerMetrics = ParquetUtil.fileMetrics(
+      table.io().newInputFile(dataFile.path),
+      MetricsConfig.forTable(table))
+    if (
+      dataFile.metrics != null &&
+      dataFile.metrics.metrics().recordCount() != footerMetrics.recordCount()
+    ) {
+      throw new IllegalStateException(
+        s"libcudf Parquet row count mismatch for ${dataFile.path}: " +
+          s"writer=${dataFile.metrics.metrics().recordCount()}, " +
+          s"footer=${footerMetrics.recordCount()}")
+    }
     val builder = DataFiles
       .builder(spec)
       .withPath(dataFile.path)
       .withFormat(getFileFormat)
       .withFileSizeInBytes(dataFile.fileSizeInBytes)
       .withPartition(PartitionDataJson.fromJson(dataFile.partitionDataJson, partitionSpec))
-      .withMetrics(dataFile.metrics.metrics())
+      .withMetrics(footerMetrics)
       .withSplitOffsets(dataFile.splitOffsets)
       .withSortOrder(sortOrder)
     builder.build()
