@@ -105,17 +105,12 @@ class GlutenMppPeerMapperSuite extends AnyFunSuite {
     assert(out.head.host == "127.0.0.1")
   }
 
-  test("host selection falls through to info.host when blockManagerHost empty and URI host empty") {
-    // URI ucx://:12345 (no host portion) -> endpointHost = None -> use info.host
-    val bad = UcxEndpointInfo(
-      executorId = "e1",
-      host = "infoHost",
-      blockManagerHost = "",
-      blockManagerPort = 0,
-      gpuResourceAddresses = Nil,
-      nativeUcxListenerEndpoint = Some("ucx://:12345"))
-    val out = GlutenMppPeerMapper.toMppPeerInfos(Seq(bad), 1)
-    assert(out.head.host == "infoHost")
+  test("host selection falls through to URI host when blockManagerHost empty") {
+    val infos = Seq(
+      info("e1", host = "infoHost", blockManagerHost = "", ucxHost = "ucxHost"))
+    val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 1)
+    assert(out.head.host == "ucxHost")
+    assert(out.head.preferredLocation == "executor_ucxHost_e1")
   }
 
   test("requestedCount truncation matches take()") {
@@ -152,7 +147,8 @@ class GlutenMppPeerMapperSuite extends AnyFunSuite {
           executorId = """e"1\x""",
           host = "h\ta\nb",
           blockManagerHost = "h\ta\nb",
-          ucxListenerPort = 60000)),
+          ucxListenerPort = 60000,
+          ucxHost = "ucxHost")),
       1)
     val json = GlutenMppPeerMapper.toPeerEndpointsJson(peers)
     // Must escape: " -> \", \ -> \\, \t -> \t, \n -> \n

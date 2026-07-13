@@ -202,6 +202,13 @@ case class MppNativeQueryExec(
 
   private def preparedChildPlan: SparkPlan = unwrapPreparedMppChild(child)
 
+  /** Expose the execution-visible child to package-local structural tests. */
+  private[gluten] def preparedChildForTests: SparkPlan = preparedChildPlan
+
+  /** Apply the same cross-cut preparation used immediately before dynamic fragment extraction. */
+  private[gluten] def fragmentExtractionPlanForTests: SparkPlan =
+    applyCrossCutRules(preparedChildPlan)
+
   override def output: Seq[Attribute] = preparedChildPlan.output
   override def outputPartitioning: Partitioning = preparedChildPlan.outputPartitioning
   override def outputOrdering: Seq[SortOrder] = preparedChildPlan.outputOrdering
@@ -436,6 +443,11 @@ case class MppNativeQueryExec(
             s"MppNativeQueryExec: delegating to BSP because extracted MPP plan is unsafe: " +
               reason)
       }
+
+      // Plan C extracts fragments dynamically, so account for them here instead of relying on the
+      // pre-extracted Plan D metrics path below.
+      metrics("numFragments") += extractedFragments.size
+      metrics("numExchanges") += extractedExchanges.size
 
       logDebug(
         s"MppNativeQueryExec: *** PHASE 3 MPP EXECUTION *** " +

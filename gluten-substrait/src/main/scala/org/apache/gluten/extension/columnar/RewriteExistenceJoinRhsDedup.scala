@@ -34,6 +34,12 @@ import org.apache.spark.sql.catalyst.rules.Rule
  * with identical condition-relevant values are redundant. Deduplicating them early lets Spark plan
  * a normal two-phase aggregate before the join instead of pushing large duplicate streams through
  * later join and aggregate stages.
+ *
+ * This rule must run as an optimizer rule, not as an analyzer rule. It uses whole-plan transforms,
+ * which Spark 3.5 deliberately rejects while executing post-hoc resolution rules. The injected
+ * operator-optimization and pre-CBO passes see predicate subqueries before RewriteSubquery. After
+ * the rule observes an Exists, its self-registered user optimizer pass also provides
+ * post-RewriteSubquery coverage on subsequent optimizer executions.
  */
 case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
   extends Rule[LogicalPlan]

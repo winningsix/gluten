@@ -16,7 +16,7 @@
  */
 package org.apache.gluten.extension
 
-import org.apache.gluten.execution.{MppNativeQueryExec, VeloxWholeStageTransformerSuite, WholeStageTransformer}
+import org.apache.gluten.execution.{MppNativeQueryExec, MppPreparedChildExec, VeloxWholeStageTransformerSuite, WholeStageTransformer}
 
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
@@ -25,9 +25,9 @@ import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
  * Test suite verifying MppStrategy (Plan C) behavior:
  *   - Correctly intercepts query plans
  *   - Skips DDL/command plans
- *   - Produces correct results via BSP delegation (Phase 1)
+ *   - Produces correct results through dynamic native MPP execution
  *   - Properly falls back when MPP is disabled
- *   - Verifies plan structure proves MPP path can be exercised (Phase 2 readiness)
+ *   - Preserves prepare-time child isolation while exposing the plan used for native extraction
  */
 class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
 
@@ -40,7 +40,7 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
       .set("spark.sql.adaptive.enabled", "false")
       .set("spark.gluten.mpp.enabled", "true")
       .set("spark.gluten.mpp.strategy.enabled", "true")
-      .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps")
+      .set("spark.gluten.mpp.substraitDumpDir", "/tmp/gluten-mpp-strategy-dumps")
       .set("spark.gluten.sql.columnar.cudf", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enabled", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan", "true")
@@ -60,7 +60,8 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
    * Walk a physical plan tree and extract fragment boundaries.
    *
    * Fragments are WholeStageTransformer subtrees separated by ShuffleExchangeLike boundaries. This
-   * is the PROTOTYPE for Phase 2's real fragment extraction in MppCollapseRule.
+   * test-only structural preview walks the same prepared child that Plan C passes into its native
+   * fragment extraction path.
    *
    * @return
    *   (wholeStageTransformers, shuffleExchanges) found in the plan tree
@@ -230,9 +231,7 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   }
 
   // ============================================================
-  // Phase 2 readiness tests - verify plan STRUCTURE, not just results.
-  // These tests document the current BSP-delegation behavior and
-  // establish the assertions that Phase 2 must satisfy.
+  // Plan C prepared-child and dynamic-extraction tests.
   // ============================================================
 
   test("MppNativeQueryExec child has ShuffleExchangeLike nodes (shuffle proof)") {
@@ -245,7 +244,7 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     val mppExec = findMppExec(df)
     assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
 
-    val childPlan = mppExec.get.child
+    val childPlan = mppExec.get.preparedChildForTests
     val exchangeNodes = childPlan.collect { case ex: ShuffleExchangeLike => ex }
     // Plan D wraps the original plan; the child tree must still contain exchanges.
     // If this fails, the child was incorrectly stripped of its exchange nodes.
@@ -256,7 +255,7 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     )
   }
 
-  test("MppNativeQueryExec child has WholeStageTransformer fragments") {
+  test("MppNativeQueryExec extraction plan has WholeStageTransformer fragments") {
     // A query with GROUP BY + ORDER BY should produce at least 2 WholeStageTransformer
     // nodes (one for the scan+agg stage, one for the final sort stage).
     // This is the prerequisite for Phase 2: each WST becomes a native fragment.
@@ -270,7 +269,7 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     val mppExec = findMppExec(df)
     assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
 
-    val childPlan = mppExec.get.child
+    val childPlan = mppExec.get.fragmentExtractionPlanForTests
     val wstNodes = childPlan.collect { case wst: WholeStageTransformer => wst }
     // Phase 2 requirement: >= 2 fragments means there is at least one exchange boundary
     // that can be converted to a streaming GPU exchange.
@@ -280,7 +279,7 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
         s"Child plan tree:\n${childPlan.treeString}")
   }
 
-  test("Fragment extraction from child plan finds exchange boundaries") {
+  test("Fragment extraction preview finds exchange boundaries") {
     // Use the extractFragmentsFromPhysicalPlan helper (Phase 2 prototype) to walk the
     // child plan and identify fragment boundaries at ShuffleExchangeLike nodes.
     val df = spark.sql("""SELECT l_returnflag, count(*) as cnt
@@ -290,7 +289,7 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     val mppExec = findMppExec(df)
     assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
 
-    val childPlan = mppExec.get.child
+    val childPlan = mppExec.get.fragmentExtractionPlanForTests
     val (fragments, exchanges) = extractFragmentsFromPhysicalPlan(childPlan)
 
     // With GROUP BY + ORDER BY we expect:
@@ -312,7 +311,7 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
         s"Fragment stageIds: ${fragments.map(_.stageId).mkString(", ")}")
   }
 
-  test("Each fragment WholeStageTransformer can generate Substrait") {
+  test("Each extraction-plan WholeStageTransformer can generate Substrait") {
     // For each WholeStageTransformer in the child plan, verify that Substrait generation
     // succeeds. This is what Phase 2 will do for each fragment before submitting to JNI.
     val df = spark.sql("""SELECT l_returnflag, count(*) as cnt
@@ -322,7 +321,7 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     val mppExec = findMppExec(df)
     assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
 
-    val childPlan = mppExec.get.child
+    val childPlan = mppExec.get.fragmentExtractionPlanForTests
     val wstNodes = childPlan.collect { case wst: WholeStageTransformer => wst }
     assert(wstNodes.nonEmpty, "Should have at least one WholeStageTransformer")
 
@@ -345,9 +344,7 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   }
 
   test("MPP metrics are reported") {
-    // Run a query and check that MppNativeQueryExec exposes the expected metrics.
-    // Phase 1 (BSP delegation) does NOT update fragment/exchange counts because
-    // hasRealFragments is false. This test documents the gap.
+    // Run a Plan C query and check that dynamic extraction updates the public MPP metrics.
     val df = spark.sql("""SELECT l_returnflag, count(*) as cnt
                          |FROM lineitem
                          |GROUP BY l_returnflag
@@ -365,21 +362,17 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     assert(metricsMap.contains("outputRows"), "Should have outputRows metric")
     assert(metricsMap.contains("totalQueryTimeMs"), "Should have totalQueryTimeMs metric")
 
-    // Phase 1 (BSP delegation): numFragments is 0 because we never enter the real MPP path.
-    // Phase 2 TODO: this should be > 0 when real MPP execution is wired up.
     val numFragments = metricsMap("numFragments").value
+    val numExchanges = metricsMap("numExchanges").value
     assert(
-      numFragments == 0,
-      s"Phase 1 BSP delegation: numFragments should be 0 (got $numFragments). " +
-        "When Phase 2 is implemented, change this assertion to numFragments > 0."
-    )
+      numFragments >= 2,
+      s"Plan C should report at least two dynamically extracted fragments, got $numFragments")
+    assert(
+      numExchanges >= 1,
+      s"Plan C should report at least one dynamically extracted exchange, got $numExchanges")
   }
 
-  test("BSP delegation path is logged with MPP WRAP MODE marker") {
-    // Verify that the BSP delegation path produces a recognizable log marker.
-    // This ensures we can distinguish BSP delegation from real MPP execution in logs.
-    // We check by examining the child plan tree for the expected structure rather
-    // than capturing logs (log capture is fragile in test suites).
+  test("Plan C defers extraction while keeping the prepared child opaque to Spark") {
     val df = spark.sql("""SELECT l_returnflag, count(*) as cnt
                          |FROM lineitem
                          |GROUP BY l_returnflag
@@ -387,24 +380,21 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     val mppExec = findMppExec(df)
     assert(mppExec.isDefined, "MppNativeQueryExec should be in plan")
 
-    // Phase 1 indicator: fragments list is empty or contains null rootOperators
-    // (because MppStrategy creates MppNativeQueryExec with empty fragments in Phase 1)
-    val fragments = mppExec.get.fragments
-    val exchanges = mppExec.get.exchanges
-
-    // Phase 1 BSP delegation: fragments have no real rootOperator
-    val hasRealFragments = fragments.nonEmpty && fragments.head.rootOperator != null
+    val planC = mppExec.get
     assert(
-      !hasRealFragments,
-      "Phase 1: fragments should NOT have real rootOperators (BSP delegation). " +
-        "When Phase 2 is implemented, change this assertion to hasRealFragments == true."
-    )
+      planC.fragments.forall(_.rootOperator == null) && planC.exchanges.isEmpty,
+      "Plan C should defer concrete fragment extraction until execution")
+    assert(
+      planC.child.isInstanceOf[MppPreparedChildExec],
+      s"Plan C should hide its prepared child, got ${planC.child.getClass.getSimpleName}")
+    assert(planC.child.children.isEmpty, "The prepare-time wrapper must remain a Spark leaf")
 
-    // Also verify the simpleString indicates current state
-    val desc = mppExec.get.simpleString(10)
-    assert(desc.contains("fragments"), s"simpleString should mention fragments: $desc")
-    logInfo(
-      s"BSP delegation confirmed: hasRealFragments=$hasRealFragments, " +
-        s"fragments=${fragments.size}, exchanges=${exchanges.size}, desc=$desc")
+    val preparedChild = planC.preparedChildForTests
+    assert(
+      !preparedChild.isInstanceOf[MppPreparedChildExec],
+      "The execution-visible child should be unwrapped")
+    assert(
+      preparedChild.collect { case exchange: ShuffleExchangeLike => exchange }.nonEmpty,
+      s"The execution-visible child should retain exchange boundaries:\n${preparedChild.treeString}")
   }
 }

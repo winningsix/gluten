@@ -65,7 +65,8 @@ object VeloxRuleApi {
     injector.injectOptimizerRule(CollectRewriteRule.apply)
     injector.injectOptimizerRule(HLLRewriteRule.apply)
     injector.injectOptimizerRule(CollapseGetJsonObjectExpressionRule.apply)
-    injector.injectPostHocResolutionRule(RewriteExistenceJoinRhsDedup.apply)
+    // Keep this rule out of Spark's analyzer. Its whole-plan transforms are optimizer-safe, but
+    // Spark 3.5 rejects LogicalPlan.transformUp while running post-hoc resolution rules.
     injector.injectOptimizerRule(RewriteExistenceJoinRhsDedup.apply)
     injector.injectPreCBORule(RewriteExistenceJoinRhsDedup.apply)
     injector.injectOptimizerRule(spark => PruneRedundantLeftSemiFilters(spark))
