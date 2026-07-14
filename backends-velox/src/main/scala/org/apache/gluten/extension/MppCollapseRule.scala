@@ -529,11 +529,16 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    * arbitrary nested row consumer as a convention adapter.
    */
   private def repairRecoverableRowShells(plan: SparkPlan): SparkPlan =
+    repairRecoverableRowShells(plan, preserveExistingRddIngress = false)
+
+  private def repairRecoverableRowShells(
+      plan: SparkPlan,
+      preserveExistingRddIngress: Boolean): SparkPlan =
     plan.transformUp {
       case r2c: RowToColumnarExecBase if isRecoverableRowOperator(r2c.child) =>
-        normalizeMppNativeOperators(r2c)
+        normalizeMppNativeOperators(r2c, preserveExistingRddIngress)
       case r2c: RowToColumnarExec if isRecoverableRowOperator(r2c.child) =>
-        normalizeMppNativeOperators(r2c)
+        normalizeMppNativeOperators(r2c, preserveExistingRddIngress)
     }
 
   private def isRecoverableRowOperator(plan: SparkPlan): Boolean = plan match {
@@ -544,15 +549,31 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   }
 
   private def tryCollapseExistingRddHybrid(plan: SparkPlan): Option[MppNativeQueryExec] = {
+    // Keep the hybrid fail-closed: only run row-shell repair after proving that the original plan
+    // contains the exact batch ExistingRDD ingress. A computed aggregate above that ingress can be
+    // left as C2R -> row aggregate -> R2C by ordinary Gluten validation; repairing it here composes
+    // the two independently supported shapes without admitting an arbitrary row subtree.
+    if (!containsExactExistingRddIngress(plan)) {
+      return None
+    }
+    val repaired = repairRecoverableRowShells(plan, preserveExistingRddIngress = true)
     // Do not run InsertTransitions over this hybrid. Its first step deliberately removes every
     // transition, including the exact R2C that identifies ExistingRDD; rebuilding that transition
     // is not guaranteed before backend component initialization and would erase the boundary this
     // path is required to validate. The plan has already passed Gluten's post-transform rules, so
     // retain the explicit ingress while applying only the transition-safe native rewrites.
     val unionRewritten =
-      MppReplicatedCartesianRule()(rewriteMppNativeUnion(MppColumnarTransitionBridge()(plan)))
+      MppReplicatedCartesianRule()(rewriteMppNativeUnion(MppColumnarTransitionBridge()(repaired)))
     if (!containsExactExistingRddIngress(unionRewritten)) {
       return None
+    }
+    // An exchange directly over ExistingRDD still needs a native producer fragment on its input
+    // side. Without this identity anchor, dynamic extraction sees the consumer ReadRel slot but
+    // has neither a producer fragment nor a captured local stream for it. Anchor only the exact
+    // R2C(ExistingRDD) child that the strict hybrid validator already admits.
+    val exchangeInputsAnchored = unionRewritten.transformUp {
+      case exchange: ShuffleExchangeLike if isExactExistingRddIngress(exchange.child) =>
+        exchange.withNewChildren(Seq(ProjectExecTransformer(exchange.child.output, exchange.child)))
     }
     // A DataFrame created directly from an ExistingRDD can reach a V2 writer without any native
     // relational suffix.  The exact R2C ingress is a local stream input, not a native fragment by
@@ -560,10 +581,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // preserves output attributes and gives ColumnarCollapseTransformStages a TransformSupport
     // consumer from which dynamic MPP extraction can build one real fragment.
     val nativeAnchored =
-      if (unionRewritten.find(_.isInstanceOf[TransformSupport]).isEmpty) {
-        ProjectExecTransformer(unionRewritten.output, unionRewritten)
+      if (exchangeInputsAnchored.find(_.isInstanceOf[TransformSupport]).isEmpty) {
+        ProjectExecTransformer(exchangeInputsAnchored.output, exchangeInputsAnchored)
       } else {
-        unionRewritten
+        exchangeInputsAnchored
       }
     tryCollapseNormalizedMpp(
       nativeAnchored,
@@ -649,7 +670,12 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     Some(MppNativeQueryExec(child = rewritten, fragments = fragments, exchanges = exchanges))
   }
 
-  private[extension] def normalizeMppNativeOperators(plan: SparkPlan): SparkPlan = {
+  private[extension] def normalizeMppNativeOperators(plan: SparkPlan): SparkPlan =
+    normalizeMppNativeOperators(plan, preserveExistingRddIngress = false)
+
+  private def normalizeMppNativeOperators(
+      plan: SparkPlan,
+      preserveExistingRddIngress: Boolean): SparkPlan = {
     // Spark may insert RowToColumnar(ColumnarToRow(nativeChild)) solely to reconcile the
     // convention expected by an exchange or V2 writer. MPP absorbs that boundary, so eliminate
     // the adjacent inverse transitions before validating/extracting fragments. This preserves the
@@ -695,11 +721,37 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // replaced above. Re-run Gluten's convention planner so it removes only stale transitions and
     // re-inserts every boundary still required by a genuine row operator. This keeps DataFrame.rdd
     // and other real row consumers as strict-MPP negatives.
-    val retransitioned = InsertTransitions
-      .create(outputsColumnar = lateOffloaded.supportsColumnar, VeloxBatchType)
-      .apply(lateOffloaded)
+    val retransitioned =
+      if (preserveExistingRddIngress) {
+        bridgeRecoverableExistingRddTransitions(lateOffloaded)
+      } else {
+        InsertTransitions
+          .create(outputsColumnar = lateOffloaded.supportsColumnar, VeloxBatchType)
+          .apply(lateOffloaded)
+      }
     val unionRewritten = rewriteMppNativeUnion(retransitioned)
     MppReplicatedCartesianRule()(unionRewritten)
+  }
+
+  /**
+   * Remove only the stale transitions around a row shell that was just late-offloaded, while
+   * retaining the exact R2C(ExistingRDD) leaf that identifies the JVM-backed local stream.
+   */
+  private def bridgeRecoverableExistingRddTransitions(plan: SparkPlan): SparkPlan = {
+    val withoutIngressC2r = plan.transformUp {
+      case c2r: ColumnarToRowExecBase if isExactExistingRddIngress(c2r.child) => c2r.child
+      case c2r: ColumnarToRowExec if isExactExistingRddIngress(c2r.child) => c2r.child
+    }
+    withoutIngressC2r.transformUp {
+      case r2c: RowToColumnarExecBase
+          if r2c.child.isInstanceOf[TransformSupport] &&
+            containsExactExistingRddIngress(r2c.child) =>
+        r2c.child
+      case r2c: RowToColumnarExec
+          if r2c.child.isInstanceOf[TransformSupport] &&
+            containsExactExistingRddIngress(r2c.child) =>
+        r2c.child
+    }
   }
 
   private def rewriteMppNativeUnion(plan: SparkPlan): SparkPlan = {
