@@ -104,9 +104,16 @@ struct MppExchangeSpec {
   std::string partitionType{"ROUND_ROBIN"};
 
   /// For partitioned exchanges (HASH, RANGE), the column indices of the
-  /// partitioning keys in the producer's output schema. Used directly as
-  /// Velox keyChannels for HashPartitionFunctionSpec.
+  /// partitioning keys in the producer's output schema.
   std::vector<int32_t> partitionKeyIndices;
+
+  /// Spark RangePartitioner boundary descriptor. Required when partitionType
+  /// is RANGE; an empty value is a validation error, never a signal to hash.
+  std::string rangeBoundsJson;
+
+  /// Number of reachable partitions implied by the unique boundaries. This
+  /// can be smaller than numPartitions when input is empty or has few keys.
+  int32_t rangeEffectivePartitions{0};
 
   /// Native peers that host this exchange's producer fragment. Empty means
   /// "this process only" and preserves the current single-executor path.

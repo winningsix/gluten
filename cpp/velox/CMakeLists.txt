@@ -164,6 +164,8 @@ set(VELOX_SRCS
     memory/VeloxColumnarBatch.cc
     memory/VeloxMemoryManager.cc
     operators/functions/RegistrationAllFunctions.cc
+    operators/functions/NetflixDateTime.cc
+    operators/functions/NetflixJson.cc
     operators/functions/RowConstructorWithNull.cc
     operators/functions/SparkExprToSubfieldFilterParser.cc
     operators/plannodes/RowVectorStream.cc

@@ -50,13 +50,13 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
     BackendsApiManager.getMetricsApiInstance.genColumnarBroadcastExchangeMetrics(sparkContext)
 
   /**
-   * Marker check: this exchange has been tagged dead by MppSuppressDeadBroadcastsRule because it
-   * lives under an MppNativeQueryExec whose Plan C single-task merge has inlined the build subtree
-   * into the consumer fragment (see MppJniWrapper "single-task merge BROADCAST, no LocalPartition
-   * wrap"). The driver-side relationFuture collect is dead work in that path, and keeping it leaks
-   * ColumnarBatchSerializeResult arrays into driver heap (~5 GB per Q14 iter, OOM by iter 3). Stays
-   * false on the BSP fallback path, which still needs executeBroadcast for non-MPP
-   * BroadcastHashJoin.
+   * Marker check: after RANGE preparation and every fallback-capable validation succeeds,
+   * MppNativeQueryExec tags this exchange dead because Plan C single-task merge has inlined the
+   * build subtree into the consumer fragment (see MppJniWrapper "single-task merge BROADCAST, no
+   * LocalPartition wrap"). The driver-side relationFuture collect is dead work in that path, and
+   * keeping it leaks ColumnarBatchSerializeResult arrays into driver heap (~5 GB per Q14 iter, OOM
+   * by iter 3). Stays false on the BSP fallback path, which still needs executeBroadcast for
+   * non-MPP BroadcastHashJoin.
    *
    * Implemented as a TreeNodeTag (not a transient var on the case class) so the marker survives
    * Catalyst plan transformations (`copy()`, `withNewChildren()`, `transform*()`) -- Spark
@@ -201,7 +201,7 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
     // Skip the driver-side build-side collect when an enclosing
     // MppNativeQueryExec has inlined this build subtree into its consumer
     // fragment via single-task merge. See [[isMppSuppressed]] for the full
-    // rationale and [[MppSuppressDeadBroadcastsRule]] for the marker pass.
+    // rationale and MppNativeQueryExec for the commit point.
     if (isMppSuppressed) return
     relationFuture
   }
@@ -258,9 +258,10 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
 object ColumnarBroadcastExchangeExec {
 
   /**
-   * Plan-tree-attached marker set by `MppSuppressDeadBroadcastsRule` to indicate this exchange is
-   * dead work because an enclosing `MppNativeQueryExec` has inlined the build subtree into its
-   * consumer fragment. See `ColumnarBroadcastExchangeExec.isMppSuppressed` for full rationale.
+   * Plan-tree-attached marker committed by `MppNativeQueryExec` after fallback-capable validation
+   * to indicate this exchange is dead work because the enclosing native fragment has inlined the
+   * build subtree into its consumer. See `ColumnarBroadcastExchangeExec.isMppSuppressed` for full
+   * rationale.
    *
    * Using a `TreeNodeTag` (rather than a non-ctor `var` on the case class) means the marker
    * survives `copy()` / `withNewChildren()` / `transform*()` because `TreeNode.copyTagsFrom`

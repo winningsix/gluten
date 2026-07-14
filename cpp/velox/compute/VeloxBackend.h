@@ -22,6 +22,7 @@
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <folly/executors/IOThreadPoolExecutor.h>
+#include <atomic>
 #include <filesystem>
 #include <thread>
 
@@ -97,6 +98,7 @@ class VeloxBackend {
   std::string cacheFilePrefix_;
 
   std::shared_ptr<facebook::velox::config::ConfigBase> backendConf_;
+  std::atomic<bool> tornDown_{false};
 
 #ifdef GLUTEN_ENABLE_GPU
   std::shared_ptr<facebook::velox::ucx_exchange::Communicator> ucxCommunicator_;

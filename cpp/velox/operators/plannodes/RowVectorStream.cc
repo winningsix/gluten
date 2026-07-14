@@ -22,6 +22,13 @@
 #include "velox/exec/Task.h"
 #include "velox/vector/arrow/Bridge.h"
 
+#ifdef GLUTEN_ENABLE_GPU
+#include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "cudf/GpuLock.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
+#endif
+
 namespace {
 
 class SuspendedSection {
@@ -46,6 +53,75 @@ class SuspendedSection {
 } // namespace
 
 namespace gluten {
+
+facebook::velox::RowVectorPtr materializeRowVectorStreamBatch(
+    facebook::velox::memory::MemoryPool* pool,
+    const std::shared_ptr<ColumnarBatch>& batch,
+    const facebook::velox::RowTypePtr& outputType) {
+  VELOX_CHECK_NOT_NULL(pool, "RowVectorStream requires a memory pool");
+  VELOX_CHECK_NOT_NULL(batch, "RowVectorStream received a null ColumnarBatch");
+  VELOX_CHECK_NOT_NULL(outputType, "RowVectorStream requires an output RowType");
+
+  auto veloxBatch = VeloxColumnarBatch::from(pool, batch);
+  VELOX_CHECK_NOT_NULL(
+      veloxBatch,
+      "RowVectorStream failed to convert ColumnarBatch type '{}' to Velox",
+      batch->getType());
+  auto rowVector = veloxBatch->getRowVector();
+  VELOX_CHECK_NOT_NULL(rowVector, "RowVectorStream received a null Velox vector");
+
+#ifdef GLUTEN_ENABLE_GPU
+  if (auto cudfVector =
+          std::dynamic_pointer_cast<facebook::velox::cudf_velox::CudfVector>(
+              rowVector)) {
+    // CudfVector intentionally exposes zero RowVector children. Keep both the
+    // original ColumnarBatch and CudfVector alive until the device table has
+    // been materialized on the host; re-wrapping children here would discard
+    // the only usable payload handle.
+    VELOX_CHECK_EQ(
+        cudfVector->getTableView().num_columns(),
+        outputType->size(),
+        "RowVectorStream CudfVector column count does not match output type");
+    GpuLockGuard gpuLock;
+    auto stream = cudfVector->stream();
+    rowVector = facebook::velox::cudf_velox::with_arrow::toVeloxColumn(
+        cudfVector->getTableView(),
+        pool,
+        outputType,
+        "",
+        stream,
+        facebook::velox::cudf_velox::get_temp_mr());
+    stream.synchronize();
+    VELOX_CHECK_NOT_NULL(
+        rowVector, "RowVectorStream failed to materialize CudfVector on the host");
+    rowVector->setType(outputType);
+  }
+#endif
+
+  VELOX_CHECK_EQ(
+      rowVector->childrenSize(),
+      outputType->size(),
+      "RowVectorStream input has {} children but output type has {} fields",
+      rowVector->childrenSize(),
+      outputType->size());
+  for (facebook::velox::column_index_t i = 0; i < outputType->size(); ++i) {
+    const auto& child = rowVector->childAt(i);
+    VELOX_CHECK_NOT_NULL(child, "RowVectorStream input child {} is null", i);
+    VELOX_CHECK(
+        outputType->childAt(i)->equivalent(*child->type()),
+        "RowVectorStream input child {} has type {} but output type requires {}",
+        i,
+        child->type()->toString(),
+        outputType->childAt(i)->toString());
+  }
+
+  return std::make_shared<facebook::velox::RowVector>(
+      rowVector->pool(),
+      outputType,
+      rowVector->nulls(),
+      rowVector->size(),
+      rowVector->children());
+}
 
 bool RowVectorStream::hasNext() {
   if (finished_) {
@@ -100,11 +176,7 @@ std::shared_ptr<ColumnarBatch> RowVectorStream::nextInternal() {
 
 facebook::velox::RowVectorPtr RowVectorStream::next() {
   auto cb = nextInternal();
-  const std::shared_ptr<VeloxColumnarBatch>& vb = VeloxColumnarBatch::from(pool_, cb);
-  auto vp = vb->getRowVector();
-  VELOX_DCHECK(vp != nullptr);
-  return std::make_shared<facebook::velox::RowVector>(
-      vp->pool(), outputType_, facebook::velox::BufferPtr(0), vp->size(), vp->children());
+  return materializeRowVectorStreamBatch(pool_, cb, outputType_);
 }
 
 ValueStreamDataSource::ValueStreamDataSource(

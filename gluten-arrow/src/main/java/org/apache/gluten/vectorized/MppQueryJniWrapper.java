@@ -78,6 +78,8 @@ public class MppQueryJniWrapper implements RuntimeAware {
    *     placeholderIters[slotIdx]}. Without this the substrait plan's {@code ReadRel(iterator:N)}
    *     for fused broadcasts has no backing iterator and triggers {@code streamIdx N vs size N} OOB
    *     at {@code constructCudfValueStreamNode}.
+   * @param replicatedCartesianMaxBuildBytes canonical build-size cap for a query containing a
+   *     replicated Cartesian, or zero to leave native nested-loop joins unbounded.
    * @return native handle (opaque jlong) for use with the other methods.
    * @throws RuntimeException on Substrait parse failure or invalid specs.
    */
@@ -88,7 +90,8 @@ public class MppQueryJniWrapper implements RuntimeAware {
       byte[] mppPeerSpecJson,
       byte[][][] splitInfosPerFragment,
       int[][] broadcastSlotIndicesPerFragment,
-      Object[][] broadcastIteratorsPerFragment);
+      Object[][] broadcastIteratorsPerFragment,
+      long replicatedCartesianMaxBuildBytes);
 
   /**
    * Build the MPP fragments and return the final Velox plan text for each fragment without starting

@@ -97,6 +97,8 @@ if(ENABLE_GPU)
                      VeloxGpuShuffleWriterTest.cc)
   add_velox_gpu_test(velox_gpu_buffer_scatter_bench SOURCES
                      GpuBufferScatterBench.cc)
+  add_velox_gpu_test(netflix_datetime_gpu_test SOURCES
+                     NetflixDateTimeGpuTest.cc)
 endif()
 
 set(VELOX_TEST_COMMON_SRCS JsonToProtoConverter.cc FilePathGenerator.cc)
@@ -133,6 +135,7 @@ add_velox_test(
   VeloxToSubstraitTypeTest.cc)
 add_velox_test(spark_functions_test SOURCES SparkFunctionTest.cc
                FunctionTest.cc)
+add_velox_test(netflix_json_test SOURCES NetflixJsonTest.cc)
 add_velox_test(runtime_test SOURCES RuntimeTest.cc)
 add_velox_test(velox_memory_test SOURCES MemoryManagerTest.cc)
 add_velox_test(buffer_outputstream_test SOURCES BufferOutputStreamTest.cc)

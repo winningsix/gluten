@@ -39,6 +39,7 @@
 #include "operators/plannodes/RowVectorStream.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include "operators/plannodes/CudfVectorStream.h"
+#include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 // IBM-baseline velox dropped velox/experimental/cudf/exchange/. The
 // runtime swap to UcxExchange / UcxPartitionedOutput is performed by
 // IBM cudf's OperatorAdapters when transportType=kUcx, so this file
@@ -229,6 +230,21 @@ std::vector<MppExchangeSpec> parseExchangeSpecs(const std::string& json) {
         spec.partitionKeyIndices.push_back(
             static_cast<int32_t>(key.asInt()));
       }
+    }
+    if (item.count("rangeBoundsJson")) {
+      spec.rangeBoundsJson = item["rangeBoundsJson"].asString();
+    }
+    if (item.count("rangeEffectivePartitions")) {
+      spec.rangeEffectivePartitions =
+          static_cast<int32_t>(item["rangeEffectivePartitions"].asInt());
+    }
+    if (spec.partitionType == "RANGE") {
+      VELOX_CHECK(
+          !spec.rangeBoundsJson.empty(),
+          "MppDumpLoader: RANGE exchange {} is missing Spark boundaries",
+          spec.id);
+      VELOX_CHECK_GT(spec.rangeEffectivePartitions, 0);
+      VELOX_CHECK_LE(spec.rangeEffectivePartitions, spec.numPartitions);
     }
     specs.push_back(std::move(spec));
   }
@@ -545,12 +561,32 @@ MppDumpLoadResult loadMppQueryFromDump(
                   outputType->childAt(idx), outputType->nameOf(idx)));
         }
         if (!keyChannels.empty()) {
-          funcSpec = std::make_shared<velox::exec::HashPartitionFunctionSpec>(
-              outputType, std::move(keyChannels));
+          if (partitionType == "RANGE") {
+#ifdef GLUTEN_ENABLE_GPU
+            VELOX_CHECK(
+                !outboundExchange->rangeBoundsJson.empty(),
+                "MppDumpLoader: RANGE exchange has no boundaries");
+            funcSpec = std::make_shared<
+                velox::ucx_exchange::RangePartitionFunctionSpec>(
+                outputType,
+                std::move(keyChannels),
+                outboundExchange->rangeBoundsJson);
+#else
+            VELOX_FAIL("MppDumpLoader: RANGE_PID requires the cuDF UCX backend");
+#endif
+          } else {
+            funcSpec =
+                std::make_shared<velox::exec::HashPartitionFunctionSpec>(
+                    outputType, std::move(keyChannels));
+          }
         }
       }
 
       if (funcSpec == nullptr) {
+        VELOX_CHECK_NE(
+            partitionType,
+            "RANGE",
+            "MppDumpLoader: refusing RANGE hash/round-robin degradation");
         partitionExprs.clear();
         funcSpec =
             std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>();

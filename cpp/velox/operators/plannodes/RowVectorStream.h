@@ -27,6 +27,22 @@
 
 namespace gluten {
 
+/**
+ * Materialize one iterator batch for the CPU ValueStream connector.
+ *
+ * VeloxColumnarBatch may wrap either a regular CPU RowVector or, in a GPU
+ * build, a CudfVector whose payload is represented by a device table rather
+ * than RowVector children.  CPU ValueStream must never manufacture a
+ * RowVector from CudfVector::children(): doing so loses the device handle and
+ * creates a structurally invalid RowVector.  This helper keeps the batch (and
+ * therefore the handle) alive through an explicit D2H conversion, then
+ * validates the CPU RowVector contract before returning it.
+ */
+facebook::velox::RowVectorPtr materializeRowVectorStreamBatch(
+    facebook::velox::memory::MemoryPool* pool,
+    const std::shared_ptr<ColumnarBatch>& batch,
+    const facebook::velox::RowTypePtr& outputType);
+
 class RowVectorStream {
  public:
   virtual ~RowVectorStream() = default;

@@ -299,7 +299,12 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
             consumerFragmentId = consumerFragmentId,
             exchangeType = exchangeType,
             numPartitions = shuffle.outputPartitioning.numPartitions,
-            partitionKeys = partitionKeys
+            partitionKeys = partitionKeys,
+            rangeOrdering = shuffle.outputPartitioning match {
+              case range: RangePartitioning => range.ordering
+              case _ => Seq.empty
+            },
+            rangeSamplePlan = shuffle.child
           )
 
           // The consumer fragment is a placeholder that represents the

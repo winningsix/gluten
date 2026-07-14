@@ -62,6 +62,7 @@
 #include "operators/plannodes/CudfVectorStream.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 #endif
 
 using namespace gluten;
@@ -210,7 +211,8 @@ std::shared_ptr<velox::config::ConfigBase> createMppSessionConfig(
 }
 
 std::unordered_map<std::string, std::string> buildMppQueryConfig(
-    const std::shared_ptr<velox::config::ConfigBase>& veloxCfg) {
+    const std::shared_ptr<velox::config::ConfigBase>& veloxCfg,
+    uint64_t replicatedCartesianMaxBuildBytes) {
   std::unordered_map<std::string, std::string> configs;
 
   configs[velox::core::QueryConfig::kPreferredOutputBatchRows] =
@@ -328,6 +330,10 @@ std::unordered_map<std::string, std::string> buildMppQueryConfig(
         std::to_string(veloxCfg->get<bool>(
             kCudfSkipOutputToVelox,
             kCudfSkipOutputToVeloxDefault));
+    if (replicatedCartesianMaxBuildBytes > 0) {
+      configs[velox::cudf_velox::CudfConfig::kCudfNestedLoopJoinMaxBuildBytes] =
+          std::to_string(replicatedCartesianMaxBuildBytes);
+    }
 #endif
 
     const auto setIfExists = [&](const std::string& glutenKey, const std::string& veloxKey) {
@@ -438,20 +444,41 @@ PartitionSpecAndExprs buildPartitionFunctionSpec(
     const std::string& partitionType,
     const std::vector<int32_t>& keyIndices,
     const velox::RowTypePtr& outputType,
-    int32_t fragmentIdForLogging) {
+    int32_t fragmentIdForLogging,
+    const std::string& rangeBoundsJson = {}) {
   PartitionSpecAndExprs result;
   const auto numFields = static_cast<int32_t>(outputType->size());
 
-  // HASH and RANGE both use HashPartitionFunctionSpec for now (RANGE is
-  // degraded to hash partitioning since GPU range partitioning isn't
-  // wired — equal keys still land in the same partition, only intra-
-  // partition ordering is lost; matches the existing UCX path's choice).
+  if (partitionType == "RANGE") {
+    VELOX_CHECK(
+        !keyIndices.empty(),
+        "MPP RANGE fragment {} has no resolved sort-key indices; refusing "
+        "hash/round-robin degradation",
+        fragmentIdForLogging);
+    VELOX_CHECK(
+        !rangeBoundsJson.empty(),
+        "MPP RANGE fragment {} has no Spark boundary descriptor; refusing "
+        "hash/round-robin degradation",
+        fragmentIdForLogging);
+#ifndef GLUTEN_ENABLE_GPU
+    VELOX_FAIL("MPP RANGE_PID requires the cuDF UCX backend");
+#endif
+  }
+
   if ((partitionType == "HASH" || partitionType == "RANGE") &&
       !keyIndices.empty()) {
     std::vector<velox::column_index_t> keyChannels;
     keyChannels.reserve(keyIndices.size());
     for (auto idx : keyIndices) {
       if (idx < 0 || idx >= numFields) {
+        if (partitionType == "RANGE") {
+          VELOX_FAIL(
+              "MPP RANGE fragment {} key index {} is outside {} output "
+              "fields; refusing hash/round-robin degradation",
+              fragmentIdForLogging,
+              idx,
+              numFields);
+        }
         LOG(WARNING) << "MppJniWrapper: fragment " << fragmentIdForLogging
                      << " partition key index " << idx
                      << " out of range (output has " << numFields
@@ -466,13 +493,25 @@ PartitionSpecAndExprs buildPartitionFunctionSpec(
               outputType->childAt(idx), outputType->nameOf(idx)));
     }
     if (!keyChannels.empty()) {
-      result.funcSpec =
-          std::make_shared<velox::exec::HashPartitionFunctionSpec>(
-              outputType, std::move(keyChannels));
+      if (partitionType == "RANGE") {
+#ifdef GLUTEN_ENABLE_GPU
+        result.funcSpec =
+            std::make_shared<velox::ucx_exchange::RangePartitionFunctionSpec>(
+                outputType, std::move(keyChannels), rangeBoundsJson);
+#endif
+      } else {
+        result.funcSpec =
+            std::make_shared<velox::exec::HashPartitionFunctionSpec>(
+                outputType, std::move(keyChannels));
+      }
     }
   }
 
   if (result.funcSpec == nullptr) {
+    VELOX_CHECK_NE(
+        partitionType,
+        "RANGE",
+        "MPP RANGE partition spec construction failed; refusing fallback");
     result.partitionExprs.clear();
     result.funcSpec =
         std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>();
@@ -496,7 +535,8 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
     const velox::RowTypePtr& producerWireType,
     const velox::core::PlanNodePtr& producerPlanForMerge = nullptr,
     const std::string& mergePartitionType = "SINGLE",
-    const std::vector<int32_t>& mergeKeyIndices = {}) {
+    const std::vector<int32_t>& mergeKeyIndices = {},
+    const std::string& mergeRangeBoundsJson = {}) {
   // Base case: this IS the target ValueStream leaf - replace it.
   if (isValueStreamNode(node) && node->id() == targetNodeId) {
     const auto& consumerType = node->outputType();
@@ -510,7 +550,8 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
       //
       // Per partition type:
       //   SINGLE       -> LocalPartitionNode::Type::kGather (N-to-1)
-      //   HASH/RANGE   -> kRepartition + HashPartitionFunctionSpec
+      //   HASH         -> kRepartition + HashPartitionFunctionSpec
+      //   RANGE        -> kRepartition + RangePartitionFunctionSpec
       //   ROUND_ROBIN  -> kRepartition + RoundRobinPartitionFunctionSpec
       //   BROADCAST    -> caller short-circuits and inlines producer plan
       //                   directly (no LocalPartitionNode); HashJoinBridge
@@ -538,7 +579,7 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
         // HASH / RANGE / ROUND_ROBIN -> kRepartition + appropriate spec.
         auto specPair = buildPartitionFunctionSpec(
             mergePartitionType, mergeKeyIndices, wireType,
-            /*fragmentIdForLogging=*/-1);
+            /*fragmentIdForLogging=*/-1, mergeRangeBoundsJson);
         LOG(WARNING) << "MppJniWrapper: replacing ValueStream node '"
                      << node->id() << "' -> LocalPartition::kRepartition "
                      << "(single-task merge " << mergePartitionType
@@ -691,7 +732,8 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
         producerWireType,
         producerPlanForMerge,
         mergePartitionType,
-        mergeKeyIndices);
+        mergeKeyIndices,
+        mergeRangeBoundsJson);
     if (newSource.get() != source.get()) {
       anyChanged = true;
     }
@@ -1071,52 +1113,30 @@ velox::core::PlanNodePtr wrapWithMppPartitionedOutput(
 
   const auto& keyIndices =
       outboundExchange != nullptr ? outboundExchange->partitionKeyIndices : std::vector<int32_t>{};
-  velox::core::PartitionFunctionSpecPtr funcSpec;
-  std::vector<velox::core::TypedExprPtr> partitionExprs;
   const auto& outputType = veloxPlanNode->outputType();
-  const auto numFields = static_cast<int32_t>(outputType->size());
-
-  if ((partitionType == "HASH" || partitionType == "RANGE") && !keyIndices.empty()) {
-    std::vector<velox::column_index_t> keyChannels;
-    keyChannels.reserve(keyIndices.size());
-    for (auto idx : keyIndices) {
-      if (idx < 0 || idx >= numFields) {
-        LOG(WARNING) << "MppJniWrapper: fragment " << fragmentId
-                     << " partition key index " << idx
-                     << " out of range (output has " << numFields
-                     << " fields); falling back to round-robin";
-        keyChannels.clear();
-        break;
-      }
-      keyChannels.push_back(static_cast<velox::column_index_t>(idx));
-      partitionExprs.push_back(std::make_shared<velox::core::FieldAccessTypedExpr>(
-          outputType->childAt(idx), outputType->nameOf(idx)));
-    }
-    if (!keyChannels.empty()) {
-      funcSpec = std::make_shared<velox::exec::HashPartitionFunctionSpec>(
-          outputType, std::move(keyChannels));
-    }
-  }
-
-  if (funcSpec == nullptr) {
-    partitionExprs.clear();
-    funcSpec = std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>();
-  }
+  auto specPair = buildPartitionFunctionSpec(
+      partitionType,
+      keyIndices,
+      outputType,
+      fragmentId,
+      outboundExchange != nullptr ? outboundExchange->rangeBoundsJson
+                                  : std::string{});
 
   LOG(WARNING) << "MppJniWrapper: fragment " << fragmentId
                << " outbound exchange type=" << partitionType
                << " keyIndices.size=" << keyIndices.size()
-               << " func=" << (funcSpec ? funcSpec->toString() : "null")
+               << " func="
+               << (specPair.funcSpec ? specPair.funcSpec->toString() : "null")
                << " usingRoundRobinFallback="
                << (partitionType == "HASH" && keyIndices.empty() ? "YES" : "no");
 
   return std::make_shared<velox::core::PartitionedOutputNode>(
       outputNodeId,
       velox::core::PartitionedOutputNode::Kind::kPartitioned,
-      std::move(partitionExprs),
+      std::move(specPair.partitionExprs),
       numOutputPartitions,
       /*replicateNullsAndAny=*/false,
-      std::move(funcSpec),
+      std::move(specPair.funcSpec),
       veloxPlanNode->outputType(),
       /*serdeKind=*/"Presto",
       veloxPlanNode,
@@ -1224,6 +1244,29 @@ std::vector<MppExchangeSpec> parseExchangeSpecs(
             static_cast<int32_t>(key.asInt()));
       }
     }
+    if (item.count("rangeBoundsJson")) {
+      spec.rangeBoundsJson = item["rangeBoundsJson"].asString();
+    }
+    if (item.count("rangeEffectivePartitions")) {
+      spec.rangeEffectivePartitions =
+          static_cast<int32_t>(item["rangeEffectivePartitions"].asInt());
+    }
+    if (spec.partitionType == "RANGE") {
+      VELOX_CHECK(
+          !spec.rangeBoundsJson.empty(),
+          "MPP RANGE exchange {} is missing Spark boundaries",
+          spec.id);
+      VELOX_CHECK_GT(
+          spec.rangeEffectivePartitions,
+          0,
+          "MPP RANGE exchange {} has invalid effective partition count",
+          spec.id);
+      VELOX_CHECK_LE(
+          spec.rangeEffectivePartitions,
+          spec.numPartitions,
+          "MPP RANGE exchange {} effective partitions exceed requested",
+          spec.id);
+    }
     if (item.count("producerEndpoints") &&
         item["producerEndpoints"].isArray()) {
       spec.producerEndpoints = parsePeerEndpointArray(item["producerEndpoints"]);
@@ -1253,13 +1296,17 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     jbyteArray mppPeerSpecJsonArr,
     jobjectArray splitInfosPerFragArr,
     jobjectArray broadcastSlotIndicesPerFragArr,
-    jobjectArray broadcastIteratorsPerFragArr) {
+    jobjectArray broadcastIteratorsPerFragArr,
+    jlong replicatedCartesianMaxBuildBytes) {
   JNI_METHOD_START
   nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"jni::nativeCreateMppQuery"};
 
   auto ctx = getRuntime(env, wrapper);
   auto runtime = dynamic_cast<VeloxRuntime*>(ctx);
   GLUTEN_CHECK(runtime != nullptr, "MppQuery requires VeloxRuntime");
+  GLUTEN_CHECK(
+      replicatedCartesianMaxBuildBytes >= 0,
+      "replicated Cartesian max build bytes must be non-negative");
 
   // --- Parse inputs ---
 
@@ -1356,7 +1403,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   if (singleTaskMode) {
     // All known partition types are supported in single-task mode:
     //   SINGLE       -> LocalPartitionNode::Type::kGather
-    //   HASH/RANGE   -> kRepartition + HashPartitionFunctionSpec
+    //   HASH         -> kRepartition + HashPartitionFunctionSpec
+    //   RANGE        -> kRepartition + RangePartitionFunctionSpec
     //   ROUND_ROBIN  -> kRepartition + RoundRobinPartitionFunctionSpec
     //   BROADCAST    -> producer plan inlined as-is (HashJoinBridge handles
     //                   the cross-pipeline access)
@@ -1818,7 +1866,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
             producerWire,
             producerPlanForMerge,
             inboundExchanges[k]->partitionType,
-            inboundExchanges[k]->partitionKeyIndices);
+            inboundExchanges[k]->partitionKeyIndices,
+            inboundExchanges[k]->rangeBoundsJson);
       }
 
       LOG(INFO) << "MppJniWrapper: fragment " << i
@@ -1919,51 +1968,20 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
           veloxPlanNode,
           transportType);
     } else {
-      // Multi-partition output. Construct the PartitionFunctionSpec from the
-      // outbound exchange's partitionType + partitionKeys.
-      //   HASH/RANGE -> HashPartitionFunctionSpec(keys)   (RANGE reuses hash
-      //                 for now since GPU range partitioning is not yet wired.
-      //                 Correctness is preserved — equal keys land in the same
-      //                 partition — only intra-partition ordering is lost.)
-      //   ROUND_ROBIN/other -> RoundRobinPartitionFunctionSpec()
+      // Multi-partition output. RANGE uses a dedicated Spark-boundary PID
+      // function; it is never substituted with hash or round-robin.
       const auto& keyIndices = outboundExchange != nullptr
           ? outboundExchange->partitionKeyIndices
           : std::vector<int32_t>{};
 
-      velox::core::PartitionFunctionSpecPtr funcSpec;
-      std::vector<velox::core::TypedExprPtr> partitionExprs;
       const auto& outputType = veloxPlanNode->outputType();
-      const auto numFields = static_cast<int32_t>(outputType->size());
-
-      if ((partitionType == "HASH" || partitionType == "RANGE") &&
-          !keyIndices.empty()) {
-        std::vector<velox::column_index_t> keyChannels;
-        keyChannels.reserve(keyIndices.size());
-        for (auto idx : keyIndices) {
-          if (idx < 0 || idx >= numFields) {
-            LOG(WARNING) << "MppJniWrapper: fragment " << i
-                         << " partition key index " << idx
-                         << " out of range (output has " << numFields
-                         << " fields); falling back to round-robin";
-            keyChannels.clear();
-            break;
-          }
-          keyChannels.push_back(static_cast<velox::column_index_t>(idx));
-          partitionExprs.push_back(
-              std::make_shared<velox::core::FieldAccessTypedExpr>(
-                  outputType->childAt(idx), outputType->nameOf(idx)));
-        }
-        if (!keyChannels.empty()) {
-          funcSpec = std::make_shared<velox::exec::HashPartitionFunctionSpec>(
-              outputType, std::move(keyChannels));
-        }
-      }
-
-      if (funcSpec == nullptr) {
-        partitionExprs.clear();
-        funcSpec =
-            std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>();
-      }
+      auto specPair = buildPartitionFunctionSpec(
+          partitionType,
+          keyIndices,
+          outputType,
+          static_cast<int32_t>(i),
+          outboundExchange != nullptr ? outboundExchange->rangeBoundsJson
+                                      : std::string{});
 
       LOG(WARNING) << "MppJniWrapper: fragment " << i
                    << " outbound exchange type=" << partitionType
@@ -1977,7 +1995,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
                         }
                         return s;
                       }()
-                   << "] func=" << (funcSpec ? funcSpec->toString() : "null")
+                   << "] func="
+                   << (specPair.funcSpec ? specPair.funcSpec->toString() : "null")
                    << " usingRoundRobinFallback="
                    << (partitionType == "HASH" && keyIndices.empty() ? "YES" : "no");
 
@@ -1991,10 +2010,10 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       wrappedPlan = std::make_shared<velox::core::PartitionedOutputNode>(
           outputNodeId,
           velox::core::PartitionedOutputNode::Kind::kPartitioned,
-          std::move(partitionExprs),
+          std::move(specPair.partitionExprs),
           numOutputPartitions,
           /*replicateNullsAndAny=*/false,
-          std::move(funcSpec),
+          std::move(specPair.funcSpec),
           veloxPlanNode->outputType(),
           /*serdeKind=*/"Presto",
           veloxPlanNode,
@@ -2145,7 +2164,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   // backpressure on the first few pages, stalling the producer pipeline and
   // never firing noMoreData to downstream. Raise to 1 GB to give chained
   // exchanges breathing room at N up to ~200.
-  auto queryConfigMap = buildMppQueryConfig(sessionCfg);
+  auto queryConfigMap = buildMppQueryConfig(
+      sessionCfg, static_cast<uint64_t>(replicatedCartesianMaxBuildBytes));
   std::shared_ptr<folly::CPUThreadPoolExecutor> spillExecutor;
   const auto spillThreadNum =
       sessionCfg->get<uint32_t>(kSpillThreadNum, kSpillThreadNumDefaultValue);

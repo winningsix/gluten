@@ -284,22 +284,33 @@ object ExpressionConverter extends SQLConfHelper with Logging {
       expr: Expression,
       attributeSeq: Seq[Attribute],
       expressionsMap: Map[Class[_], String]): Option[ExpressionTransformer] = {
-    Option {
-      expr match {
-        case pythonUDF: PythonUDF =>
-          replacePythonUDFWithExpressionTransformer(pythonUDF, attributeSeq, expressionsMap)
-        case scalaUDF: ScalaUDF =>
-          replaceScalaUDFWithExpressionTransformer(scalaUDF, attributeSeq, expressionsMap)
-        case _ if HiveUDFTransformer.isHiveUDF(expr) =>
-          BackendsApiManager.getSparkPlanExecApiInstance.genHiveUDFTransformer(expr, attributeSeq)
-        case staticInvoke: StaticInvoke =>
-          replaceStaticInvokeWithExpressionTransformer(staticInvoke, attributeSeq, expressionsMap)
-        case invoke: Invoke =>
-          replaceInvokeWithExpressionTransformer(invoke, attributeSeq, expressionsMap)
-        case _ =>
-          null
+    NetflixDateTimeExpressionTransformer
+      .tryTransform(
+        expr,
+        replaceWithExpressionTransformer0(_, attributeSeq, expressionsMap),
+        conf.sessionLocalTimeZone)
+      .orElse {
+        Option {
+          expr match {
+            case pythonUDF: PythonUDF =>
+              replacePythonUDFWithExpressionTransformer(pythonUDF, attributeSeq, expressionsMap)
+            case scalaUDF: ScalaUDF =>
+              replaceScalaUDFWithExpressionTransformer(scalaUDF, attributeSeq, expressionsMap)
+            case _ if HiveUDFTransformer.isHiveUDF(expr) =>
+              BackendsApiManager.getSparkPlanExecApiInstance
+                .genHiveUDFTransformer(expr, attributeSeq)
+            case staticInvoke: StaticInvoke =>
+              replaceStaticInvokeWithExpressionTransformer(
+                staticInvoke,
+                attributeSeq,
+                expressionsMap)
+            case invoke: Invoke =>
+              replaceInvokeWithExpressionTransformer(invoke, attributeSeq, expressionsMap)
+            case _ =>
+              null
+          }
+        }
       }
-    }
   }
 
   private def transformExpression(

@@ -69,6 +69,9 @@ import scala.util.control.NonFatal
  * @param broadcastProducerFragmentIds
  *   Fragments that produce BROADCAST exchanges. Only peer 0 scans these fragments to avoid
  *   duplicating build-side rows across peers.
+ * @param replicatedCartesianMaxBuildBytes
+ *   Canonical build-size cap for a query containing a replicated Cartesian, or zero when no native
+ *   nested-loop join cap should be installed.
  * @param pipelineTime
  *   Metric for tracking total pipeline execution time.
  * @param outputRows
@@ -91,11 +94,17 @@ class MppNativeQueryRDD(
     sparkPartitionCount: Int,
     broadcastProducerFragmentIds: Set[Int],
     keepDeviceOutput: Boolean,
+    replicatedCartesianMaxBuildBytes: Long,
     pipelineTime: SQLMetric,
     outputRows: SQLMetric,
     outputBatches: SQLMetric
 ) extends RDD[ColumnarBatch](sc, localInputRDDs.getDependencies)
   with Logging {
+
+  require(
+    replicatedCartesianMaxBuildBytes >= 0,
+    s"replicated Cartesian max build bytes must be non-negative, found " +
+      replicatedCartesianMaxBuildBytes)
 
   private val numSparkPartitions: Int =
     if (peerInfos.nonEmpty) peerInfos.length else math.max(1, sparkPartitionCount)
@@ -256,7 +265,8 @@ class MppNativeQueryRDD(
       mppPeerSpecJson.getBytes("UTF-8"),
       localFragmentSplitInfos,
       jvmStreamSlotIndicesPerFrag,
-      jvmStreamIteratorsPerFrag
+      jvmStreamIteratorsPerFrag,
+      replicatedCartesianMaxBuildBytes
     )
     @volatile var mppClosed = false
     def closeMppHandle(): Long = this.synchronized {

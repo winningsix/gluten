@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <limits>
 #include <vector>
 
 #include "operators/functions/RegistrationAllFunctions.h"
@@ -110,4 +111,134 @@ TEST_F(SparkFunctionTest, roundWithDecimal) {
   runRoundWithDecimalTest<int32_t>(testRoundWithDecIntegralData<int32_t>());
   runRoundWithDecimalTest<int16_t>(testRoundWithDecIntegralData<int16_t>());
   runRoundWithDecimalTest<int8_t>(testRoundWithDecIntegralData<int8_t>());
+}
+
+TEST_F(SparkFunctionTest, netflixToUnixTimeIntegralDefaultFormatUtc) {
+  auto dateInts = makeNullableFlatVector<int32_t>(
+      {19700101, 20240101, 20230229, std::nullopt});
+  auto seconds = evaluate<FlatVector<int64_t>>(
+      "nf_to_unixtime(c0, '-', 'Etc/UTC')", makeRowVector({dateInts}));
+  auto millis = evaluate<FlatVector<int64_t>>(
+      "nf_to_unixtime_ms(c0, '-', 'UTC')", makeRowVector({dateInts}));
+
+  ASSERT_EQ(seconds->valueAt(0), 0);
+  ASSERT_EQ(seconds->valueAt(1), 1704067200);
+  ASSERT_TRUE(seconds->isNullAt(2));
+  ASSERT_TRUE(seconds->isNullAt(3));
+  ASSERT_EQ(millis->valueAt(0), 0);
+  ASSERT_EQ(millis->valueAt(1), 1704067200000);
+  ASSERT_TRUE(millis->isNullAt(2));
+  ASSERT_TRUE(millis->isNullAt(3));
+}
+
+TEST_F(SparkFunctionTest, netflixDateIntJob175IntegralDefaultFormatUtc) {
+  auto values = makeNullableFlatVector<int32_t>({
+      10000101,
+      19700101,
+      20000229,
+      20260531,
+      99991231,
+      20230229,
+      10'000'000,
+      100'000'000,
+      100'000'001,
+      std::numeric_limits<int32_t>::max(),
+      std::numeric_limits<int32_t>::min(),
+      std::nullopt});
+  auto utc = evaluate<FlatVector<int32_t>>(
+      "nf_dateint(c0, '-', 'UTC')", makeRowVector({values}));
+  auto etcUtc = evaluate<FlatVector<int32_t>>(
+      "nf_dateint(c0, '-', 'Etc/UTC')", makeRowVector({values}));
+
+  const std::vector<std::optional<int32_t>> expected{
+      10000101,
+      19700101,
+      20000229,
+      20260531,
+      99991231,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      19730303,
+      20380119,
+      std::nullopt,
+      std::nullopt};
+  for (size_t row = 0; row < expected.size(); ++row) {
+    if (expected[row].has_value()) {
+      ASSERT_EQ(utc->valueAt(row), *expected[row]);
+      ASSERT_EQ(etcUtc->valueAt(row), *expected[row]);
+    } else {
+      ASSERT_TRUE(utc->isNullAt(row));
+      ASSERT_TRUE(etcUtc->isNullAt(row));
+    }
+  }
+}
+
+TEST_F(SparkFunctionTest, netflixDateIntRejectsFormatAndTimezoneOutsideSlice) {
+  auto values = makeNullableFlatVector<int32_t>({20260531, std::nullopt});
+  auto explicitFormat = evaluate<FlatVector<int32_t>>(
+      "nf_dateint(c0, 'yyyyMMdd', 'UTC')", makeRowVector({values}));
+  auto nonUtc = evaluate<FlatVector<int32_t>>(
+      "nf_dateint(c0, '-', 'America/Los_Angeles')", makeRowVector({values}));
+  auto zulu = evaluate<FlatVector<int32_t>>(
+      "nf_dateint(c0, '-', 'Z')", makeRowVector({values}));
+
+  ASSERT_TRUE(explicitFormat->isNullAt(0));
+  ASSERT_TRUE(explicitFormat->isNullAt(1));
+  ASSERT_TRUE(nonUtc->isNullAt(0));
+  ASSERT_TRUE(nonUtc->isNullAt(1));
+  ASSERT_TRUE(zulu->isNullAt(0));
+  ASSERT_TRUE(zulu->isNullAt(1));
+}
+
+TEST_F(SparkFunctionTest, netflixToUnixTimeEpochSecondsAndMillis) {
+  auto epochs = makeNullableFlatVector<int64_t>(
+      {1704067200, 1704067200000, 100000000000000, std::nullopt});
+  auto seconds = evaluate<FlatVector<int64_t>>(
+      "nf_to_unixtime(c0, '-', 'UTC')", makeRowVector({epochs}));
+  auto millis = evaluate<FlatVector<int64_t>>(
+      "nf_to_unixtime_ms(c0, '-', 'Etc/UTC')", makeRowVector({epochs}));
+
+  ASSERT_EQ(seconds->valueAt(0), 1704067200);
+  ASSERT_EQ(seconds->valueAt(1), 1704067200);
+  ASSERT_TRUE(seconds->isNullAt(2));
+  ASSERT_TRUE(seconds->isNullAt(3));
+  ASSERT_EQ(millis->valueAt(0), 1704067200000);
+  ASSERT_EQ(millis->valueAt(1), 1704067200000);
+  ASSERT_TRUE(millis->isNullAt(2));
+  ASSERT_TRUE(millis->isNullAt(3));
+}
+
+TEST_F(SparkFunctionTest, netflixToUnixTimeIntegralThresholds) {
+  auto values = makeNullableFlatVector<int64_t>({
+      100000000,
+      100000001,
+      99999999999,
+      100000000000,
+      99999999999999,
+      100000000000000,
+      std::numeric_limits<int64_t>::min(),
+      std::nullopt});
+  auto seconds = evaluate<FlatVector<int64_t>>(
+      "nf_to_unixtime(c0, '-', 'UTC')", makeRowVector({values}));
+  auto millis = evaluate<FlatVector<int64_t>>(
+      "nf_to_unixtime_ms(c0, '-', 'Etc/UTC')", makeRowVector({values}));
+
+  ASSERT_TRUE(seconds->isNullAt(0));
+  ASSERT_EQ(seconds->valueAt(1), 100000001);
+  ASSERT_EQ(seconds->valueAt(2), 99999999999);
+  ASSERT_EQ(seconds->valueAt(3), 100000000);
+  ASSERT_EQ(seconds->valueAt(4), 99999999999);
+  ASSERT_TRUE(seconds->isNullAt(5));
+  ASSERT_TRUE(seconds->isNullAt(6));
+  ASSERT_TRUE(seconds->isNullAt(7));
+
+  ASSERT_TRUE(millis->isNullAt(0));
+  ASSERT_EQ(millis->valueAt(1), 100000001000);
+  ASSERT_EQ(millis->valueAt(2), 99999999999000);
+  ASSERT_EQ(millis->valueAt(3), 100000000000);
+  ASSERT_EQ(millis->valueAt(4), 99999999999999);
+  ASSERT_TRUE(millis->isNullAt(5));
+  ASSERT_TRUE(millis->isNullAt(6));
+  ASSERT_TRUE(millis->isNullAt(7));
 }
