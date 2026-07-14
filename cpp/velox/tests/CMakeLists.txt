@@ -97,8 +97,6 @@ if(ENABLE_GPU)
                      VeloxGpuShuffleWriterTest.cc)
   add_velox_gpu_test(velox_gpu_buffer_scatter_bench SOURCES
                      GpuBufferScatterBench.cc)
-  add_velox_gpu_test(netflix_datetime_gpu_test SOURCES
-                     NetflixDateTimeGpuTest.cc)
 endif()
 
 set(VELOX_TEST_COMMON_SRCS JsonToProtoConverter.cc FilePathGenerator.cc)

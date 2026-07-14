@@ -24,7 +24,6 @@ import org.apache.gluten.utils.DecimalArithmeticUtil
 
 import org.apache.spark.{SPARK_REVISION, SPARK_VERSION_SHORT}
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.SQLConfHelper
 import org.apache.spark.sql.catalyst.expressions.{StringTrimBoth, _}
 import org.apache.spark.sql.catalyst.expressions.objects.{Invoke, StaticInvoke, StructsToJsonInvoke}
 import org.apache.spark.sql.catalyst.optimizer.NormalizeNaNAndZero
@@ -39,7 +38,7 @@ trait Transformable {
   def getTransformer(childrenTransformers: Seq[ExpressionTransformer]): ExpressionTransformer
 }
 
-object ExpressionConverter extends SQLConfHelper with Logging {
+object ExpressionConverter extends Logging {
 
   def replaceWithExpressionTransformer(
       exprs: Seq[Expression],
@@ -284,16 +283,10 @@ object ExpressionConverter extends SQLConfHelper with Logging {
       expr: Expression,
       attributeSeq: Seq[Attribute],
       expressionsMap: Map[Class[_], String]): Option[ExpressionTransformer] = {
-    NetflixDateTimeExpressionTransformer
+    ExpressionTransformerProvider
       .tryTransform(
         expr,
-        replaceWithExpressionTransformer0(_, attributeSeq, expressionsMap),
-        conf.sessionLocalTimeZone)
-      .orElse {
-        ExpressionTransformerProvider.tryTransform(
-          expr,
-          replaceWithExpressionTransformer0(_, attributeSeq, expressionsMap))
-      }
+        replaceWithExpressionTransformer0(_, attributeSeq, expressionsMap))
       .orElse {
         Option {
           expr match {
