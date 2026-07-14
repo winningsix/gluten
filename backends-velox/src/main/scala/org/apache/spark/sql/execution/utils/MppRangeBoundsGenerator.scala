@@ -40,13 +40,21 @@ import scala.util.control.NonFatal
  * bounded priority sample. Only those samples and the final unique boundaries are materialized on
  * the driver. This preserves Spark's range ordering and boundary selection semantics without an
  * optional second pass over imbalanced input partitions.
+ *
+ * The bounded row and byte shares are currently assigned statically per input partition and are
+ * not transferable from empty partitions. A sparse layout therefore fails closed when it cannot
+ * supply at least one candidate per requested RANGE peer. A future mergeable global reservoir can
+ * make those unused shares transferable without another producer scan.
  */
 object MppRangeBoundsGenerator {
 
   private val MaxSampleRowsKey = "spark.gluten.mpp.rangeSampleMaxRows"
   private val MaxSampleBytesKey = "spark.gluten.mpp.rangeSampleMaxBytes"
-  private val DefaultMaxSampleRows = 1000000
+  private val DefaultMaxSampleRows = 200000
   private val DefaultMaxSampleBytes = 128L << 20
+
+  // The byte cap covers exact serialized UnsafeRow key payload only. The independent row cap
+  // bounds the number of driver objects; neither value is presented as an exact JVM heap estimate.
 
   /**
    * The count is the number of producer rows observed, not just the retained sample size. It is
@@ -55,8 +63,7 @@ object MppRangeBoundsGenerator {
   private[utils] case class PartitionSketch(
       count: Long,
       samples: Array[UnsafeRow],
-      serializedKeyBytes: Long,
-      oversizedRows: Long)
+      serializedKeyBytes: Long)
 
   private case class PrioritizedRow(priority: Long, row: UnsafeRow, serializedKeyBytes: Long)
 
@@ -126,9 +133,12 @@ object MppRangeBoundsGenerator {
         } catch {
           case throwable: Throwable =>
             entries.synchronized {
+              // Publish the original failure before removing the key, while holding the same lock.
+              // Existing waiters observe this future; a retry cannot install a second generation
+              // until the failed generation is complete and no longer discoverable.
+              entry.result.completeExceptionally(throwable)
               entries -= entry
             }
-            entry.result.completeExceptionally(throwable)
             throw throwable
         }
       } else {
@@ -145,19 +155,16 @@ object MppRangeBoundsGenerator {
     }
   }
 
-  private val SupportedTypeNames = Set(
-    BooleanType.typeName,
-    ByteType.typeName,
-    ShortType.typeName,
-    IntegerType.typeName,
-    LongType.typeName,
-    StringType.typeName,
-    DateType.typeName,
-    TimestampType.typeName,
-    "timestamp_ntz"
-  )
-
-  def supports(dataType: DataType): Boolean = SupportedTypeNames.contains(dataType.typeName)
+  def supports(dataType: DataType): Boolean = dataType match {
+    case BooleanType | ByteType | ShortType | IntegerType | LongType | StringType | DateType |
+        TimestampType =>
+      true
+    // Keep older Spark profiles source-compatible: timestamp_ntz may not expose a stable singleton
+    // there. Every other accepted type uses exact singleton matching, which deliberately rejects
+    // Spark 4 collated StringType instances even though they share the "string" typeName.
+    case timestampNtz if timestampNtz.typeName == "timestamp_ntz" => true
+    case _ => false
+  }
 
   def generate(
       samplePlan: SparkPlan,
@@ -273,11 +280,6 @@ object MppRangeBoundsGenerator {
         s"$maxSampleBytes-byte limit")
 
     sketches.zipWithIndex.foreach {
-      case (sketch, partitionId) if sketch.oversizedRows > 0L =>
-        throw new IllegalArgumentException(
-          s"MPP RANGE input partition $partitionId had ${sketch.oversizedRows} serialized keys " +
-            "larger than its bounded byte budget; increase " +
-            s"$MaxSampleBytesKey")
       case (sketch, partitionId) if sketch.count > 0L && sketch.samples.isEmpty =>
         throw new IllegalArgumentException(
           s"MPP RANGE input partition $partitionId had ${sketch.count} rows but produced no " +
@@ -289,6 +291,12 @@ object MppRangeBoundsGenerator {
     if (numItems == 0L) {
       return Array.empty[InternalRow]
     }
+    require(
+      numItems < partitions.toLong || retainedRows >= partitions.toLong,
+      s"MPP RANGE found $numItems input rows but only $retainedRows bounded samples for " +
+        s"$partitions requested partitions; sparse input partitions cannot transfer unused " +
+        s"sample budget yet. Increase $MaxSampleRowsKey/$MaxSampleBytesKey or implement a " +
+        "mergeable global reservoir")
 
     val candidates = ArrayBuffer.empty[(InternalRow, Float)]
     sketches.foreach {
@@ -303,8 +311,9 @@ object MppRangeBoundsGenerator {
   }
 
   /**
-   * Retains the rows with the smallest deterministic random priorities. Enforcing the byte limit by
-   * evicting the largest retained priority keeps selection independent of key ordering and values.
+   * Retains exactly the rows with the smallest deterministic random priorities. The serialized-key
+   * byte budget is an admission guard for that uniform row reservoir: it never changes which rows
+   * are selected. If the required selected set cannot fit, sampling fails closed.
    */
   private[utils] def sketchPartition(
       rows: Iterator[UnsafeRow],
@@ -320,7 +329,6 @@ object MppRangeBoundsGenerator {
     val random = new java.util.Random(seed)
     var count = 0L
     var serializedKeyBytes = 0L
-    var oversizedRows = 0L
 
     rows.foreach {
       row =>
@@ -328,36 +336,35 @@ object MppRangeBoundsGenerator {
         // UnsafeRow's backing byte array is exactly the serialized key payload transported to the
         // driver. Account that payload rather than JVM object-size estimates.
         val rowBytes = row.getSizeInBytes.toLong
-        if (rowBytes > maxSerializedKeyBytes) {
-          oversizedRows = Math.addExact(oversizedRows, 1L)
-        } else {
-          val priority = random.nextLong() & Long.MaxValue
-          val fitsWithoutEviction =
-            retained.size < maxRows && serializedKeyBytes <= maxSerializedKeyBytes - rowBytes
-          if (
-            fitsWithoutEviction ||
-            (retained.nonEmpty && priority < retained.head.priority)
-          ) {
-            // UnsafeProjection reuses its output row. Copy only selected keys instead of allocating
-            // one UnsafeRow for every producer row scanned.
-            val candidate = PrioritizedRow(priority, row.copy(), rowBytes)
-            retained.enqueue(candidate)
-            serializedKeyBytes =
-              Math.addExact(serializedKeyBytes, candidate.serializedKeyBytes)
-            while (retained.size > maxRows || serializedKeyBytes > maxSerializedKeyBytes) {
-              val removed = retained.dequeue()
-              serializedKeyBytes =
-                Math.subtractExact(serializedKeyBytes, removed.serializedKeyBytes)
-            }
-          }
+        val priority = random.nextLong() & Long.MaxValue
+        if (retained.size < maxRows) {
+          val admittedBytes = Math.addExact(serializedKeyBytes, rowBytes)
+          require(
+            admittedBytes <= maxSerializedKeyBytes,
+            s"MPP RANGE selected reservoir keys require $admittedBytes serialized bytes, " +
+              s"exceeding the $maxSerializedKeyBytes-byte partition budget; increase " +
+              s"$MaxSampleBytesKey")
+          // UnsafeProjection reuses its output row. Copy only selected keys instead of allocating
+          // one UnsafeRow for every producer row scanned.
+          retained.enqueue(PrioritizedRow(priority, row.copy(), rowBytes))
+          serializedKeyBytes = admittedBytes
+        } else if (priority < retained.head.priority) {
+          val evicted = retained.head
+          val replacementBytes = Math.addExact(
+            Math.subtractExact(serializedKeyBytes, evicted.serializedKeyBytes),
+            rowBytes)
+          require(
+            replacementBytes <= maxSerializedKeyBytes,
+            s"MPP RANGE selected reservoir keys require $replacementBytes serialized bytes, " +
+              s"exceeding the $maxSerializedKeyBytes-byte partition budget; increase " +
+              s"$MaxSampleBytesKey")
+          retained.dequeue()
+          retained.enqueue(PrioritizedRow(priority, row.copy(), rowBytes))
+          serializedKeyBytes = replacementBytes
         }
     }
 
-    PartitionSketch(
-      count,
-      retained.dequeueAll.reverseIterator.map(_.row).toArray,
-      serializedKeyBytes,
-      oversizedRows)
+    PartitionSketch(count, retained.dequeueAll.reverseIterator.map(_.row).toArray, serializedKeyBytes)
   }
 
   private def partitionLimits(

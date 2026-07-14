@@ -25,8 +25,8 @@ import org.apache.spark.unsafe.types.UTF8String
 
 import com.fasterxml.jackson.databind.ObjectMapper
 
-import java.util.concurrent.{Callable, CountDownLatch, Executors, TimeUnit}
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.{Callable, CountDownLatch, ExecutionException, Executors, TimeUnit}
+import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 
 class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
 
@@ -62,7 +62,22 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
     assert(!MppRangeBoundsGenerator.supports(DoubleType))
   }
 
-  test("one-pass priority reservoir enforces serialized row and byte limits deterministically") {
+  test("D1 type guard rejects Spark 4 collated strings when that API is available") {
+    StringType.getClass.getMethods
+      .find(
+        method =>
+          method.getName == "apply" &&
+            method.getParameterTypes.sameElements(Array[Class[_]](classOf[String])))
+      .foreach {
+        applyByCollationName =>
+          val collated = applyByCollationName
+            .invoke(StringType, "UTF8_LCASE")
+            .asInstanceOf[org.apache.spark.sql.types.DataType]
+          assert(!MppRangeBoundsGenerator.supports(collated))
+      }
+  }
+
+  test("one-pass priority reservoir enforces row limits deterministically") {
     val key = AttributeReference("key", IntegerType, nullable = false)()
     val projection = UnsafeProjection.create(Seq(key), Seq(key))
     val rows = (0 until 100).map {
@@ -85,21 +100,67 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
     assert(byRows.serializedKeyBytes == byRows.samples.map(_.getSizeInBytes.toLong).sum)
     assert(byRows.samples.map(_.getInt(0)).sameElements(repeated.samples.map(_.getInt(0))))
 
-    val byBytes = MppRangeBoundsGenerator.sketchPartition(
-      rows.iterator,
-      maxRows = 100,
-      maxSerializedKeyBytes = rowBytes * 3L,
-      seed = 19L)
-    assert(byBytes.samples.length == 3)
-    assert(byBytes.serializedKeyBytes == rowBytes * 3L)
+    assert(rowBytes > 0L)
+  }
 
-    val oversized = MppRangeBoundsGenerator.sketchPartition(
+  test("variable-width reservoir matches pure row-priority selection") {
+    val key = AttributeReference("key", StringType, nullable = false)()
+    val projection = UnsafeProjection.create(Seq(key), Seq(key))
+    val values = Seq("a", "medium-key", "x" * 200, "bb", "y" * 80, "tail")
+    val rows = values.map {
+      value =>
+        projection(new GenericInternalRow(Array[Any](UTF8String.fromString(value)))).copy()
+    }
+    val seed = 137L
+    val referenceRandom = new java.util.Random(seed)
+    val expected = rows
+      .map(row => (referenceRandom.nextLong() & Long.MaxValue, row.getUTF8String(0).toString))
+      .sortBy(_._1)
+      .take(3)
+      .map(_._2)
+
+    val sketch = MppRangeBoundsGenerator.sketchPartition(
       rows.iterator,
-      maxRows = 100,
-      maxSerializedKeyBytes = rowBytes - 1L,
-      seed = 23L)
-    assert(oversized.samples.isEmpty)
-    assert(oversized.oversizedRows == 100L)
+      maxRows = 3,
+      maxSerializedKeyBytes = rows.map(_.getSizeInBytes.toLong).sum,
+      seed = seed)
+
+    assert(sketch.samples.map(_.getUTF8String(0).toString).toSeq == expected)
+    assert(sketch.serializedKeyBytes == sketch.samples.map(_.getSizeInBytes.toLong).sum)
+  }
+
+  test("byte admission fails only when a selected priority key cannot fit") {
+    val key = AttributeReference("key", StringType, nullable = false)()
+    val projection = UnsafeProjection.create(Seq(key), Seq(key))
+    def row(value: String) = {
+      projection(new GenericInternalRow(Array[Any](UTF8String.fromString(value)))).copy()
+    }
+    val small = row("s")
+    val large = row("z" * 4096)
+
+    val selectedFailure = intercept[IllegalArgumentException] {
+      MppRangeBoundsGenerator.sketchPartition(
+        Iterator(large),
+        maxRows = 1,
+        maxSerializedKeyBytes = small.getSizeInBytes.toLong,
+        seed = 1L)
+    }
+    assert(selectedFailure.getMessage.contains("selected reservoir keys"))
+
+    val seedWithUnselectedSecond = (0L until 10000L).find {
+      seed =>
+        val random = new java.util.Random(seed)
+        val first = random.nextLong() & Long.MaxValue
+        val second = random.nextLong() & Long.MaxValue
+        second > first
+    }.get
+    val unaffected = MppRangeBoundsGenerator.sketchPartition(
+      Iterator(small, large),
+      maxRows = 1,
+      maxSerializedKeyBytes = small.getSizeInBytes.toLong,
+      seed = seedWithUnselectedSecond)
+    assert(unaffected.samples.length == 1)
+    assert(unaffected.samples.head.getUTF8String(0).toString == "s")
   }
 
   test("weighted skew samples produce monotonic Spark-compatible bounds") {
@@ -113,13 +174,11 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
       MppRangeBoundsGenerator.PartitionSketch(
         count = 800L,
         samples = heavy,
-        serializedKeyBytes = heavy.map(_.getSizeInBytes.toLong).sum,
-        oversizedRows = 0L),
+        serializedKeyBytes = heavy.map(_.getSizeInBytes.toLong).sum),
       MppRangeBoundsGenerator.PartitionSketch(
         count = 200L,
         samples = light,
-        serializedKeyBytes = light.map(_.getSizeInBytes.toLong).sum,
-        oversizedRows = 0L))
+        serializedKeyBytes = light.map(_.getSizeInBytes.toLong).sum))
     implicit val ordering: Ordering[InternalRow] = Ordering.by(_.getInt(0))
 
     val bounds = MppRangeBoundsGenerator.determineBounds(
@@ -138,34 +197,32 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
     assert(bounds.length + 1 <= 4)
   }
 
-  test("driver validation fails closed on oversized keys and collected budget overflow") {
+  test("driver validation fails closed on collected row and byte budget overflow") {
     val key = AttributeReference("key", IntegerType, nullable = false)()
     val projection = UnsafeProjection.create(Seq(key), Seq(key))
     val row = projection(new GenericInternalRow(Array[Any](1))).copy()
     val rowBytes = row.getSizeInBytes.toLong
     implicit val ordering: Ordering[InternalRow] = Ordering.by(_.getInt(0))
 
-    val oversized = MppRangeBoundsGenerator.PartitionSketch(
-      count = 1L,
-      samples = Array.empty,
-      serializedKeyBytes = 0L,
-      oversizedRows = 1L)
-    val oversizedFailure = intercept[IllegalArgumentException] {
+    val rowOverflow = MppRangeBoundsGenerator.PartitionSketch(
+      count = 2L,
+      samples = Array(row, row.copy()),
+      serializedKeyBytes = rowBytes * 2L)
+    val rowFailure = intercept[IllegalArgumentException] {
       MppRangeBoundsGenerator.determineBounds(
         partitions = 2,
         inputPartitions = 1,
         samplePointsPerPartitionHint = 1,
-        maxSampleRows = 10,
-        maxSampleBytes = rowBytes - 1L,
-        sketches = Array(oversized))
+        maxSampleRows = 1,
+        maxSampleBytes = rowBytes * 2L,
+        sketches = Array(rowOverflow))
     }
-    assert(oversizedFailure.getMessage.contains("serialized keys"))
+    assert(rowFailure.getMessage.contains("sample rows"))
 
     val overflow = MppRangeBoundsGenerator.PartitionSketch(
       count = 2L,
       samples = Array(row, row.copy()),
-      serializedKeyBytes = rowBytes * 2L,
-      oversizedRows = 0L)
+      serializedKeyBytes = rowBytes * 2L)
     val byteFailure = intercept[IllegalArgumentException] {
       MppRangeBoundsGenerator.determineBounds(
         partitions = 2,
@@ -176,6 +233,52 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
         sketches = Array(overflow))
     }
     assert(byteFailure.getMessage.contains("serialized key bytes"))
+  }
+
+  test("sparse partition samples fail closed unless the full input is smaller than RANGE width") {
+    val key = AttributeReference("key", IntegerType, nullable = false)()
+    val projection = UnsafeProjection.create(Seq(key), Seq(key))
+    def row(value: Int) = projection(new GenericInternalRow(Array[Any](value))).copy()
+    val one = row(1)
+    val two = row(2)
+    val empty = MppRangeBoundsGenerator.PartitionSketch(
+      count = 0L,
+      samples = Array.empty,
+      serializedKeyBytes = 0L)
+    implicit val ordering: Ordering[InternalRow] = Ordering.by(_.getInt(0))
+
+    val sparseLarge = Array(
+      MppRangeBoundsGenerator.PartitionSketch(
+        count = 1000L,
+        samples = Array(one),
+        serializedKeyBytes = one.getSizeInBytes.toLong)) ++ Array.fill(15)(empty)
+    val sparseFailure = intercept[IllegalArgumentException] {
+      MppRangeBoundsGenerator.determineBounds(
+        partitions = 8,
+        inputPartitions = sparseLarge.length,
+        samplePointsPerPartitionHint = 100,
+        maxSampleRows = 200,
+        maxSampleBytes = 1L << 20,
+        sketches = sparseLarge)
+    }
+    assert(sparseFailure.getMessage.contains("only 1 bounded samples"))
+    assert(sparseFailure.getMessage.contains("mergeable global reservoir"))
+
+    val sparseSmall = Array(
+      MppRangeBoundsGenerator.PartitionSketch(
+        count = 2L,
+        samples = Array(one, two),
+        serializedKeyBytes = one.getSizeInBytes.toLong + two.getSizeInBytes.toLong)) ++
+      Array.fill(15)(empty)
+    val smallBounds = MppRangeBoundsGenerator.determineBounds(
+      partitions = 8,
+      inputPartitions = sparseSmall.length,
+      samplePointsPerPartitionHint = 100,
+      maxSampleRows = 200,
+      maxSampleBytes = 1L << 20,
+      sketches = sparseSmall)
+    assert(smallBounds.length + 1 <= 2)
+    assert(smallBounds.length + 1 <= 8)
   }
 
   test("query cache computes equivalent RANGE bounds once under concurrent access") {
@@ -249,5 +352,71 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
     val retried = failed.getOrCompute(plan, plan.output, ascending, 8)(result("retry"))
     assert(retried._1.json == "retry")
     assert(!retried._2)
+  }
+
+  test("concurrent cache failure reaches all waiters before a clean retry generation") {
+    val key = AttributeReference("key", IntegerType, nullable = false)()
+    val plan = LocalTableScanExec(Seq(key), Seq.empty[InternalRow], None)
+    val ordering = Seq(SortOrder(key, Ascending, NullsFirst, Seq.empty))
+    val cache = new MppRangeBoundsGenerator.QueryCache("execution-failure")
+    val failure = new IllegalStateException("concurrent sample failed")
+    val calls = new AtomicInteger(0)
+    val ownerStarted = new CountDownLatch(1)
+    val releaseOwner = new CountDownLatch(1)
+    val waiterThread = new AtomicReference[Thread]()
+    val pool = Executors.newFixedThreadPool(2)
+
+    try {
+      val owner = pool.submit(new Callable[Unit] {
+        override def call(): Unit = {
+          cache.getOrCompute(plan, plan.output, ordering, requestedPartitions = 8) {
+            calls.incrementAndGet()
+            ownerStarted.countDown()
+            assert(releaseOwner.await(10, TimeUnit.SECONDS))
+            throw failure
+          }
+          ()
+        }
+      })
+      assert(ownerStarted.await(10, TimeUnit.SECONDS))
+      val waiter = pool.submit(new Callable[Unit] {
+        override def call(): Unit = {
+          waiterThread.set(Thread.currentThread())
+          cache.getOrCompute(plan, plan.output, ordering, requestedPartitions = 8) {
+            calls.incrementAndGet()
+            MppRangeBoundsGenerator.Result("unexpected", boundaryCount = 0)
+          }
+          ()
+        }
+      })
+
+      val waitDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10L)
+      while (
+        Option(waiterThread.get()).forall(_.getState != Thread.State.WAITING) &&
+        System.nanoTime() < waitDeadline
+      ) {
+        Thread.`yield`()
+      }
+      assert(waiterThread.get() != null)
+      assert(waiterThread.get().getState == Thread.State.WAITING)
+      releaseOwner.countDown()
+
+      val ownerFailure = intercept[ExecutionException](owner.get(10, TimeUnit.SECONDS))
+      val waiterFailure = intercept[ExecutionException](waiter.get(10, TimeUnit.SECONDS))
+      assert(ownerFailure.getCause eq failure)
+      assert(waiterFailure.getCause eq failure)
+      assert(calls.get() == 1)
+
+      val retry = cache.getOrCompute(plan, plan.output, ordering, requestedPartitions = 8) {
+        calls.incrementAndGet()
+        MppRangeBoundsGenerator.Result("retry", boundaryCount = 7)
+      }
+      assert(retry._1.json == "retry")
+      assert(!retry._2)
+      assert(calls.get() == 2)
+    } finally {
+      releaseOwner.countDown()
+      pool.shutdownNow()
+    }
   }
 }
