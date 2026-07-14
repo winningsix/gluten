@@ -607,11 +607,13 @@ private[execution] class MppAlignedInputRDD(
   }
 
   override def compute(split: Partition, context: TaskContext): Iterator[ColumnarBatch] = {
-    val parentIterators = split
+    split
       .asInstanceOf[MppAlignedInputPartition]
       .parentPartitions
-      .map(parentRDD.iterator(_, context))
-    parentIterators.iterator.flatten
+      .iterator
+      // Creating an RDD iterator may start its runtime (for example, a Python worker). Keep the
+      // aligned parents sequential so a coalesced partition does not start every parent at once.
+      .flatMap(parentRDD.iterator(_, context))
   }
 
   override protected def getPreferredLocations(split: Partition): Seq[String] = {
