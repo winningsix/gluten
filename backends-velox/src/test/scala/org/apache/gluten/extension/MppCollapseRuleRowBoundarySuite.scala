@@ -259,7 +259,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(c2r.children.head.output == child.output)
   }
 
-  test("root DeserializeToObject does not compose with the ExistingRDD ingress hybrid") {
+  test("root DeserializeToObject composes Spark C2R with the exact ExistingRDD ingress hybrid") {
     val attr = AttributeReference("a", IntegerType, nullable = true)()
     val scan = existingRddScan(attr)
     val ingress = RowToVeloxColumnarExec(scan)
@@ -267,7 +267,54 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val boundary = deserializeRows(ColumnarToRowExec(nativeSuffix))
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
-    assertStrictRejection(rule, boundary, "No viable transition found", "ProjectExecTransformer")
+    val collapsed = rule(boundary)
+
+    assert(collapsed.isInstanceOf[DeserializeToObjectExec])
+    assert(collapsed.children.head.isInstanceOf[MppNativeQueryExec])
+    assert(collapsed.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
+    assert(collapsed.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+  }
+
+  test("root DeserializeToObject composes Gluten C2R with the exact ExistingRDD ingress hybrid") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val scan = existingRddScan(attr)
+    val ingress = RowToVeloxColumnarExec(scan)
+    val nativeSuffix = ProjectExecTransformer(ingress.output, ingress)
+    val boundary = deserializeRows(VeloxColumnarToRowExec(nativeSuffix))
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val collapsed = rule(boundary)
+
+    assert(collapsed.isInstanceOf[DeserializeToObjectExec])
+    val c2r = collapsed.children.head
+    assert(c2r.isInstanceOf[VeloxColumnarToRowExec])
+    assert(c2r.children.head.isInstanceOf[MppNativeQueryExec])
+    assert(c2r.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+  }
+
+  test("root DeserializeToObject repairs a sortable row shell over ExistingRDD ingress") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val scan = existingRddScan(attr)
+    val ingress = RowToVeloxColumnarExec(scan)
+    val rowInput = VeloxColumnarToRowExec(ingress)
+    val rowSort = org.apache.spark.sql.execution.SortExec(
+      Seq(SortOrder(attr, Ascending, NullsFirst, Seq.empty)),
+      global = false,
+      rowInput,
+      testSpillFrequency = 0)
+    val stalePlan = RowToVeloxColumnarExec(rowSort)
+    val boundary = deserializeRows(VeloxColumnarToRowExec(stalePlan))
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val collapsed = rule(boundary)
+
+    val c2r = collapsed.children.head
+    assert(c2r.isInstanceOf[VeloxColumnarToRowExec])
+    val mpp = c2r.children.head
+    assert(mpp.isInstanceOf[MppNativeQueryExec])
+    assert(mpp.find(_.isInstanceOf[SortExecTransformer]).isDefined)
+    assert(mpp.find(_.isInstanceOf[VeloxColumnarToRowExec]).isEmpty)
+    assert(mpp.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
   }
 
   test("nested DeserializeToObject remains a strict MPP rejection") {

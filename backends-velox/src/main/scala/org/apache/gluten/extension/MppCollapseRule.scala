@@ -386,7 +386,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case c2r: ColumnarToRowExecBase =>
         collapseTerminalObjectEgressThroughC2r(boundary, c2r, c2r.child)
       case c2r: ColumnarToRowExec =>
-        tryCollapseMpp(c2r.child).map {
+        tryCollapseExistingRddHybrid(c2r.child).orElse(tryCollapseMpp(c2r.child)).map {
           nativeChild =>
             logWarning(
               "MppCollapseRule: *** INTENTIONAL TERMINAL NATIVE OBJECT OUTPUT *** " +
@@ -401,7 +401,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       boundary: DeserializeToObjectExec,
       directRowTransition: SparkPlan,
       relationalChild: SparkPlan): Option[SparkPlan] = {
-    tryCollapseMpp(relationalChild).map {
+    tryCollapseExistingRddHybrid(relationalChild).orElse(tryCollapseMpp(relationalChild)).map {
       nativeChild =>
         val objectInput = directRowTransition.withNewChildren(Seq(nativeChild))
         logWarning(
