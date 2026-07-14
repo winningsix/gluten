@@ -956,6 +956,26 @@ void MppQueryCoordinator::start() {
                  << replica << "/" << fragmentTasks_[fragmentId].size() << " taskId=" << task->taskId()
                  << " drivers=" << perReplicaDrivers << " inboundN=" << inboundN
                  << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN) : std::string{});
+#ifdef GLUTEN_ENABLE_GPU
+    // Velox's generic Task lifecycle is built without the cuDF/UCX integration definition in the
+    // current library layering, while the cuDF adapter still replaces a kUcx output operator at
+    // runtime. Register its strict output queue here, before any producer driver can enqueue. The
+    // coordinator already owns UCX fanout updates and teardown, and initializeTask is idempotent
+    // with a future Task-side lifecycle hook.
+    const auto outputNode = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+        fragmentSpecs_[fragmentId].planFragment.planNode);
+    if (outputNode != nullptr &&
+        outputNode->transportType() == core::PartitionedOutputNode::TransportType::kUcx) {
+      facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef()->initializeTask(
+          task,
+          outputNode->kind(),
+          outputNode->numPartitions(),
+          perReplicaDrivers);
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: initialized UCX output queue before task start"
+                   << " taskId=" << task->taskId() << " destinations=" << outputNode->numPartitions()
+                   << " drivers=" << perReplicaDrivers;
+    }
+#endif
     task->start(perReplicaDrivers);
     fragmentTaskStarted[fragmentId][replica] = true;
     if (lifecycleLogEnabled) {

@@ -67,12 +67,25 @@ object GlutenMppPeerResolver extends Logging {
     driverService match {
       case Some(service) =>
         val registry = service.endpointRegistry
-        if (GlutenMppControlPlaneConfig.awaitMinExecutors(conf)) {
-          registry.awaitMinExecutors(
-            requestedCount,
-            GlutenMppControlPlaneConfig.awaitTimeoutMs(conf))
-        }
+        val awaitEnabled = GlutenMppControlPlaneConfig.awaitMinExecutors(conf)
+        val timeoutMs = GlutenMppControlPlaneConfig.awaitTimeoutMs(conf)
+        val startedNs = System.nanoTime()
+        val thresholdMet =
+          if (awaitEnabled) {
+            logInfo(
+              s"GlutenMppPeerResolver: waiting for $requestedCount executor UCX endpoints " +
+                s"(timeoutMs=$timeoutMs, current=${registry.snapshot().length})")
+            registry.awaitMinExecutors(requestedCount, timeoutMs)
+          } else {
+            false
+          }
         val snapshot = registry.snapshot()
+        if (awaitEnabled) {
+          val elapsedMs = (System.nanoTime() - startedNs) / 1000000L
+          logInfo(
+            s"GlutenMppPeerResolver: endpoint wait finished thresholdMet=$thresholdMet " +
+              s"elapsedMs=$elapsedMs current=${snapshot.length} requested=$requestedCount")
+        }
         RegistryAttempt(
           GlutenMppPeerMapper.fromEndpointRecords(snapshot, requestedCount),
           snapshot.length,
