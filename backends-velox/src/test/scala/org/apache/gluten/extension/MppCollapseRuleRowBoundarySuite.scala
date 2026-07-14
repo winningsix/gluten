@@ -17,6 +17,7 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
+import org.apache.gluten.exception.GlutenException
 import org.apache.gluten.execution.{FlushableHashAggregateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, MppExistingRddStreamInput, MppNativeQueryExec, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, VeloxColumnarToRowExec}
 import org.apache.gluten.expression.aggregate.VeloxCollectList
 import org.apache.gluten.extension.columnar.FallbackTags
@@ -25,19 +26,34 @@ import org.apache.spark.SparkFunSuite
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, AttributeReference, Cast, CreateNamedStruct, EqualTo, If, Literal, Multiply, NamedExpression, NullsFirst, SortOrder}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, AttributeReference, Cast, CreateNamedStruct, EqualTo, If, Literal, Multiply, NamedExpression, NullsFirst, SortOrder}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Partial, Sum}
 import org.apache.spark.sql.catalyst.expressions.objects.CreateExternalRow
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
-import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, ColumnarToRowExec, DeserializeToObjectExec, MapPartitionsExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SparkPlan}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, ColumnarToRowExec, DeserializeToObjectExec, MapPartitionsExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.aggregate.{BaseAggregateExec, HashAggregateExec}
-import org.apache.spark.sql.execution.python.BatchEvalPythonExec
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{DoubleType, IntegerType, LongType, ObjectType, StringType, StructType}
+import org.apache.spark.sql.types.{DoubleType, IntegerType, LongType, ObjectType, StringType, StructField, StructType}
+import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import org.mockito.Mockito.{mock, when, withSettings}
 
 class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
+
+  private case class NonNativePythonExec(child: SparkPlan) extends UnaryExecNode {
+    override def output: Seq[Attribute] = child.output
+
+    override def supportsColumnar: Boolean = true
+
+    override protected def doExecute(): RDD[InternalRow] =
+      throw new UnsupportedOperationException("planning-only Python fixture")
+
+    override protected def doExecuteColumnar(): RDD[ColumnarBatch] =
+      throw new UnsupportedOperationException("planning-only Python fixture")
+
+    override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
+      copy(child = newChild)
+  }
 
   private def nativeLeaf(): LocalTableScanExecTransformer =
     LocalTableScanExecTransformer(
@@ -48,11 +64,24 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     RDDScanExec(Seq(attr), mock(classOf[RDD[InternalRow]]), "ExistingRDD")
 
   private def deserializeRows(child: SparkPlan): DeserializeToObjectExec = {
-    val schema = StructType(child.output.map(_.toStructField))
+    val schema = StructType(
+      child.output.map(
+        attr => StructField(attr.name, attr.dataType, attr.nullable, attr.metadata)))
     val deserializer = CreateExternalRow(child.output, schema)
     val outputObject =
       AttributeReference("obj", ObjectType(classOf[Row]), nullable = false)()
     DeserializeToObjectExec(deserializer, outputObject, child)
+  }
+
+  private def assertStrictRejection(
+      rule: MppCollapseRule,
+      plan: SparkPlan,
+      expectedMessageParts: String*): Unit = {
+    val error = intercept[RuntimeException] {
+      rule(plan)
+    }
+    assert(error.isInstanceOf[GlutenException] || error.isInstanceOf[IllegalStateException])
+    expectedMessageParts.foreach(part => assert(error.getMessage.contains(part)))
   }
 
   private def columnarExchange() = {
@@ -240,9 +269,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val boundary = deserializeRows(ColumnarToRowExec(nativeSuffix))
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
-    val result = rule(boundary)
-
-    assert(result.find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
+    assertStrictRejection(rule, boundary, "No viable transition found", "ProjectExecTransformer")
   }
 
   test("nested DeserializeToObject remains a strict MPP rejection") {
@@ -250,9 +277,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val parent = ProjectExecTransformer(objectBoundary.output, objectBoundary)
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
-    val result = rule(parent)
-
-    assert(result.find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
+    assertStrictRejection(rule, parent, "No viable transition found", "DeserializeToObject")
   }
 
   test("root object operators other than DeserializeToObject remain rejected") {
@@ -265,18 +290,16 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val mapped = MapPartitionsExec((rows: Iterator[Any]) => rows, mappedObject, child)
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
-    assert(rule(serialized).find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
-    assert(rule(mapped).find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
+    assertStrictRejection(rule, serialized, "No viable transition found", "SerializeFromObject")
+    assertStrictRejection(rule, mapped, "No viable transition found", "MapPartitions")
   }
 
   test("root DeserializeToObject does not admit a Python producer") {
-    val python = BatchEvalPythonExec(Seq.empty, Seq.empty, nativeLeaf())
+    val python = NonNativePythonExec(nativeLeaf())
     val boundary = deserializeRows(ColumnarToRowExec(python))
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
-    val result = rule(boundary)
-
-    assert(result.find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
+    assertStrictRejection(rule, boundary, "No viable transition found", "NonNativePython")
   }
 
   test("terminal root egress connects the exact ExistingRDD ingress hybrid to MPP") {
