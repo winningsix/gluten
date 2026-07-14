@@ -395,6 +395,7 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
       "The execution-visible child should be unwrapped")
     assert(
       preparedChild.collect { case exchange: ShuffleExchangeLike => exchange }.nonEmpty,
-      s"The execution-visible child should retain exchange boundaries:\n${preparedChild.treeString}")
+      "The execution-visible child should retain exchange boundaries:\n" +
+        preparedChild.treeString)
   }
 }
