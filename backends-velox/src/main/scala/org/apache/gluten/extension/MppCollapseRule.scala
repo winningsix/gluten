@@ -29,7 +29,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, PlanExpression, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExecBase, ColumnarToRowExec, CommandResultExec, FilterExec, ProjectExec, RowToColumnarExec, ScalarSubquery, SortExec, SparkPlan}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExecBase, ColumnarToRowExec, CommandResultExec, DeserializeToObjectExec, FilterExec, ProjectExec, RowToColumnarExec, ScalarSubquery, SortExec, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.command.{DataWritingCommandExec, ExecutedCommandExec}
@@ -309,6 +309,13 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    */
   private def collapseMppOrArrowHybrid(plan: SparkPlan): Option[SparkPlan] = {
     plan match {
+      // Dataset.rdd is represented by a terminal DeserializeToObjectExec in Spark 4. Keep exactly
+      // that object-producing root outside MPP while requiring the relational producer below it
+      // to satisfy the ordinary fully-native or exact ExistingRDD-ingress contract. Object
+      // operators at any nested position, and every other root object operator, remain rejected by
+      // the strict recursive validator.
+      case deserialize: DeserializeToObjectExec =>
+        collapseTerminalObjectEgress(deserialize)
       // Spark materializes an uncorrelated scalar subquery through a final C2R even when its
       // producer is entirely native. A global aggregate without grouping emits at most one row,
       // so retain that semantically required driver boundary while collapsing its child to MPP.
@@ -329,14 +336,16 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
                 s"boundary=${c2r.getClass.getSimpleName}; final C2R converts at most one row")
             c2r.withNewChildren(Seq(nativeChild))
         }
-      // Dataset.rdd / javaToPython is an intentional terminal row consumer. Keep exactly this
-      // root adapter outside MppNativeQueryExec while requiring its entire child to be either
-      // native or the separately validated ExistingRDD-input hybrid. A nested C2R still reaches
-      // the strict validator and is rejected.
+      // A terminal root C2R is Spark's row-consumer boundary (for example Dataset.rdd /
+      // javaToPython, collect, head, or toLocalIterator). The physical plan does not retain which
+      // action requested it, so define the contract by its exact position: keep only the plan-root
+      // adapter outside MppNativeQueryExec while requiring its entire child to be either native or
+      // the separately validated batch ExistingRDD-input hybrid. A nested C2R still reaches the
+      // strict validator and is rejected.
       case c2r: ColumnarToRowExecBase =>
-        collapseIntentionalRddEgress(c2r, c2r.child)
+        collapseTerminalRowEgress(c2r, c2r.child)
       case c2r: ColumnarToRowExec =>
-        collapseIntentionalRddEgress(c2r, c2r.child)
+        collapseTerminalRowEgress(c2r, c2r.child)
       case _ =>
         tryCollapseExistingRddHybrid(plan)
           .orElse(tryCollapseMpp(plan))
@@ -344,15 +353,47 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     }
   }
 
-  private def collapseIntentionalRddEgress(
+  private def collapseTerminalRowEgress(
       boundary: SparkPlan,
       child: SparkPlan): Option[SparkPlan] = {
     tryCollapseExistingRddHybrid(child).orElse(tryCollapseMpp(child)).map {
       nativeChild =>
         logWarning(
-          "MppCollapseRule: *** INTENTIONAL NATIVE RDD ROW OUTPUT *** " +
+          "MppCollapseRule: *** INTENTIONAL TERMINAL NATIVE ROW OUTPUT *** " +
             s"boundary=${boundary.getClass.getSimpleName}; the root C2R remains outside MPP")
         boundary.withNewChildren(Seq(nativeChild))
+    }
+  }
+
+  /**
+   * Collapse the relational producer of a root Dataset.rdd object adapter.
+   *
+   * InsertTransitions normally places one direct C2R between DeserializeToObjectExec and a
+   * columnar child. Preserve that required transition outside MPP, but peel it before validating
+   * the relational subtree so it is not mistaken for a nested row island. If the caller supplies
+   * no explicit C2R, MppNativeQueryExec.doExecute already provides the Velox native-to-row
+   * conversion; adding a second adapter would only duplicate the boundary.
+   */
+  private def collapseTerminalObjectEgress(
+      boundary: DeserializeToObjectExec): Option[SparkPlan] = {
+    val (directRowTransition, relationalChild): (Option[SparkPlan], SparkPlan) =
+      boundary.child match {
+        case c2r: ColumnarToRowExecBase => (Some(c2r), c2r.child)
+        case c2r: ColumnarToRowExec => (Some(c2r), c2r.child)
+        case child => (None, child)
+      }
+
+    tryCollapseExistingRddHybrid(relationalChild).orElse(tryCollapseMpp(relationalChild)).map {
+      nativeChild =>
+        val objectInput = directRowTransition match {
+          case Some(c2r) => c2r.withNewChildren(Seq(nativeChild))
+          case None => nativeChild
+        }
+        logWarning(
+          "MppCollapseRule: *** INTENTIONAL TERMINAL NATIVE OBJECT OUTPUT *** " +
+            s"boundary=${boundary.getClass.getSimpleName}; only the root object adapter " +
+            "remains outside MPP")
+        boundary.withNewChildren(Seq(objectInput))
     }
   }
 
@@ -482,8 +523,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   /**
    * An isolated C2R below another operator is an execution boundary, not a convention adapter.
    * Permit only the two existing normalization shapes: an adjacent R2C(C2R(native)) pair, or the
-   * identity C2R immediately below a Gluten columnar shuffle. The explicit root C2R has already
-   * been peeled by [[collapseIntentionalRddEgress]] before this check.
+   * identity C2R immediately below a Gluten columnar shuffle. The explicit terminal root C2R has
+   * already been peeled by [[collapseTerminalRowEgress]] before this check.
    */
   private def containsUnpairedNestedRowOutput(plan: SparkPlan): Boolean = {
     def isC2r(node: SparkPlan): Boolean = node match {
@@ -709,8 +750,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       // A remaining row transition is a real execution boundary. The only C2R shape that MPP may
       // elide is an identity C2R directly over Gluten's ColumnarExchange under a V2 write; that
       // narrowly-scoped normalization runs before this validation. In particular, a top-level
-      // DataFrame.rdd / javaToPython consumer must fail strict MPP instead of being mistaken for a
-      // harmless driver adapter.
+      // terminal root consumer is admitted only by collapseTerminalRowEgress, outside this strict
+      // recursive validator; the same C2R at any nested position remains rejected.
       case c2r: ColumnarToRowExecBase =>
         logWarning(
           s"MppCollapseRule: BLOCKED by native-to-row execution boundary: " +

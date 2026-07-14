@@ -131,16 +131,42 @@ private[execution] case class MppLocalStreamSlot(fragmentId: Int, slotIdx: Int)
  * an InputIterator slot, but it must not treat an arbitrary row subtree as equivalent to an RDD
  * scan. Keep this matcher deliberately unary and transparent: conversion/adaptor nodes are
  * accepted; C2R, Python, projections, filters, whole stages, and every other row operator are not.
+ * Spark 4 also carries an optional streaming source on RDDScanExec; strict MPP admits only the
+ * batch form. Spark 3.x has no such accessor, so the reflective check below is a cross-version
+ * compatibility guard rather than a relaxation.
  */
 private[gluten] object MppExistingRddStreamInput {
 
   def scan(plan: SparkPlan): Option[RDDScanExec] = plan match {
-    case existing: RDDScanExec => Some(existing)
+    case existing: RDDScanExec if isBatchExistingRddScan(existing) => Some(existing)
     case cia: ColumnarInputAdapter => scan(cia.child)
     case c2c: ColumnarToColumnarExec => scan(c2c.child)
     case r2c: RowToColumnarExecBase => scan(r2c.child)
     case r2c: org.apache.spark.sql.execution.RowToColumnarExec => scan(r2c.child)
     case _ => None
+  }
+
+  private def isBatchExistingRddScan(scan: RDDScanExec): Boolean = {
+    if (scan.name != "ExistingRDD") {
+      return false
+    }
+
+    // RDDScanExec.stream was added in Spark 4. Referencing it directly would break the common
+    // Spark 3.5 build, where every RDDScanExec is batch-only. If Spark exposes the accessor, fail
+    // closed unless it returns an empty scala.Option.
+    scan.getClass.getMethods
+      .find(method => method.getName == "stream" && method.getParameterCount == 0) match {
+      case None => true
+      case Some(streamAccessor) =>
+        try {
+          streamAccessor.invoke(scan) match {
+            case stream: Option[_] => stream.isEmpty
+            case _ => false
+          }
+        } catch {
+          case NonFatal(_) => false
+        }
+    }
   }
 }
 

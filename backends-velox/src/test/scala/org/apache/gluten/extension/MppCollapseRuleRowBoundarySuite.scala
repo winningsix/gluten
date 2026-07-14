@@ -23,14 +23,17 @@ import org.apache.gluten.extension.columnar.FallbackTags
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, AttributeReference, Cast, CreateNamedStruct, EqualTo, If, Literal, Multiply, NamedExpression, NullsFirst, SortOrder}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Partial, Sum}
+import org.apache.spark.sql.catalyst.expressions.objects.CreateExternalRow
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
-import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, ColumnarToRowExec, ProjectExec, RDDScanExec, SparkPlan}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, ColumnarToRowExec, DeserializeToObjectExec, MapPartitionsExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SparkPlan}
 import org.apache.spark.sql.execution.aggregate.{BaseAggregateExec, HashAggregateExec}
+import org.apache.spark.sql.execution.python.BatchEvalPythonExec
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{DoubleType, IntegerType, LongType, StringType}
+import org.apache.spark.sql.types.{DoubleType, IntegerType, LongType, ObjectType, StringType, StructType}
 
 import org.mockito.Mockito.{mock, when, withSettings}
 
@@ -43,6 +46,14 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
 
   private def existingRddScan(attr: AttributeReference): RDDScanExec =
     RDDScanExec(Seq(attr), mock(classOf[RDD[InternalRow]]), "ExistingRDD")
+
+  private def deserializeRows(child: SparkPlan): DeserializeToObjectExec = {
+    val schema = StructType(child.output.map(_.toStructField))
+    val deserializer = CreateExternalRow(child.output, schema)
+    val outputObject =
+      AttributeReference("obj", ObjectType(classOf[Row]), nullable = false)()
+    DeserializeToObjectExec(deserializer, outputObject, child)
+  }
 
   private def columnarExchange() = {
     val child = nativeLeaf()
@@ -155,7 +166,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(!rule.isFullyNativeSupported(RowToVeloxColumnarExec(child)))
   }
 
-  test("root native-to-row output is an intentional MPP egress, not a native row island") {
+  test("terminal root native-to-row output is an intentional MPP egress") {
     val child = nativeLeaf()
     val boundary = ColumnarToRowExec(child)
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
@@ -170,7 +181,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(!rule.isFullyNativeSupported(boundary))
   }
 
-  test("Gluten root native-to-row output is also an intentional MPP egress") {
+  test("Gluten terminal root native-to-row output is also an intentional MPP egress") {
     val child = nativeLeaf()
     val boundary = VeloxColumnarToRowExec(child)
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
@@ -182,7 +193,86 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(!rule.isFullyNativeSupported(boundary))
   }
 
-  test("root RDD egress connects the exact ExistingRDD ingress hybrid to MPP") {
+  test("root DeserializeToObject keeps only the object egress outside MPP") {
+    val child = nativeLeaf()
+    val boundary = deserializeRows(child)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val collapsed = rule(boundary)
+
+    assert(collapsed.isInstanceOf[DeserializeToObjectExec])
+    assert(collapsed.children.head.isInstanceOf[MppNativeQueryExec])
+    assert(collapsed.children.head.output == child.output)
+    // No explicit C2R is needed in this shape: MppNativeQueryExec.doExecute performs the single
+    // Velox native-to-row conversion requested by DeserializeToObjectExec.execute.
+    assert(collapsed.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
+    assert(!rule.isFullyNativeSupported(boundary))
+  }
+
+  test("root DeserializeToObject preserves its one direct C2R outside MPP") {
+    val child = nativeLeaf()
+    val boundary = deserializeRows(ColumnarToRowExec(child))
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val collapsed = rule(boundary)
+
+    assert(collapsed.isInstanceOf[DeserializeToObjectExec])
+    val c2r = collapsed.children.head
+    assert(c2r.isInstanceOf[ColumnarToRowExec])
+    assert(c2r.children.head.isInstanceOf[MppNativeQueryExec])
+    assert(c2r.children.head.output == child.output)
+  }
+
+  test("root DeserializeToObject accepts the exact ExistingRDD ingress hybrid") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val scan = existingRddScan(attr)
+    val ingress = RowToVeloxColumnarExec(scan)
+    val nativeSuffix = ProjectExecTransformer(ingress.output, ingress)
+    val boundary = deserializeRows(ColumnarToRowExec(nativeSuffix))
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val collapsed = rule(boundary)
+
+    val mpp = collapsed.children.head.children.head.asInstanceOf[MppNativeQueryExec]
+    assert(
+      mpp.child.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+  }
+
+  test("nested DeserializeToObject remains a strict MPP rejection") {
+    val objectBoundary = deserializeRows(ColumnarToRowExec(nativeLeaf()))
+    val parent = ProjectExecTransformer(objectBoundary.output, objectBoundary)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val result = rule(parent)
+
+    assert(result.find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
+  }
+
+  test("root object operators other than DeserializeToObject remain rejected") {
+    val child = nativeLeaf()
+    val serialized = SerializeFromObjectExec(Seq(Alias(Literal(1), "value")()), child)
+    val mappedObject = AttributeReference(
+      "mapped",
+      ObjectType(classOf[Row]),
+      nullable = false)()
+    val mapped = MapPartitionsExec((rows: Iterator[Any]) => rows, mappedObject, child)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assert(rule(serialized).find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
+    assert(rule(mapped).find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
+  }
+
+  test("root DeserializeToObject does not admit a Python producer") {
+    val python = BatchEvalPythonExec(Seq.empty, Seq.empty, nativeLeaf())
+    val boundary = deserializeRows(python)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val result = rule(boundary)
+
+    assert(result.find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
+  }
+
+  test("terminal root egress connects the exact ExistingRDD ingress hybrid to MPP") {
     val attr = AttributeReference("a", IntegerType, nullable = true)()
     val scan = existingRddScan(attr)
     val ingress = RowToVeloxColumnarExec(scan)
@@ -222,6 +312,51 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
       MppExistingRddStreamInput
         .scan(ColumnarInputAdapter(ingress))
         .contains(scan))
+  }
+
+  test("ExistingRDD matcher rejects non-Existing RDDScan names") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val scan = RDDScanExec(
+      Seq(attr),
+      mock(classOf[RDD[InternalRow]]),
+      "OneRowRelation")
+    val ingress = RowToVeloxColumnarExec(scan)
+    val nativeSuffix = ProjectExecTransformer(ingress.output, ingress)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assert(MppExistingRddStreamInput.scan(ingress).isEmpty)
+    assert(!rule.isSupportedExistingRddHybridPlan(nativeSuffix))
+  }
+
+  test("ExistingRDD matcher rejects Spark 4 streaming RDDScan") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val batchScan = existingRddScan(attr)
+    val spark4Constructor = classOf[RDDScanExec].getConstructors.find(_.getParameterCount == 6)
+
+    spark4Constructor match {
+      case Some(constructor) =>
+        // Spark 4's sixth constructor argument is Option[SparkDataStream]. The element type is
+        // erased, and the matcher only needs to prove that a non-empty stream is rejected.
+        val streamingScan = constructor
+          .newInstance(
+            batchScan.output.asInstanceOf[AnyRef],
+            batchScan.rdd,
+            batchScan.name,
+            batchScan.outputPartitioning,
+            batchScan.outputOrdering.asInstanceOf[AnyRef],
+            Some(new Object()).asInstanceOf[AnyRef])
+          .asInstanceOf[RDDScanExec]
+        val ingress = RowToVeloxColumnarExec(streamingScan)
+        val nativeSuffix = ProjectExecTransformer(ingress.output, ingress)
+        val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+        assert(MppExistingRddStreamInput.scan(ingress).isEmpty)
+        assert(!rule.isSupportedExistingRddHybridPlan(nativeSuffix))
+      case None =>
+        // Spark 3.x has no streaming RDDScanExec form; keep this cross-version suite meaningful
+        // there by asserting that the accessor itself is absent.
+        assert(!classOf[RDDScanExec].getMethods.exists(_.getName == "stream"))
+    }
   }
 
   test("ExistingRDD hybrid validation rejects row operators hidden below R2C") {
