@@ -266,8 +266,8 @@ class MppNativeQueryRDD(
 
     // MPP creates multiple Velox Tasks behind this one Spark task. Allocate the query-level root
     // only after all JVM-side validation and stream materialization has succeeded. The lease keeps
-    // ownership until nativeCreateMppQuery returns; a native parse/plan-conversion failure therefore
-    // deletes the root instead of leaking it for the lifetime of the executor.
+    // ownership until nativeCreateMppQuery returns; a native parse/plan-conversion failure
+    // therefore deletes the root instead of leaking it for the lifetime of the executor.
     val spillRootLease =
       MppNativeQueryRDD.createSpillRootLease(SparkDirectoryUtil.get().namespace("gluten-spill"))
     val mppHandle = spillRootLease.handoffAfterCreate {

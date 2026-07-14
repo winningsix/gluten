@@ -18,7 +18,7 @@ package org.apache.spark.sql.execution.utils
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Ascending, AttributeReference, Descending, GenericInternalRow, NullsFirst, NullsLast, SortOrder, UnsafeProjection}
+import org.apache.spark.sql.catalyst.expressions.{Ascending, AttributeReference, Descending, GenericInternalRow, NullsFirst, NullsLast, SortOrder, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.execution.LocalTableScanExec
 import org.apache.spark.sql.types.{DecimalType, DoubleType, FloatType, IntegerType, StringType}
 import org.apache.spark.unsafe.types.UTF8String
@@ -131,7 +131,7 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
   test("byte admission fails only when a selected priority key cannot fit") {
     val key = AttributeReference("key", StringType, nullable = false)()
     val projection = UnsafeProjection.create(Seq(key), Seq(key))
-    def row(value: String) = {
+    def row(value: String): UnsafeRow = {
       projection(new GenericInternalRow(Array[Any](UTF8String.fromString(value)))).copy()
     }
     val small = row("s")
@@ -165,7 +165,8 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
   test("weighted skew samples produce monotonic Spark-compatible bounds") {
     val key = AttributeReference("key", IntegerType, nullable = false)()
     val projection = UnsafeProjection.create(Seq(key), Seq(key))
-    def row(value: Int) = projection(new GenericInternalRow(Array[Any](value))).copy()
+    def row(value: Int): UnsafeRow =
+      projection(new GenericInternalRow(Array[Any](value))).copy()
 
     val heavy = Array(row(0), row(1))
     val light = Array(row(10), row(20))
@@ -238,7 +239,8 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
   test("sparse partition samples fail closed unless the full input is smaller than RANGE width") {
     val key = AttributeReference("key", IntegerType, nullable = false)()
     val projection = UnsafeProjection.create(Seq(key), Seq(key))
-    def row(value: Int) = projection(new GenericInternalRow(Array[Any](value))).copy()
+    def row(value: Int): UnsafeRow =
+      projection(new GenericInternalRow(Array[Any](value))).copy()
     val one = row(1)
     val two = row(2)
     val empty = MppRangeBoundsGenerator.PartitionSketch(

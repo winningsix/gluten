@@ -359,7 +359,8 @@ case class MppNativeQueryExec(
   private def executeColumnarInternal(keepDeviceOutput: Boolean): RDD[ColumnarBatch] = {
     val executionChild = preparedChildPlan
     // Scope generated RANGE bounds to this MPP launch. A new action gets a new cache even if it
-    // reuses the same SparkPlan object; equivalent exchanges inside this launch join one generation.
+    // reuses the same SparkPlan object; equivalent exchanges inside this launch join one
+    // generation.
     val rangeBoundsCache = new MppRangeBoundsGenerator.QueryCache(
       Option(sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY))
         .filter(_.nonEmpty)
