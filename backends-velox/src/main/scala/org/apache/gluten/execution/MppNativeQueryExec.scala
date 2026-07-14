@@ -358,6 +358,12 @@ case class MppNativeQueryExec(
 
   private def executeColumnarInternal(keepDeviceOutput: Boolean): RDD[ColumnarBatch] = {
     val executionChild = preparedChildPlan
+    // Scope generated RANGE bounds to this MPP launch. A new action gets a new cache even if it
+    // reuses the same SparkPlan object; equivalent exchanges inside this launch join one generation.
+    val rangeBoundsCache = new MppRangeBoundsGenerator.QueryCache(
+      Option(sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY))
+        .filter(_.nonEmpty)
+        .getOrElse(s"untracked-${UUID.randomUUID()}"))
     logDebug(
       s"MppNativeQueryExec: executing with ${fragments.size} fragments " +
         s"and ${exchanges.size} exchanges")
@@ -447,7 +453,7 @@ case class MppNativeQueryExec(
 
       val preparedExtractedExchanges =
         try {
-          prepareMppRangeExchanges(extractedExchanges)
+          prepareMppRangeExchanges(extractedExchanges, rangeBoundsCache)
         } catch {
           case NonFatal(e) =>
             return delegateToBsp(
@@ -593,7 +599,7 @@ case class MppNativeQueryExec(
 
     val preparedExchanges =
       try {
-        prepareMppRangeExchanges(exchanges)
+        prepareMppRangeExchanges(exchanges, rangeBoundsCache)
       } catch {
         case NonFatal(e) =>
           return delegateToBsp(
@@ -3307,7 +3313,9 @@ case class MppNativeQueryExec(
     }
   }
 
-  private def prepareMppRangeExchanges(exchanges: Seq[ExchangeSpec]): Seq[ExchangeSpec] = {
+  private def prepareMppRangeExchanges(
+      exchanges: Seq[ExchangeSpec],
+      rangeBoundsCache: MppRangeBoundsGenerator.QueryCache): Seq[ExchangeSpec] = {
     exchanges.map {
       case spec if spec.exchangeType == "RANGE" && spec.rangeBoundsJson.isDefined =>
         require(
@@ -3331,20 +3339,28 @@ case class MppNativeQueryExec(
         require(
           spec.rangeSamplePlan != null,
           s"MPP RANGE exchange ${spec.id} is missing its producer sampling plan")
-        val bounds = MppRangeBoundsGenerator.generate(
+        val (bounds, reused) = rangeBoundsCache.getOrCompute(
           spec.rangeSamplePlan,
           spec.rangeSamplePlan.output,
           spec.rangeOrdering,
-          spec.numPartitions)
+          spec.numPartitions) {
+          MppRangeBoundsGenerator.generate(
+            spec.rangeSamplePlan,
+            spec.rangeSamplePlan.output,
+            spec.rangeOrdering,
+            spec.numPartitions)
+        }
         require(
           bounds.effectivePartitions <= spec.numPartitions,
           s"MPP RANGE exchange ${spec.id} computed ${bounds.effectivePartitions} effective " +
             s"partitions for ${spec.numPartitions} requested partitions"
         )
         logInfo(
-          s"MppNativeQueryExec: RANGE exchange ${spec.id} computed " +
+          s"MppNativeQueryExec: RANGE exchange ${spec.id} " +
+            (if (reused) "reused" else "computed") + " " +
             s"${bounds.boundaryCount} Spark-compatible boundaries from bounded samples " +
-            s"(${bounds.effectivePartitions}/${spec.numPartitions} effective/requested partitions)")
+            s"(${bounds.effectivePartitions}/${spec.numPartitions} effective/requested partitions, " +
+            s"execution=${rangeBoundsCache.queryExecutionId})")
         spec.copy(
           rangeBoundsJson = Some(bounds.json),
           rangeEffectivePartitions = Some(bounds.effectivePartitions))
