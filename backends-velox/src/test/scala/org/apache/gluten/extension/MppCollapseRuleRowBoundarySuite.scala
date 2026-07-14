@@ -448,6 +448,20 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(rule.findUnpairedNestedRowOutput(roundTrip).isEmpty)
   }
 
+  test("unpaired row-output diagnostic reports the root-to-boundary child path") {
+    val boundary = VeloxColumnarToRowExec(nativeLeaf())
+    val rowProject = ProjectExec(boundary.output, boundary)
+    val rowInput = RowToVeloxColumnarExec(rowProject)
+    val root = ProjectExecTransformer(rowInput.output, rowInput)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assert(rule.findUnpairedNestedRowOutput(root).contains(boundary))
+    assert(
+      rule.describeAncestorPath(root, boundary) ==
+        "root=ProjectExecTransformer -> child[0]=RowToVeloxColumnarExec -> " +
+        "child[0]=ProjectExec -> child[0]=VeloxColumnarToRowExec")
+  }
+
   test("ExistingRDD hybrid validation accepts only an exact RDD ingress below a native suffix") {
     val attr = AttributeReference("a", IntegerType, nullable = true)()
     val scan = existingRddScan(attr)
@@ -488,6 +502,17 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
       collapsed
         .find(node => MppExistingRddStreamInput.rowInput(node).contains(serializer))
         .isDefined)
+
+    val guardOutcomes = MppExistingRddStreamInput.objectIngressGuardOutcomes(nativeSuffix)
+    assert(guardOutcomes.size == 1)
+    val guardOutcome = guardOutcomes.head
+    assert(guardOutcome.contains("childShape=ExternalRDDScanExec"))
+    assert(guardOutcome.contains("directExternalObjectScan=true"))
+    assert(guardOutcome.contains("externalOutputArity=1"))
+    assert(guardOutcome.contains("exactlyOneObjectInput=true"))
+    assert(guardOutcome.contains("serializerReferencesWithinInput=true"))
+    assert(guardOutcome.contains("outputContainsNoObjectType=true"))
+    assert(guardOutcome.contains("accepted=true"))
   }
 
   test("ExistingRDD hybrid captures Spark's codegen InputAdapter object ingress") {
@@ -568,6 +593,22 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
         assert(
           !rule.isSupportedExistingRddHybridPlan(ProjectExecTransformer(ingress.output, ingress)))
     }
+
+    val adapterGuards =
+      MppExistingRddStreamInput.objectIngressGuardOutcomes(doubleInputAdapterSerializer)
+    assert(adapterGuards.size == 1)
+    val adapterGuard = adapterGuards.head
+    assert(adapterGuard.contains("childShape=InputAdapter->InputAdapter"))
+    assert(adapterGuard.contains("directExternalObjectScan=false"))
+    assert(adapterGuard.contains("accepted=false"))
+
+    val referenceGuards =
+      MppExistingRddStreamInput.objectIngressGuardOutcomes(foreignReferencedSerializer)
+    assert(referenceGuards.size == 1)
+    val referenceGuard = referenceGuards.head
+    assert(referenceGuard.contains("childShape=ExternalRDDScanExec"))
+    assert(referenceGuard.contains("serializerReferencesWithinInput=false"))
+    assert(referenceGuard.contains("accepted=false"))
   }
 
   test("ExistingRDD hybrid validation absorbs a shuffle directly over the exact ingress") {

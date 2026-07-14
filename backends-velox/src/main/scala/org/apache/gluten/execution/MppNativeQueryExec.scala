@@ -143,6 +143,29 @@ private[execution] case class MppLocalStreamSlot(fragmentId: Int, slotIdx: Int)
  */
 private[gluten] object MppExistingRddStreamInput {
 
+  private case class ObjectIngressGuardOutcome(
+      childShape: String,
+      directExternalObjectScan: Boolean,
+      externalOutputArity: Option[Int],
+      exactlyOneObjectInput: Boolean,
+      serializerReferencesWithinInput: Boolean,
+      outputContainsNoObjectType: Boolean) {
+
+    def accepted: Boolean =
+      directExternalObjectScan &&
+        exactlyOneObjectInput &&
+        serializerReferencesWithinInput &&
+        outputContainsNoObjectType
+
+    def diagnostic: String =
+      s"SerializeFromObjectExec guard outcomes: childShape=$childShape; " +
+        s"directExternalObjectScan=$directExternalObjectScan; " +
+        s"externalOutputArity=${externalOutputArity.map(_.toString).getOrElse("unavailable")}; " +
+        s"exactlyOneObjectInput=$exactlyOneObjectInput; " +
+        s"serializerReferencesWithinInput=$serializerReferencesWithinInput; " +
+        s"outputContainsNoObjectType=$outputContainsNoObjectType; accepted=$accepted"
+  }
+
   def rowInput(plan: SparkPlan): Option[SparkPlan] = plan match {
     case existing: RDDScanExec if isBatchExistingRddScan(existing) => Some(existing)
     case serializer: SerializeFromObjectExec if isExternalObjectSerializerIngress(serializer) =>
@@ -158,14 +181,41 @@ private[gluten] object MppExistingRddStreamInput {
   def scan(plan: SparkPlan): Option[RDDScanExec] =
     rowInput(plan).collect { case existing: RDDScanExec => existing }
 
-  private def isExternalObjectSerializerIngress(serializer: SerializeFromObjectExec): Boolean = {
-    directExternalObjectScan(serializer.child).exists {
-      external =>
-        external.output.size == 1 &&
-        external.output.head.dataType.isInstanceOf[ObjectType] &&
-        serializer.serializer.forall(_.references.subsetOf(external.outputSet)) &&
-        serializer.output.forall(attr => !containsObjectType(attr.dataType))
+  /**
+   * Explain every SerializeFromObject candidate without changing the exact ingress matcher. Keeping
+   * each guard outcome explicit makes a strict-MPP rejection actionable while preserving the
+   * fail-closed contract.
+   */
+  def objectIngressGuardOutcomes(plan: SparkPlan): Seq[String] =
+    plan.collect {
+      case serializer: SerializeFromObjectExec => evaluateObjectIngress(serializer).diagnostic
     }
+
+  private def isExternalObjectSerializerIngress(serializer: SerializeFromObjectExec): Boolean =
+    evaluateObjectIngress(serializer).accepted
+
+  private def evaluateObjectIngress(
+      serializer: SerializeFromObjectExec): ObjectIngressGuardOutcome = {
+    val external = directExternalObjectScan(serializer.child)
+    ObjectIngressGuardOutcome(
+      childShape = describeObjectIngressChild(serializer.child),
+      directExternalObjectScan = external.isDefined,
+      externalOutputArity = external.map(_.output.size),
+      exactlyOneObjectInput = external.exists {
+        scan => scan.output.size == 1 && scan.output.head.dataType.isInstanceOf[ObjectType]
+      },
+      serializerReferencesWithinInput = external.exists {
+        scan => serializer.serializer.forall(_.references.subsetOf(scan.outputSet))
+      },
+      outputContainsNoObjectType =
+        serializer.output.forall(attr => !containsObjectType(attr.dataType))
+    )
+  }
+
+  private def describeObjectIngressChild(plan: SparkPlan): String = plan match {
+    case adapter: InputAdapter =>
+      s"InputAdapter->${adapter.child.getClass.getSimpleName}"
+    case other => other.getClass.getSimpleName
   }
 
   private def directExternalObjectScan(plan: SparkPlan): Option[ExternalRDDScanExec[_]] =

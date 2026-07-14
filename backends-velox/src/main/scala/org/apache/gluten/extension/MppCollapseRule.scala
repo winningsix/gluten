@@ -517,6 +517,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
           "MppCollapseRule: refusing to normalize an unpaired nested C2R; " +
             "only the explicit root row-output path may retain that boundary. " +
             s"Offending boundary: ${describeExecutionBoundary(boundary, "native-to-row")}. " +
+            s"Ancestor path: ${describeAncestorPath(repaired, boundary)}. " +
             s"Subtree: ${boundary.treeString.take(500)}")
         return None
       case None => ()
@@ -591,18 +592,24 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // contains an exact JVM-backed ingress. A computed aggregate above that ingress can be left as
     // C2R -> row aggregate -> R2C by ordinary Gluten validation; repairing it here composes the two
     // independently supported shapes without admitting an arbitrary row subtree.
-    if (!containsExactJvmStreamIngress(plan)) {
+    val originalHasIngress = logHybridIngressStage("original", plan)
+    if (!originalHasIngress) {
       return None
     }
     val repaired = repairRecoverableRowShells(plan, preserveExistingRddIngress = true)
+    logHybridIngressTransition("row-shell-repair", plan, repaired)
     // Do not run InsertTransitions over this hybrid. Its first step deliberately removes every
     // transition, including the exact R2C that identifies the JVM-backed ingress; rebuilding that
     // transition is not guaranteed before backend component initialization and would erase the
     // boundary this path is required to validate. The plan has already passed Gluten's
     // post-transform rules, so retain the explicit ingress while applying only the transition-safe
     // native rewrites.
-    val unionRewritten =
-      MppReplicatedCartesianRule()(rewriteMppNativeUnion(MppColumnarTransitionBridge()(repaired)))
+    val transitionBridged = MppColumnarTransitionBridge()(repaired)
+    logHybridIngressTransition("columnar-transition-bridge", repaired, transitionBridged)
+    val nativeUnionRewritten = rewriteMppNativeUnion(transitionBridged)
+    logHybridIngressTransition("native-union-rewrite", transitionBridged, nativeUnionRewritten)
+    val unionRewritten = MppReplicatedCartesianRule()(nativeUnionRewritten)
+    logHybridIngressTransition("replicated-cartesian-rewrite", nativeUnionRewritten, unionRewritten)
     if (!containsExactJvmStreamIngress(unionRewritten)) {
       return None
     }
@@ -614,6 +621,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case exchange: ShuffleExchangeLike if isExactJvmStreamIngress(exchange.child) =>
         exchange.withNewChildren(Seq(ProjectExecTransformer(exchange.child.output, exchange.child)))
     }
+    logHybridIngressTransition("exchange-input-anchor", unionRewritten, exchangeInputsAnchored)
     // A DataFrame created directly from a JVM-backed input can reach a V2 writer without any native
     // relational suffix. The exact R2C ingress is a local stream input, not a native fragment by
     // itself, so anchor this otherwise transparent plan with an identity native project.  This
@@ -625,6 +633,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       } else {
         exchangeInputsAnchored
       }
+    logHybridIngressTransition("native-fragment-anchor", exchangeInputsAnchored, nativeAnchored)
     tryCollapseNormalizedMpp(
       nativeAnchored,
       allowExistingRddIngress = true,
@@ -869,6 +878,31 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   private def containsExactJvmStreamIngress(plan: SparkPlan): Boolean =
     plan.find(isExactJvmStreamIngress).isDefined
 
+  private def logHybridIngressStage(stage: String, plan: SparkPlan): Boolean = {
+    val exactIngress = containsExactJvmStreamIngress(plan)
+    val objectGuardOutcomes = MppExistingRddStreamInput.objectIngressGuardOutcomes(plan)
+    val candidateText =
+      if (objectGuardOutcomes.isEmpty) "objectIngressCandidates=none"
+      else objectGuardOutcomes.mkString("objectIngressCandidates=[", " | ", "]")
+    val message =
+      s"MppCollapseRule: exact JVM stream ingress diagnostic: stage=$stage; " +
+        s"exactIngress=$exactIngress; $candidateText"
+    if (objectGuardOutcomes.nonEmpty && !exactIngress) logWarning(message) else logInfo(message)
+    exactIngress
+  }
+
+  private def logHybridIngressTransition(
+      stage: String,
+      before: SparkPlan,
+      after: SparkPlan): Unit = {
+    val beforeHasIngress = containsExactJvmStreamIngress(before)
+    val afterHasIngress = logHybridIngressStage(stage, after)
+    if (beforeHasIngress && !afterHasIngress) {
+      logWarning(
+        s"MppCollapseRule: exact JVM stream ingress LOST after hybrid normalization stage=$stage")
+    }
+  }
+
   private def isExactJvmStreamIngress(plan: SparkPlan): Boolean = plan match {
     case r2c: RowToColumnarExecBase => MppExistingRddStreamInput.rowInput(r2c).isDefined
     case r2c: RowToColumnarExec => MppExistingRddStreamInput.rowInput(r2c).isDefined
@@ -1084,6 +1118,37 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       .getOrElse("")
     s"${boundary.getClass.getSimpleName}: $direction execution boundary; " +
       s"$childText$fallbackText"
+  }
+
+  /** Describe the exact child-index path to a rejected nested execution boundary. */
+  private[extension] def describeAncestorPath(root: SparkPlan, boundary: SparkPlan): String = {
+    def loop(node: SparkPlan): Option[Seq[(SparkPlan, Option[Int])]] = {
+      if (node eq boundary) {
+        Some(Seq((node, None)))
+      } else {
+        node.children.zipWithIndex.iterator
+          .map {
+            case (child, index) =>
+              loop(child).map(path => (node, Some(index)) +: path)
+          }
+          .collectFirst { case Some(path) => path }
+      }
+    }
+
+    loop(root) match {
+      case Some(path) =>
+        path.zipWithIndex
+          .map {
+            case ((node, _), 0) => s"root=${node.getClass.getSimpleName}"
+            case ((node, _), index) =>
+              val childIndex = path(index - 1)._2.get
+              s"child[$childIndex]=${node.getClass.getSimpleName}"
+          }
+          .mkString(" -> ")
+      case None =>
+        s"boundary ${boundary.getClass.getSimpleName} is not reachable from " +
+          s"root ${root.getClass.getSimpleName}"
+    }
   }
 
   private def firstFallbackReason(plan: SparkPlan): Option[(SparkPlan, String)] = {
