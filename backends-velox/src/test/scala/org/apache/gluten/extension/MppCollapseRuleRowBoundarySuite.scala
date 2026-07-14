@@ -30,7 +30,7 @@ import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, A
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Partial, Sum}
 import org.apache.spark.sql.catalyst.expressions.objects.CreateExternalRow
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, RangePartitioning, UnknownPartitioning}
-import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, ColumnarToRowExec, DeserializeToObjectExec, ExternalRDDScanExec, FilterExec, GenerateExec, MapPartitionsExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SparkPlan, UnaryExecNode}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, ColumnarToRowExec, DeserializeToObjectExec, ExternalRDDScanExec, FilterExec, GenerateExec, InputAdapter, MapPartitionsExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.aggregate.{BaseAggregateExec, HashAggregateExec, SortAggregateExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{DoubleType, IntegerType, LongType, ObjectType, StringType, StructField, StructType}
@@ -490,6 +490,29 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
         .isDefined)
   }
 
+  test("ExistingRDD hybrid captures Spark's codegen InputAdapter object ingress") {
+    val objectAttr =
+      AttributeReference("obj", ObjectType(classOf[Row]), nullable = true)()
+    val external = ExternalRDDScanExec(objectAttr, mock(classOf[RDD[Row]]))
+    val encodedValue = If(IsNotNull(objectAttr), Literal(1), Literal(0))
+    val serializer =
+      SerializeFromObjectExec(Seq(Alias(encodedValue, "a")()), InputAdapter(external))
+    val ingress = RowToVeloxColumnarExec(serializer)
+    val nativeSuffix = ProjectExecTransformer(ingress.output, ingress)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assert(!rule.isFullyNativeSupported(nativeSuffix))
+    assert(rule.isSupportedExistingRddHybridPlan(nativeSuffix))
+    assert(MppExistingRddStreamInput.rowInput(ingress).contains(serializer))
+
+    val collapsed = rule(nativeSuffix)
+    assert(collapsed.isInstanceOf[MppNativeQueryExec])
+    assert(
+      collapsed
+        .find(node => MppExistingRddStreamInput.rowInput(node).contains(serializer))
+        .isDefined)
+  }
+
   test("ExistingRDD object ingress rejects non-direct and non-ExternalRDD serializers") {
     val objectAttr =
       AttributeReference("obj", ObjectType(classOf[Row]), nullable = true)()
@@ -507,6 +530,18 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val foreignAttr = AttributeReference("foreign", IntegerType, nullable = true)()
     val foreignReferencedSerializer =
       SerializeFromObjectExec(Seq(Alias(foreignAttr, "foreign")()), external)
+    val doubleInputAdapterSerializer =
+      SerializeFromObjectExec(Seq(Alias(Literal(1), "a")()), InputAdapter(InputAdapter(external)))
+    val adapterOverNestedSerializer =
+      SerializeFromObjectExec(Seq(Alias(Literal(1), "a")()), InputAdapter(nested))
+    val adapterOverRelationalSerializer =
+      SerializeFromObjectExec(Seq(Alias(Literal(1), "a")()), InputAdapter(relationalScan))
+    val columnarAdapterSerializer =
+      SerializeFromObjectExec(Seq(Alias(Literal(1), "a")()), ColumnarInputAdapter(external))
+    val adapterObjectSerializer =
+      SerializeFromObjectExec(Seq(Alias(objectAttr, "still_object")()), InputAdapter(external))
+    val adapterForeignReferencedSerializer =
+      SerializeFromObjectExec(Seq(Alias(foreignAttr, "foreign")()), InputAdapter(external))
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
     assert(MppExistingRddStreamInput.rowInput(directExternalIngress).isEmpty)
@@ -519,7 +554,14 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
       relationalSerializer,
       objectSerializer,
       nestedObjectSerializer,
-      foreignReferencedSerializer).foreach {
+      foreignReferencedSerializer,
+      doubleInputAdapterSerializer,
+      adapterOverNestedSerializer,
+      adapterOverRelationalSerializer,
+      columnarAdapterSerializer,
+      adapterObjectSerializer,
+      adapterForeignReferencedSerializer
+    ).foreach {
       serializer =>
         val ingress = RowToVeloxColumnarExec(serializer)
         assert(MppExistingRddStreamInput.rowInput(ingress).isEmpty)

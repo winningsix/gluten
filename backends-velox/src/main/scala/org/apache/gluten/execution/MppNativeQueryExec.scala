@@ -48,7 +48,7 @@ import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide
 import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ColumnarShuffleExchangeExec, ExecSubqueryExpression, ExternalRDDScanExec, FilterExec, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
+import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ColumnarShuffleExchangeExec, ExecSubqueryExpression, ExternalRDDScanExec, FilterExec, InputAdapter, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeExec, ShuffleExchangeLike}
@@ -130,8 +130,9 @@ private[execution] case class MppLocalStreamSlot(fragmentId: Int, slotIdx: Int)
  * An application that leaves Spark SQL through `Dataset.rdd` and later calls `toDF` produces an
  * [[RDDScanExec]] ("ExistingRDD") at the new query's leaf. The MPP runtime can feed that leaf into
  * an InputIterator slot. A typed Dataset materialized as `RDD[Row]` and registered as a view has a
- * second exact leaf shape: SerializeFromObjectExec directly over ExternalRDDScanExec. Capturing the
- * serializer itself preserves Spark's encoder semantics before columnarizing its relational rows.
+ * second exact leaf shape: SerializeFromObjectExec over ExternalRDDScanExec. Spark whole-stage
+ * codegen may insert exactly one row InputAdapter between those operators. Capturing the serializer
+ * itself preserves Spark's encoder semantics before columnarizing its relational rows.
  *
  * Do not treat an arbitrary row subtree as equivalent to either ingress. Keep this matcher
  * deliberately unary and transparent: conversion/adaptor nodes are accepted; C2R, Python,
@@ -144,7 +145,7 @@ private[gluten] object MppExistingRddStreamInput {
 
   def rowInput(plan: SparkPlan): Option[SparkPlan] = plan match {
     case existing: RDDScanExec if isBatchExistingRddScan(existing) => Some(existing)
-    case serializer: SerializeFromObjectExec if isDirectExternalObjectSerializer(serializer) =>
+    case serializer: SerializeFromObjectExec if isExternalObjectSerializerIngress(serializer) =>
       Some(serializer)
     case cia: ColumnarInputAdapter => rowInput(cia.child)
     case c2c: ColumnarToColumnarExec => rowInput(c2c.child)
@@ -157,16 +158,30 @@ private[gluten] object MppExistingRddStreamInput {
   def scan(plan: SparkPlan): Option[RDDScanExec] =
     rowInput(plan).collect { case existing: RDDScanExec => existing }
 
-  private def isDirectExternalObjectSerializer(serializer: SerializeFromObjectExec): Boolean = {
-    serializer.child match {
-      case external: ExternalRDDScanExec[_] =>
+  private def isExternalObjectSerializerIngress(serializer: SerializeFromObjectExec): Boolean = {
+    directExternalObjectScan(serializer.child).exists {
+      external =>
         external.output.size == 1 &&
         external.output.head.dataType.isInstanceOf[ObjectType] &&
         serializer.serializer.forall(_.references.subsetOf(external.outputSet)) &&
         serializer.output.forall(attr => !containsObjectType(attr.dataType))
-      case _ => false
     }
   }
+
+  private def directExternalObjectScan(plan: SparkPlan): Option[ExternalRDDScanExec[_]] =
+    plan match {
+      case external: ExternalRDDScanExec[_] => Some(external)
+      // Spark's CollapseCodegenStages inserts this row adapter at a whole-stage boundary. Accept only
+      // one direct adapter here; making InputAdapter generally transparent would admit arbitrary row
+      // subtrees as strict-MPP local streams. ColumnarInputAdapter is a separate Gluten convention
+      // adapter and is intentionally not accepted in this serializer-specific position.
+      case adapter: InputAdapter =>
+        adapter.child match {
+          case external: ExternalRDDScanExec[_] => Some(external)
+          case _ => None
+        }
+      case _ => None
+    }
 
   private def containsObjectType(dataType: DataType): Boolean = dataType match {
     case _: ObjectType => true
