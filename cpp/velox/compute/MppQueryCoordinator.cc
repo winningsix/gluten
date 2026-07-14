@@ -84,6 +84,19 @@ namespace {
 /// for data that's already enqueued under a different key.
 constexpr const char* kTaskIdPrefix = "gpu-local-";
 
+/// Bound each CPU root-output fetch well below Velox's output-buffer limit.
+///
+/// OutputBuffer::getData() implicitly acknowledges the previous sequence, but
+/// MppQueryCoordinator::next() returns only one page to Spark at a time.  An
+/// unbounded fetch can therefore move an entire 1 GiB output buffer (roughly a
+/// thousand pages for wide rows) into pendingRootPages_.  The producer then
+/// refills to the buffer limit while Spark drains that oversized local backlog,
+/// leaving both sides in prolonged backpressure with no acknowledgement
+/// cadence.  Keep the local backlog small enough that getData() advances and
+/// releases producer memory regularly.  A single oversized page is still
+/// returned by Velox, so this is a batching limit rather than a row-size limit.
+constexpr uint64_t kRootOutputFetchMaxBytes = 64ULL << 20;
+
 int envIntOrDefault(const char* name, int defaultValue) {
   const char* value = std::getenv(name);
   if (value == nullptr || value[0] == '\0') {
@@ -1474,7 +1487,6 @@ bool MppQueryCoordinator::fetchNextOutputPage(std::vector<std::unique_ptr<Serial
   nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"coordinator::fetchNextOutputPage"};
   const auto rootReplicas = fragmentReplicaCount_[rootFragmentId_];
   constexpr int32_t kDestination = 0; // each root Task gathers to dest 0
-  constexpr uint64_t kMaxBytes = std::numeric_limits<uint64_t>::max();
 
   if (rootOutputSequence_.empty()) {
     rootOutputSequence_.assign(rootReplicas, 0);
@@ -1542,7 +1554,7 @@ bool MppQueryCoordinator::fetchNextOutputPage(std::vector<std::unique_ptr<Serial
     auto ok = bufferManager_->getData(
         rootTaskId,
         kDestination,
-        kMaxBytes,
+        kRootOutputFetchMaxBytes,
         requestedSeq,
         [state, idx, qid = queryId_](
             std::vector<std::unique_ptr<folly::IOBuf>> gotPages,
@@ -1891,7 +1903,7 @@ RowVectorPtr MppQueryCoordinator::next() {
   while (!noMoreData_) {
     while (!pendingRootPages_.empty()) {
       auto page = std::move(pendingRootPages_.front());
-      pendingRootPages_.erase(pendingRootPages_.begin());
+      pendingRootPages_.pop_front();
       if (!page) {
         continue;
       }
