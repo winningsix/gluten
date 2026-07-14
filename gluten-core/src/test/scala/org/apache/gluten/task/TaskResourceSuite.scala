@@ -25,6 +25,7 @@ import org.apache.spark.util.SparkTaskUtil
 import org.scalatest.funsuite.AnyFunSuite
 
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 
 class TaskResourceSuite extends AnyFunSuite with SQLHelper {
   test("Run unsafe") {
@@ -82,5 +83,41 @@ class TaskResourceSuite extends AnyFunSuite with SQLHelper {
         })
     }
     assert(unregisteredCount == 2)
+  }
+
+  test("Bind an active task context to a callback thread") {
+    var released = 0
+    TaskResources.runUnsafe {
+      val owner = TaskResources.getLocalTaskContext()
+      val failure = new AtomicReference[Throwable]()
+      val callback = new Thread(
+        () => {
+          try {
+            assert(!TaskResources.inSparkTask())
+            TaskResources.runWithTaskContext(owner) {
+              assert(TaskResources.getLocalTaskContext() eq owner)
+              TaskResources.addResource(
+                "callback-resource",
+                new TaskResource {
+                  override def release(): Unit = released += 1
+
+                  override def resourceName(): String = "callback resource"
+                })
+            }
+            assert(!TaskResources.inSparkTask())
+          } catch {
+            case t: Throwable => failure.set(t)
+          }
+        },
+        "task-context-callback-test"
+      )
+      callback.start()
+      callback.join()
+      if (failure.get() != null) {
+        throw failure.get()
+      }
+      assert(released == 0)
+    }
+    assert(released == 1)
   }
 }

@@ -28,6 +28,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.task.TaskResources
 import org.apache.spark.util.{Namespace, SparkDirectoryUtil}
 
 import org.apache.commons.io.FileUtils
@@ -257,7 +258,10 @@ class MppNativeQueryRDD(
         jvmStreamSlotIndicesPerFrag(consumerId) = sortedBySlot.map(_._1).toArray
         jvmStreamIteratorsPerFrag(consumerId) = sortedBySlot.map {
           case (_, iterator) =>
-            new ColumnarBatchInIterator(BackendsApiManager.getBackendName, iterator): Object
+            MppNativeQueryRDD.createTaskContextAwareInputIterator(
+              BackendsApiManager.getBackendName,
+              iterator,
+              context): Object
         }.toArray
         logInfo(
           s"MppNativeQueryRDD: fragment $consumerId has ${sortedBySlot.size} JVM stream(s) " +
@@ -667,6 +671,30 @@ final private[execution] class MppSpillRootLease(val root: File, deleteRoot: Fil
 }
 
 private[execution] object MppNativeQueryRDD extends Logging {
+
+  /**
+   * Native MPP drivers pull JVM stream inputs from native worker threads, outside Spark's task
+   * thread. Bind the owning task context around the complete bridge call so both the delegated
+   * iterator and ColumnarBatch handle conversion use the task's live resource registry.
+   */
+  private[execution] def createTaskContextAwareInputIterator(
+      backendName: String,
+      delegated: JIterator[ColumnarBatch],
+      taskContext: TaskContext): ColumnarBatchInIterator = {
+    new ColumnarBatchInIterator(backendName, delegated) {
+      override def hasNext(): Boolean = {
+        TaskResources.runWithTaskContext(taskContext) {
+          super.hasNext()
+        }
+      }
+
+      override def next(): Long = {
+        TaskResources.runWithTaskContext(taskContext) {
+          super.next()
+        }
+      }
+    }
+  }
 
   private[execution] def rethrowAfterCleanup(
       primaryFailure: Throwable,
