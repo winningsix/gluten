@@ -23,7 +23,7 @@ import org.apache.spark.task.{TaskResource, TaskResources}
 import org.scalatest.funsuite.AnyFunSuite
 
 import java.util.{Iterator => JIterator}
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 class MppNativeQueryRDDTaskContextSuite extends AnyFunSuite with SQLHelper {
 
@@ -105,5 +105,74 @@ class MppNativeQueryRDDTaskContextSuite extends AnyFunSuite with SQLHelper {
       ownerThread.setContextClassLoader(originalOwnerContextClassLoader)
     }
     assert(released == 1)
+  }
+
+  test("MPP input bridge rejects a null owner thread context classloader") {
+    val ownerThread = Thread.currentThread()
+    val originalOwnerContextClassLoader = ownerThread.getContextClassLoader
+    val delegatedUsed = new AtomicBoolean(false)
+    val delegated = new JIterator[ColumnarBatch] {
+      override def hasNext: Boolean = {
+        delegatedUsed.set(true)
+        false
+      }
+
+      override def next(): ColumnarBatch = {
+        delegatedUsed.set(true)
+        throw new IllegalStateException("delegated iterator must not be used")
+      }
+    }
+    TaskResources.runUnsafe {
+      val owner = TaskResources.getLocalTaskContext()
+      ownerThread.setContextClassLoader(null)
+      try {
+        val error = intercept[IllegalArgumentException] {
+          MppNativeQueryRDD.createTaskContextAwareInputIterator("velox", delegated, owner)
+        }
+        assert(
+          error.getMessage.contains(
+            "MPP input callback bridge requires a non-null owner thread context classloader"))
+        assert(!delegatedUsed.get())
+      } finally {
+        ownerThread.setContextClassLoader(originalOwnerContextClassLoader)
+      }
+    }
+    assert(ownerThread.getContextClassLoader eq originalOwnerContextClassLoader)
+  }
+
+  test("MPP input bridge binds the owner classloader when the task context is already bound") {
+    val ownerThread = Thread.currentThread()
+    val originalOwnerContextClassLoader = ownerThread.getContextClassLoader
+    val ownerContextClassLoader = new ClassLoader(originalOwnerContextClassLoader) {}
+    val hostileContextClassLoader = new ClassLoader(null) {}
+    ownerThread.setContextClassLoader(ownerContextClassLoader)
+    try {
+      TaskResources.runUnsafe {
+        val owner = TaskResources.getLocalTaskContext()
+        val delegated = new JIterator[ColumnarBatch] {
+          override def hasNext: Boolean = {
+            assert(TaskResources.getLocalTaskContext() eq owner)
+            assert(Thread.currentThread().getContextClassLoader eq ownerContextClassLoader)
+            false
+          }
+
+          override def next(): ColumnarBatch = throw new NoSuchElementException
+        }
+        val bridge =
+          MppNativeQueryRDD.createTaskContextAwareInputIterator("velox", delegated, owner)
+        ownerThread.setContextClassLoader(hostileContextClassLoader)
+        try {
+          assert(TaskResources.getLocalTaskContext() eq owner)
+          assert(!bridge.hasNext())
+          assert(TaskResources.getLocalTaskContext() eq owner)
+          assert(ownerThread.getContextClassLoader eq hostileContextClassLoader)
+        } finally {
+          ownerThread.setContextClassLoader(ownerContextClassLoader)
+        }
+      }
+    } finally {
+      ownerThread.setContextClassLoader(originalOwnerContextClassLoader)
+    }
+    assert(ownerThread.getContextClassLoader eq originalOwnerContextClassLoader)
   }
 }

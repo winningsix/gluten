@@ -683,6 +683,9 @@ private[execution] object MppNativeQueryRDD extends Logging {
       delegated: JIterator[ColumnarBatch],
       taskContext: TaskContext): ColumnarBatchInIterator = {
     val ownerContextClassLoader = Thread.currentThread().getContextClassLoader
+    require(
+      ownerContextClassLoader != null,
+      "MPP input callback bridge requires a non-null owner thread context classloader")
     new ColumnarBatchInIterator(backendName, delegated) {
       private def runWithOwnerThreadContext[T](body: => T): T = {
         val callbackThread = Thread.currentThread()
