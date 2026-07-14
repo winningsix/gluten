@@ -169,7 +169,8 @@ abstract class BatchScanExecTransformerBase(
   override def metricsUpdater(): MetricsUpdater =
     BackendsApiManager.getMetricsApiInstance.genBatchScanTransformerMetricsUpdater(metrics)
 
-  @transient protected lazy val finalPartitions: Seq[Partition] =
+  /** Build the Spark-side scan partitions before a source-specific transformer refines them. */
+  protected def planFinalPartitions(): Seq[Partition] =
     SparkShimLoader.getSparkShims
       .orderPartitions(
         this,
@@ -184,6 +185,8 @@ abstract class BatchScanExecTransformerBase(
       .map {
         case (inputPartitions, index) => new SparkDataSourceRDDPartition(index, inputPartitions)
       }
+
+  @transient protected lazy val finalPartitions: Seq[Partition] = planFinalPartitions()
 
   @transient override lazy val fileFormat: ReadFileFormat =
     BackendsApiManager.getSettings.getSubstraitReadFileFormatV2(scan)

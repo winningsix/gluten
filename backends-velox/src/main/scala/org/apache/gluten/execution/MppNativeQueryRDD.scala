@@ -268,8 +268,8 @@ class MppNativeQueryRDD(
     // only after all JVM-side validation and stream materialization has succeeded. The lease keeps
     // ownership until nativeCreateMppQuery returns; a native parse/plan-conversion failure therefore
     // deletes the root instead of leaking it for the lifetime of the executor.
-    val spillRootLease = MppNativeQueryRDD.createSpillRootLease(
-      SparkDirectoryUtil.get().namespace("gluten-spill"))
+    val spillRootLease =
+      MppNativeQueryRDD.createSpillRootLease(SparkDirectoryUtil.get().namespace("gluten-spill"))
     val mppHandle = spillRootLease.handoffAfterCreate {
       spillRootPath =>
         jniWrapper.nativeCreateMppQuery(
@@ -361,7 +361,8 @@ class MppNativeQueryRDD(
             activeQuery.foreach(
               query => GlutenMppExecutorService.reportFailure(query, listenerFailure)),
           () => closeMppHandle(),
-          () => reportTerminal(MppPeerState.Failed))
+          () => reportTerminal(MppPeerState.Failed)
+        )
     }
 
     val tCreateDoneStartBegin = System.nanoTime()
@@ -640,9 +641,7 @@ private[gluten] case class MppPeerInfo(
  * the lease in both cases: before handoff that recursively deletes the root, while after handoff it
  * is an idempotent no-op because native MppQueryCoordinator owns cleanup.
  */
-private[execution] final class MppSpillRootLease(
-    val root: File,
-    deleteRoot: File => Unit)
+final private[execution] class MppSpillRootLease(val root: File, deleteRoot: File => Unit)
   extends AutoCloseable {
   private val ownsRoot = new AtomicBoolean(true)
 

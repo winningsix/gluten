@@ -67,7 +67,7 @@ case class IcebergScanTransformer(
   private val numSplits = SQLMetrics.createMetric(sparkContext, new NumSplits().description())
 
   @transient override protected lazy val finalPartitions: Seq[Partition] = {
-    coalesceIcebergInputPartitions(super.finalPartitions)
+    coalesceIcebergInputPartitions(planFinalPartitions())
   }
 
   private def coalesceIcebergInputPartitions(planned: Seq[Partition]): Seq[Partition] = {
@@ -81,9 +81,7 @@ case class IcebergScanTransformer(
       .getConfString("spark.gluten.mpp.enabled", "false")
       .equalsIgnoreCase("true")
     val singleTaskMode = !conf
-      .getConfString(
-        "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode",
-        "false")
+      .getConfString("spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode", "false")
       .equalsIgnoreCase("false")
     val targetBytes = conf.filesMaxPartitionBytes
     val openCostInBytes = conf.filesOpenCostInBytes

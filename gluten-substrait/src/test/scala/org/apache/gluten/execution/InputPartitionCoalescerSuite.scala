@@ -78,7 +78,8 @@ class InputPartitionCoalescerSuite extends AnyFunSuite {
       Vector(MockInputPartition(0, 10, fileFormat = "PARQUET")),
       Vector(MockInputPartition(1, 10, fileFormat = "PARQUET")),
       Vector(MockInputPartition(2, 10, fileFormat = "ORC")),
-      Vector(MockInputPartition(3, 10, fileFormat = "ORC")))
+      Vector(MockInputPartition(3, 10, fileFormat = "ORC"))
+    )
 
     val result = coalesce(input)()
 
@@ -110,22 +111,21 @@ class InputPartitionCoalescerSuite extends AnyFunSuite {
       case _ => None
     }
 
-    assert(result === Seq(
-      Seq(knownBefore),
-      Seq(unknown),
-      Seq(exceptional),
-      empty,
-      Seq(knownAfter1, knownAfter2)))
+    assert(
+      result === Seq(
+        Seq(knownBefore),
+        Seq(unknown),
+        Seq(exceptional),
+        empty,
+        Seq(knownAfter1, knownAfter2)))
   }
 
   test("does not overflow group or bin cost arithmetic") {
     val small = MockInputPartition(0, 1)
     val max = MockInputPartition(1, Long.MaxValue)
     val overflow = MockInputPartition(2, 1)
-    val input: Seq[Seq[InputPartition]] = Vector(
-      Vector(small),
-      Vector(max, overflow),
-      Vector(small.copy(id = 3)))
+    val input: Seq[Seq[InputPartition]] =
+      Vector(Vector(small), Vector(max, overflow), Vector(small.copy(id = 3)))
 
     assert(coalesce(input, targetBytes = Long.MaxValue)() eq input)
 
@@ -163,7 +163,8 @@ class InputPartitionCoalescerSuite extends AnyFunSuite {
       hasKeyGroupedPartitioning,
       hasCommonPartitionValues,
       applyPartialClustering,
-      replicatePartitions)(partitionInfo)
+      replicatePartitions
+    )(partitionInfo)
   }
 
   private case class MockInputPartition(

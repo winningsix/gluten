@@ -140,8 +140,7 @@ object GlutenIcebergSourceUtil {
     val metadata = collectPartitionMetadata(partition, readPartitionSchema)
     metadata.splits.foreach {
       split =>
-        paths.add(
-          BackendsApiManager.getTransformerApiInstance.encodeFilePathIfNeed(split.path))
+        paths.add(BackendsApiManager.getTransformerApiInstance.encodeFilePathIfNeed(split.path))
         starts.add(split.start)
         lengths.add(split.length)
         partitionColumns.add(split.partitionColumns)

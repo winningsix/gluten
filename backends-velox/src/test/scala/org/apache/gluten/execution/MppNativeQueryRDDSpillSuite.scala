@@ -129,7 +129,8 @@ class MppNativeQueryRDDSpillSuite extends AnyFunSuite {
         () => {
           cleanupOrder += "terminal-report"
           throw terminalReportError
-        })
+        }
+      )
     }
 
     assert(thrown eq primaryFailure)

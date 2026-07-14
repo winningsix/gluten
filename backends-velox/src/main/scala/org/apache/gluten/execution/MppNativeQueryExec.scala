@@ -3355,12 +3355,11 @@ case class MppNativeQueryExec(
           s"MPP RANGE exchange ${spec.id} computed ${bounds.effectivePartitions} effective " +
             s"partitions for ${spec.numPartitions} requested partitions"
         )
-        logInfo(
-          s"MppNativeQueryExec: RANGE exchange ${spec.id} " +
-            (if (reused) "reused" else "computed") + " " +
-            s"${bounds.boundaryCount} Spark-compatible boundaries from bounded samples " +
-            s"(${bounds.effectivePartitions}/${spec.numPartitions} effective/requested partitions, " +
-            s"execution=${rangeBoundsCache.queryExecutionId})")
+        logInfo(s"MppNativeQueryExec: RANGE exchange ${spec.id} " +
+          (if (reused) "reused" else "computed") + " " +
+          s"${bounds.boundaryCount} Spark-compatible boundaries from bounded samples " +
+          s"(${bounds.effectivePartitions}/${spec.numPartitions} effective/requested partitions, " +
+          s"execution=${rangeBoundsCache.queryExecutionId})")
         spec.copy(
           rangeBoundsJson = Some(bounds.json),
           rangeEffectivePartitions = Some(bounds.effectivePartitions))

@@ -108,8 +108,7 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
     val projection = UnsafeProjection.create(Seq(key), Seq(key))
     val values = Seq("a", "medium-key", "x" * 200, "bb", "y" * 80, "tail")
     val rows = values.map {
-      value =>
-        projection(new GenericInternalRow(Array[Any](UTF8String.fromString(value)))).copy()
+      value => projection(new GenericInternalRow(Array[Any](UTF8String.fromString(value)))).copy()
     }
     val seed = 137L
     val referenceRandom = new java.util.Random(seed)
@@ -178,7 +177,8 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
       MppRangeBoundsGenerator.PartitionSketch(
         count = 200L,
         samples = light,
-        serializedKeyBytes = light.map(_.getSizeInBytes.toLong).sum))
+        serializedKeyBytes = light.map(_.getSizeInBytes.toLong).sum)
+    )
     implicit val ordering: Ordering[InternalRow] = Ordering.by(_.getInt(0))
 
     val bounds = MppRangeBoundsGenerator.determineBounds(

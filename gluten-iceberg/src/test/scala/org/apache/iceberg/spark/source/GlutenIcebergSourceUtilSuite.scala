@@ -54,9 +54,8 @@ class GlutenIcebergSourceUtilSuite extends AnyFunSuite {
     val metadata =
       GlutenIcebergSourceUtil.collectPartitionMetadata(wrapper, readPartitionSchema)
 
-    assert(metadata.splits.map(_.path) === Seq(
-      "file:/tmp/data-a.parquet",
-      "file:/tmp/data-b.parquet"))
+    assert(
+      metadata.splits.map(_.path) === Seq("file:/tmp/data-a.parquet", "file:/tmp/data-b.parquet"))
     assert(metadata.splits.map(_.start) === Seq(0L, 0L))
     assert(metadata.splits.map(_.length) === Seq(101L, 202L))
     assert(metadata.splits.map(_.partitionColumns.get("p")) === Seq("a", "b"))
@@ -66,10 +65,12 @@ class GlutenIcebergSourceUtilSuite extends AnyFunSuite {
         "file:/tmp/delete-b.parquet"))
     assert(metadata.preferredLocations === Seq("host-a", "host-shared", "host-b"))
 
-    assert(GlutenIcebergSourceUtil.inputPartitionPlanningInfo(inputA, 7) ===
-      Some((116L, FileFormat.PARQUET.toString)))
-    assert(GlutenIcebergSourceUtil.inputPartitionPlanningInfo(inputB, 7) ===
-      Some((217L, FileFormat.PARQUET.toString)))
+    assert(
+      GlutenIcebergSourceUtil.inputPartitionPlanningInfo(inputA, 7) ===
+        Some((116L, FileFormat.PARQUET.toString)))
+    assert(
+      GlutenIcebergSourceUtil.inputPartitionPlanningInfo(inputB, 7) ===
+        Some((217L, FileFormat.PARQUET.toString)))
   }
 
   private def fileScanTask(

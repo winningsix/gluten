@@ -36,15 +36,15 @@ import scala.util.control.NonFatal
 /**
  * Computes Spark-compatible range bounds for an MPP exchange.
  *
- * Each successful sampling task scans its input partition once and retains a deterministic,
- * bounded priority sample. Only those samples and the final unique boundaries are materialized on
- * the driver. This preserves Spark's range ordering and boundary selection semantics without an
+ * Each successful sampling task scans its input partition once and retains a deterministic, bounded
+ * priority sample. Only those samples and the final unique boundaries are materialized on the
+ * driver. This preserves Spark's range ordering and boundary selection semantics without an
  * optional second pass over imbalanced input partitions.
  *
- * The bounded row and byte shares are currently assigned statically per input partition and are
- * not transferable from empty partitions. A sparse layout therefore fails closed when it cannot
- * supply at least one candidate per requested RANGE peer. A future mergeable global reservoir can
- * make those unused shares transferable without another producer scan.
+ * The bounded row and byte shares are currently assigned statically per input partition and are not
+ * transferable from empty partitions. A sparse layout therefore fails closed when it cannot supply
+ * at least one candidate per requested RANGE peer. A future mergeable global reservoir can make
+ * those unused shares transferable without another producer scan.
  */
 object MppRangeBoundsGenerator {
 
@@ -67,7 +67,7 @@ object MppRangeBoundsGenerator {
 
   private case class PrioritizedRow(priority: Long, row: UnsafeRow, serializedKeyBytes: Long)
 
-  private implicit val PrioritizedRowOrdering: Ordering[PrioritizedRow] =
+  implicit private val PrioritizedRowOrdering: Ordering[PrioritizedRow] =
     Ordering.by[PrioritizedRow, Long](_.priority)
 
   case class Result(json: String, boundaryCount: Int) {
@@ -214,29 +214,32 @@ object MppRangeBoundsGenerator {
       samplePointsPerPartitionHint,
       maxSampleRows,
       maxSampleBytes,
-      input.mapPartitionsWithIndex {
-        case (partitionId, batches) =>
-          val projection = UnsafeProjection.create(ordering.map(_.child), outputAttributes)
-          val projectedRows = batches.flatMap {
-            batch =>
-              ExecUtil
-                .convertColumnarToRow(batch)
-                .map(row => projection(row).asInstanceOf[UnsafeRow])
-          }
-          val limits = partitionLimits(
-            partitionId,
-            inputPartitions,
-            requestedPartitions,
-            samplePointsPerPartitionHint,
-            maxSampleRows,
-            maxSampleBytes)
-          Iterator.single(
-            sketchPartition(
-              projectedRows,
-              limits._1,
-              limits._2,
-              sampleSeed(inputRddId, partitionId)))
-      }.collect())
+      input
+        .mapPartitionsWithIndex {
+          case (partitionId, batches) =>
+            val projection = UnsafeProjection.create(ordering.map(_.child), outputAttributes)
+            val projectedRows = batches.flatMap {
+              batch =>
+                ExecUtil
+                  .convertColumnarToRow(batch)
+                  .map(row => projection(row).asInstanceOf[UnsafeRow])
+            }
+            val limits = partitionLimits(
+              partitionId,
+              inputPartitions,
+              requestedPartitions,
+              samplePointsPerPartitionHint,
+              maxSampleRows,
+              maxSampleBytes)
+            Iterator.single(
+              sketchPartition(
+                projectedRows,
+                limits._1,
+                limits._2,
+                sampleSeed(inputRddId, partitionId)))
+        }
+        .collect()
+    )
     Result(encode(ordering, bounds), bounds.length)
   }
 
@@ -262,15 +265,13 @@ object MppRangeBoundsGenerator {
       sketches.length == inputPartitions,
       s"MPP RANGE sampling returned ${sketches.length} sketches for $inputPartitions inputs")
 
-    val retainedRows = sketches.foldLeft(0L)((sum, sketch) => Math.addExact(sum, sketch.samples.length))
+    val retainedRows =
+      sketches.foldLeft(0L)((sum, sketch) => Math.addExact(sum, sketch.samples.length))
     val retainedBytes = sketches.foldLeft(0L) {
       case (sum, sketch) => Math.addExact(sum, sketch.serializedKeyBytes)
     }
-    val targetRows = globalSampleRowLimit(
-      inputPartitions,
-      partitions,
-      samplePointsPerPartitionHint,
-      maxSampleRows)
+    val targetRows =
+      globalSampleRowLimit(inputPartitions, partitions, samplePointsPerPartitionHint, maxSampleRows)
     require(
       retainedRows <= targetRows,
       s"MPP RANGE retained $retainedRows sample rows, exceeding the $targetRows-row limit")
@@ -296,7 +297,8 @@ object MppRangeBoundsGenerator {
       s"MPP RANGE found $numItems input rows but only $retainedRows bounded samples for " +
         s"$partitions requested partitions; sparse input partitions cannot transfer unused " +
         s"sample budget yet. Increase $MaxSampleRowsKey/$MaxSampleBytesKey or implement a " +
-        "mergeable global reservoir")
+        "mergeable global reservoir"
+    )
 
     val candidates = ArrayBuffer.empty[(InternalRow, Float)]
     sketches.foreach {
@@ -343,7 +345,8 @@ object MppRangeBoundsGenerator {
             admittedBytes <= maxSerializedKeyBytes,
             s"MPP RANGE selected reservoir keys require $admittedBytes serialized bytes, " +
               s"exceeding the $maxSerializedKeyBytes-byte partition budget; increase " +
-              s"$MaxSampleBytesKey")
+              s"$MaxSampleBytesKey"
+          )
           // UnsafeProjection reuses its output row. Copy only selected keys instead of allocating
           // one UnsafeRow for every producer row scanned.
           retained.enqueue(PrioritizedRow(priority, row.copy(), rowBytes))
@@ -357,14 +360,18 @@ object MppRangeBoundsGenerator {
             replacementBytes <= maxSerializedKeyBytes,
             s"MPP RANGE selected reservoir keys require $replacementBytes serialized bytes, " +
               s"exceeding the $maxSerializedKeyBytes-byte partition budget; increase " +
-              s"$MaxSampleBytesKey")
+              s"$MaxSampleBytesKey"
+          )
           retained.dequeue()
           retained.enqueue(PrioritizedRow(priority, row.copy(), rowBytes))
           serializedKeyBytes = replacementBytes
         }
     }
 
-    PartitionSketch(count, retained.dequeueAll.reverseIterator.map(_.row).toArray, serializedKeyBytes)
+    val selected = retained.dequeueAll.reverseIterator.map {
+      entry: PrioritizedRow => entry.row
+    }.toArray
+    PartitionSketch(count, selected, serializedKeyBytes)
   }
 
   private def partitionLimits(
@@ -396,8 +403,12 @@ object MppRangeBoundsGenerator {
       samplePointsPerPartitionHint: Int,
       maxSampleRows: Int,
       maxSampleBytes: Long): Unit = {
-    require(inputPartitions > 0, s"MPP RANGE input partition count must be positive: $inputPartitions")
-    require(requestedPartitions > 0, s"MPP RANGE partition count must be positive: $requestedPartitions")
+    require(
+      inputPartitions > 0,
+      s"MPP RANGE input partition count must be positive: $inputPartitions")
+    require(
+      requestedPartitions > 0,
+      s"MPP RANGE partition count must be positive: $requestedPartitions")
     require(
       samplePointsPerPartitionHint > 0,
       s"MPP RANGE sample-points hint must be positive: $samplePointsPerPartitionHint")
@@ -406,11 +417,13 @@ object MppRangeBoundsGenerator {
     require(
       inputPartitions <= maxSampleRows,
       s"MPP RANGE has $inputPartitions input partitions but $MaxSampleRowsKey=$maxSampleRows; " +
-        "at least one bounded sample slot per input partition is required")
+        "at least one bounded sample slot per input partition is required"
+    )
     require(
       maxSampleBytes / inputPartitions > 0L,
       s"MPP RANGE has $inputPartitions input partitions but $MaxSampleBytesKey=$maxSampleBytes; " +
-        "the bounded byte budget cannot represent one key per input partition")
+        "the bounded byte budget cannot represent one key per input partition"
+    )
   }
 
   private def globalSampleRowLimit(
@@ -421,9 +434,11 @@ object MppRangeBoundsGenerator {
     val sparkTarget = math.min(
       Math.multiplyExact(samplePointsPerPartitionHint.toLong, requestedPartitions.toLong),
       1000000L)
-    math.min(
-      maxSampleRows.toLong,
-      math.max(inputPartitions.toLong, Math.multiplyExact(3L, sparkTarget))).toInt
+    math
+      .min(
+        maxSampleRows.toLong,
+        math.max(inputPartitions.toLong, Math.multiplyExact(3L, sparkTarget)))
+      .toInt
   }
 
   private def fairShare(total: Long, partitionId: Int, partitions: Int): Long = {
@@ -467,7 +482,8 @@ object MppRangeBoundsGenerator {
           order.nullOrdering match {
             case NullsFirst => true
             case NullsLast => false
-          })
+          }
+        )
     }
   }
 

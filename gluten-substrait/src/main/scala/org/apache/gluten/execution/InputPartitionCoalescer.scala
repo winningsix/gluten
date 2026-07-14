@@ -98,11 +98,12 @@ private[execution] object InputPartitionCoalescer {
     var mergeKey: Option[String] = None
     group.foreach {
       partition =>
-        val info = try {
-          partitionInfo(partition)
-        } catch {
-          case NonFatal(_) => None
-        }
+        val info =
+          try {
+            partitionInfo(partition)
+          } catch {
+            case NonFatal(_) => None
+          }
         info match {
           case Some((value, key))
               if key != null && value >= 0 && value <= Long.MaxValue - total &&
