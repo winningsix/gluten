@@ -16,12 +16,13 @@
  */
 package org.apache.gluten.extension
 
+import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.backendsapi.velox.VeloxBatchType
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution._
 import org.apache.gluten.extension.columnar.{FallbackTags, UnionTransformerRule}
 import org.apache.gluten.extension.columnar.offload.OffloadOthers.ARROW_SCALAR_NORMALIZATION_REJECTION_TAG
-import org.apache.gluten.extension.columnar.rewrite.PullOutPreProject
+import org.apache.gluten.extension.columnar.rewrite.{PullOutPostProject, PullOutPreProject}
 import org.apache.gluten.extension.columnar.transition.InsertTransitions
 
 import org.apache.spark.api.python.ColumnarArrowEvalPythonExec
@@ -29,7 +30,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, PlanExpression, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExecBase, ColumnarToRowExec, CommandResultExec, DeserializeToObjectExec, FilterExec, ProjectExec, RowToColumnarExec, ScalarSubquery, SortExec, SparkPlan}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExecBase, ColumnarToRowExec, CommandResultExec, DeserializeToObjectExec, FilterExec, GenerateExec, ProjectExec, RowToColumnarExec, ScalarSubquery, SortExec, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.command.{DataWritingCommandExec, ExecutedCommandExec}
@@ -540,15 +541,48 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       preserveExistingRddIngress: Boolean): SparkPlan =
     plan.transformUp {
       case r2c: RowToColumnarExecBase if isRecoverableRowOperator(r2c.child) =>
-        normalizeMppNativeOperators(r2c, preserveExistingRddIngress)
+        normalizeMppNativeOperators(
+          r2c,
+          preserveExistingRddIngress,
+          recoverGenerate = isRecoverableGenerateRowIsland(r2c.child))
       case r2c: RowToColumnarExec if isRecoverableRowOperator(r2c.child) =>
-        normalizeMppNativeOperators(r2c, preserveExistingRddIngress)
+        normalizeMppNativeOperators(
+          r2c,
+          preserveExistingRddIngress,
+          recoverGenerate = isRecoverableGenerateRowIsland(r2c.child))
     }
 
   private def isRecoverableRowOperator(plan: SparkPlan): Boolean = plan match {
     case _: BaseAggregateExec => true
     case sort: SortExec if !sort.global => true
     case _: ProjectExec | _: FilterExec => true
+    case _ => false
+  }
+
+  /**
+   * Recognize the exact closed row island left when Generate's computed input fails the ordinary
+   * heuristic offload as a unit:
+   *
+   * R2C -> (Project/Filter)* -> Generate -> C2R -> native child
+   *
+   * The enclosing R2C is matched by [[repairRecoverableRowShells]]. Requiring a supported
+   * generator, direct schema-identical C2R, and a columnar child keeps this repair distinct from an
+   * arbitrary nested row consumer. The latter must continue to fail strict MPP validation.
+   */
+  private def isRecoverableGenerateRowIsland(plan: SparkPlan): Boolean = plan match {
+    case project: ProjectExec => isRecoverableGenerateRowIsland(project.child)
+    case filter: FilterExec => isRecoverableGenerateRowIsland(filter.child)
+    case generate: GenerateExec if GenerateExecTransformer.supportsGenerate(generate.generator) =>
+      generate.child match {
+        case c2r: ColumnarToRowExecBase if c2r.children.size == 1 =>
+          val nativeChild = c2r.children.head
+          nativeChild.supportsColumnar &&
+          MppCollapseRule.sameOutput(c2r.output, nativeChild.output)
+        case c2r: ColumnarToRowExec =>
+          c2r.child.supportsColumnar &&
+          MppCollapseRule.sameOutput(c2r.output, c2r.child.output)
+        case _ => false
+      }
     case _ => false
   }
 
@@ -676,11 +710,12 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   }
 
   private[extension] def normalizeMppNativeOperators(plan: SparkPlan): SparkPlan =
-    normalizeMppNativeOperators(plan, preserveExistingRddIngress = false)
+    normalizeMppNativeOperators(plan, preserveExistingRddIngress = false, recoverGenerate = false)
 
   private def normalizeMppNativeOperators(
       plan: SparkPlan,
-      preserveExistingRddIngress: Boolean): SparkPlan = {
+      preserveExistingRddIngress: Boolean,
+      recoverGenerate: Boolean = false): SparkPlan = {
     // Spark may insert RowToColumnar(ColumnarToRow(nativeChild)) solely to reconcile the
     // convention expected by an exchange or V2 writer. MPP absorbs that boundary, so eliminate
     // the adjacent inverse transitions before validating/extracting fragments. This preserves the
@@ -706,13 +741,17 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     val preProjected = coalesceElided.transformUp {
       case agg: BaseAggregateExec => PullOutPreProject.rewrite(agg)
       case sort: SortExec if !sort.global => PullOutPreProject.rewrite(sort)
+      case generate: GenerateExec if recoverGenerate => PullOutPreProject.rewrite(generate)
+    }
+    val postProjected = preProjected.transformUp {
+      case generate: GenerateExec if recoverGenerate => PullOutPostProject.rewrite(generate)
     }
     // RAS may leave a vanilla Spark aggregate behind when its generic
     // profitability/validation pass declines a very wide aggregate. MPP has a
     // stricter end-to-end contract and validates the generated native/cuDF plan
     // later, so materialize the native aggregate transformer here instead of
     // accepting a row/BSP island.
-    val aggregateRewritten = preProjected.transformUp {
+    val aggregateRewritten = postProjected.transformUp {
       case agg: BaseAggregateExec if !agg.isInstanceOf[HashAggregateExecBaseTransformer] =>
         HashAggregateExecBaseTransformer.from(agg)
     }
@@ -721,6 +760,14 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case filter: FilterExec => FilterExecTransformer(filter.condition, filter.child)
       case sort: SortExec if !sort.global =>
         SortExecTransformer(sort.sortOrder, global = false, sort.child, sort.testSpillFrequency)
+      case generate: GenerateExec
+          if recoverGenerate && GenerateExecTransformer.supportsGenerate(generate.generator) =>
+        BackendsApiManager.getSparkPlanExecApiInstance.genGenerateTransformer(
+          generate.generator,
+          generate.requiredChildOutput,
+          generate.outer,
+          generate.generatorOutput,
+          generate.child)
     }
     // The incoming plan's transitions were selected before the row aggregate/sort/project was
     // replaced above. Re-run Gluten's convention planner so it removes only stale transitions and

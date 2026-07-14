@@ -18,7 +18,7 @@ package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.exception.GlutenException
-import org.apache.gluten.execution.{FlushableHashAggregateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, MppExistingRddStreamInput, MppNativeQueryExec, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, VeloxColumnarToRowExec}
+import org.apache.gluten.execution.{FlushableHashAggregateExecTransformer, GenerateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, MppExistingRddStreamInput, MppNativeQueryExec, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, VeloxColumnarToRowExec}
 import org.apache.gluten.expression.aggregate.VeloxCollectList
 import org.apache.gluten.extension.columnar.FallbackTags
 
@@ -26,11 +26,11 @@ import org.apache.spark.SparkFunSuite
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, AttributeReference, Cast, CreateNamedStruct, EqualTo, If, Literal, Multiply, NamedExpression, NullsFirst, SortOrder}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, AttributeReference, Cast, CreateArray, CreateNamedStruct, EqualTo, Explode, If, IsNotNull, Literal, Multiply, NamedExpression, NullsFirst, SortOrder}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Partial, Sum}
 import org.apache.spark.sql.catalyst.expressions.objects.CreateExternalRow
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, RangePartitioning}
-import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, ColumnarToRowExec, DeserializeToObjectExec, MapPartitionsExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SparkPlan, UnaryExecNode}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, ColumnarToRowExec, DeserializeToObjectExec, FilterExec, GenerateExec, MapPartitionsExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.aggregate.{BaseAggregateExec, HashAggregateExec, SortAggregateExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{DoubleType, IntegerType, LongType, ObjectType, StringType, StructField, StructType}
@@ -385,6 +385,59 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val result = rule(parent)
 
     assert(result.find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
+  }
+
+  test("closed Generate row island is repaired without admitting its nested C2R") {
+    val accountId = AttributeReference("account_id", LongType, nullable = true)()
+    val id = AttributeReference("id", StringType, nullable = true)()
+    val nestedJson = AttributeReference("sub_nested_json", StringType, nullable = true)()
+    val nativeInput = LocalTableScanExecTransformer(Seq(accountId, id, nestedJson), Seq.empty)
+    val nativeProject = ProjectExecTransformer(nativeInput.output, nativeInput)
+    val boundary = VeloxColumnarToRowExec(nativeProject)
+    val generatedJson = AttributeReference("consumption_json", StringType, nullable = true)()
+    val generate = GenerateExec(
+      Explode(CreateArray(Seq(nestedJson))),
+      requiredChildOutput = Seq(accountId, id),
+      outer = false,
+      generatorOutput = Seq(generatedJson),
+      child = boundary)
+    val rowFilter = FilterExec(IsNotNull(generatedJson), generate)
+    val closedIsland = RowToVeloxColumnarExec(rowFilter)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assert(rule.findUnpairedNestedRowOutput(closedIsland).contains(boundary))
+
+    val collapsed = rule(closedIsland)
+
+    assert(collapsed.isInstanceOf[MppNativeQueryExec])
+    assert(collapsed.find(_.isInstanceOf[GenerateExecTransformer]).isDefined)
+    assert(collapsed.find(_.isInstanceOf[ProjectExecTransformer]).isDefined)
+    assert(collapsed.find(_.isInstanceOf[VeloxColumnarToRowExec]).isEmpty)
+    assert(collapsed.find(_.isInstanceOf[RowToVeloxColumnarExec]).isEmpty)
+  }
+
+  test("Generate repair rejects an arbitrary row operator below Generate") {
+    val accountId = AttributeReference("account_id", LongType, nullable = true)()
+    val id = AttributeReference("id", StringType, nullable = true)()
+    val nestedJson = AttributeReference("sub_nested_json", StringType, nullable = true)()
+    val nativeInput = LocalTableScanExecTransformer(Seq(accountId, id, nestedJson), Seq.empty)
+    val boundary = VeloxColumnarToRowExec(nativeInput)
+    val arbitraryRowProject = ProjectExec(boundary.output, boundary)
+    val generatedJson = AttributeReference("consumption_json", StringType, nullable = true)()
+    val generate = GenerateExec(
+      Explode(CreateArray(Seq(nestedJson))),
+      requiredChildOutput = Seq(accountId, id),
+      outer = false,
+      generatorOutput = Seq(generatedJson),
+      child = arbitraryRowProject)
+    val closedButArbitrary = RowToVeloxColumnarExec(FilterExec(IsNotNull(generatedJson), generate))
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assertStrictRejection(
+      rule,
+      closedButArbitrary,
+      "No viable transition found",
+      "Generate explode")
   }
 
   test("unpaired row-output diagnostic preserves an adjacent round-trip adapter") {
