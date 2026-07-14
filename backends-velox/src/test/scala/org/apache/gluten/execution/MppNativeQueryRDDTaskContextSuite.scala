@@ -29,50 +29,80 @@ class MppNativeQueryRDDTaskContextSuite extends AnyFunSuite with SQLHelper {
 
   test("MPP input bridge binds the owning Spark task context on native callback threads") {
     var released = 0
-    TaskResources.runUnsafe {
-      val owner = TaskResources.getLocalTaskContext()
-      val nextSentinel = new IllegalStateException("delegated next sentinel")
-      val delegated = new JIterator[ColumnarBatch] {
-        override def hasNext: Boolean = {
-          assert(TaskResources.getLocalTaskContext() eq owner)
-          TaskResources.addResource(
-            "mpp-callback-resource",
-            new TaskResource {
-              override def release(): Unit = released += 1
-
-              override def resourceName(): String = "MPP callback resource"
-            })
-          false
-        }
-
-        override def next(): ColumnarBatch = {
-          assert(TaskResources.getLocalTaskContext() eq owner)
-          throw nextSentinel
-        }
-      }
-      val bridge =
-        MppNativeQueryRDD.createTaskContextAwareInputIterator("velox", delegated, owner)
-      val failure = new AtomicReference[Throwable]()
-      val callback = new Thread(
-        () => {
-          try {
-            assert(!TaskResources.inSparkTask())
-            assert(!bridge.hasNext())
-            val observed = intercept[IllegalStateException](bridge.next())
-            assert(observed eq nextSentinel)
-            assert(!TaskResources.inSparkTask())
-          } catch {
-            case t: Throwable => failure.set(t)
+    val ownerThread = Thread.currentThread()
+    val originalOwnerContextClassLoader = ownerThread.getContextClassLoader
+    val ownerContextClassLoader = new ClassLoader(originalOwnerContextClassLoader) {}
+    ownerThread.setContextClassLoader(ownerContextClassLoader)
+    try {
+      TaskResources.runUnsafe {
+        val owner = TaskResources.getLocalTaskContext()
+        val nextSentinel = new IllegalStateException("delegated next sentinel")
+        val visibleClassName = classOf[MppNativeQueryRDDTaskContextSuite].getName
+        val delegated = new JIterator[ColumnarBatch] {
+          private def assertOwnerThreadContext(): Unit = {
+            assert(TaskResources.getLocalTaskContext() eq owner)
+            assert(Thread.currentThread().getContextClassLoader eq ownerContextClassLoader)
+            // scalastyle:off classforname
+            val visibleClass =
+              Class.forName(visibleClassName, true, Thread.currentThread().getContextClassLoader)
+            // scalastyle:on classforname
+            assert(visibleClass eq classOf[MppNativeQueryRDDTaskContextSuite])
           }
-        },
-        "mpp-native-callback-test"
-      )
-      callback.start()
-      callback.join()
-      if (failure.get() != null) {
-        throw failure.get()
+
+          override def hasNext: Boolean = {
+            assertOwnerThreadContext()
+            TaskResources.addResource(
+              "mpp-callback-resource",
+              new TaskResource {
+                override def release(): Unit = released += 1
+
+                override def resourceName(): String = "MPP callback resource"
+              })
+            false
+          }
+
+          override def next(): ColumnarBatch = {
+            assertOwnerThreadContext()
+            throw nextSentinel
+          }
+        }
+        val bridge =
+          MppNativeQueryRDD.createTaskContextAwareInputIterator("velox", delegated, owner)
+        val failure = new AtomicReference[Throwable]()
+        val hostileContextClassLoader = new ClassLoader(null) {}
+        // scalastyle:off classforname
+        assertThrows[ClassNotFoundException] {
+          Class.forName(visibleClassName, true, hostileContextClassLoader)
+        }
+        // scalastyle:on classforname
+        val callback = new Thread(
+          () => {
+            try {
+              assert(!TaskResources.inSparkTask())
+              assert(Thread.currentThread().getContextClassLoader eq hostileContextClassLoader)
+              assert(!bridge.hasNext())
+              assert(!TaskResources.inSparkTask())
+              assert(Thread.currentThread().getContextClassLoader eq hostileContextClassLoader)
+              val observed = intercept[IllegalStateException](bridge.next())
+              assert(observed eq nextSentinel)
+              assert(!TaskResources.inSparkTask())
+              assert(Thread.currentThread().getContextClassLoader eq hostileContextClassLoader)
+            } catch {
+              case t: Throwable => failure.set(t)
+            }
+          },
+          "mpp-native-callback-test"
+        )
+        callback.setContextClassLoader(hostileContextClassLoader)
+        callback.start()
+        callback.join()
+        if (failure.get() != null) {
+          throw failure.get()
+        }
+        assert(released == 0)
       }
-      assert(released == 0)
+    } finally {
+      ownerThread.setContextClassLoader(originalOwnerContextClassLoader)
     }
     assert(released == 1)
   }

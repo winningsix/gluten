@@ -674,22 +674,35 @@ private[execution] object MppNativeQueryRDD extends Logging {
 
   /**
    * Native MPP drivers pull JVM stream inputs from native worker threads, outside Spark's task
-   * thread. Bind the owning task context around the complete bridge call so both the delegated
-   * iterator and ColumnarBatch handle conversion use the task's live resource registry.
+   * thread. Bind the owning task context and its context classloader around the complete bridge
+   * call so the delegated iterator can load task classes and ColumnarBatch handle conversion uses
+   * the task's live resource registry.
    */
   private[execution] def createTaskContextAwareInputIterator(
       backendName: String,
       delegated: JIterator[ColumnarBatch],
       taskContext: TaskContext): ColumnarBatchInIterator = {
+    val ownerContextClassLoader = Thread.currentThread().getContextClassLoader
     new ColumnarBatchInIterator(backendName, delegated) {
+      private def runWithOwnerThreadContext[T](body: => T): T = {
+        val callbackThread = Thread.currentThread()
+        val previousContextClassLoader = callbackThread.getContextClassLoader
+        callbackThread.setContextClassLoader(ownerContextClassLoader)
+        try {
+          TaskResources.runWithTaskContext(taskContext)(body)
+        } finally {
+          callbackThread.setContextClassLoader(previousContextClassLoader)
+        }
+      }
+
       override def hasNext(): Boolean = {
-        TaskResources.runWithTaskContext(taskContext) {
+        runWithOwnerThreadContext {
           super.hasNext()
         }
       }
 
       override def next(): Long = {
-        TaskResources.runWithTaskContext(taskContext) {
+        runWithOwnerThreadContext {
           super.next()
         }
       }
