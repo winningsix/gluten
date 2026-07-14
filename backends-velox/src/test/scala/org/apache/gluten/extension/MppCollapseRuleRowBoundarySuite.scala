@@ -18,7 +18,7 @@ package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.exception.GlutenException
-import org.apache.gluten.execution.{FlushableHashAggregateExecTransformer, GenerateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, MppExistingRddStreamInput, MppNativeQueryExec, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, VeloxColumnarToRowExec}
+import org.apache.gluten.execution.{ColumnarUnionExec, FlushableHashAggregateExecTransformer, GenerateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, MppExistingRddStreamInput, MppNativeQueryExec, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, UnionExecTransformer, VeloxColumnarToRowExec}
 import org.apache.gluten.expression.aggregate.VeloxCollectList
 import org.apache.gluten.extension.columnar.FallbackTags
 
@@ -29,7 +29,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, AttributeReference, Cast, CreateArray, CreateNamedStruct, EqualTo, Explode, If, IsNotNull, Literal, Multiply, NamedExpression, NullsFirst, SortOrder}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Partial, Sum}
 import org.apache.spark.sql.catalyst.expressions.objects.CreateExternalRow
-import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, RangePartitioning}
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, RangePartitioning, UnknownPartitioning}
 import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, ColumnarToRowExec, DeserializeToObjectExec, FilterExec, GenerateExec, MapPartitionsExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.aggregate.{BaseAggregateExec, HashAggregateExec, SortAggregateExec}
 import org.apache.spark.sql.internal.SQLConf
@@ -585,6 +585,66 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(nativePlan.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
     assert(nativePlan.find(_.isInstanceOf[VeloxColumnarToRowExec]).isEmpty)
     assert(nativePlan.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+  }
+
+  test("ExistingRDD hybrid normalizes a collect-list row shell across a native union") {
+    val subject = AttributeReference("subject", StringType, nullable = true)()
+    val predicate = AttributeReference("predicate", StringType, nullable = true)()
+    val value = AttributeReference("value", StringType, nullable = true)()
+    val scan =
+      RDDScanExec(Seq(subject, predicate, value), mock(classOf[RDD[InternalRow]]), "ExistingRDD")
+    val ingress = RowToVeloxColumnarExec(scan)
+    val nativeSibling =
+      LocalTableScanExecTransformer(Seq(subject, predicate, value), Seq.empty)
+    val union = ColumnarUnionExec(Seq(ingress, nativeSibling), UnknownPartitioning(0))
+    val nativeSort = SortExecTransformer(
+      Seq(SortOrder(subject, Ascending, NullsFirst, Seq.empty)),
+      global = false,
+      union,
+      testSpillFrequency = 0)
+    val rowInput = VeloxColumnarToRowExec(nativeSort)
+    val struct = CreateNamedStruct(
+      Seq(Literal("subject"), subject, Literal("predicate"), predicate, Literal("value"), value))
+    val aggregate = AggregateExpression(
+      VeloxCollectList(struct),
+      Partial,
+      isDistinct = false,
+      filter = None,
+      resultId = NamedExpression.newExprId)
+    val rowAggregate = SortAggregateExec(
+      requiredChildDistributionExpressions = None,
+      isStreaming = true,
+      numShufflePartitions = None,
+      groupingExpressions = Seq(subject),
+      aggregateExpressions = Seq(aggregate),
+      aggregateAttributes = Seq(aggregate.resultAttribute),
+      initialInputBufferOffset = 0,
+      resultExpressions = Seq(subject, aggregate.resultAttribute),
+      child = rowInput
+    )
+    val stalePlan = RowToVeloxColumnarExec(rowAggregate)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val normalized = rule.normalizeMppNativeOperators(
+      stalePlan,
+      preserveExistingRddIngress = true,
+      rewriteNativeUnion = _.transformUp {
+        case union: ColumnarUnionExec => UnionExecTransformer(union.children)
+      })
+
+    assert(normalized.find(_.isInstanceOf[UnionExecTransformer]).isDefined)
+    assert(normalized.find(_.isInstanceOf[ColumnarUnionExec]).isEmpty)
+    assert(normalized.find(_.isInstanceOf[RowToVeloxColumnarExec]).size == 1)
+    assert(normalized.find(_.isInstanceOf[VeloxColumnarToRowExec]).isEmpty)
+    val nativeAggregate = normalized
+      .find(_.isInstanceOf[HashAggregateExecBaseTransformer])
+      .get
+      .asInstanceOf[HashAggregateExecBaseTransformer]
+    assert(
+      nativeAggregate.aggregateExpressions.forall(
+        _.aggregateFunction.children.forall(_.isInstanceOf[AttributeReference])))
+    assert(nativeAggregate.child.isInstanceOf[ProjectExecTransformer])
+    assert(normalized.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
   }
 
   test("ExistingRDD matcher rejects non-Existing RDDScan names") {

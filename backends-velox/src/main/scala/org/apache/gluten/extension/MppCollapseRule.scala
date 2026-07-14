@@ -715,7 +715,28 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   private def normalizeMppNativeOperators(
       plan: SparkPlan,
       preserveExistingRddIngress: Boolean,
-      recoverGenerate: Boolean = false): SparkPlan = {
+      recoverGenerate: Boolean = false): SparkPlan =
+    normalizeMppNativeOperators(
+      plan,
+      preserveExistingRddIngress,
+      recoverGenerate,
+      rewriteNativeUnion = rewriteMppNativeUnion)
+
+  private[extension] def normalizeMppNativeOperators(
+      plan: SparkPlan,
+      preserveExistingRddIngress: Boolean,
+      rewriteNativeUnion: SparkPlan => SparkPlan): SparkPlan =
+    normalizeMppNativeOperators(
+      plan,
+      preserveExistingRddIngress,
+      recoverGenerate = false,
+      rewriteNativeUnion)
+
+  private def normalizeMppNativeOperators(
+      plan: SparkPlan,
+      preserveExistingRddIngress: Boolean,
+      recoverGenerate: Boolean,
+      rewriteNativeUnion: SparkPlan => SparkPlan): SparkPlan = {
     // Spark may insert RowToColumnar(ColumnarToRow(nativeChild)) solely to reconcile the
     // convention expected by an exchange or V2 writer. MPP absorbs that boundary, so eliminate
     // the adjacent inverse transitions before validating/extracting fragments. This preserves the
@@ -773,15 +794,20 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // replaced above. Re-run Gluten's convention planner so it removes only stale transitions and
     // re-inserts every boundary still required by a genuine row operator. This keeps DataFrame.rdd
     // and other real row consumers as strict-MPP negatives.
+    // ExistingRDD recovery must see a validated native union rather than ColumnarUnionExec;
+    // otherwise its strict native-tree check retains the now-stale C2R/R2C shell. The ordinary
+    // path still rewrites after transition insertion, where output partitioning is fully known.
+    val unionPrepared =
+      if (preserveExistingRddIngress) rewriteNativeUnion(lateOffloaded) else lateOffloaded
     val retransitioned =
       if (preserveExistingRddIngress) {
-        bridgeRecoverableExistingRddTransitions(lateOffloaded)
+        bridgeRecoverableExistingRddTransitions(unionPrepared)
       } else {
         InsertTransitions
-          .create(outputsColumnar = lateOffloaded.supportsColumnar, VeloxBatchType)
-          .apply(lateOffloaded)
+          .create(outputsColumnar = unionPrepared.supportsColumnar, VeloxBatchType)
+          .apply(unionPrepared)
       }
-    val unionRewritten = rewriteMppNativeUnion(retransitioned)
+    val unionRewritten = rewriteNativeUnion(retransitioned)
     MppReplicatedCartesianRule()(unionRewritten)
   }
 
