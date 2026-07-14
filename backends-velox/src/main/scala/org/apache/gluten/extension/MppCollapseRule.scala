@@ -588,33 +588,34 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
   private def tryCollapseExistingRddHybrid(plan: SparkPlan): Option[MppNativeQueryExec] = {
     // Keep the hybrid fail-closed: only run row-shell repair after proving that the original plan
-    // contains the exact batch ExistingRDD ingress. A computed aggregate above that ingress can be
-    // left as C2R -> row aggregate -> R2C by ordinary Gluten validation; repairing it here composes
-    // the two independently supported shapes without admitting an arbitrary row subtree.
-    if (!containsExactExistingRddIngress(plan)) {
+    // contains an exact JVM-backed ingress. A computed aggregate above that ingress can be left as
+    // C2R -> row aggregate -> R2C by ordinary Gluten validation; repairing it here composes the two
+    // independently supported shapes without admitting an arbitrary row subtree.
+    if (!containsExactJvmStreamIngress(plan)) {
       return None
     }
     val repaired = repairRecoverableRowShells(plan, preserveExistingRddIngress = true)
     // Do not run InsertTransitions over this hybrid. Its first step deliberately removes every
-    // transition, including the exact R2C that identifies ExistingRDD; rebuilding that transition
-    // is not guaranteed before backend component initialization and would erase the boundary this
-    // path is required to validate. The plan has already passed Gluten's post-transform rules, so
-    // retain the explicit ingress while applying only the transition-safe native rewrites.
+    // transition, including the exact R2C that identifies the JVM-backed ingress; rebuilding that
+    // transition is not guaranteed before backend component initialization and would erase the
+    // boundary this path is required to validate. The plan has already passed Gluten's
+    // post-transform rules, so retain the explicit ingress while applying only the transition-safe
+    // native rewrites.
     val unionRewritten =
       MppReplicatedCartesianRule()(rewriteMppNativeUnion(MppColumnarTransitionBridge()(repaired)))
-    if (!containsExactExistingRddIngress(unionRewritten)) {
+    if (!containsExactJvmStreamIngress(unionRewritten)) {
       return None
     }
-    // An exchange directly over ExistingRDD still needs a native producer fragment on its input
+    // An exchange directly over a JVM-backed ingress still needs a native producer fragment on its
     // side. Without this identity anchor, dynamic extraction sees the consumer ReadRel slot but
     // has neither a producer fragment nor a captured local stream for it. Anchor only the exact
-    // R2C(ExistingRDD) child that the strict hybrid validator already admits.
+    // R2C child that the strict hybrid validator already admits.
     val exchangeInputsAnchored = unionRewritten.transformUp {
-      case exchange: ShuffleExchangeLike if isExactExistingRddIngress(exchange.child) =>
+      case exchange: ShuffleExchangeLike if isExactJvmStreamIngress(exchange.child) =>
         exchange.withNewChildren(Seq(ProjectExecTransformer(exchange.child.output, exchange.child)))
     }
-    // A DataFrame created directly from an ExistingRDD can reach a V2 writer without any native
-    // relational suffix.  The exact R2C ingress is a local stream input, not a native fragment by
+    // A DataFrame created directly from a JVM-backed input can reach a V2 writer without any native
+    // relational suffix. The exact R2C ingress is a local stream input, not a native fragment by
     // itself, so anchor this otherwise transparent plan with an identity native project.  This
     // preserves output attributes and gives ColumnarCollapseTransformStages a TransformSupport
     // consumer from which dynamic MPP extraction can build one real fragment.
@@ -627,7 +628,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     tryCollapseNormalizedMpp(
       nativeAnchored,
       allowExistingRddIngress = true,
-      mode = "native with exact ExistingRDD ingress")
+      mode = "native with exact JVM-backed ingress")
   }
 
   /**
@@ -813,7 +814,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
   /**
    * Remove only the stale transitions around a row shell that was just late-offloaded, while
-   * retaining the exact R2C(ExistingRDD) leaf that identifies the JVM-backed local stream.
+   * retaining the exact R2C leaf that identifies the JVM-backed local stream.
    */
   private def bridgeRecoverableExistingRddTransitions(plan: SparkPlan): SparkPlan = {
     val withoutIngressC2r = plan.transformUp {
@@ -857,20 +858,20 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     isNativeSupported(plan, allowExistingRddIngress = false)
 
   /**
-   * Validate the second half of an `.rdd ... toDF` round trip without weakening the ordinary
-   * strict-MPP contract. At least one exact ExistingRDD ingress must be present; every other node
+   * Validate a native suffix with one of the exact JVM-backed ingresses without weakening the
+   * ordinary strict-MPP contract. At least one exact ingress must be present; every other node
    * remains subject to the same native validator.
    */
   private[extension] def isSupportedExistingRddHybridPlan(plan: SparkPlan): Boolean =
-    containsExactExistingRddIngress(plan) &&
+    containsExactJvmStreamIngress(plan) &&
       isNativeSupported(plan, allowExistingRddIngress = true)
 
-  private def containsExactExistingRddIngress(plan: SparkPlan): Boolean =
-    plan.find(isExactExistingRddIngress).isDefined
+  private def containsExactJvmStreamIngress(plan: SparkPlan): Boolean =
+    plan.find(isExactJvmStreamIngress).isDefined
 
-  private def isExactExistingRddIngress(plan: SparkPlan): Boolean = plan match {
-    case r2c: RowToColumnarExecBase => MppExistingRddStreamInput.scan(r2c).isDefined
-    case r2c: RowToColumnarExec => MppExistingRddStreamInput.scan(r2c).isDefined
+  private def isExactJvmStreamIngress(plan: SparkPlan): Boolean = plan match {
+    case r2c: RowToColumnarExecBase => MppExistingRddStreamInput.rowInput(r2c).isDefined
+    case r2c: RowToColumnarExec => MppExistingRddStreamInput.rowInput(r2c).isDefined
     case _ => false
   }
 
@@ -916,13 +917,13 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case _: TransformSupport =>
         plan.children.forall(isNativeSupported(_, allowExistingRddIngress))
 
-      // Exact ExistingRDD is the only permitted JVM-backed input slot. Do not recurse into the
-      // RDDScanExec: MppNativeQueryExec captures and columnarizes that scan as a local stream.
+      // Exact matched rowInput is the only permitted JVM-backed input slot. Do not recurse into
+      // it: MppNativeQueryExec captures and columnarizes the row plan as a local stream.
       case r2c: RowToColumnarExecBase
-          if allowExistingRddIngress && MppExistingRddStreamInput.scan(r2c).isDefined =>
+          if allowExistingRddIngress && MppExistingRddStreamInput.rowInput(r2c).isDefined =>
         true
       case r2c: RowToColumnarExec
-          if allowExistingRddIngress && MppExistingRddStreamInput.scan(r2c).isDefined =>
+          if allowExistingRddIngress && MppExistingRddStreamInput.rowInput(r2c).isDefined =>
         true
 
       // A remaining row transition is a real execution boundary. The only C2R shape that MPP may
@@ -1033,10 +1034,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case _: TransformSupport =>
         findInChildren(plan)
       case r2c: RowToColumnarExecBase
-          if allowExistingRddIngress && MppExistingRddStreamInput.scan(r2c).isDefined =>
+          if allowExistingRddIngress && MppExistingRddStreamInput.rowInput(r2c).isDefined =>
         None
       case r2c: RowToColumnarExec
-          if allowExistingRddIngress && MppExistingRddStreamInput.scan(r2c).isDefined =>
+          if allowExistingRddIngress && MppExistingRddStreamInput.rowInput(r2c).isDefined =>
         None
       case c2r: ColumnarToRowExecBase =>
         Some(describeExecutionBoundary(c2r, "native-to-row"))
@@ -1116,7 +1117,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
           shuffle.child.isInstanceOf[ShuffleQueryStageExec] ||
           shuffle.child.isInstanceOf[BroadcastQueryStageExec] ||
           shuffle.child.isInstanceOf[ColumnarToColumnarExec] ||
-          (allowExistingRddIngress && isExactExistingRddIngress(shuffle.child))
+          (allowExistingRddIngress && isExactJvmStreamIngress(shuffle.child))
 
         if (!partitioningSupported) {
           logWarning(

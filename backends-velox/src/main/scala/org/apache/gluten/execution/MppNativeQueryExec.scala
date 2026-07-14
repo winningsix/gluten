@@ -48,7 +48,7 @@ import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide
 import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ColumnarShuffleExchangeExec, ExecSubqueryExpression, FilterExec, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
+import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ColumnarShuffleExchangeExec, ExecSubqueryExpression, ExternalRDDScanExec, FilterExec, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeExec, ShuffleExchangeLike}
@@ -57,6 +57,7 @@ import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.ui.GlutenUIUtils
 import org.apache.spark.sql.execution.utils.MppRangeBoundsGenerator
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{ArrayType, DataType, MapType, ObjectType, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import com.google.common.collect.Lists
@@ -124,26 +125,56 @@ private[execution] case class MppLocalStreamInput(
 private[execution] case class MppLocalStreamSlot(fragmentId: Int, slotIdx: Int)
 
 /**
- * Exact matcher for the one JVM-backed stream shape admitted by strict MPP.
+ * Exact matcher for the JVM-backed stream shapes admitted by strict MPP.
  *
  * An application that leaves Spark SQL through `Dataset.rdd` and later calls `toDF` produces an
  * [[RDDScanExec]] ("ExistingRDD") at the new query's leaf. The MPP runtime can feed that leaf into
- * an InputIterator slot, but it must not treat an arbitrary row subtree as equivalent to an RDD
- * scan. Keep this matcher deliberately unary and transparent: conversion/adaptor nodes are
- * accepted; C2R, Python, projections, filters, whole stages, and every other row operator are not.
- * Spark 4 also carries an optional streaming source on RDDScanExec; strict MPP admits only the
+ * an InputIterator slot. A typed Dataset materialized as `RDD[Row]` and registered as a view has a
+ * second exact leaf shape: SerializeFromObjectExec directly over ExternalRDDScanExec. Capturing the
+ * serializer itself preserves Spark's encoder semantics before columnarizing its relational rows.
+ *
+ * Do not treat an arbitrary row subtree as equivalent to either ingress. Keep this matcher
+ * deliberately unary and transparent: conversion/adaptor nodes are accepted; C2R, Python,
+ * projections, filters, whole stages, nested object operators, and every other row operator are
+ * not. Spark 4 also carries an optional streaming source on RDDScanExec; strict MPP admits only the
  * batch form. Spark 3.x has no such accessor, so the reflective check below is a cross-version
  * compatibility guard rather than a relaxation.
  */
 private[gluten] object MppExistingRddStreamInput {
 
-  def scan(plan: SparkPlan): Option[RDDScanExec] = plan match {
+  def rowInput(plan: SparkPlan): Option[SparkPlan] = plan match {
     case existing: RDDScanExec if isBatchExistingRddScan(existing) => Some(existing)
-    case cia: ColumnarInputAdapter => scan(cia.child)
-    case c2c: ColumnarToColumnarExec => scan(c2c.child)
-    case r2c: RowToColumnarExecBase => scan(r2c.child)
-    case r2c: org.apache.spark.sql.execution.RowToColumnarExec => scan(r2c.child)
+    case serializer: SerializeFromObjectExec if isDirectExternalObjectSerializer(serializer) =>
+      Some(serializer)
+    case cia: ColumnarInputAdapter => rowInput(cia.child)
+    case c2c: ColumnarToColumnarExec => rowInput(c2c.child)
+    case r2c: RowToColumnarExecBase => rowInput(r2c.child)
+    case r2c: org.apache.spark.sql.execution.RowToColumnarExec => rowInput(r2c.child)
     case _ => None
+  }
+
+  // Kept for callers that specifically need the legacy relational ExistingRDD leaf.
+  def scan(plan: SparkPlan): Option[RDDScanExec] =
+    rowInput(plan).collect { case existing: RDDScanExec => existing }
+
+  private def isDirectExternalObjectSerializer(serializer: SerializeFromObjectExec): Boolean = {
+    serializer.child match {
+      case external: ExternalRDDScanExec[_] =>
+        external.output.size == 1 &&
+        external.output.head.dataType.isInstanceOf[ObjectType] &&
+        serializer.serializer.forall(_.references.subsetOf(external.outputSet)) &&
+        serializer.output.forall(attr => !containsObjectType(attr.dataType))
+      case _ => false
+    }
+  }
+
+  private def containsObjectType(dataType: DataType): Boolean = dataType match {
+    case _: ObjectType => true
+    case array: ArrayType => containsObjectType(array.elementType)
+    case map: MapType =>
+      containsObjectType(map.keyType) || containsObjectType(map.valueType)
+    case struct: StructType => struct.fields.exists(field => containsObjectType(field.dataType))
+    case _ => false
   }
 
   private def isBatchExistingRddScan(scan: RDDScanExec): Boolean = {
@@ -926,13 +957,13 @@ case class MppNativeQueryExec(
                         t
                       )
                   }
-                case None if producerFragId < 0 && isExistingRddStreamInput(child) =>
+                case None if producerFragId < 0 && isJvmBackedStreamInput(child) =>
                   localStreamInputs += MppLocalStreamInput(
                     fragmentId = fragId,
                     slotIdx = slotIdx,
-                    rdd = executeExistingRddColumnar(child))
+                    rdd = executeJvmBackedStreamColumnar(child))
                   logInfo(
-                    s"MppNativeQueryExec: captured local ExistingRDD stream at " +
+                    s"MppNativeQueryExec: captured local JVM-backed stream at " +
                       s"consumerF=$fragId slot=$slotIdx")
                 case _ if producerFragId < 0 =>
                   // Non-broadcast collapse (e.g. collapseSingleGather sentinel).
@@ -1732,16 +1763,16 @@ case class MppNativeQueryExec(
     }
   }
 
-  private def isExistingRddStreamInput(plan: SparkPlan): Boolean = {
-    MppExistingRddStreamInput.scan(plan).isDefined
+  private def isJvmBackedStreamInput(plan: SparkPlan): Boolean = {
+    MppExistingRddStreamInput.rowInput(plan).isDefined
   }
 
-  private def executeExistingRddColumnar(plan: SparkPlan): RDD[ColumnarBatch] = {
-    val scan = MppExistingRddStreamInput.scan(plan).getOrElse {
+  private def executeJvmBackedStreamColumnar(plan: SparkPlan): RDD[ColumnarBatch] = {
+    val rowInput = MppExistingRddStreamInput.rowInput(plan).getOrElse {
       throw new IllegalArgumentException(
-        s"Expected an ExistingRDD stream input, got ${plan.getClass.getSimpleName}")
+        s"Expected an exact JVM-backed stream input, got ${plan.getClass.getSimpleName}")
     }
-    RowToVeloxColumnarExec(scan).executeColumnar()
+    RowToVeloxColumnarExec(rowInput).executeColumnar()
   }
 
   private def alignLocalStreamInputs(
