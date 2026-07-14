@@ -29,9 +29,7 @@ class MppNativeQueryRDDSpillSuite extends AnyFunSuite {
     val localRoot1 = Files.createTempDirectory("gluten-mpp-spill-root-1")
     val localRoot2 = Files.createTempDirectory("gluten-mpp-spill-root-2")
     try {
-      val namespace = new Namespace(
-        Array(localRoot1.toFile, localRoot2.toFile),
-        "gluten-spill")
+      val namespace = new Namespace(Array(localRoot1.toFile, localRoot2.toFile), "gluten-spill")
 
       val spillRoot1 = Paths.get(MppNativeQueryRDD.createSpillRoot(namespace))
       val spillRoot2 = Paths.get(MppNativeQueryRDD.createSpillRoot(namespace))

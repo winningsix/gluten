@@ -170,8 +170,8 @@ class MppNativeQueryRDD(
     // native coordinator create an isolated child for every fragment replica.
     // This follows the same SparkDirectoryUtil lifecycle as BSP spill instead
     // of falling back to the process-wide java.io.tmpdir.
-    val spillRootPath = MppNativeQueryRDD.createSpillRoot(
-      SparkDirectoryUtil.get().namespace("gluten-spill"))
+    val spillRootPath =
+      MppNativeQueryRDD.createSpillRoot(SparkDirectoryUtil.get().namespace("gluten-spill"))
     val runtime =
       Runtimes.contextInstance(BackendsApiManager.getBackendName, "MppQuery", runtimeExtraConf)
     val jniWrapper = MppQueryJniWrapper.create(runtime)

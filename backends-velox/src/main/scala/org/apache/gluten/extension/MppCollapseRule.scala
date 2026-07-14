@@ -374,14 +374,14 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    * defined by Spark's transition contract; diagnostic plan strings can be truncated before the
    * child tree and are not evidence for accepting any looser object shape.
    */
-  private def collapseTerminalObjectEgress(
-      boundary: DeserializeToObjectExec): Option[SparkPlan] = boundary.child match {
-    case c2r: ColumnarToRowExecBase =>
-      collapseTerminalObjectEgressThroughC2r(boundary, c2r, c2r.child)
-    case c2r: ColumnarToRowExec =>
-      collapseTerminalObjectEgressThroughC2r(boundary, c2r, c2r.child)
-    case _ => None
-  }
+  private def collapseTerminalObjectEgress(boundary: DeserializeToObjectExec): Option[SparkPlan] =
+    boundary.child match {
+      case c2r: ColumnarToRowExecBase =>
+        collapseTerminalObjectEgressThroughC2r(boundary, c2r, c2r.child)
+      case c2r: ColumnarToRowExec =>
+        collapseTerminalObjectEgressThroughC2r(boundary, c2r, c2r.child)
+      case _ => None
+    }
 
   private def collapseTerminalObjectEgressThroughC2r(
       boundary: DeserializeToObjectExec,
@@ -510,8 +510,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // is not guaranteed before backend component initialization and would erase the boundary this
     // path is required to validate. The plan has already passed Gluten's post-transform rules, so
     // retain the explicit ingress while applying only the transition-safe native rewrites.
-    val unionRewritten = MppReplicatedCartesianRule()(
-      rewriteMppNativeUnion(MppColumnarTransitionBridge()(plan)))
+    val unionRewritten =
+      MppReplicatedCartesianRule()(rewriteMppNativeUnion(MppColumnarTransitionBridge()(plan)))
     if (!containsExactExistingRddIngress(unionRewritten)) {
       return None
     }
@@ -695,14 +695,12 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case _ => false
     }.isDefined
 
-  private def isNativeSupported(
-      plan: SparkPlan,
-      allowExistingRddIngress: Boolean): Boolean = {
+  private def isNativeSupported(plan: SparkPlan, allowExistingRddIngress: Boolean): Boolean = {
     plan match {
       // Exchanges that we can absorb into the MPP plan
       case exchange: ShuffleExchangeLike =>
         canAbsorbExchange(exchange) &&
-          isNativeSupported(exchange.child, allowExistingRddIngress)
+        isNativeSupported(exchange.child, allowExistingRddIngress)
 
       // Broadcast exchanges are absorbable when the build side is itself a fully
       // native TransformSupport subtree (recurse into children, same as shuffle).

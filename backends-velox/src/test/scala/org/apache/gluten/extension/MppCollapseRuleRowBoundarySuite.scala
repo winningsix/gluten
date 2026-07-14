@@ -65,8 +65,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
 
   private def deserializeRows(child: SparkPlan): DeserializeToObjectExec = {
     val schema = StructType(
-      child.output.map(
-        attr => StructField(attr.name, attr.dataType, attr.nullable, attr.metadata)))
+      child.output.map(attr => StructField(attr.name, attr.dataType, attr.nullable, attr.metadata)))
     val deserializer = CreateExternalRow(child.output, schema)
     val outputObject =
       AttributeReference("obj", ObjectType(classOf[Row]), nullable = false)()
@@ -283,10 +282,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
   test("root object operators other than DeserializeToObject remain rejected") {
     val child = nativeLeaf()
     val serialized = SerializeFromObjectExec(Seq(Alias(Literal(1), "value")()), child)
-    val mappedObject = AttributeReference(
-      "mapped",
-      ObjectType(classOf[Row]),
-      nullable = false)()
+    val mappedObject = AttributeReference("mapped", ObjectType(classOf[Row]), nullable = false)()
     val mapped = MapPartitionsExec((rows: Iterator[Any]) => rows, mappedObject, child)
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
@@ -314,8 +310,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
 
     assert(collapsed.isInstanceOf[ColumnarToRowExec])
     val mpp = collapsed.children.head.asInstanceOf[MppNativeQueryExec]
-    assert(
-      mpp.child.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+    assert(mpp.child.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
   }
 
   test("a nested native-to-row boundary cannot activate MPP") {
@@ -346,10 +341,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
 
   test("ExistingRDD matcher rejects non-Existing RDDScan names") {
     val attr = AttributeReference("a", IntegerType, nullable = true)()
-    val scan = RDDScanExec(
-      Seq(attr),
-      mock(classOf[RDD[InternalRow]]),
-      "OneRowRelation")
+    val scan = RDDScanExec(Seq(attr), mock(classOf[RDD[InternalRow]]), "OneRowRelation")
     val ingress = RowToVeloxColumnarExec(scan)
     val nativeSuffix = ProjectExecTransformer(ingress.output, ingress)
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
@@ -374,7 +366,8 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
             batchScan.name,
             batchScan.outputPartitioning,
             batchScan.outputOrdering.asInstanceOf[AnyRef],
-            Some(new Object()).asInstanceOf[AnyRef])
+            Some(new Object()).asInstanceOf[AnyRef]
+          )
           .asInstanceOf[RDDScanExec]
         val ingress = RowToVeloxColumnarExec(streamingScan)
         val nativeSuffix = ProjectExecTransformer(ingress.output, ingress)
@@ -409,8 +402,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
 
     assert(MppExistingRddStreamInput.scan(roundTrip).isEmpty)
     assert(
-      !rule.isSupportedExistingRddHybridPlan(
-        ProjectExecTransformer(roundTrip.output, roundTrip)))
+      !rule.isSupportedExistingRddHybridPlan(ProjectExecTransformer(roundTrip.output, roundTrip)))
   }
 
   test("strict row-boundary diagnostic reports the row child and its fallback reason") {
