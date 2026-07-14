@@ -425,6 +425,58 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(nativePlan.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
   }
 
+  test("ExistingRDD hybrid bridges a native sort below a computed collect-list aggregate") {
+    val subject = AttributeReference("subject", StringType, nullable = true)()
+    val predicate = AttributeReference("predicate", StringType, nullable = true)()
+    val value = AttributeReference("value", StringType, nullable = true)()
+    val scan =
+      RDDScanExec(Seq(subject, predicate, value), mock(classOf[RDD[InternalRow]]), "ExistingRDD")
+    val ingress = RowToVeloxColumnarExec(scan)
+    val nativeSort = SortExecTransformer(
+      Seq(SortOrder(subject, Ascending, NullsFirst, Seq.empty)),
+      global = false,
+      ingress,
+      testSpillFrequency = 0)
+    val rowInput = VeloxColumnarToRowExec(nativeSort)
+    val struct = CreateNamedStruct(
+      Seq(Literal("subject"), subject, Literal("predicate"), predicate, Literal("value"), value))
+    val aggregate = AggregateExpression(
+      VeloxCollectList(struct),
+      Partial,
+      isDistinct = false,
+      filter = None,
+      resultId = NamedExpression.newExprId)
+    val rowAggregate = SortAggregateExec(
+      requiredChildDistributionExpressions = None,
+      isStreaming = false,
+      numShufflePartitions = None,
+      groupingExpressions = Seq(subject),
+      aggregateExpressions = Seq(aggregate),
+      aggregateAttributes = Seq(aggregate.resultAttribute),
+      initialInputBufferOffset = 0,
+      resultExpressions = Seq(subject, aggregate.resultAttribute),
+      child = rowInput
+    )
+    val stalePlan = RowToVeloxColumnarExec(rowAggregate)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val collapsed = rule(stalePlan)
+
+    assert(collapsed.isInstanceOf[MppNativeQueryExec])
+    val nativePlan = collapsed.asInstanceOf[MppNativeQueryExec].child
+    val nativeAggregate = nativePlan
+      .find(_.isInstanceOf[HashAggregateExecBaseTransformer])
+      .get
+      .asInstanceOf[HashAggregateExecBaseTransformer]
+    assert(
+      nativeAggregate.aggregateExpressions.forall(
+        _.aggregateFunction.children.forall(_.isInstanceOf[AttributeReference])))
+    assert(nativePlan.find(_.isInstanceOf[SortExecTransformer]).isDefined)
+    assert(nativePlan.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
+    assert(nativePlan.find(_.isInstanceOf[VeloxColumnarToRowExec]).isEmpty)
+    assert(nativePlan.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+  }
+
   test("ExistingRDD matcher rejects non-Existing RDDScan names") {
     val attr = AttributeReference("a", IntegerType, nullable = true)()
     val scan = RDDScanExec(Seq(attr), mock(classOf[RDD[InternalRow]]), "OneRowRelation")

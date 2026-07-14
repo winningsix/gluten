@@ -2143,6 +2143,19 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   auto executor =
       std::make_shared<folly::CPUThreadPoolExecutor>(poolSize);
 
+  // Generate the query id before allocating the query memory pool. Multiple
+  // MPP query RDDs can run concurrently in one executor (for example, a
+  // broadcast input while a write query is still draining). Velox requires
+  // sibling memory-pool names to be unique, so the old fixed "MppQuery" name
+  // made the second query fail in addAggregateChild().
+  static std::atomic<uint64_t> gMppQueryCounter{0};
+  const auto localQueryOrdinal =
+      gMppQueryCounter.fetch_add(1, std::memory_order_relaxed);
+  auto queryId = peerSpec.queryId.empty()
+      ? fmt::format("mpp-{}", localQueryOrdinal)
+      : peerSpec.queryId;
+  const auto mppPoolName = fmt::format("MppQuery.{}", localQueryOrdinal);
+
   // Create QueryCtx. We pass nullptr for the executor in QueryCtx::create
   // since Velox tasks use the executor passed to Task::start() (the
   // coordinator calls task->start(numDrivers) which uses Task's internal
@@ -2151,7 +2164,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   // QueryCtx needs an aggregate pool so it can create leaf child pools
   // for each Task's operators.
   auto rootPool = runtime->memoryManager()->getAggregateMemoryPool();
-  auto mppPool = rootPool->addAggregateChild("MppQuery");
+  auto mppPool = rootPool->addAggregateChild(mppPoolName);
   std::unordered_map<std::string, std::shared_ptr<velox::config::ConfigBase>>
       connectorConfigs;
   auto hiveConnectorSessionConfig = createHiveConnectorSessionConfig(sessionCfg);
@@ -2185,23 +2198,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       VeloxBackend::get()->getAsyncDataCache(),
       mppPool,
       spillExecutor.get(),
-      "MppQuery");
-
-  // Generate a process-unique query ID. Previously we used the queryCtx
-  // pointer address, but the allocator freely reuses addresses across
-  // consecutive queries in the same JVM: when iter N's queryCtx is
-  // destructed and iter N+1 happens to allocate at the same address, the
-  // two queries end up with identical queryIds and therefore identical
-  // taskIds. Stale state keyed by taskId (ExchangeClient remoteTaskIds_,
-  // UcxExchangeSource registries, etc.) then bridges the two queries
-  // and hangs the second one. Use a monotonically increasing counter
-  // instead.
-  static std::atomic<uint64_t> gMppQueryCounter{0};
-  auto queryId = peerSpec.queryId.empty()
-      ? fmt::format(
-            "mpp-{}",
-            gMppQueryCounter.fetch_add(1, std::memory_order_relaxed))
-      : peerSpec.queryId;
+      mppPoolName);
 
   std::optional<velox::common::SpillDiskOptions> spillDiskOpts;
   const auto spillStrategy =

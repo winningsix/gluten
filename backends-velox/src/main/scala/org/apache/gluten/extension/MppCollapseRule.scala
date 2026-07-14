@@ -739,17 +739,14 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    */
   private def bridgeRecoverableExistingRddTransitions(plan: SparkPlan): SparkPlan = {
     val withoutIngressC2r = plan.transformUp {
-      case c2r: ColumnarToRowExecBase if isExactExistingRddIngress(c2r.child) => c2r.child
-      case c2r: ColumnarToRowExec if isExactExistingRddIngress(c2r.child) => c2r.child
+      case c2r: ColumnarToRowExecBase if isSupportedExistingRddHybridPlan(c2r.child) =>
+        c2r.child
+      case c2r: ColumnarToRowExec if isSupportedExistingRddHybridPlan(c2r.child) => c2r.child
     }
     withoutIngressC2r.transformUp {
-      case r2c: RowToColumnarExecBase
-          if r2c.child.isInstanceOf[TransformSupport] &&
-            containsExactExistingRddIngress(r2c.child) =>
+      case r2c: RowToColumnarExecBase if isSupportedExistingRddHybridPlan(r2c.child) =>
         r2c.child
-      case r2c: RowToColumnarExec
-          if r2c.child.isInstanceOf[TransformSupport] &&
-            containsExactExistingRddIngress(r2c.child) =>
+      case r2c: RowToColumnarExec if isSupportedExistingRddHybridPlan(r2c.child) =>
         r2c.child
     }
   }
