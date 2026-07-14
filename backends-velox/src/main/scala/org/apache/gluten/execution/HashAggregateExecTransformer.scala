@@ -686,6 +686,18 @@ case class RegularHashAggregateExecTransformer(
   override protected def withNewChildInternal(newChild: SparkPlan): HashAggregateExecTransformer = {
     copy(child = newChild)
   }
+
+  override private[gluten] def withNewAggregateExpressions(
+      newGroupingExpressions: Seq[NamedExpression],
+      newAggregateExpressions: Seq[AggregateExpression],
+      newAggregateAttributes: Seq[Attribute],
+      newResultExpressions: Seq[NamedExpression]): HashAggregateExecBaseTransformer =
+    copy(
+      groupingExpressions = newGroupingExpressions,
+      aggregateExpressions = newAggregateExpressions,
+      aggregateAttributes = newAggregateAttributes,
+      resultExpressions = newResultExpressions
+    )
 }
 
 // Hash aggregation that emits pre-aggregated data which allows duplications on grouping keys
@@ -718,6 +730,18 @@ case class FlushableHashAggregateExecTransformer(
   override protected def withNewChildInternal(newChild: SparkPlan): HashAggregateExecTransformer = {
     copy(child = newChild)
   }
+
+  override private[gluten] def withNewAggregateExpressions(
+      newGroupingExpressions: Seq[NamedExpression],
+      newAggregateExpressions: Seq[AggregateExpression],
+      newAggregateAttributes: Seq[Attribute],
+      newResultExpressions: Seq[NamedExpression]): HashAggregateExecBaseTransformer =
+    copy(
+      groupingExpressions = newGroupingExpressions,
+      aggregateExpressions = newAggregateExpressions,
+      aggregateAttributes = newAggregateAttributes,
+      resultExpressions = newResultExpressions
+    )
 }
 
 case class HashAggregateExecPullOutHelper(

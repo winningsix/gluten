@@ -18,6 +18,7 @@ package org.apache.gluten.utils
 
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.exception.{GlutenException, GlutenNotSupportException}
+import org.apache.gluten.execution.HashAggregateExecBaseTransformer
 
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, AggregateFunction, Complete, Partial}
@@ -99,7 +100,9 @@ trait PullOutProjectHelper {
   }
 
   protected def supportedAggregate(agg: BaseAggregateExec): Boolean = agg match {
-    case _: HashAggregateExec | _: SortAggregateExec | _: ObjectHashAggregateExec => true
+    case _: HashAggregateExec | _: SortAggregateExec | _: ObjectHashAggregateExec |
+        _: HashAggregateExecBaseTransformer =>
+      true
     case _ => false
   }
 
@@ -136,6 +139,14 @@ trait PullOutProjectHelper {
       )
       newObjectHash.copyTagsFrom(objectHash)
       newObjectHash
+    case transformer: HashAggregateExecBaseTransformer =>
+      val newTransformer = transformer.withNewAggregateExpressions(
+        newGroupingExpressions,
+        newAggregateExpressions,
+        newAggregateAttributes,
+        newResultExpressions)
+      newTransformer.copyTagsFrom(transformer)
+      newTransformer
     case _ =>
       throw new GlutenNotSupportException(s"Unsupported agg $agg")
   }

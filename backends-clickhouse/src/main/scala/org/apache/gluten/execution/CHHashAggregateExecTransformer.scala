@@ -477,6 +477,18 @@ case class CHHashAggregateExecTransformer(
     copy(child = newChild)
   }
 
+  override private[gluten] def withNewAggregateExpressions(
+      newGroupingExpressions: Seq[NamedExpression],
+      newAggregateExpressions: Seq[AggregateExpression],
+      newAggregateAttributes: Seq[Attribute],
+      newResultExpressions: Seq[NamedExpression]): HashAggregateExecBaseTransformer =
+    copy(
+      groupingExpressions = newGroupingExpressions,
+      aggregateExpressions = newAggregateExpressions,
+      aggregateAttributes = newAggregateAttributes,
+      resultExpressions = newResultExpressions
+    )
+
   private def getAdvancedExtension(
       validation: Boolean = false,
       originalInputAttributes: Seq[Attribute] = Seq.empty): AdvancedExtensionNode = {

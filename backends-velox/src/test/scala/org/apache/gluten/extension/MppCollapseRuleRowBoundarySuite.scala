@@ -17,11 +17,12 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
-import org.apache.gluten.execution.{HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, ProjectExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, VeloxColumnarToRowExec}
+import org.apache.gluten.execution.{FlushableHashAggregateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, VeloxColumnarToRowExec}
+import org.apache.gluten.expression.aggregate.VeloxCollectList
 import org.apache.gluten.extension.columnar.FallbackTags
 
 import org.apache.spark.SparkFunSuite
-import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, AttributeReference, Cast, EqualTo, If, Literal, Multiply, NamedExpression, NullsFirst, SortOrder}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, AttributeReference, Cast, CreateNamedStruct, EqualTo, If, Literal, Multiply, NamedExpression, NullsFirst, SortOrder}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Partial, Sum}
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.execution.{ColumnarShuffleExchangeExec, ColumnarToRowExec, ProjectExec, SparkPlan}
@@ -44,6 +45,42 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
       outputPartitioning = HashPartitioning(Seq(child.output.head), 4),
       child = child,
       projectOutputAttributes = child.output)
+  }
+
+  private def collectStructAggregate(flushable: Boolean): HashAggregateExecBaseTransformer = {
+    val subject = AttributeReference("subject", StringType, nullable = true)()
+    val predicate = AttributeReference("predicate", StringType, nullable = true)()
+    val value = AttributeReference("value", StringType, nullable = true)()
+    val child = LocalTableScanExecTransformer(Seq(subject, predicate, value), Seq.empty)
+    val struct = CreateNamedStruct(
+      Seq(Literal("subject"), subject, Literal("predicate"), predicate, Literal("value"), value))
+    val aggregate = AggregateExpression(
+      VeloxCollectList(struct),
+      Partial,
+      isDistinct = false,
+      filter = None,
+      resultId = NamedExpression.newExprId)
+    if (flushable) {
+      FlushableHashAggregateExecTransformer(
+        requiredChildDistributionExpressions = None,
+        groupingExpressions = Seq(subject),
+        aggregateExpressions = Seq(aggregate),
+        aggregateAttributes = Seq(aggregate.resultAttribute),
+        initialInputBufferOffset = 0,
+        resultExpressions = Seq(subject, aggregate.resultAttribute),
+        child = child
+      )
+    } else {
+      RegularHashAggregateExecTransformer(
+        requiredChildDistributionExpressions = None,
+        groupingExpressions = Seq(subject),
+        aggregateExpressions = Seq(aggregate),
+        aggregateAttributes = Seq(aggregate.resultAttribute),
+        initialInputBufferOffset = 0,
+        resultExpressions = Seq(subject, aggregate.resultAttribute),
+        child = child
+      )
+    }
   }
 
   test("V2 write normalization strips Spark C2R directly over Gluten ColumnarExchange") {
@@ -194,6 +231,37 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
         _.aggregateFunction.children.forall(_.isInstanceOf[AttributeReference])))
     assert(normalized.find(_.isInstanceOf[ProjectExecTransformer]).isDefined)
     assert(rule.isFullyNativeSupported(normalized))
+  }
+
+  Seq(false, true).foreach {
+    flushable =>
+      val implementation = if (flushable) "flushable" else "regular"
+      test(s"strict normalization pre-projects an already native $implementation aggregate") {
+        val original = collectStructAggregate(flushable)
+        val originalOutputIds = original.output.map(_.exprId)
+        val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+        val normalized = rule.normalizeMppNativeOperators(original)
+        val rebuilt = normalized
+          .find(_.isInstanceOf[HashAggregateExecBaseTransformer])
+          .get
+          .asInstanceOf[HashAggregateExecBaseTransformer]
+
+        assert(rebuilt.output.map(_.exprId) == originalOutputIds)
+        assert(
+          rebuilt.aggregateExpressions.forall(
+            _.aggregateFunction.children.forall(_.isInstanceOf[AttributeReference])))
+        assert(rebuilt.child.isInstanceOf[ProjectExecTransformer])
+        val preProject = rebuilt.child.asInstanceOf[ProjectExecTransformer]
+        assert(preProject.projectList.exists(_.exists(_.isInstanceOf[CreateNamedStruct])))
+        assert(rebuilt.aggregateExpressions.map(_.mode) == original.aggregateExpressions.map(_.mode))
+        if (flushable) {
+          assert(rebuilt.isInstanceOf[FlushableHashAggregateExecTransformer])
+        } else {
+          assert(rebuilt.isInstanceOf[RegularHashAggregateExecTransformer])
+        }
+        assert(rule.isFullyNativeSupported(normalized))
+      }
   }
 
   test("bounded scalar result recognizes only a global aggregate without grouping") {

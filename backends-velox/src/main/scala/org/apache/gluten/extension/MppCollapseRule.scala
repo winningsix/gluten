@@ -499,8 +499,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // fails validation, so repeat the official pre-project rewrite before force-offloading the
     // strict-MPP subtree. This is expression-preserving and does not broaden native validation.
     val preProjected = coalesceElided.transformUp {
-      case agg: BaseAggregateExec if !agg.isInstanceOf[HashAggregateExecBaseTransformer] =>
-        PullOutPreProject.rewrite(agg)
+      case agg: BaseAggregateExec => PullOutPreProject.rewrite(agg)
       case sort: SortExec if !sort.global => PullOutPreProject.rewrite(sort)
     }
     // RAS may leave a vanilla Spark aggregate behind when its generic
