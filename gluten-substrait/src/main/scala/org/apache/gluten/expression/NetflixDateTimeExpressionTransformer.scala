@@ -21,7 +21,7 @@ import org.apache.gluten.substrait.SubstraitContext
 import org.apache.gluten.substrait.expression.{ExpressionBuilder, ExpressionNode}
 
 import org.apache.spark.sql.catalyst.expressions.{Expression, Literal, TimeZoneAwareExpression}
-import org.apache.spark.sql.types.{DataType, IntegerType, LongType, StringType}
+import org.apache.spark.sql.types.{DataType, IntegerType, LongType, StringType, TimestampType}
 import org.apache.spark.unsafe.types.UTF8String
 
 import scala.collection.JavaConverters._
@@ -39,6 +39,13 @@ import scala.collection.JavaConverters._
  * validation instead of silently using different date/time semantics.
  */
 private[expression] object NetflixDateTimeExpressionTransformer {
+  private val NfDateIntClassName = "com.netflix.bdp.expressions.NfDateInt"
+  private val NfFromUnixTimeTzClassName = "com.netflix.bdp.expressions.NfFromUnixTimeTz"
+  private val NfHourClassName = "com.netflix.bdp.expressions.NfHour"
+
+  private val NfDateIntFromUnixTimeTzFunctionName = "nf_dateint_from_unixtime_tz"
+  private val NfHourFromUnixTimeTzFunctionName = "nf_hour_from_unixtime_tz"
+
   private case class FunctionSpec(
       functionName: String,
       inputTypes: Set[DataType],
@@ -67,7 +74,7 @@ private[expression] object NetflixDateTimeExpressionTransformer {
     // Job 175's snapshot_utc_date is a nullable Iceberg INT. Keep this deliberately narrower than
     // Netflix NfDateInt's full JVM domain: strings, Spark dates/timestamps, and BIGINT remain on
     // the fail-closed path until each domain has independent native parity coverage.
-    "com.netflix.bdp.expressions.NfDateInt" ->
+    NfDateIntClassName ->
       FunctionSpec("nf_dateint", Set(IntegerType), IntegerType, "INT", NfDateIntUtcZoneIds)
   )
 
@@ -75,59 +82,148 @@ private[expression] object NetflixDateTimeExpressionTransformer {
       expr: Expression,
       transformChild: Expression => ExpressionTransformer,
       sessionTimeZone: => String): Option[ExpressionTransformer] = {
-    FunctionsByClassName.get(expr.getClass.getName).map {
-      spec =>
-        val functionName = spec.functionName
-        if (expr.children.size != 2) {
-          unsupported(
-            functionName,
-            s"expected exactly two Catalyst children (date, format), got ${expr.children.size}")
-        }
-
-        val Seq(date, format) = expr.children
-        if (!spec.inputTypes.contains(date.dataType)) {
-          unsupported(
-            functionName,
-            s"first native slice supports ${spec.inputDomain} input, " +
-              s"got ${date.dataType.catalogString}")
-        }
-        if (expr.dataType != spec.resultType) {
-          unsupported(
-            functionName,
-            s"expected ${spec.resultType.catalogString} output, got ${expr.dataType.catalogString}")
-        }
-
-        val formatText = format match {
-          case Literal(value: UTF8String, StringType) => value.toString
-          case Literal(value: String, StringType) => value
-          case Literal(null, StringType) =>
-            unsupported(functionName, "format must be the non-null plan-time literal '-'")
-          case _ =>
-            unsupported(functionName, "format must be a plan-time string literal")
-        }
-        if (formatText != "-") {
-          unsupported(
-            functionName,
-            s"first native slice supports only the default '-' format, got '$formatText'")
-        }
-
-        val timeZoneId = expr match {
-          case timezoneExpression: TimeZoneAwareExpression =>
-            timezoneExpression.timeZoneId.getOrElse(sessionTimeZone)
-          case _ =>
+    tryTransformFromUnixTimeTzFusion(expr, transformChild, sessionTimeZone).orElse {
+      FunctionsByClassName.get(expr.getClass.getName).map {
+        spec =>
+          val functionName = spec.functionName
+          if (expr.children.size != 2) {
             unsupported(
               functionName,
-              s"${expr.getClass.getName} must implement TimeZoneAwareExpression")
+              s"expected exactly two Catalyst children (date, format), got ${expr.children.size}")
+          }
+
+          val Seq(date, format) = expr.children
+          if (!spec.inputTypes.contains(date.dataType)) {
+            unsupported(
+              functionName,
+              s"first native slice supports ${spec.inputDomain} input, " +
+                s"got ${date.dataType.catalogString}")
+          }
+          validateResultType(expr, spec.resultType, functionName)
+          validateDefaultFormat(format, functionName)
+          val timeZoneId =
+            validatedOuterTimeZone(expr, spec.utcZoneIds, functionName, sessionTimeZone)
+
+          NetflixDateTimeTransformer(
+            functionName,
+            Seq(transformChild(date), transformChild(format), transformChild(Literal(timeZoneId))),
+            expr)
+      }
+    }
+  }
+
+  /**
+   * Lower only the exact nested Netflix expressions used by Jobs 215/216. Standalone TIMESTAMP
+   * NfDateInt remains outside the existing Job175 INT slice; accepting this composition does not
+   * broaden either expression independently.
+   */
+  private def tryTransformFromUnixTimeTzFusion(
+      expr: Expression,
+      transformChild: Expression => ExpressionTransformer,
+      sessionTimeZone: => String): Option[ExpressionTransformer] = {
+    val fusion = expr.getClass.getName match {
+      case NfDateIntClassName if expr.children.size == 2 =>
+        val Seq(timestamp, format) = expr.children
+        if (timestamp.getClass.getName == NfFromUnixTimeTzClassName) {
+          Some((NfDateIntFromUnixTimeTzFunctionName, timestamp, Some(format)))
+        } else {
+          None
         }
-        if (!spec.utcZoneIds.contains(timeZoneId)) {
-          unsupported(functionName, s"first native slice supports only UTC, got '$timeZoneId'")
+      case NfHourClassName if expr.children.size == 1 =>
+        val timestamp = expr.children.head
+        if (timestamp.getClass.getName == NfFromUnixTimeTzClassName) {
+          Some((NfHourFromUnixTimeTzFunctionName, timestamp, None))
+        } else {
+          None
+        }
+      case _ => None
+    }
+
+    fusion.map {
+      case (functionName, timestamp, format) =>
+        validateResultType(expr, IntegerType, functionName)
+        if (timestamp.dataType != TimestampType) {
+          unsupported(
+            functionName,
+            s"expected NfFromUnixTimeTz to produce TIMESTAMP, got " +
+              timestamp.dataType.catalogString)
+        }
+        if (timestamp.children.size != 2) {
+          unsupported(
+            functionName,
+            s"expected NfFromUnixTimeTz(date, timezone), got " +
+              s"${timestamp.children.size} children")
         }
 
-        NetflixDateTimeTransformer(
-          functionName,
-          Seq(transformChild(date), transformChild(format), transformChild(Literal(timeZoneId))),
-          expr)
+        val Seq(epoch, rowTimeZone) = timestamp.children
+        if (epoch.dataType != LongType) {
+          unsupported(
+            functionName,
+            s"first fused native slice requires BIGINT epoch input, got " +
+              epoch.dataType.catalogString)
+        }
+        if (rowTimeZone.dataType != StringType) {
+          unsupported(
+            functionName,
+            s"first fused native slice requires STRING timezone expression, got " +
+              rowTimeZone.dataType.catalogString)
+        }
+
+        format.foreach(validateDefaultFormat(_, functionName))
+        val outerTimeZone =
+          validatedOuterTimeZone(expr, NfDateIntUtcZoneIds, functionName, sessionTimeZone)
+        val nativeChildren =
+          Seq(transformChild(epoch), transformChild(rowTimeZone)) ++
+            format.map(transformChild) ++
+            Seq(transformChild(Literal(outerTimeZone)))
+        NetflixDateTimeTransformer(functionName, nativeChildren, expr)
     }
+  }
+
+  private def validateResultType(
+      expr: Expression,
+      expected: DataType,
+      functionName: String): Unit = {
+    if (expr.dataType != expected) {
+      unsupported(
+        functionName,
+        s"expected ${expected.catalogString} output, got ${expr.dataType.catalogString}")
+    }
+  }
+
+  private def validateDefaultFormat(format: Expression, functionName: String): Unit = {
+    val formatText = format match {
+      case Literal(value: UTF8String, StringType) => value.toString
+      case Literal(value: String, StringType) => value
+      case Literal(null, StringType) =>
+        unsupported(functionName, "format must be the non-null plan-time literal '-'")
+      case _ =>
+        unsupported(functionName, "format must be a plan-time string literal")
+    }
+    if (formatText != "-") {
+      unsupported(
+        functionName,
+        s"first native slice supports only the default '-' format, got '$formatText'")
+    }
+  }
+
+  private def validatedOuterTimeZone(
+      expr: Expression,
+      supportedZoneIds: Set[String],
+      functionName: String,
+      sessionTimeZone: => String): String = {
+    val timeZoneId = expr match {
+      case timezoneExpression: TimeZoneAwareExpression =>
+        timezoneExpression.timeZoneId.getOrElse(sessionTimeZone)
+      case _ =>
+        unsupported(
+          functionName,
+          s"${expr.getClass.getName} must implement TimeZoneAwareExpression")
+    }
+    if (!supportedZoneIds.contains(timeZoneId)) {
+      unsupported(functionName, s"first native slice supports only UTC, got '$timeZoneId'")
+    }
+    timeZoneId
   }
 
   private def unsupported(functionName: String, reason: String): Nothing = {
@@ -142,8 +238,9 @@ private case class NetflixDateTimeTransformer(
     original: Expression)
   extends ExpressionTransformer {
   override def doTransform(context: SubstraitContext): ExpressionNode = {
-    // Unlike the Catalyst expression, the native call has timezone as a third argument. Build the
-    // Substrait signature from transformer children so native signature resolution sees all three.
+    // Netflix Catalyst expressions carry timezone metadata outside their children. Build the
+    // Substrait signature from transformer children so regular and fused native calls include
+    // every explicit data or metadata argument.
     val functionName = ConverterUtils.makeFuncName(substraitExprName, children.map(_.dataType))
     val functionId = context.registerFunction(functionName)
     val childNodes = children.map(_.doTransform(context)).asJava

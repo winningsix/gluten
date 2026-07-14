@@ -36,6 +36,7 @@
 #include "velox/vector/arrow/Bridge.h"
 
 #include <algorithm>
+#include <limits>
 #include <unordered_set>
 
 #ifdef GLUTEN_ENABLE_GPU
@@ -162,17 +163,55 @@ VectorPtr readFlatVectorStringView(
 
   auto valueBuffer = buffers[bufferIdx++];
 
+  GLUTEN_CHECK(lengthOrIndices != nullptr, "Invalid string length buffer: buffer is null");
+  const uint64_t expectedLengthBufferSize = static_cast<uint64_t>(length) * sizeof(StringLengthType);
+  GLUTEN_CHECK(
+      lengthOrIndices->size() == expectedLengthBufferSize,
+      fmt::format(
+          "Invalid string length buffer: expected exactly {} bytes for {} rows, but got {} bytes",
+          expectedLengthBufferSize,
+          length,
+          lengthOrIndices->size()));
+  GLUTEN_CHECK(valueBuffer != nullptr, "Invalid string value buffer: buffer is null");
+
   const auto* rawLength = lengthOrIndices->as<StringLengthType>();
   const auto* valueBufferPtr = valueBuffer->as<char>();
+  const uint64_t valueBufferSize = valueBuffer->size();
 
   auto values = AlignedBuffer::allocate<char>(sizeof(StringView) * length, pool);
   auto* rawValues = values->asMutable<StringView>();
 
   uint64_t offset = 0;
-  for (int32_t i = 0; i < length; ++i) {
-    rawValues[i] = StringView(valueBufferPtr + offset, rawLength[i]);
-    offset += rawLength[i];
+  for (uint32_t i = 0; i < length; ++i) {
+    const auto stringLength = rawLength[i];
+    GLUTEN_CHECK(
+        stringLength <= static_cast<StringLengthType>(std::numeric_limits<int32_t>::max()),
+        fmt::format(
+            "Invalid string length at row {}: {} exceeds INT32_MAX (value buffer size: {}, offset: {})",
+            i,
+            stringLength,
+            valueBufferSize,
+            offset));
+    GLUTEN_CHECK(
+        offset <= valueBufferSize && static_cast<uint64_t>(stringLength) <= valueBufferSize - offset,
+        fmt::format(
+            "Invalid string length at row {}: length {} at offset {} exceeds value buffer size {}",
+            i,
+            stringLength,
+            offset,
+            valueBufferSize));
+
+    rawValues[i] = StringView(valueBufferPtr + offset, static_cast<int32_t>(stringLength));
+    offset += static_cast<uint64_t>(stringLength);
   }
+
+  GLUTEN_CHECK(
+      offset == valueBufferSize,
+      fmt::format(
+          "Invalid string value buffer: decoded {} bytes for {} rows, but buffer has {} bytes",
+          offset,
+          length,
+          valueBufferSize));
 
   std::vector<BufferPtr> stringBuffers;
   stringBuffers.emplace_back(valueBuffer);
@@ -239,37 +278,13 @@ RowTypePtr getComplexWriteType(const std::vector<TypePtr>& types) {
   return std::make_shared<const RowType>(std::move(complexTypeColNames), std::move(complexTypeChildrens));
 }
 
-// Compute which buffer indices belong to each column based on schema types.
-// Returns number of flat buffers (excluding the complex type buffer at end).
-int32_t countFlatBuffersPerColumn(const std::vector<TypePtr>& types, std::vector<int32_t>& bufferStartPerColumn) {
-  int32_t bufferIdx = 0;
-  for (size_t i = 0; i < types.size(); ++i) {
-    bufferStartPerColumn.push_back(bufferIdx);
-    auto kind = types[i]->kind();
-    switch (kind) {
-      case TypeKind::ROW:
-      case TypeKind::MAP:
-      case TypeKind::ARRAY:
-        break;
-      case TypeKind::UNKNOWN:
-        break;
-      case TypeKind::VARCHAR:
-      case TypeKind::VARBINARY:
-        bufferIdx += 3;
-        break;
-      default:
-        bufferIdx += 2;
-        break;
-    }
-  }
-  return bufferIdx;
-}
-
 std::vector<bool> computeBufferProjection(
     const std::vector<TypePtr>& types,
     const std::vector<uint32_t>& columnProjection,
-    bool hasComplexType) {
+    bool hasComplexType,
+    const std::vector<int32_t>& dictionaryFields) {
   std::unordered_set<uint32_t> projectedCols(columnProjection.begin(), columnProjection.end());
+  std::unordered_set<int32_t> dictionaryCols(dictionaryFields.begin(), dictionaryFields.end());
 
   std::vector<bool> bufferProjection;
   bool anyComplexNeeded = false;
@@ -291,7 +306,9 @@ std::vector<bool> computeBufferProjection(
       case TypeKind::VARBINARY:
         bufferProjection.push_back(needed);
         bufferProjection.push_back(needed);
-        bufferProjection.push_back(needed);
+        if (dictionaryCols.count(static_cast<int32_t>(i)) == 0) {
+          bufferProjection.push_back(needed);
+        }
         break;
       default:
         bufferProjection.push_back(needed);
@@ -350,26 +367,31 @@ RowVectorPtr deserialize(
         complexIdx++;
       } break;
       default: {
+        const bool isDictionary = !dictionaryFields.empty() && dictionaryIdx < dictionaryFields.size() &&
+            dictionaryFields[dictionaryIdx] == static_cast<int32_t>(i);
+        const auto requiredBuffers = kind == TypeKind::UNKNOWN
+            ? 0
+            : ((kind == TypeKind::VARCHAR || kind == TypeKind::VARBINARY) ? (isDictionary ? 2 : 3) : 2);
+        GLUTEN_CHECK(
+            bufferIdx >= 0 && static_cast<size_t>(bufferIdx) + requiredBuffers <= buffers.size(),
+            fmt::format(
+                "Invalid shuffle buffer layout for column {}: need {} "
+                "buffers at index {}, but only {} buffers are available",
+                i,
+                requiredBuffers,
+                bufferIdx,
+                buffers.size()));
         if (!needed) {
           // Skip buffers for this column
-          if (kind == TypeKind::UNKNOWN) {
-            // no buffers
-          } else if (kind == TypeKind::VARCHAR || kind == TypeKind::VARBINARY) {
-            bufferIdx += 3;
-          } else {
-            bufferIdx += 2;
-          }
-
-          if (!dictionaryFields.empty() && dictionaryIdx < dictionaryFields.size() &&
-              dictionaryFields[dictionaryIdx] == static_cast<int32_t>(i)) {
+          bufferIdx += requiredBuffers;
+          if (isDictionary) {
             dictionaryIdx++;
           }
           children.emplace_back(BaseVector::createNullConstant(types[i], numRows, pool));
           break;
         }
         VectorPtr dictionary{nullptr};
-        if (!dictionaryFields.empty() && dictionaryIdx < dictionaryFields.size() &&
-            dictionaryFields[dictionaryIdx] == static_cast<int32_t>(i)) {
+        if (isDictionary) {
           dictionary = dictionaries[dictionaryIdx++];
         }
         auto res = VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH_ALL(
@@ -437,22 +459,64 @@ arrow::Result<VectorPtr> readDictionaryForBinary(
     arrow::util::Codec* codec) {
   // Read length buffer.
   ARROW_ASSIGN_OR_RAISE(auto lengthBuffer, readDictionaryBuffer(in, pool, codec));
+  ARROW_RETURN_IF(
+      lengthBuffer == nullptr, arrow::Status::Invalid("Invalid dictionary string length buffer: buffer is null"));
+  ARROW_RETURN_IF(
+      lengthBuffer->size() % sizeof(StringLengthType) != 0,
+      arrow::Status::Invalid(fmt::format(
+          "Invalid dictionary string length buffer: size {} is not a multiple of {}",
+          lengthBuffer->size(),
+          sizeof(StringLengthType))));
   const auto* lengthBufferPtr = lengthBuffer->as<StringLengthType>();
 
   // Read value buffer.
   ARROW_ASSIGN_OR_RAISE(auto valueBuffer, readDictionaryBuffer(in, pool, codec));
+  ARROW_RETURN_IF(
+      valueBuffer == nullptr, arrow::Status::Invalid("Invalid dictionary string value buffer: buffer is null"));
   const auto* valueBufferPtr = valueBuffer->as<char>();
+  const uint64_t valueBufferSize = valueBuffer->size();
 
   // Build StringViews.
   const auto numElements = lengthBuffer->size() / sizeof(StringLengthType);
+  ARROW_RETURN_IF(
+      numElements > static_cast<size_t>(std::numeric_limits<int32_t>::max()),
+      arrow::Status::Invalid(
+          fmt::format("Invalid dictionary string length buffer: {} elements exceeds INT32_MAX", numElements)));
   auto values = AlignedBuffer::allocate<char>(sizeof(StringView) * numElements, pool, std::nullopt, true);
   auto* rawValues = values->asMutable<StringView>();
 
   uint64_t offset = 0;
   for (size_t i = 0; i < numElements; ++i) {
-    rawValues[i] = StringView(valueBufferPtr + offset, lengthBufferPtr[i]);
-    offset += lengthBufferPtr[i];
+    const auto stringLength = lengthBufferPtr[i];
+    ARROW_RETURN_IF(
+        stringLength > static_cast<StringLengthType>(std::numeric_limits<int32_t>::max()),
+        arrow::Status::Invalid(fmt::format(
+            "Invalid dictionary string length at element {}: {} exceeds INT32_MAX "
+            "(value buffer size: {}, offset: {})",
+            i,
+            stringLength,
+            valueBufferSize,
+            offset)));
+    ARROW_RETURN_IF(
+        offset > valueBufferSize || static_cast<uint64_t>(stringLength) > valueBufferSize - offset,
+        arrow::Status::Invalid(fmt::format(
+            "Invalid dictionary string length at element {}: length {} at offset {} exceeds value buffer size {}",
+            i,
+            stringLength,
+            offset,
+            valueBufferSize)));
+
+    rawValues[i] = StringView(valueBufferPtr + offset, static_cast<int32_t>(stringLength));
+    offset += static_cast<uint64_t>(stringLength);
   }
+
+  ARROW_RETURN_IF(
+      offset != valueBufferSize,
+      arrow::Status::Invalid(fmt::format(
+          "Invalid dictionary string value buffer: decoded {} bytes for {} elements, but buffer has {} bytes",
+          offset,
+          numElements,
+          valueBufferSize)));
 
   std::vector<BufferPtr> stringBuffers;
   stringBuffers.emplace_back(valueBuffer);
@@ -620,11 +684,6 @@ void VeloxHashShuffleReaderDeserializer::initBufferProjection() {
     return;
   }
 
-  auto types = rowType_->as<TypeKind::ROW>().children();
-  auto complexRowType = getComplexWriteType(types);
-  bool hasComplexType = complexRowType->children().size() > 0;
-
-  bufferProjection_ = computeBufferProjection(types, columnProjection_, hasComplexType);
   hasProjection_ = true;
 }
 
@@ -649,6 +708,10 @@ std::shared_ptr<ColumnarBatch> VeloxHashShuffleReaderDeserializer::next() {
 
   if (hasProjection_) {
     // Two-phase read: header first, then only projected buffers.
+    auto types = rowType_->as<TypeKind::ROW>().children();
+    auto complexRowType = getComplexWriteType(types);
+    auto bufferProjection =
+        computeBufferProjection(types, columnProjection_, !complexRowType->children().empty(), dictionaryFields_);
     GLUTEN_ASSIGN_OR_THROW(auto header, BlockPayload::readHeader(in_.get(), deserializeTime_));
     numRows = header.numRows;
     GLUTEN_ASSIGN_OR_THROW(
@@ -658,7 +721,7 @@ std::shared_ptr<ColumnarBatch> VeloxHashShuffleReaderDeserializer::next() {
             header,
             codec_,
             memoryManager_->defaultArrowMemoryPool(),
-            bufferProjection_,
+            bufferProjection,
             deserializeTime_,
             decompressTime_));
     return makeColumnarBatch(

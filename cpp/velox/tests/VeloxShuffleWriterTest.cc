@@ -18,6 +18,13 @@
 #include <arrow/c/bridge.h>
 #include <arrow/io/api.h>
 
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <limits>
+#include <thread>
+
+#include "shuffle/ShuffleCompressionPool.h"
 #include "shuffle/VeloxHashShuffleWriter.h"
 #include "shuffle/VeloxRssSortShuffleWriter.h"
 #include "shuffle/VeloxSortShuffleWriter.h"
@@ -196,6 +203,75 @@ class VeloxShuffleWriterTestEnvironment : public ::testing::Environment {
     VeloxShuffleWriterTestBase::tearDownVeloxBackend();
   }
 };
+
+class VeloxShuffleReaderValidationTest : public ::testing::Test, public VeloxShuffleWriterTestBase {
+ protected:
+  std::shared_ptr<ResultIterator> makeMalformedStringReader(
+      uint32_t numRows,
+      std::vector<StringLengthType> lengths,
+      std::string values,
+      bool includeValueBuffer = true) {
+    std::vector<std::shared_ptr<arrow::Buffer>> buffers{nullptr, arrow::Buffer::FromVector(std::move(lengths))};
+    if (includeValueBuffer) {
+      buffers.push_back(arrow::Buffer::FromString(std::move(values)));
+    }
+    GLUTEN_ASSIGN_OR_THROW(
+        auto payload,
+        BlockPayload::fromBuffers(
+            Payload::kUncompressed, numRows, std::move(buffers), nullptr, arrow::default_memory_pool(), nullptr));
+
+    GLUTEN_ASSIGN_OR_THROW(auto output, arrow::io::BufferOutputStream::Create(1024, arrow::default_memory_pool()));
+    const auto blockType = static_cast<uint8_t>(BlockType::kPlainPayload);
+    GLUTEN_THROW_NOT_OK(output->Write(&blockType, sizeof(blockType)));
+    GLUTEN_THROW_NOT_OK(payload->serialize(output.get()));
+    GLUTEN_ASSIGN_OR_THROW(auto serialized, output->Finish());
+
+    const auto rowType = ROW({"value"}, {VARCHAR()});
+    const auto schema = toArrowSchema(rowType, getDefaultMemoryManager()->getLeafMemoryPool().get());
+    auto factory = std::make_unique<VeloxShuffleReaderDeserializerFactory>(
+        schema,
+        nullptr,
+        arrowCompressionTypeToVelox(arrow::Compression::UNCOMPRESSED),
+        rowType,
+        kDefaultBatchSize,
+        kDefaultReadBufferSize,
+        kDefaultDeserializerBufferSize,
+        getDefaultMemoryManager(),
+        ShuffleWriterType::kHashShuffle);
+    auto reader = std::make_shared<VeloxShuffleReader>(std::move(factory));
+    auto input = std::make_shared<arrow::io::BufferReader>(std::move(serialized));
+    return reader->read(std::make_shared<TestStreamReader>(std::move(input)));
+  }
+
+  void expectMalformedStringFailure(
+      uint32_t numRows,
+      std::vector<StringLengthType> lengths,
+      std::string values,
+      const std::string& expectedMessage) {
+    auto iterator = makeMalformedStringReader(numRows, std::move(lengths), std::move(values));
+    try {
+      iterator->next();
+      FAIL() << "Expected malformed string shuffle payload to fail";
+    } catch (const GlutenException& e) {
+      EXPECT_NE(std::string(e.what()).find(expectedMessage), std::string::npos) << e.what();
+    }
+  }
+};
+
+TEST_F(VeloxShuffleReaderValidationTest, rejectsMalformedStringLengths) {
+  expectMalformedStringFailure(1, {std::numeric_limits<StringLengthType>::max()}, "x", "exceeds INT32_MAX");
+  expectMalformedStringFailure(1, {2}, "x", "exceeds value buffer size");
+  expectMalformedStringFailure(2, {1}, "x", "expected exactly 8 bytes");
+  expectMalformedStringFailure(1, {1}, "xy", "decoded 1 bytes");
+
+  auto missingValueBuffer = makeMalformedStringReader(1, {1}, "", false);
+  try {
+    missingValueBuffer->next();
+    FAIL() << "Expected truncated string shuffle payload to fail";
+  } catch (const GlutenException& e) {
+    EXPECT_NE(std::string(e.what()).find("need 3 buffers"), std::string::npos) << e.what();
+  }
+}
 
 class VeloxShuffleWriterTest : public ::testing::TestWithParam<ShuffleTestParams>, public VeloxShuffleWriterTestBase {
  protected:
@@ -692,6 +768,68 @@ TEST_P(RoundRobinPartitioningShuffleWriterTest, preAllocForceReuse) {
   ASSERT_NOT_OK(splitRowVector(*shuffleWriter, inputStringHasNull));
 
   ASSERT_NOT_OK(shuffleWriter->stop());
+}
+
+TEST_P(RoundRobinPartitioningShuffleWriterTest, asyncCompressionOwnsReusedBuffers) {
+  const auto& params = GetParam();
+  if (params.shuffleWriterType != ShuffleWriterType::kHashShuffle ||
+      params.partitionWriterType != PartitionWriterType::kLocal ||
+      params.compressionType != arrow::Compression::LZ4_FRAME || params.compressionThreshold != 0 ||
+      params.mergeBufferSize != 0 || params.enableDictionary) {
+    GTEST_SKIP();
+  }
+
+  auto options = std::make_shared<HashShuffleWriterOptions>();
+  options->partitioning = Partitioning::kRoundRobin;
+  options->splitBufferSize = 4;
+  options->splitBufferReallocThreshold = 1;
+  auto shuffleWriter = createShuffleWriter(1, options);
+
+  // Keep all compression workers busy so the first payload is guaranteed to
+  // remain queued while the writer reuses and overwrites its backing buffers.
+  std::promise<void> releasePromise;
+  auto release = releasePromise.get_future().share();
+  std::atomic<int32_t> started{0};
+  std::vector<std::future<void>> blockers;
+  const auto workerCount = ShuffleCompressionPool::instance().workerCount();
+  blockers.reserve(workerCount);
+  for (int32_t i = 0; i < workerCount; ++i) {
+    blockers.emplace_back(ShuffleCompressionPool::instance().submit([&]() {
+      started.fetch_add(1, std::memory_order_release);
+      release.wait();
+    }));
+  }
+  const auto startDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (started.load(std::memory_order_acquire) != workerCount && std::chrono::steady_clock::now() < startDeadline) {
+    std::this_thread::yield();
+  }
+  if (started.load(std::memory_order_acquire) != workerCount) {
+    releasePromise.set_value();
+    for (auto& blocker : blockers) {
+      blocker.get();
+    }
+    FAIL() << "Timed out waiting for shuffle compression workers";
+  }
+
+  // Both batches have the same total string bytes, but different per-row
+  // lengths and contents. Without detaching a reuseBuffers payload before
+  // async compression, the first block is deterministically overwritten by
+  // the second one.
+  auto first = makeRowVector({makeFlatVector<StringView>({"a", "bb", "ccc", "dddd"})});
+  auto second = makeRowVector({makeFlatVector<StringView>({"wwww", "xxx", "yy", "z"})});
+  auto firstStatus = splitRowVector(*shuffleWriter, first);
+  auto evictStatus = shuffleWriter->evictPartitionBuffers(0, true);
+  auto secondStatus = splitRowVector(*shuffleWriter, second);
+
+  releasePromise.set_value();
+  for (auto& blocker : blockers) {
+    blocker.get();
+  }
+
+  ASSERT_NOT_OK(firstStatus);
+  ASSERT_NOT_OK(evictStatus);
+  ASSERT_NOT_OK(secondStatus);
+  shuffleWriteReadMultiBlocks(*shuffleWriter, 1, {{first, second}});
 }
 
 TEST_P(RoundRobinPartitioningShuffleWriterTest, spillVerifyResult) {

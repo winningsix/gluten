@@ -19,15 +19,22 @@ package org.apache.gluten.expression
 import org.apache.gluten.exception.GlutenNotSupportException
 import org.apache.gluten.substrait.SubstraitContext
 
-import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression, Literal}
-import org.apache.spark.sql.types.{DateType, IntegerType, StringType, TimestampType}
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, BoundReference, Coalesce, Expression, Literal}
+import org.apache.spark.sql.types.{DateType, IntegerType, LongType, StringType, TimestampType}
 
-import com.netflix.bdp.expressions.{NfDateInt, NfToUnixTime, NfToUnixTimeMs}
+import com.netflix.bdp.expressions.{NfDateInt, NfFromUnixTimeTz, NfHour, NfToUnixTime, NfToUnixTimeMs}
 import org.scalatest.funsuite.AnyFunSuite
 
 class NetflixDateTimeExpressionTransformerSuite extends AnyFunSuite {
   private def transformChild(expression: Expression): ExpressionTransformer = expression match {
     case literal: Literal => LiteralTransformer(literal)
+    case attribute: AttributeReference =>
+      AttributeReferenceTransformer(
+        "selection",
+        attribute,
+        BoundReference(0, attribute.dataType, attribute.nullable))
+    case coalesce: Coalesce =>
+      GenericExpressionTransformer("coalesce", coalesce.children.map(transformChild), coalesce)
     case other => fail(s"unexpected child in focused test: $other")
   }
 
@@ -77,6 +84,89 @@ class NetflixDateTimeExpressionTransformerSuite extends AnyFunSuite {
     assert(context.registeredFunction.keySet().toArray.exists {
       _.toString.startsWith("nf_dateint:i32_str_str")
     })
+  }
+
+  test("maps exact Job215 and Job216 timestamp fusions with literal and dynamic row zones") {
+    val epoch = AttributeReference("event_utc_ms_ts", LongType, nullable = true)()
+    val zone = AttributeReference("region_iana_time_zone_code", StringType, nullable = true)()
+    val dynamicZone = Coalesce(Seq(zone, Literal("UTC")))
+    val dateExpression =
+      NfDateInt(NfFromUnixTimeTz(epoch, dynamicZone), Literal("-"), Some("Etc/UTC"))
+    val hourExpression =
+      NfHour(NfFromUnixTimeTz(epoch, Literal("UTC")), Some("UTC"))
+
+    val dateInt = NetflixDateTimeExpressionTransformer
+      .tryTransform(dateExpression, transformChild, "America/Los_Angeles")
+      .get
+    val hour = NetflixDateTimeExpressionTransformer
+      .tryTransform(hourExpression, transformChild, "America/Los_Angeles")
+      .get
+
+    assert(dateInt.substraitExprName === "nf_dateint_from_unixtime_tz")
+    assert(
+      dateInt.children
+        .map(_.original) === Seq(epoch, dynamicZone, Literal("-"), Literal("Etc/UTC")))
+    assert(hour.substraitExprName === "nf_hour_from_unixtime_tz")
+    assert(hour.children.map(_.original) === Seq(epoch, Literal("UTC"), Literal("UTC")))
+
+    val context = new SubstraitContext
+    dateInt.doTransform(context)
+    hour.doTransform(context)
+    assert(context.registeredFunction.keySet().toArray.exists {
+      _.toString.startsWith("nf_dateint_from_unixtime_tz:i64_str_str_str")
+    })
+    assert(context.registeredFunction.keySet().toArray.exists {
+      _.toString.startsWith("nf_hour_from_unixtime_tz:i64_str_str")
+    })
+  }
+
+  test("timestamp fusion validates inner types, DateInt format, and outer timezone") {
+    val epoch = AttributeReference("epoch", LongType, nullable = true)()
+    val zone = AttributeReference("zone", StringType, nullable = true)()
+    val validTimestamp = NfFromUnixTimeTz(epoch, zone)
+    val cases = Seq(
+      NfDateInt(
+        NfFromUnixTimeTz(AttributeReference("epoch", IntegerType, nullable = true)(), zone),
+        Literal("-"),
+        Some("UTC")) -> "requires BIGINT epoch input",
+      NfDateInt(
+        NfFromUnixTimeTz(epoch, AttributeReference("zone", IntegerType, nullable = true)()),
+        Literal("-"),
+        Some("UTC")) -> "requires STRING timezone expression",
+      NfDateInt(validTimestamp, AttributeReference("format", StringType)(), Some("UTC")) ->
+        "format must be a plan-time string literal",
+      NfDateInt(validTimestamp, Literal("yyyyMMdd"), Some("UTC")) ->
+        "supports only the default '-' format",
+      NfDateInt(validTimestamp, Literal("-"), Some("America/Los_Angeles")) ->
+        "supports only UTC",
+      NfHour(validTimestamp, Some("Z")) -> "supports only UTC"
+    )
+
+    cases.foreach {
+      case (expression, expected) =>
+        val error = intercept[GlutenNotSupportException] {
+          NetflixDateTimeExpressionTransformer.tryTransform(expression, transformChild, "UTC")
+        }
+        assert(error.getMessage.contains(expected), expression.toString)
+    }
+  }
+
+  test("standalone TIMESTAMP DateInt and same-simple-name inner expression remain fail closed") {
+    case class NfFromUnixTimeTz(date: Expression, timezone: Expression)
+      extends TimestampBinaryExpressionForTest
+    val timestamp = AttributeReference("timestamp", TimestampType, nullable = true)()
+    val fakeInner = NfFromUnixTimeTz(Literal(1704067200000L), Literal("UTC"))
+
+    Seq(timestamp, fakeInner).foreach {
+      input =>
+        val error = intercept[GlutenNotSupportException] {
+          NetflixDateTimeExpressionTransformer.tryTransform(
+            NfDateInt(input, Literal("-"), Some("UTC")),
+            transformChild,
+            "UTC")
+        }
+        assert(error.getMessage.contains("supports INT input"))
+    }
   }
 
   test("does not match a class by simple name") {
@@ -166,6 +256,21 @@ private trait BinaryExpressionForTest
     org.apache.spark.sql.types.LongType
   override def nullable: Boolean = true
   override def nullSafeEval(dateValue: Any, formatValue: Any): Any = null
+  override protected def withNewChildrenInternal(
+      newLeft: Expression,
+      newRight: Expression): Expression = this
+}
+
+private trait TimestampBinaryExpressionForTest
+  extends org.apache.spark.sql.catalyst.expressions.BinaryExpression
+  with org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback {
+  def date: Expression
+  def timezone: Expression
+  override def left: Expression = date
+  override def right: Expression = timezone
+  override def dataType: org.apache.spark.sql.types.DataType = TimestampType
+  override def nullable: Boolean = true
+  override def nullSafeEval(dateValue: Any, timezoneValue: Any): Any = null
   override protected def withNewChildrenInternal(
       newLeft: Expression,
       newRight: Expression): Expression = this

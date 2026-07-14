@@ -16,9 +16,9 @@
  */
 package com.netflix.bdp.expressions
 
-import org.apache.spark.sql.catalyst.expressions.{BinaryExpression, Expression, TimeZoneAwareExpression}
+import org.apache.spark.sql.catalyst.expressions.{BinaryExpression, Expression, TimeZoneAwareExpression, UnaryExpression}
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
-import org.apache.spark.sql.types.{DataType, IntegerType, LongType}
+import org.apache.spark.sql.types.{DataType, IntegerType, LongType, TimestampType}
 
 /** Test-only stand-in that keeps Gluten's production module independent of the Netflix jar. */
 case class NfToUnixTime(date: Expression, format: Expression, timeZoneId: Option[String] = None)
@@ -67,4 +67,31 @@ case class NfDateInt(date: Expression, format: Expression, timeZoneId: Option[St
   override protected def withNewChildrenInternal(
       newLeft: Expression,
       newRight: Expression): Expression = copy(date = newLeft, format = newRight)
+}
+
+case class NfFromUnixTimeTz(date: Expression, timezone: Expression)
+  extends BinaryExpression
+  with CodegenFallback {
+  override def left: Expression = date
+  override def right: Expression = timezone
+  override def dataType: DataType = TimestampType
+  override def nullable: Boolean = true
+  override def nullSafeEval(dateValue: Any, timezoneValue: Any): Any = null
+  override protected def withNewChildrenInternal(
+      newLeft: Expression,
+      newRight: Expression): Expression = copy(date = newLeft, timezone = newRight)
+}
+
+case class NfHour(date: Expression, timeZoneId: Option[String] = None)
+  extends UnaryExpression
+  with TimeZoneAwareExpression
+  with CodegenFallback {
+  override def child: Expression = date
+  override def dataType: DataType = IntegerType
+  override def nullable: Boolean = true
+  override def nullSafeEval(dateValue: Any): Any = null
+  override def withTimeZone(timeZoneId: String): TimeZoneAwareExpression =
+    copy(timeZoneId = Some(timeZoneId))
+  override protected def withNewChildInternal(newChild: Expression): Expression =
+    copy(date = newChild)
 }

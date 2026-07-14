@@ -77,4 +77,45 @@ TEST_F(NetflixDateTimeGpuTest, UnixTimeDateIntChronoCastsMatchCpu) {
       "nf_to_unixtime_ms(c0, '-', 'Etc/UTC')", input, input->rowType());
 }
 
+TEST_F(NetflixDateTimeGpuTest, FusedFromUnixTimeTzFieldsMatchCpu) {
+  auto input = makeRowVector(
+      {makeNullableFlatVector<int64_t>(
+           {1'704'067'200,
+            1'704'067'200'000,
+            1'710'063'000,
+            1'710'066'600,
+            1'704'067'200,
+            1'704'067'200,
+            12'622'807'800,
+            -2'717'683'500,
+            100'000'000'000'000,
+            std::nullopt}),
+       makeNullableFlatVector<StringView>(
+           {"UTC",
+            "America/Los_Angeles",
+            "America/Los_Angeles",
+            "America/Los_Angeles",
+            "PST",
+            "+05:30",
+            "America/Los_Angeles",
+            "America/Los_Angeles",
+            "UTC",
+            std::nullopt})});
+
+  assertExpressionMatchesCpu("nf_dateint_from_unixtime_tz(c0, c1, '-', 'UTC')", input, input->rowType());
+  assertExpressionMatchesCpu("nf_hour_from_unixtime_tz(c0, c1, 'Etc/UTC')", input, input->rowType());
+  assertExpressionMatchesCpu(
+      "nf_dateint_from_unixtime_tz(c0, 'America/Los_Angeles', '-', 'UTC')",
+      makeRowVector({input->childAt(0)}),
+      ROW({"c0"}, {BIGINT()}));
+
+  auto nullZones = makeRowVector(
+      {makeFlatVector<int64_t>({1'704'067'200, 1'704'067'201}),
+       makeNullableFlatVector<StringView>({std::nullopt, std::nullopt})});
+  assertExpressionMatchesCpu("nf_dateint_from_unixtime_tz(c0, c1, '-', 'UTC')", nullZones, nullZones->rowType());
+
+  auto emptyZone = makeRowVector({makeFlatVector<int64_t>({1'704'067'200})});
+  assertExpressionMatchesCpu("nf_hour_from_unixtime_tz(c0, '', 'UTC')", emptyZone, emptyZone->rowType());
+}
+
 } // namespace

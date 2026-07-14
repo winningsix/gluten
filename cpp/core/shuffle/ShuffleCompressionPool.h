@@ -17,11 +17,13 @@
 
 #pragma once
 
+#include <algorithm>
 #include <condition_variable>
 #include <functional>
 #include <future>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -55,11 +57,19 @@ class ShuffleCompressionPool {
             std::forward<F>(func));
     auto future = task->get_future();
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      std::unique_lock<std::mutex> lock(mutex_);
+      queueSpaceCv_.wait(lock, [this] { return stopped_ || queue_.size() < maxQueuedTasks_; });
+      if (stopped_) {
+        throw std::runtime_error("Shuffle compression pool is stopped");
+      }
       queue_.push([task]() { (*task)(); });
     }
     cv_.notify_one();
     return future;
+  }
+
+  int workerCount() const {
+    return static_cast<int>(workers_.size());
   }
 
   ~ShuffleCompressionPool() {
@@ -68,6 +78,7 @@ class ShuffleCompressionPool {
       stopped_ = true;
     }
     cv_.notify_all();
+    queueSpaceCv_.notify_all();
     for (auto& t : workers_) {
       if (t.joinable()) {
         t.join();
@@ -83,9 +94,9 @@ class ShuffleCompressionPool {
     return n;
   }
 
-  explicit ShuffleCompressionPool(int numThreads)
-      : stopped_(false) {
-    for (int i = 0; i < numThreads; ++i) {
+  explicit ShuffleCompressionPool(int numThreads) : maxQueuedTasks_(std::max(numThreads, 1)), stopped_(false) {
+    const auto workerThreads = std::max(numThreads, 1);
+    for (int i = 0; i < workerThreads; ++i) {
       workers_.emplace_back([this] {
         while (true) {
           Task task;
@@ -100,6 +111,7 @@ class ShuffleCompressionPool {
             task = std::move(queue_.front());
             queue_.pop();
           }
+          queueSpaceCv_.notify_one();
           task();
         }
       });
@@ -115,6 +127,8 @@ class ShuffleCompressionPool {
   std::queue<Task> queue_;
   std::mutex mutex_;
   std::condition_variable cv_;
+  std::condition_variable queueSpaceCv_;
+  const size_t maxQueuedTasks_;
   bool stopped_;
 };
 

@@ -69,7 +69,6 @@ class VeloxHashShuffleReaderDeserializer final : public ColumnarBatchIterator {
   // Column projection: indices of columns to read. Empty means read all.
   std::vector<uint32_t> columnProjection_;
   // Buffer-level projection derived from columnProjection_ and schema.
-  std::vector<bool> bufferProjection_;
   bool hasProjection_{false};
 };
 
