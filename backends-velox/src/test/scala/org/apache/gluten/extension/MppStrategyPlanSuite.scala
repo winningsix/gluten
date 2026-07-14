@@ -396,6 +396,7 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     assert(
       preparedChild.collect { case exchange: ShuffleExchangeLike => exchange }.nonEmpty,
       "The execution-visible child should retain exchange boundaries:\n" +
-        preparedChild.treeString)
+        preparedChild.treeString
+    )
   }
 }
