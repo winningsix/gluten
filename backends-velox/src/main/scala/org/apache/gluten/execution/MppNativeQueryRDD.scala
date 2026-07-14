@@ -30,8 +30,12 @@ import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.{Namespace, SparkDirectoryUtil}
 
+import org.apache.commons.io.FileUtils
+
+import java.io.File
 import java.util.{HashMap => JHashMap, Iterator => JIterator}
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -165,13 +169,6 @@ class MppNativeQueryRDD(
     if (keepDeviceOutput) {
       runtimeExtraConf.put("spark.gluten.sql.columnar.cudf.skipOutputToVelox", "true")
     }
-    // MPP creates multiple Velox Tasks behind this one Spark task. Allocate a
-    // query-level root from Spark's configured local directories and let the
-    // native coordinator create an isolated child for every fragment replica.
-    // This follows the same SparkDirectoryUtil lifecycle as BSP spill instead
-    // of falling back to the process-wide java.io.tmpdir.
-    val spillRootPath =
-      MppNativeQueryRDD.createSpillRoot(SparkDirectoryUtil.get().namespace("gluten-spill"))
     val runtime =
       Runtimes.contextInstance(BackendsApiManager.getBackendName, "MppQuery", runtimeExtraConf)
     val jniWrapper = MppQueryJniWrapper.create(runtime)
@@ -267,17 +264,26 @@ class MppNativeQueryRDD(
             s"at slots ${sortedBySlot.map(_._1).mkString("[", ",", "]")}")
     }
 
-    val mppHandle = jniWrapper.nativeCreateMppQuery(
-      fragmentPlans,
-      numDriversPerFragment,
-      exchangeSpecsJson.getBytes("UTF-8"),
-      mppPeerSpecJson.getBytes("UTF-8"),
-      localFragmentSplitInfos,
-      jvmStreamSlotIndicesPerFrag,
-      jvmStreamIteratorsPerFrag,
-      replicatedCartesianMaxBuildBytes,
-      spillRootPath
-    )
+    // MPP creates multiple Velox Tasks behind this one Spark task. Allocate the query-level root
+    // only after all JVM-side validation and stream materialization has succeeded. The lease keeps
+    // ownership until nativeCreateMppQuery returns; a native parse/plan-conversion failure therefore
+    // deletes the root instead of leaking it for the lifetime of the executor.
+    val spillRootLease = MppNativeQueryRDD.createSpillRootLease(
+      SparkDirectoryUtil.get().namespace("gluten-spill"))
+    val mppHandle = spillRootLease.handoffAfterCreate {
+      spillRootPath =>
+        jniWrapper.nativeCreateMppQuery(
+          fragmentPlans,
+          numDriversPerFragment,
+          exchangeSpecsJson.getBytes("UTF-8"),
+          mppPeerSpecJson.getBytes("UTF-8"),
+          localFragmentSplitInfos,
+          jvmStreamSlotIndicesPerFrag,
+          jvmStreamIteratorsPerFrag,
+          replicatedCartesianMaxBuildBytes,
+          spillRootPath
+        )
+    }
     @volatile var mppClosed = false
     def closeMppHandle(): Long = this.synchronized {
       if (mppClosed) {
@@ -293,34 +299,69 @@ class MppNativeQueryRDD(
       }
     }
 
+    def closeMppHandleAtTaskCompletion(): Unit = {
+      if (!mppClosed) {
+        try {
+          closeMppHandle()
+        } catch {
+          case NonFatal(e) =>
+            logWarning("MppNativeQueryRDD: failed to close MPP query at task completion", e)
+        }
+      }
+    }
+
+    def closeMppHandleAfterSetupFailure(setupFailure: Throwable): Nothing =
+      MppNativeQueryRDD.rethrowAfterCleanup(setupFailure, () => closeMppHandle())
+
+    // Install the native-handle owner immediately after creation. In particular, no control-plane
+    // registration failure may leave a successfully-created coordinator without a completion hook.
+    try {
+      context.addTaskCompletionListener[Unit](_ => closeMppHandleAtTaskCompletion())
+    } catch {
+      case listenerFailure: Throwable => closeMppHandleAfterSetupFailure(listenerFailure)
+    }
+
     val runId = MppQueryRunId(mppQueryId, context.stageId(), context.stageAttemptNumber())
-    val activeQuery = GlutenMppExecutorService.registerQuery(
-      runId,
-      mppPartition.index,
-      mppPartition.totalPartitions,
-      context,
-      () => jniWrapper.nativeAbortMppQuery(mppHandle))
+    val activeQuery =
+      try {
+        GlutenMppExecutorService.registerQuery(
+          runId,
+          mppPartition.index,
+          mppPartition.totalPartitions,
+          context,
+          () => jniWrapper.nativeAbortMppQuery(mppHandle))
+      } catch {
+        case registrationFailure: Throwable =>
+          closeMppHandleAfterSetupFailure(registrationFailure)
+      }
 
     def reportTerminal(state: String): Unit =
       activeQuery.foreach(GlutenMppExecutorService.reportTerminal(_, state))
 
-    context.addTaskCompletionListener[Unit] {
-      taskContext =>
-        if (!mppClosed) {
-          try {
-            closeMppHandle()
-          } catch {
-            case NonFatal(e) =>
-              logWarning("MppNativeQueryRDD: failed to close MPP query at task completion", e)
-          }
-        }
-        val terminalState =
-          if (taskContext.isInterrupted() || activeQuery.exists(_.isAbortRequested)) {
-            MppPeerState.Aborted
-          } else {
-            MppPeerState.Succeeded
-          }
-        reportTerminal(terminalState)
+    try {
+      context.addTaskCompletionListener[Unit] {
+        taskContext =>
+          // This listener is registered after the close-only safety hook and therefore runs first
+          // under Spark's LIFO listener ordering. Keep the old close-before-terminal-report
+          // contract; the earlier hook remains an idempotent backstop for registration races.
+          closeMppHandleAtTaskCompletion()
+          val terminalState =
+            if (taskContext.isInterrupted() || activeQuery.exists(_.isAbortRequested)) {
+              MppPeerState.Aborted
+            } else {
+              MppPeerState.Succeeded
+            }
+          reportTerminal(terminalState)
+      }
+    } catch {
+      case listenerFailure: Throwable =>
+        MppNativeQueryRDD.rethrowAfterCleanup(
+          listenerFailure,
+          () =>
+            activeQuery.foreach(
+              query => GlutenMppExecutorService.reportFailure(query, listenerFailure)),
+          () => closeMppHandle(),
+          () => reportTerminal(MppPeerState.Failed))
     }
 
     val tCreateDoneStartBegin = System.nanoTime()
@@ -592,12 +633,64 @@ private[gluten] case class MppPeerInfo(
     port: Int,
     preferredLocation: String)
 
-private[execution] object MppNativeQueryRDD {
+/**
+ * Owns a newly-created MPP spill root until the native coordinator has accepted it.
+ *
+ * [[handoffAfterCreate]] transfers ownership only after its callback returns. Its `finally` closes
+ * the lease in both cases: before handoff that recursively deletes the root, while after handoff it
+ * is an idempotent no-op because native MppQueryCoordinator owns cleanup.
+ */
+private[execution] final class MppSpillRootLease(
+    val root: File,
+    deleteRoot: File => Unit)
+  extends AutoCloseable {
+  private val ownsRoot = new AtomicBoolean(true)
 
-  private[execution] def createSpillRoot(namespace: Namespace): String = {
-    namespace
-      .mkChildDirRoundRobin(s"mpp-${UUID.randomUUID()}")
-      .getAbsolutePath
+  def path: String = root.getAbsolutePath
+
+  def handoffAfterCreate[T](create: String => T): T = {
+    try {
+      val result = create(path)
+      ownsRoot.set(false)
+      result
+    } finally {
+      close()
+    }
+  }
+
+  override def close(): Unit = {
+    if (ownsRoot.compareAndSet(true, false)) {
+      deleteRoot(root)
+    }
+  }
+}
+
+private[execution] object MppNativeQueryRDD extends Logging {
+
+  private[execution] def rethrowAfterCleanup(
+      primaryFailure: Throwable,
+      cleanupActions: (() => Unit)*): Nothing = {
+    cleanupActions.foreach {
+      cleanup =>
+        try {
+          cleanup()
+        } catch {
+          case cleanupFailure: Throwable if cleanupFailure ne primaryFailure =>
+            primaryFailure.addSuppressed(cleanupFailure)
+          case _: Throwable =>
+        }
+    }
+    throw primaryFailure
+  }
+
+  private[execution] def createSpillRootLease(namespace: Namespace): MppSpillRootLease = {
+    val root = namespace.mkChildDirRoundRobin(s"mpp-${UUID.randomUUID()}")
+    new MppSpillRootLease(
+      root,
+      file =>
+        if (!FileUtils.deleteQuietly(file) && file.exists()) {
+          logWarning(s"MppNativeQueryRDD: failed to delete unowned MPP spill root $file")
+        })
   }
 
   def alignInputRDD(rdd: RDD[ColumnarBatch], targetPartitions: Int): RDD[ColumnarBatch] = {
