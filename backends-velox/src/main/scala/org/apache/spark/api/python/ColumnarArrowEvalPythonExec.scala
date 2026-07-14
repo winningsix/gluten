@@ -125,6 +125,122 @@ private[python] class AckingPythonInputBatch(
   }
 }
 
+/**
+ * Stateful Arrow stream writer shared by the Spark 3 writer-thread and Spark 4 non-blocking Python
+ * runner protocols.
+ *
+ * Spark 3 calls [[writeAll]] once from its dedicated writer thread. Spark 4 repeatedly calls
+ * [[writeNext]] while its `ReaderInputStream` alternates socket reads and writes. The latter must
+ * consume at most one input batch per invocation: Spark bounds each socket write chunk only after
+ * the method returns. Draining the iterator here would otherwise materialize the entire partition
+ * in `DirectByteBufferOutputStream` before Python can consume its first record batch.
+ */
+final private[python] class ColumnarArrowBatchStreamWriter(schema: StructType, timeZoneId: String)
+  extends AutoCloseable {
+  private val arrowSchema = SparkSchemaUtil.toArrowSchema(schema, timeZoneId)
+  private val allocator = ArrowBufferAllocators.contextInstance()
+
+  private var root: VectorSchemaRoot = _
+  private var loader: VectorLoader = _
+  private var writer: ArrowStreamWriter = _
+  private var closed = false
+
+  def writeAll(inputIterator: Iterator[ColumnarBatch], dataOut: DataOutputStream): Unit = {
+    // Spark <= 3.5's WriterThread historically emitted no Arrow stream for an empty partition.
+    // Preserve that protocol exactly; Spark 4's incremental path intentionally starts and ends an
+    // empty stream to match PythonArrowInput.
+    if (!inputIterator.hasNext) {
+      return
+    }
+    ensureStarted(dataOut)
+    try {
+      while (inputIterator.hasNext) {
+        writeBatch(inputIterator.next())
+      }
+      finish()
+    } catch {
+      case t: Throwable =>
+        close()
+        throw t
+    }
+  }
+
+  def writeNext(inputIterator: Iterator[ColumnarBatch], dataOut: DataOutputStream): Boolean = {
+    ensureStarted(dataOut)
+    try {
+      if (inputIterator.hasNext) {
+        writeBatch(inputIterator.next())
+        dataOut.flush()
+        true
+      } else {
+        finish()
+        dataOut.flush()
+        false
+      }
+    } catch {
+      case t: Throwable =>
+        close()
+        throw t
+    }
+  }
+
+  private def ensureStarted(dataOut: DataOutputStream): Unit = {
+    require(!closed, "Columnar Arrow Python stream is already closed")
+    if (writer == null) {
+      root = VectorSchemaRoot.create(arrowSchema, allocator)
+      loader = new VectorLoader(root)
+      writer = new ArrowStreamWriter(root, null, dataOut)
+      writer.start()
+    }
+  }
+
+  private def writeBatch(nextBatch: ColumnarBatch): Unit = {
+    try {
+      val cols = (0 until nextBatch.numCols).toList.map(
+        i =>
+          nextBatch
+            .column(i)
+            .asInstanceOf[ArrowWritableColumnVector]
+            .getValueVector)
+      val nextRecordBatch = SparkVectorUtil.toArrowRecordBatch(nextBatch.numRows, cols)
+      try {
+        loader.load(nextRecordBatch)
+        writer.writeBatch()
+      } finally {
+        nextRecordBatch.close()
+      }
+    } finally {
+      nextBatch match {
+        case ack: PythonInputBatchSerializationAck => ack.serializationFinished()
+        case _ =>
+      }
+    }
+  }
+
+  private def finish(): Unit = {
+    if (!closed) {
+      try {
+        writer.end()
+      } finally {
+        close()
+      }
+    }
+  }
+
+  /** Release Arrow vectors without trying to write a footer to a failed or canceled socket. */
+  override def close(): Unit = {
+    if (!closed) {
+      closed = true
+      if (root != null) {
+        root.close()
+        root = null
+      }
+      loader = null
+      writer = null
+    }
+  }
+}
+
 class ColumnarArrowPythonRunner(
     funcs: Seq[(ChainedPythonFunctions, Long)],
     evalType: Int,
@@ -215,6 +331,9 @@ class ColumnarArrowPythonRunner(
       partitionIndex: Int,
       context: TaskContext): Writer = {
     new Writer(env, worker, inputIterator, partitionIndex, context) {
+      private val streamWriter = new ColumnarArrowBatchStreamWriter(schema, timeZoneId)
+      context.addTaskCompletionListener[Unit](_ => streamWriter.close())
+
       override protected def writeCommand(dataOut: DataOutputStream): Unit = {
         // Write config for the worker as a number of key -> value pairs of strings
         dataOut.writeInt(conf.size)
@@ -228,67 +347,13 @@ class ColumnarArrowPythonRunner(
       // For Spark earlier than 4.0. It overrides the corresponding abstract method
       // in Writer class. We omitted the override keyword for compatibility consideration.
       def writeIteratorToStream(dataOut: DataOutputStream): Unit = {
-        writeToStreamHelper(dataOut)
+        streamWriter.writeAll(inputIterator, dataOut)
       }
 
       // For Spark 4.0. It overrides the corresponding abstract method in Writer class.
       // We omitted the override keyword for compatibility consideration.
       def writeNextInputToStream(dataOut: DataOutputStream): Boolean = {
-        writeToStreamHelper(dataOut)
-      }
-
-      def writeToStreamHelper(dataOut: DataOutputStream): Boolean = {
-        if (!inputIterator.hasNext) {
-          // See https://issues.apache.org/jira/browse/SPARK-44705:
-          // Starting from Spark 4.0, we should return false once the iterator is drained out,
-          // otherwise Spark won't stop calling this method repeatedly.
-          return false
-        }
-        var numRows: Long = 0
-        val arrowSchema = SparkSchemaUtil.toArrowSchema(schema, timeZoneId)
-        val allocator = ArrowBufferAllocators.contextInstance()
-        val root = VectorSchemaRoot.create(arrowSchema, allocator)
-
-        Utils.tryWithSafeFinally {
-          val loader = new VectorLoader(root)
-          val writer = new ArrowStreamWriter(root, null, dataOut)
-          writer.start()
-          while (inputIterator.hasNext) {
-            val nextBatch = inputIterator.next()
-            try {
-              numRows += nextBatch.numRows
-
-              val cols = (0 until nextBatch.numCols).toList.map(
-                i =>
-                  nextBatch
-                    .column(i)
-                    .asInstanceOf[ArrowWritableColumnVector]
-                    .getValueVector)
-              val nextRecordBatch =
-                SparkVectorUtil.toArrowRecordBatch(nextBatch.numRows, cols)
-              try {
-                loader.load(nextRecordBatch)
-                writer.writeBatch()
-              } finally {
-                nextRecordBatch.close()
-              }
-            } finally {
-              nextBatch match {
-                case ack: PythonInputBatchSerializationAck => ack.serializationFinished()
-                case _ =>
-              }
-            }
-          }
-          // end writes footer to the output stream and doesn't clean any resources.
-          // It could throw exception if the output stream is closed, so it should be
-          // in the try block.
-          writer.end()
-          true
-        } {
-          root.close()
-          // allocator can't close now or the data will loss
-          // allocator.close()
-        }
+        streamWriter.writeNext(inputIterator, dataOut)
       }
     }
   }
