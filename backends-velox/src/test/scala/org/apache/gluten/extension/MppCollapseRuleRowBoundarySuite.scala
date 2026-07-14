@@ -193,19 +193,14 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(!rule.isFullyNativeSupported(boundary))
   }
 
-  test("root DeserializeToObject keeps only the object egress outside MPP") {
+  test("root DeserializeToObject without a direct C2R remains rejected") {
     val child = nativeLeaf()
     val boundary = deserializeRows(child)
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
-    val collapsed = rule(boundary)
+    val result = rule(boundary)
 
-    assert(collapsed.isInstanceOf[DeserializeToObjectExec])
-    assert(collapsed.children.head.isInstanceOf[MppNativeQueryExec])
-    assert(collapsed.children.head.output == child.output)
-    // No explicit C2R is needed in this shape: MppNativeQueryExec.doExecute performs the single
-    // Velox native-to-row conversion requested by DeserializeToObjectExec.execute.
-    assert(collapsed.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
+    assert(result.find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
     assert(!rule.isFullyNativeSupported(boundary))
   }
 
@@ -223,7 +218,21 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(c2r.children.head.output == child.output)
   }
 
-  test("root DeserializeToObject accepts the exact ExistingRDD ingress hybrid") {
+  test("root DeserializeToObject preserves its one direct Gluten C2R outside MPP") {
+    val child = nativeLeaf()
+    val boundary = deserializeRows(VeloxColumnarToRowExec(child))
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val collapsed = rule(boundary)
+
+    assert(collapsed.isInstanceOf[DeserializeToObjectExec])
+    val c2r = collapsed.children.head
+    assert(c2r.isInstanceOf[VeloxColumnarToRowExec])
+    assert(c2r.children.head.isInstanceOf[MppNativeQueryExec])
+    assert(c2r.children.head.output == child.output)
+  }
+
+  test("root DeserializeToObject does not compose with the ExistingRDD ingress hybrid") {
     val attr = AttributeReference("a", IntegerType, nullable = true)()
     val scan = existingRddScan(attr)
     val ingress = RowToVeloxColumnarExec(scan)
@@ -231,11 +240,9 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val boundary = deserializeRows(ColumnarToRowExec(nativeSuffix))
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
-    val collapsed = rule(boundary)
+    val result = rule(boundary)
 
-    val mpp = collapsed.children.head.children.head.asInstanceOf[MppNativeQueryExec]
-    assert(
-      mpp.child.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+    assert(result.find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
   }
 
   test("nested DeserializeToObject remains a strict MPP rejection") {
@@ -264,7 +271,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
 
   test("root DeserializeToObject does not admit a Python producer") {
     val python = BatchEvalPythonExec(Seq.empty, Seq.empty, nativeLeaf())
-    val boundary = deserializeRows(python)
+    val boundary = deserializeRows(ColumnarToRowExec(python))
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
     val result = rule(boundary)

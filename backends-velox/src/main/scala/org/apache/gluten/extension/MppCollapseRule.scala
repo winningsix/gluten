@@ -309,11 +309,11 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    */
   private def collapseMppOrArrowHybrid(plan: SparkPlan): Option[SparkPlan] = {
     plan match {
-      // Dataset.rdd is represented by a terminal DeserializeToObjectExec in Spark 4. Keep exactly
-      // that object-producing root outside MPP while requiring the relational producer below it
-      // to satisfy the ordinary fully-native or exact ExistingRDD-ingress contract. Object
-      // operators at any nested position, and every other root object operator, remain rejected by
-      // the strict recursive validator.
+      // Dataset.rdd is represented by a terminal DeserializeToObjectExec. Keep exactly that
+      // object-producing root and its direct C2R outside MPP while requiring the relational
+      // producer below them to satisfy the ordinary fully-native contract. Object operators at any
+      // nested position, and every other root object operator, remain rejected by the strict
+      // recursive validator.
       case deserialize: DeserializeToObjectExec =>
         collapseTerminalObjectEgress(deserialize)
       // Spark materializes an uncorrelated scalar subquery through a final C2R even when its
@@ -368,31 +368,32 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   /**
    * Collapse the relational producer of a root Dataset.rdd object adapter.
    *
-   * InsertTransitions normally places one direct C2R between DeserializeToObjectExec and a
+   * Spark's InsertTransitions contract places one direct C2R between DeserializeToObjectExec and a
    * columnar child. Preserve that required transition outside MPP, but peel it before validating
-   * the relational subtree so it is not mistaken for a nested row island. If the caller supplies
-   * no explicit C2R, MppNativeQueryExec.doExecute already provides the Velox native-to-row
-   * conversion; adding a second adapter would only duplicate the boundary.
+   * the relational subtree so it is not mistaken for a nested row island. This direct adjacency is
+   * defined by Spark's transition contract; diagnostic plan strings can be truncated before the
+   * child tree and are not evidence for accepting any looser object shape.
    */
   private def collapseTerminalObjectEgress(
-      boundary: DeserializeToObjectExec): Option[SparkPlan] = {
-    val (directRowTransition, relationalChild): (Option[SparkPlan], SparkPlan) =
-      boundary.child match {
-        case c2r: ColumnarToRowExecBase => (Some(c2r), c2r.child)
-        case c2r: ColumnarToRowExec => (Some(c2r), c2r.child)
-        case child => (None, child)
-      }
+      boundary: DeserializeToObjectExec): Option[SparkPlan] = boundary.child match {
+    case c2r: ColumnarToRowExecBase =>
+      collapseTerminalObjectEgressThroughC2r(boundary, c2r, c2r.child)
+    case c2r: ColumnarToRowExec =>
+      collapseTerminalObjectEgressThroughC2r(boundary, c2r, c2r.child)
+    case _ => None
+  }
 
-    tryCollapseExistingRddHybrid(relationalChild).orElse(tryCollapseMpp(relationalChild)).map {
+  private def collapseTerminalObjectEgressThroughC2r(
+      boundary: DeserializeToObjectExec,
+      directRowTransition: SparkPlan,
+      relationalChild: SparkPlan): Option[SparkPlan] = {
+    tryCollapseMpp(relationalChild).map {
       nativeChild =>
-        val objectInput = directRowTransition match {
-          case Some(c2r) => c2r.withNewChildren(Seq(nativeChild))
-          case None => nativeChild
-        }
+        val objectInput = directRowTransition.withNewChildren(Seq(nativeChild))
         logWarning(
           "MppCollapseRule: *** INTENTIONAL TERMINAL NATIVE OBJECT OUTPUT *** " +
-            s"boundary=${boundary.getClass.getSimpleName}; only the root object adapter " +
-            "remains outside MPP")
+            s"boundary=${boundary.getClass.getSimpleName}; the root object adapter and its " +
+            s"direct ${directRowTransition.getClass.getSimpleName} remain outside MPP")
         boundary.withNewChildren(Seq(objectInput))
     }
   }
