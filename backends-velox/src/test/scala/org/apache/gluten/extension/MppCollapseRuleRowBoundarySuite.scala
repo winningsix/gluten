@@ -31,7 +31,7 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression,
 import org.apache.spark.sql.catalyst.expressions.objects.CreateExternalRow
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, ColumnarToRowExec, DeserializeToObjectExec, MapPartitionsExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SparkPlan, UnaryExecNode}
-import org.apache.spark.sql.execution.aggregate.{BaseAggregateExec, HashAggregateExec}
+import org.apache.spark.sql.execution.aggregate.{BaseAggregateExec, HashAggregateExec, SortAggregateExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{DoubleType, IntegerType, LongType, ObjectType, StringType, StructField, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -313,6 +313,21 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(mpp.child.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
   }
 
+  test("an ingress-only ExistingRDD plan gets an identity native fragment anchor") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val scan = existingRddScan(attr)
+    val ingress = RowToVeloxColumnarExec(scan)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val collapsed = rule(ingress)
+
+    assert(collapsed.isInstanceOf[MppNativeQueryExec])
+    val mpp = collapsed.asInstanceOf[MppNativeQueryExec]
+    assert(mpp.child.isInstanceOf[ProjectExecTransformer])
+    assert(mpp.child.output.map(_.exprId) == ingress.output.map(_.exprId))
+    assert(mpp.child.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+  }
+
   test("a nested native-to-row boundary cannot activate MPP") {
     val boundary = VeloxColumnarToRowExec(nativeLeaf())
     val parent = ProjectExecTransformer(boundary.output, boundary)
@@ -337,6 +352,23 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
       MppExistingRddStreamInput
         .scan(ColumnarInputAdapter(ingress))
         .contains(scan))
+  }
+
+  test("ExistingRDD hybrid validation absorbs a shuffle directly over the exact ingress") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val scan = existingRddScan(attr)
+    val ingress = RowToVeloxColumnarExec(scan)
+    val exchange = ColumnarShuffleExchangeExec(
+      outputPartitioning = HashPartitioning(Seq(attr), 4),
+      child = ingress,
+      projectOutputAttributes = ingress.output)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assert(!rule.isFullyNativeSupported(exchange))
+    assert(rule.isSupportedExistingRddHybridPlan(exchange))
+    val collapsed = rule(exchange)
+    assert(collapsed.isInstanceOf[MppNativeQueryExec])
+    assert(collapsed.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
   }
 
   test("ExistingRDD matcher rejects non-Existing RDDScan names") {
@@ -392,6 +424,12 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
 
     assert(!rule.isSupportedExistingRddHybridPlan(nativeSuffix))
     assert(MppExistingRddStreamInput.scan(ingress).isEmpty)
+
+    val exchange = ColumnarShuffleExchangeExec(
+      outputPartitioning = HashPartitioning(Seq(attr), 4),
+      child = ingress,
+      projectOutputAttributes = ingress.output)
+    assert(!rule.isSupportedExistingRddHybridPlan(exchange))
   }
 
   test("ExistingRDD matcher rejects a native-to-row round trip") {
@@ -486,6 +524,50 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
         _.aggregateFunction.children.forall(_.isInstanceOf[AttributeReference])))
     assert(normalized.find(_.isInstanceOf[ProjectExecTransformer]).isDefined)
     assert(rule.isFullyNativeSupported(normalized))
+  }
+
+  test("strict collapse normalizes a stale collect-list struct aggregate before row rejection") {
+    val subject = AttributeReference("subject", StringType, nullable = true)()
+    val predicate = AttributeReference("predicate", StringType, nullable = true)()
+    val value = AttributeReference("value", StringType, nullable = true)()
+    val child = LocalTableScanExecTransformer(Seq(subject, predicate, value), Seq.empty)
+    val rowInput = ColumnarToRowExec(child)
+    val struct = CreateNamedStruct(
+      Seq(Literal("subject"), subject, Literal("predicate"), predicate, Literal("value"), value))
+    val aggregate = AggregateExpression(
+      VeloxCollectList(struct),
+      Partial,
+      isDistinct = false,
+      filter = None,
+      resultId = NamedExpression.newExprId)
+    val rowAggregate = SortAggregateExec(
+      requiredChildDistributionExpressions = None,
+      isStreaming = false,
+      numShufflePartitions = None,
+      groupingExpressions = Seq(subject),
+      aggregateExpressions = Seq(aggregate),
+      aggregateAttributes = Seq(aggregate.resultAttribute),
+      initialInputBufferOffset = 0,
+      resultExpressions = Seq(subject, aggregate.resultAttribute),
+      child = rowInput
+    )
+    val stalePlan = RowToVeloxColumnarExec(rowAggregate)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val collapsed = rule(stalePlan)
+
+    assert(collapsed.isInstanceOf[MppNativeQueryExec])
+    val nativePlan = collapsed.asInstanceOf[MppNativeQueryExec].child
+    assert(nativePlan.find(_.isInstanceOf[RowToVeloxColumnarExec]).isEmpty)
+    assert(nativePlan.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
+    val nativeAggregate = nativePlan
+      .find(_.isInstanceOf[HashAggregateExecBaseTransformer])
+      .get
+      .asInstanceOf[HashAggregateExecBaseTransformer]
+    assert(
+      nativeAggregate.aggregateExpressions.forall(
+        _.aggregateFunction.children.forall(_.isInstanceOf[AttributeReference])))
+    assert(nativeAggregate.child.isInstanceOf[ProjectExecTransformer])
   }
 
   Seq(false, true).foreach {

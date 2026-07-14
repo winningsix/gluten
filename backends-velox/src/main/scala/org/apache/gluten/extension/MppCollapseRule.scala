@@ -505,17 +505,42 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    * non-TransformSupport operators that are not exchanges).
    */
   private def tryCollapseMpp(plan: SparkPlan): Option[MppNativeQueryExec] = {
-    if (containsUnpairedNestedRowOutput(plan)) {
+    // Gluten's ordinary validation can leave a temporary C2R -> row aggregate/sort/project/filter
+    // -> R2C shell when a native operator has a computed argument. Repair only those explicit
+    // late-offload shapes before checking row boundaries. Running the broad transition normalizer
+    // first would also erase an unrelated nested C2R and weaken the strict-MPP contract.
+    val repaired = repairRecoverableRowShells(plan)
+    if (containsUnpairedNestedRowOutput(repaired)) {
       logWarning(
         "MppCollapseRule: refusing to normalize an unpaired nested C2R; " +
           "only the explicit root row-output path may retain that boundary")
       return None
     }
-    val unionRewritten = normalizeMppNativeOperators(plan)
+    val normalized = normalizeMppNativeOperators(repaired)
     tryCollapseNormalizedMpp(
-      unionRewritten,
+      normalized,
       allowExistingRddIngress = false,
       mode = "fully native-supported")
+  }
+
+  /**
+   * Apply the existing strict native normalizer only to row shells it explicitly knows how to
+   * late-offload. This makes computed aggregate/sort expressions reachable without treating an
+   * arbitrary nested row consumer as a convention adapter.
+   */
+  private def repairRecoverableRowShells(plan: SparkPlan): SparkPlan =
+    plan.transformUp {
+      case r2c: RowToColumnarExecBase if isRecoverableRowOperator(r2c.child) =>
+        normalizeMppNativeOperators(r2c)
+      case r2c: RowToColumnarExec if isRecoverableRowOperator(r2c.child) =>
+        normalizeMppNativeOperators(r2c)
+    }
+
+  private def isRecoverableRowOperator(plan: SparkPlan): Boolean = plan match {
+    case _: BaseAggregateExec => true
+    case sort: SortExec if !sort.global => true
+    case _: ProjectExec | _: FilterExec => true
+    case _ => false
   }
 
   private def tryCollapseExistingRddHybrid(plan: SparkPlan): Option[MppNativeQueryExec] = {
@@ -529,8 +554,19 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     if (!containsExactExistingRddIngress(unionRewritten)) {
       return None
     }
+    // A DataFrame created directly from an ExistingRDD can reach a V2 writer without any native
+    // relational suffix.  The exact R2C ingress is a local stream input, not a native fragment by
+    // itself, so anchor this otherwise transparent plan with an identity native project.  This
+    // preserves output attributes and gives ColumnarCollapseTransformStages a TransformSupport
+    // consumer from which dynamic MPP extraction can build one real fragment.
+    val nativeAnchored =
+      if (unionRewritten.find(_.isInstanceOf[TransformSupport]).isEmpty) {
+        ProjectExecTransformer(unionRewritten.output, unionRewritten)
+      } else {
+        unionRewritten
+      }
     tryCollapseNormalizedMpp(
-      unionRewritten,
+      nativeAnchored,
       allowExistingRddIngress = true,
       mode = "native with exact ExistingRDD ingress")
   }
@@ -703,24 +739,26 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       isNativeSupported(plan, allowExistingRddIngress = true)
 
   private def containsExactExistingRddIngress(plan: SparkPlan): Boolean =
-    plan.find {
-      case r2c: RowToColumnarExecBase => MppExistingRddStreamInput.scan(r2c).isDefined
-      case r2c: RowToColumnarExec => MppExistingRddStreamInput.scan(r2c).isDefined
-      case _ => false
-    }.isDefined
+    plan.find(isExactExistingRddIngress).isDefined
+
+  private def isExactExistingRddIngress(plan: SparkPlan): Boolean = plan match {
+    case r2c: RowToColumnarExecBase => MppExistingRddStreamInput.scan(r2c).isDefined
+    case r2c: RowToColumnarExec => MppExistingRddStreamInput.scan(r2c).isDefined
+    case _ => false
+  }
 
   private def isNativeSupported(plan: SparkPlan, allowExistingRddIngress: Boolean): Boolean = {
     plan match {
       // Exchanges that we can absorb into the MPP plan
       case exchange: ShuffleExchangeLike =>
-        canAbsorbExchange(exchange) &&
+        canAbsorbExchange(exchange, allowExistingRddIngress) &&
         isNativeSupported(exchange.child, allowExistingRddIngress)
 
       // Broadcast exchanges are absorbable when the build side is itself a fully
       // native TransformSupport subtree (recurse into children, same as shuffle).
       // The native MPP runtime treats BROADCAST as a distinct exchange type.
       case bc: BroadcastExchangeLike =>
-        val absorbable = canAbsorbExchange(bc) &&
+        val absorbable = canAbsorbExchange(bc, allowExistingRddIngress) &&
           bc.children.forall(isNativeSupported(_, allowExistingRddIngress))
         if (!absorbable) {
           logWarning(
@@ -848,9 +886,9 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         .headOption
 
     plan match {
-      case _: ShuffleExchangeLike if canAbsorbExchange(plan) =>
+      case _: ShuffleExchangeLike if canAbsorbExchange(plan, allowExistingRddIngress) =>
         findInChildren(plan)
-      case _: BroadcastExchangeLike if canAbsorbExchange(plan) =>
+      case _: BroadcastExchangeLike if canAbsorbExchange(plan, allowExistingRddIngress) =>
         findInChildren(plan)
       case _: ShuffleQueryStageExec =>
         findFirstUnsupportedOperator(
@@ -943,14 +981,15 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    *   - The partitioning type is one we support for GPU streaming exchange
    *   - There are no UDFs that require JVM execution in the exchange
    */
-  private def canAbsorbExchange(exchange: SparkPlan): Boolean = {
+  private def canAbsorbExchange(exchange: SparkPlan, allowExistingRddIngress: Boolean): Boolean = {
     exchange match {
       case shuffle: ShuffleExchangeLike =>
         val partitioningSupported = isSupportedPartitioning(shuffle.outputPartitioning)
         val childSupported = shuffle.child.isInstanceOf[TransformSupport] ||
           shuffle.child.isInstanceOf[ShuffleQueryStageExec] ||
           shuffle.child.isInstanceOf[BroadcastQueryStageExec] ||
-          shuffle.child.isInstanceOf[ColumnarToColumnarExec]
+          shuffle.child.isInstanceOf[ColumnarToColumnarExec] ||
+          (allowExistingRddIngress && isExactExistingRddIngress(shuffle.child))
 
         if (!partitioningSupported) {
           logWarning(
