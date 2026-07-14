@@ -14,7 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.gluten.execution
+package org.apache.iceberg.spark.source
+
+import org.apache.gluten.execution.{IcebergScanTransformer, SparkDataSourceRDDPartition}
 
 import org.apache.spark.Partition
 import org.apache.spark.sql.QueryTest
@@ -26,7 +28,6 @@ import org.apache.spark.sql.types.{IntegerType, StructField, StructType}
 
 import org.apache.iceberg._
 import org.apache.iceberg.expressions.{Expressions, ResidualEvaluator}
-import org.apache.iceberg.spark.source.SparkInputPartition
 import org.apache.iceberg.types.Types
 
 import scala.collection.JavaConverters._
