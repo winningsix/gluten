@@ -171,10 +171,11 @@ private[gluten] object MppExistingRddStreamInput {
   private def directExternalObjectScan(plan: SparkPlan): Option[ExternalRDDScanExec[_]] =
     plan match {
       case external: ExternalRDDScanExec[_] => Some(external)
-      // Spark's CollapseCodegenStages inserts this row adapter at a whole-stage boundary. Accept only
-      // one direct adapter here; making InputAdapter generally transparent would admit arbitrary row
-      // subtrees as strict-MPP local streams. ColumnarInputAdapter is a separate Gluten convention
-      // adapter and is intentionally not accepted in this serializer-specific position.
+      // Spark's CollapseCodegenStages inserts this row adapter at a whole-stage boundary.
+      // Accept only one direct adapter here; making InputAdapter generally transparent would
+      // admit arbitrary row subtrees as strict-MPP local streams. ColumnarInputAdapter is a
+      // separate Gluten convention adapter and is intentionally not accepted in this
+      // serializer-specific position.
       case adapter: InputAdapter =>
         adapter.child match {
           case external: ExternalRDDScanExec[_] => Some(external)
