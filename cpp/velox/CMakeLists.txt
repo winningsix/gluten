@@ -580,16 +580,10 @@ if(ENABLE_GPU)
     facebook::velox::velox_cudf_iceberg_connector
     ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/iceberg/libvelox_cudf_iceberg_connector.a
   )
-  # IBM-baseline velox dropped velox/experimental/cudf/exchange/. The
-  # equivalent functionality is in IBM's UcxExchange/UcxPartitionedOutput
-  # which live under velox/experimental/ucx-exchange/, linked transitively
-  # via velox_cudf_exec.
-  file(
-    GLOB GLUTEN_UCX_EXCHANGE_OBJECTS
-    "${VELOX_BUILD_PATH}/velox/experimental/ucx-exchange/CMakeFiles/velox_ucx_exchange.dir/*.cpp.o")
-  if(NOT GLUTEN_UCX_EXCHANGE_OBJECTS)
-    message(FATAL_ERROR "Cannot find Velox UCX exchange object files under ${VELOX_BUILD_PATH}")
-  endif()
+  # IBM-baseline velox dropped velox/experimental/cudf/exchange/. Its
+  # replacement velox_ucx_exchange object library is already embedded in
+  # velox_cudf_exec and must be linked exactly once. Linking the standalone
+  # objects again registers gflags and process-wide UCX singletons twice.
 
   target_compile_definitions(
     velox PRIVATE LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
@@ -598,12 +592,6 @@ if(ENABLE_GPU)
   set_target_properties(
     velox_curl PROPERTIES IMPORTED_LOCATION
                           ${VELOX_BUILD_PATH}/_deps/curl-build/lib/libcurl.so)
-
-  # velox_cudf_exec also embeds these object-library members.  libgluten uses
-  # --allow-multiple-definition, so the linker keeps the first definition.
-  # Put the standalone objects first so an incremental UCX rebuild cannot be
-  # shadowed by stale copies in the aggregate archive.
-  target_link_libraries(velox PRIVATE ${GLUTEN_UCX_EXCHANGE_OBJECTS})
 
   # Static cuDF integration archives: PRIVATE + whole-archive. Like
   # facebook::velox, these need every .o pulled in so consumer-used APIs
