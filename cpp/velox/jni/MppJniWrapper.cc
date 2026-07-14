@@ -1297,7 +1297,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     jobjectArray splitInfosPerFragArr,
     jobjectArray broadcastSlotIndicesPerFragArr,
     jobjectArray broadcastIteratorsPerFragArr,
-    jlong replicatedCartesianMaxBuildBytes) {
+    jlong replicatedCartesianMaxBuildBytes,
+    jstring spillRootPathJstr) {
   JNI_METHOD_START
   nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"jni::nativeCreateMppQuery"};
 
@@ -1307,6 +1308,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   GLUTEN_CHECK(
       replicatedCartesianMaxBuildBytes >= 0,
       "replicated Cartesian max build bytes must be non-negative");
+  const auto spillRootPath = jStringToCString(env, spillRootPathJstr);
 
   // --- Parse inputs ---
 
@@ -2205,9 +2207,10 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
   const auto spillStrategy =
       sessionCfg->get<std::string>(kSpillStrategy, kSpillStrategyDefaultValue);
   if (spillStrategy != "none") {
-    const auto spillDir =
-        std::filesystem::temp_directory_path() /
-        fmt::format("gluten-mpp-spill-{}", queryId);
+    VELOX_CHECK(
+        !spillRootPath.empty(),
+        "MPP spill is enabled but Spark did not provide a local spill root");
+    const auto spillDir = std::filesystem::path(spillRootPath);
     std::filesystem::create_directories(spillDir);
     velox::common::SpillDiskOptions opts;
     opts.spillDirPath = spillDir.string();
@@ -2217,6 +2220,14 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     LOG(WARNING) << "MppJniWrapper: spill disk enabled for " << queryId
                  << " dir=" << spillDir.string();
   } else {
+    if (!spillRootPath.empty()) {
+      std::error_code error;
+      std::filesystem::remove_all(spillRootPath, error);
+      if (error) {
+        LOG(WARNING) << "MppJniWrapper: failed to remove unused spill root "
+                     << spillRootPath << ": " << error.message();
+      }
+    }
     LOG(WARNING) << "MppJniWrapper: spill disk disabled for " << queryId;
   }
 

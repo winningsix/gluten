@@ -80,6 +80,8 @@ public class MppQueryJniWrapper implements RuntimeAware {
    *     at {@code constructCudfValueStreamNode}.
    * @param replicatedCartesianMaxBuildBytes canonical build-size cap for a query containing a
    *     replicated Cartesian, or zero to leave native nested-loop joins unbounded.
+   * @param spillRootPath query-unique local spill root allocated from Spark's configured local
+   *     directories. The native coordinator creates one isolated child directory per Velox Task.
    * @return native handle (opaque jlong) for use with the other methods.
    * @throws RuntimeException on Substrait parse failure or invalid specs.
    */
@@ -91,7 +93,8 @@ public class MppQueryJniWrapper implements RuntimeAware {
       byte[][][] splitInfosPerFragment,
       int[][] broadcastSlotIndicesPerFragment,
       Object[][] broadcastIteratorsPerFragment,
-      long replicatedCartesianMaxBuildBytes);
+      long replicatedCartesianMaxBuildBytes,
+      String spillRootPath);
 
   /**
    * Build the MPP fragments and return the final Velox plan text for each fragment without starting

@@ -28,8 +28,10 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.util.{Namespace, SparkDirectoryUtil}
 
 import java.util.{HashMap => JHashMap, Iterator => JIterator}
+import java.util.UUID
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -163,6 +165,13 @@ class MppNativeQueryRDD(
     if (keepDeviceOutput) {
       runtimeExtraConf.put("spark.gluten.sql.columnar.cudf.skipOutputToVelox", "true")
     }
+    // MPP creates multiple Velox Tasks behind this one Spark task. Allocate a
+    // query-level root from Spark's configured local directories and let the
+    // native coordinator create an isolated child for every fragment replica.
+    // This follows the same SparkDirectoryUtil lifecycle as BSP spill instead
+    // of falling back to the process-wide java.io.tmpdir.
+    val spillRootPath = MppNativeQueryRDD.createSpillRoot(
+      SparkDirectoryUtil.get().namespace("gluten-spill"))
     val runtime =
       Runtimes.contextInstance(BackendsApiManager.getBackendName, "MppQuery", runtimeExtraConf)
     val jniWrapper = MppQueryJniWrapper.create(runtime)
@@ -266,7 +275,8 @@ class MppNativeQueryRDD(
       localFragmentSplitInfos,
       jvmStreamSlotIndicesPerFrag,
       jvmStreamIteratorsPerFrag,
-      replicatedCartesianMaxBuildBytes
+      replicatedCartesianMaxBuildBytes,
+      spillRootPath
     )
     @volatile var mppClosed = false
     def closeMppHandle(): Long = this.synchronized {
@@ -583,6 +593,12 @@ private[gluten] case class MppPeerInfo(
     preferredLocation: String)
 
 private[execution] object MppNativeQueryRDD {
+
+  private[execution] def createSpillRoot(namespace: Namespace): String = {
+    namespace
+      .mkChildDirRoundRobin(s"mpp-${UUID.randomUUID()}")
+      .getAbsolutePath
+  }
 
   def alignInputRDD(rdd: RDD[ColumnarBatch], targetPartitions: Int): RDD[ColumnarBatch] = {
     require(targetPartitions > 0, s"targetPartitions must be positive, got $targetPartitions")

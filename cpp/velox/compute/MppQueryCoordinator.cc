@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <numeric>
 #include <sstream>
@@ -217,6 +218,20 @@ MppQueryCoordinator::MppQueryCoordinator(
   VELOX_CHECK_GE(peerIndex_, 0, "MPP peer index must be non-negative");
   VELOX_CHECK_GT(peerCount_, 0, "MPP peer count must be positive");
   VELOX_CHECK_LT(peerIndex_, peerCount_, "MPP peer index {} must be less than peer count {}", peerIndex_, peerCount_);
+  if (spillDiskOpts_.has_value()) {
+    auto& opts = spillDiskOpts_.value();
+    if (!opts.spillDirCreated) {
+      VELOX_CHECK_NOT_NULL(
+          opts.spillDirCreateCb,
+          "MPP spill root must either exist or provide a create callback");
+      opts.spillDirPath = opts.spillDirCreateCb();
+      opts.spillDirCreated = true;
+      opts.spillDirCreateCb = nullptr;
+    }
+    VELOX_CHECK(
+        !opts.spillDirPath.empty(), "MPP spill root path must not be empty");
+    std::filesystem::create_directories(opts.spillDirPath);
+  }
 
   // Validate that fragment ids form a contiguous 0-based sequence so we can
   // use them as vector indices.
@@ -376,6 +391,15 @@ MppQueryCoordinator::~MppQueryCoordinator() {
   {
     nvtx3::scoped_range_in<GlutenMppDomain> r{"coordinator::~destructor:fragmentTasks.clear"};
     fragmentTasks_.clear();
+  }
+  if (spillDiskOpts_.has_value()) {
+    std::error_code error;
+    std::filesystem::remove_all(spillDiskOpts_->spillDirPath, error);
+    if (error) {
+      LOG(ERROR) << "MppQueryCoordinator[" << queryId_
+                 << "]: failed to remove spill root '"
+                 << spillDiskOpts_->spillDirPath << "': " << error.message();
+    }
   }
   {
     nvtx3::scoped_range_in<GlutenMppDomain> r{"coordinator::~destructor:bufferManager.reset"};
@@ -886,6 +910,17 @@ void MppQueryCoordinator::start() {
                                                                 : std::max(1, spec.numDrivers);
     for (int32_t i = 0; i < replicas; ++i) {
       auto taskId = makeTaskId(spec.id, i);
+      std::optional<common::SpillDiskOptions> taskSpillDiskOpts;
+      if (spillDiskOpts_.has_value()) {
+        const auto taskSpillDir =
+            std::filesystem::path(spillDiskOpts_->spillDirPath) /
+            fmt::format("fragment-{}-replica-{}", spec.id, i);
+        std::filesystem::create_directories(taskSpillDir);
+        taskSpillDiskOpts = common::SpillDiskOptions{
+            .spillDirPath = taskSpillDir.string(),
+            .spillDirCreated = true,
+            .spillDirCreateCb = nullptr};
+      }
       auto task = Task::create(
           taskId,
           spec.planFragment,
@@ -898,7 +933,7 @@ void MppQueryCoordinator::start() {
           Task::ExecutionMode::kParallel,
           /*consumer=*/Consumer{},
           /*memoryArbitrationPriority=*/0,
-          spillDiskOpts_);
+          std::move(taskSpillDiskOpts));
       fragmentTasks_[spec.id].push_back(std::move(task));
       fragmentTaskDrivers[spec.id].push_back(perReplicaDrivers);
       fragmentTaskBroadcastFanout[spec.id].push_back(bcastN);
