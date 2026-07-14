@@ -17,15 +17,17 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
-import org.apache.gluten.execution.{FlushableHashAggregateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, VeloxColumnarToRowExec}
+import org.apache.gluten.execution.{FlushableHashAggregateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, MppExistingRddStreamInput, MppNativeQueryExec, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, VeloxColumnarToRowExec}
 import org.apache.gluten.expression.aggregate.VeloxCollectList
 import org.apache.gluten.extension.columnar.FallbackTags
 
 import org.apache.spark.SparkFunSuite
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, AttributeReference, Cast, CreateNamedStruct, EqualTo, If, Literal, Multiply, NamedExpression, NullsFirst, SortOrder}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Partial, Sum}
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
-import org.apache.spark.sql.execution.{ColumnarShuffleExchangeExec, ColumnarToRowExec, ProjectExec, SparkPlan}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, ColumnarToRowExec, ProjectExec, RDDScanExec, SparkPlan}
 import org.apache.spark.sql.execution.aggregate.{BaseAggregateExec, HashAggregateExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{DoubleType, IntegerType, LongType, StringType}
@@ -38,6 +40,9 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     LocalTableScanExecTransformer(
       Seq(AttributeReference("a", IntegerType, nullable = true)()),
       Seq.empty)
+
+  private def existingRddScan(attr: AttributeReference): RDDScanExec =
+    RDDScanExec(Seq(attr), mock(classOf[RDD[InternalRow]]), "ExistingRDD")
 
   private def columnarExchange() = {
     val child = nativeLeaf()
@@ -148,6 +153,99 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(!rule.isFullyNativeSupported(ColumnarToRowExec(child)))
     assert(!rule.isFullyNativeSupported(VeloxColumnarToRowExec(child)))
     assert(!rule.isFullyNativeSupported(RowToVeloxColumnarExec(child)))
+  }
+
+  test("root native-to-row output is an intentional MPP egress, not a native row island") {
+    val child = nativeLeaf()
+    val boundary = ColumnarToRowExec(child)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val collapsed = rule(boundary)
+
+    assert(collapsed.isInstanceOf[ColumnarToRowExec])
+    assert(collapsed.children.head.isInstanceOf[MppNativeQueryExec])
+    assert(collapsed.children.head.asInstanceOf[MppNativeQueryExec].output == child.output)
+    // The strict native validator itself remains fail-closed for C2R. Only the root egress path
+    // may retain this adapter outside MppNativeQueryExec.
+    assert(!rule.isFullyNativeSupported(boundary))
+  }
+
+  test("Gluten root native-to-row output is also an intentional MPP egress") {
+    val child = nativeLeaf()
+    val boundary = VeloxColumnarToRowExec(child)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val collapsed = rule(boundary)
+
+    assert(collapsed.isInstanceOf[VeloxColumnarToRowExec])
+    assert(collapsed.children.head.isInstanceOf[MppNativeQueryExec])
+    assert(!rule.isFullyNativeSupported(boundary))
+  }
+
+  test("root RDD egress connects the exact ExistingRDD ingress hybrid to MPP") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val scan = existingRddScan(attr)
+    val ingress = RowToVeloxColumnarExec(scan)
+    val nativeSuffix = ProjectExecTransformer(ingress.output, ingress)
+    val boundary = ColumnarToRowExec(nativeSuffix)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val collapsed = rule(boundary)
+
+    assert(collapsed.isInstanceOf[ColumnarToRowExec])
+    val mpp = collapsed.children.head.asInstanceOf[MppNativeQueryExec]
+    assert(
+      mpp.child.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+  }
+
+  test("a nested native-to-row boundary cannot activate MPP") {
+    val boundary = VeloxColumnarToRowExec(nativeLeaf())
+    val parent = ProjectExecTransformer(boundary.output, boundary)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val result = rule(parent)
+
+    assert(result.find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
+  }
+
+  test("ExistingRDD hybrid validation accepts only an exact RDD ingress below a native suffix") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val scan = existingRddScan(attr)
+    val ingress = RowToVeloxColumnarExec(scan)
+    val nativeSuffix = ProjectExecTransformer(ingress.output, ingress)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assert(!rule.isFullyNativeSupported(nativeSuffix))
+    assert(rule.isSupportedExistingRddHybridPlan(nativeSuffix))
+    assert(MppExistingRddStreamInput.scan(ingress).contains(scan))
+    assert(
+      MppExistingRddStreamInput
+        .scan(ColumnarInputAdapter(ingress))
+        .contains(scan))
+  }
+
+  test("ExistingRDD hybrid validation rejects row operators hidden below R2C") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val scan = existingRddScan(attr)
+    val rowProject = ProjectExec(Seq(attr), scan)
+    val ingress = RowToVeloxColumnarExec(rowProject)
+    val nativeSuffix = ProjectExecTransformer(ingress.output, ingress)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assert(!rule.isSupportedExistingRddHybridPlan(nativeSuffix))
+    assert(MppExistingRddStreamInput.scan(ingress).isEmpty)
+  }
+
+  test("ExistingRDD matcher rejects a native-to-row round trip") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val scan = existingRddScan(attr)
+    val roundTrip = RowToVeloxColumnarExec(ColumnarToRowExec(RowToVeloxColumnarExec(scan)))
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assert(MppExistingRddStreamInput.scan(roundTrip).isEmpty)
+    assert(
+      !rule.isSupportedExistingRddHybridPlan(
+        ProjectExecTransformer(roundTrip.output, roundTrip)))
   }
 
   test("strict row-boundary diagnostic reports the row child and its fallback reason") {

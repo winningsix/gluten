@@ -123,6 +123,27 @@ private[execution] case class MppLocalStreamInput(
 
 private[execution] case class MppLocalStreamSlot(fragmentId: Int, slotIdx: Int)
 
+/**
+ * Exact matcher for the one JVM-backed stream shape admitted by strict MPP.
+ *
+ * An application that leaves Spark SQL through `Dataset.rdd` and later calls `toDF` produces an
+ * [[RDDScanExec]] ("ExistingRDD") at the new query's leaf. The MPP runtime can feed that leaf into
+ * an InputIterator slot, but it must not treat an arbitrary row subtree as equivalent to an RDD
+ * scan. Keep this matcher deliberately unary and transparent: conversion/adaptor nodes are
+ * accepted; C2R, Python, projections, filters, whole stages, and every other row operator are not.
+ */
+private[gluten] object MppExistingRddStreamInput {
+
+  def scan(plan: SparkPlan): Option[RDDScanExec] = plan match {
+    case existing: RDDScanExec => Some(existing)
+    case cia: ColumnarInputAdapter => scan(cia.child)
+    case c2c: ColumnarToColumnarExec => scan(c2c.child)
+    case r2c: RowToColumnarExecBase => scan(r2c.child)
+    case r2c: org.apache.spark.sql.execution.RowToColumnarExec => scan(r2c.child)
+    case _ => None
+  }
+}
+
 private case class MppReplicatedJoinBuildInput(child: SparkPlan) extends UnaryTransformSupport {
 
   override def output: Seq[Attribute] = child.output
@@ -1679,23 +1700,11 @@ case class MppNativeQueryExec(
   }
 
   private def isExistingRddStreamInput(plan: SparkPlan): Boolean = {
-    existingRddScan(plan).isDefined
-  }
-
-  private def existingRddScan(plan: SparkPlan): Option[RDDScanExec] = {
-    plan match {
-      case scan: RDDScanExec => Some(scan)
-      case wst: WholeStageTransformer => existingRddScan(wst.child)
-      case cia: ColumnarInputAdapter => existingRddScan(cia.child)
-      case c2c: ColumnarToColumnarExec => existingRddScan(c2c.child)
-      case c2r: ColumnarToRowExecBase => existingRddScan(c2r.child)
-      case r2c: RowToColumnarExecBase => existingRddScan(r2c.child)
-      case _ => None
-    }
+    MppExistingRddStreamInput.scan(plan).isDefined
   }
 
   private def executeExistingRddColumnar(plan: SparkPlan): RDD[ColumnarBatch] = {
-    val scan = existingRddScan(plan).getOrElse {
+    val scan = MppExistingRddStreamInput.scan(plan).getOrElse {
       throw new IllegalArgumentException(
         s"Expected an ExistingRDD stream input, got ${plan.getClass.getSimpleName}")
     }
