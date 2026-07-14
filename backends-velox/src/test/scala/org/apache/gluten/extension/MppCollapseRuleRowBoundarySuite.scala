@@ -194,18 +194,18 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(!rule.isFullyNativeSupported(RowToVeloxColumnarExec(child)))
   }
 
-  test("terminal root native-to-row output is an intentional MPP egress") {
+  test("terminal root Spark C2R is removed before MPP row egress") {
     val child = nativeLeaf()
     val boundary = ColumnarToRowExec(child)
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
     val collapsed = rule(boundary)
 
-    assert(collapsed.isInstanceOf[ColumnarToRowExec])
-    assert(collapsed.children.head.isInstanceOf[MppNativeQueryExec])
-    assert(collapsed.children.head.asInstanceOf[MppNativeQueryExec].output == child.output)
+    assert(collapsed.isInstanceOf[MppNativeQueryExec])
+    assert(collapsed.output == child.output)
+    assert(collapsed.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
     // The strict native validator itself remains fail-closed for C2R. Only the root egress path
-    // may retain this adapter outside MppNativeQueryExec.
+    // may recognize and safely remove this standard Spark adapter.
     assert(!rule.isFullyNativeSupported(boundary))
   }
 
@@ -232,7 +232,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(!rule.isFullyNativeSupported(boundary))
   }
 
-  test("root DeserializeToObject preserves its one direct C2R outside MPP") {
+  test("root DeserializeToObject removes Spark C2R before MPP row egress") {
     val child = nativeLeaf()
     val boundary = deserializeRows(ColumnarToRowExec(child))
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
@@ -240,10 +240,9 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val collapsed = rule(boundary)
 
     assert(collapsed.isInstanceOf[DeserializeToObjectExec])
-    val c2r = collapsed.children.head
-    assert(c2r.isInstanceOf[ColumnarToRowExec])
-    assert(c2r.children.head.isInstanceOf[MppNativeQueryExec])
-    assert(c2r.children.head.output == child.output)
+    assert(collapsed.children.head.isInstanceOf[MppNativeQueryExec])
+    assert(collapsed.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
+    assert(collapsed.children.head.output == child.output)
   }
 
   test("root DeserializeToObject preserves its one direct Gluten C2R outside MPP") {
@@ -308,8 +307,9 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
 
     val collapsed = rule(boundary)
 
-    assert(collapsed.isInstanceOf[ColumnarToRowExec])
-    val mpp = collapsed.children.head.asInstanceOf[MppNativeQueryExec]
+    assert(collapsed.isInstanceOf[MppNativeQueryExec])
+    val mpp = collapsed.asInstanceOf[MppNativeQueryExec]
+    assert(collapsed.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
     assert(mpp.child.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
   }
 

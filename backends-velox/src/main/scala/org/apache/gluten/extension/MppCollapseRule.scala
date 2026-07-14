@@ -333,8 +333,9 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
           nativeChild =>
             logWarning(
               "MppCollapseRule: *** MPP MODE ACTIVE UNDER BOUNDED SCALAR ROW OUTPUT *** " +
-                s"boundary=${c2r.getClass.getSimpleName}; final C2R converts at most one row")
-            c2r.withNewChildren(Seq(nativeChild))
+                s"boundary=${c2r.getClass.getSimpleName}; Spark C2R removed and " +
+                "MppNativeQueryExec performs the final JNI row conversion")
+            nativeChild
         }
       // A terminal root C2R is Spark's row-consumer boundary (for example Dataset.rdd /
       // javaToPython, collect, head, or toLocalIterator). The physical plan does not retain which
@@ -358,10 +359,16 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       child: SparkPlan): Option[SparkPlan] = {
     tryCollapseExistingRddHybrid(child).orElse(tryCollapseMpp(child)).map {
       nativeChild =>
+        val (rowOutput, transitionMessage) = boundary match {
+          case c2r: ColumnarToRowExecBase =>
+            (c2r.withNewChildren(Seq(nativeChild)), "the Gluten C2R remains outside MPP")
+          case _: ColumnarToRowExec =>
+            (nativeChild, "Spark C2R removed; MppNativeQueryExec performs JNI row conversion")
+        }
         logWarning(
           "MppCollapseRule: *** INTENTIONAL TERMINAL NATIVE ROW OUTPUT *** " +
-            s"boundary=${boundary.getClass.getSimpleName}; the root C2R remains outside MPP")
-        boundary.withNewChildren(Seq(nativeChild))
+            s"boundary=${boundary.getClass.getSimpleName}; $transitionMessage")
+        rowOutput
     }
   }
 
@@ -379,7 +386,14 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case c2r: ColumnarToRowExecBase =>
         collapseTerminalObjectEgressThroughC2r(boundary, c2r, c2r.child)
       case c2r: ColumnarToRowExec =>
-        collapseTerminalObjectEgressThroughC2r(boundary, c2r, c2r.child)
+        tryCollapseMpp(c2r.child).map {
+          nativeChild =>
+            logWarning(
+              "MppCollapseRule: *** INTENTIONAL TERMINAL NATIVE OBJECT OUTPUT *** " +
+                s"boundary=${boundary.getClass.getSimpleName}; direct Spark C2R removed and " +
+                "MppNativeQueryExec performs the JNI row conversion")
+            boundary.withNewChildren(Seq(nativeChild))
+        }
       case _ => None
     }
 
