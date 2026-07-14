@@ -254,7 +254,8 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
         assert(rebuilt.child.isInstanceOf[ProjectExecTransformer])
         val preProject = rebuilt.child.asInstanceOf[ProjectExecTransformer]
         assert(preProject.projectList.exists(_.exists(_.isInstanceOf[CreateNamedStruct])))
-        assert(rebuilt.aggregateExpressions.map(_.mode) == original.aggregateExpressions.map(_.mode))
+        assert(
+          rebuilt.aggregateExpressions.map(_.mode) == original.aggregateExpressions.map(_.mode))
         if (flushable) {
           assert(rebuilt.isInstanceOf[FlushableHashAggregateExecTransformer])
         } else {
