@@ -40,10 +40,6 @@
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #endif
 
-#ifdef GLUTEN_ENABLE_GPU
-DEFINE_bool(velox_ucx_exchange, false, "Enable Velox UCX exchange.");
-#endif
-
 #include "compute/VeloxRuntime.h"
 #include "config/VeloxConfig.h"
 #include "jni/JniFileSystem.h"
