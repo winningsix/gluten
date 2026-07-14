@@ -510,11 +510,15 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // late-offload shapes before checking row boundaries. Running the broad transition normalizer
     // first would also erase an unrelated nested C2R and weaken the strict-MPP contract.
     val repaired = repairRecoverableRowShells(plan)
-    if (containsUnpairedNestedRowOutput(repaired)) {
-      logWarning(
-        "MppCollapseRule: refusing to normalize an unpaired nested C2R; " +
-          "only the explicit root row-output path may retain that boundary")
-      return None
+    findUnpairedNestedRowOutput(repaired) match {
+      case Some(boundary) =>
+        logWarning(
+          "MppCollapseRule: refusing to normalize an unpaired nested C2R; " +
+            "only the explicit root row-output path may retain that boundary. " +
+            s"Offending boundary: ${describeExecutionBoundary(boundary, "native-to-row")}. " +
+            s"Subtree: ${boundary.treeString.take(500)}")
+        return None
+      case None => ()
     }
     val normalized = normalizeMppNativeOperators(repaired)
     tryCollapseNormalizedMpp(
@@ -598,7 +602,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    * identity C2R immediately below a Gluten columnar shuffle. The explicit terminal root C2R has
    * already been peeled by [[collapseTerminalRowEgress]] before this check.
    */
-  private def containsUnpairedNestedRowOutput(plan: SparkPlan): Boolean = {
+  private[extension] def findUnpairedNestedRowOutput(plan: SparkPlan): Option[SparkPlan] = {
     def isC2r(node: SparkPlan): Boolean = node match {
       case _: ColumnarToRowExecBase | _: ColumnarToRowExec => true
       case _ => false
@@ -606,13 +610,14 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
     def childOf(node: SparkPlan): SparkPlan = node.children.head
 
-    def loop(node: SparkPlan): Boolean = node match {
+    def loop(node: SparkPlan): Option[SparkPlan] = node match {
       case r2c: RowToColumnarExecBase if isC2r(r2c.child) => loop(childOf(r2c.child))
       case r2c: RowToColumnarExec if isC2r(r2c.child) => loop(childOf(r2c.child))
       case exchange: ColumnarShuffleExchangeExecBase if isC2r(exchange.child) =>
         loop(childOf(exchange.child))
-      case _: ColumnarToRowExecBase | _: ColumnarToRowExec => true
-      case other => other.children.exists(loop)
+      case c2r: ColumnarToRowExecBase => Some(c2r)
+      case c2r: ColumnarToRowExec => Some(c2r)
+      case other => other.children.iterator.map(loop).collectFirst { case Some(found) => found }
     }
 
     loop(plan)

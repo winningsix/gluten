@@ -333,9 +333,19 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val parent = ProjectExecTransformer(boundary.output, boundary)
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
+    assert(rule.findUnpairedNestedRowOutput(parent).contains(boundary))
+
     val result = rule(parent)
 
     assert(result.find(_.isInstanceOf[MppNativeQueryExec]).isEmpty)
+  }
+
+  test("unpaired row-output diagnostic preserves an adjacent round-trip adapter") {
+    val boundary = VeloxColumnarToRowExec(nativeLeaf())
+    val roundTrip = RowToVeloxColumnarExec(boundary)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assert(rule.findUnpairedNestedRowOutput(roundTrip).isEmpty)
   }
 
   test("ExistingRDD hybrid validation accepts only an exact RDD ingress below a native suffix") {
