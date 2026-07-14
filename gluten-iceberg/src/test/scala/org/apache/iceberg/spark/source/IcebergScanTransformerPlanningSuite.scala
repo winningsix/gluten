@@ -56,9 +56,7 @@ abstract class IcebergScanTransformerPlanningSuite extends QueryTest with Shared
     val planned = plannedPartitions(4, bytesPerPartition = 10L)
 
     withPlanningConf(singleTaskMode = false) {
-      val transformer = new PlanningIcebergScanTransformer(
-        planned,
-        Seq(SortOrder(key, Ascending)))
+      val transformer = new PlanningIcebergScanTransformer(planned, Seq(SortOrder(key, Ascending)))
       assert(transformer.getPartitions eq planned)
     }
   }
@@ -77,7 +75,8 @@ abstract class IcebergScanTransformerPlanningSuite extends QueryTest with Shared
       "spark.gluten.mpp.enabled" -> "true",
       "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode" -> singleTaskMode.toString,
       "spark.sql.files.maxPartitionBytes" -> "64",
-      "spark.sql.files.openCostInBytes" -> "1")(body)
+      "spark.sql.files.openCostInBytes" -> "1"
+    )(body)
   }
 
   private def plannedPartitions(count: Int, bytesPerPartition: Long): Seq[PlannedPartition] = {
@@ -102,7 +101,8 @@ abstract class IcebergScanTransformerPlanningSuite extends QueryTest with Shared
       Array.empty[DeleteFile],
       SchemaParser.toJson(schema),
       PartitionSpecParser.toJson(spec),
-      ResidualEvaluator.of(spec, Expressions.alwaysTrue(), true))
+      ResidualEvaluator.of(spec, Expressions.alwaysTrue(), true)
+    )
   }
 
   /** Uses reflection so the test remains source-compatible across Iceberg constructor additions. */
