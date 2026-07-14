@@ -25,12 +25,13 @@ import org.apache.gluten.substrait.rel.LocalFilesNode.ReadFileFormat
 
 import org.apache.spark.Partition
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{AttributeReference, DynamicPruningExpression, Expression, Literal}
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, DynamicPruningExpression, Expression, Literal, SortOrder}
 import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.connector.catalog.Table
 import org.apache.spark.sql.connector.read.Scan
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.execution.metric.SQLMetrics
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{ArrayType, DataType, StructType}
 
 import org.apache.iceberg.{BaseTable, MetadataColumns, Schema, SnapshotSummary, TableProperties}
@@ -47,6 +48,7 @@ case class IcebergScanTransformer(
     override val runtimeFilters: Seq[Expression],
     @transient override val table: Table,
     override val keyGroupedPartitioning: Option[Seq[Expression]] = None,
+    override val ordering: Option[Seq[SortOrder]] = None,
     override val commonPartitionValues: Option[Seq[(InternalRow, Int)]] = None,
     override val pushDownFilters: Option[Seq[Expression]] = None)
   extends BatchScanExecTransformerBase(
@@ -55,6 +57,7 @@ case class IcebergScanTransformer(
     runtimeFilters = runtimeFilters,
     table = table,
     keyGroupedPartitioning = keyGroupedPartitioning,
+    ordering = ordering,
     commonPartitionValues = commonPartitionValues
   ) {
 
@@ -62,6 +65,58 @@ case class IcebergScanTransformer(
   // but the implementation is different.
   // So use Metric to get NumSplits, NumDeletes is not reported by native metric
   private val numSplits = SQLMetrics.createMetric(sparkContext, new NumSplits().description())
+
+  @transient override protected lazy val finalPartitions: Seq[Partition] = {
+    coalesceIcebergInputPartitions(super.finalPartitions)
+  }
+
+  private def coalesceIcebergInputPartitions(planned: Seq[Partition]): Seq[Partition] = {
+    val inputPartitionGroups = planned.map {
+      case partition: SparkDataSourceRDDPartition => partition.inputPartitions
+      case _ => return planned
+    }
+
+    val conf = SQLConf.get
+    val mppEnabled = conf
+      .getConfString("spark.gluten.mpp.enabled", "false")
+      .equalsIgnoreCase("true")
+    val singleTaskMode = !conf
+      .getConfString(
+        "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode",
+        "false")
+      .equalsIgnoreCase("false")
+    val targetBytes = conf.filesMaxPartitionBytes
+    val openCostInBytes = conf.filesOpenCostInBytes
+
+    val coalesced = InputPartitionCoalescer.coalesceAdjacentIfSupported(
+      inputPartitionGroups,
+      targetBytes,
+      mppEnabled,
+      singleTaskMode,
+      outputPartitioning,
+      outputOrdering.nonEmpty,
+      keyGroupedPartitioning.isDefined,
+      commonPartitionValues.isDefined,
+      applyPartialClustering,
+      replicatePartitions
+    )(
+      inputPartition =>
+        GlutenIcebergSourceUtil.inputPartitionPlanningInfo(inputPartition, openCostInBytes))
+
+    if (coalesced.size == inputPartitionGroups.size) {
+      planned
+    } else {
+      logInfo(
+        s"Coalesced ${inputPartitionGroups.size} Iceberg V2 scan partitions " +
+          s"(${inputPartitionGroups.map(_.size).sum} input partitions) into " +
+          s"${coalesced.size} partitions with targetBytes=$targetBytes and " +
+          s"openCostInBytes=$openCostInBytes.")
+      coalesced.zipWithIndex.map {
+        case (inputPartitions, index) =>
+          new SparkDataSourceRDDPartition(index, inputPartitions)
+      }
+    }
+  }
 
   override def withNewPushdownFilters(filters: Seq[Expression]): BatchScanExecTransformerBase = {
     this.copy(pushDownFilters = Some(filters))
@@ -290,6 +345,7 @@ object IcebergScanTransformer {
       batchScan.runtimeFilters,
       table = SparkShimLoader.getSparkShims.getBatchScanExecTable(batchScan),
       keyGroupedPartitioning = SparkShimLoader.getSparkShims.getKeyGroupedPartitioning(batchScan),
+      ordering = Option(batchScan.outputOrdering).filter(_.nonEmpty),
       commonPartitionValues = SparkShimLoader.getSparkShims.getCommonPartitionValues(batchScan)
     )
   }
