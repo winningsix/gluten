@@ -16,7 +16,7 @@
  */
 package org.apache.gluten.execution
 
-import org.apache.spark.sql.catalyst.plans.physical.{Partitioning, SinglePartition, UnknownPartitioning}
+import org.apache.spark.sql.catalyst.plans.physical.{SinglePartition, UnknownPartitioning}
 import org.apache.spark.sql.connector.read.InputPartition
 
 import org.scalatest.funsuite.AnyFunSuite
@@ -58,19 +58,29 @@ class InputPartitionCoalescerSuite extends AnyFunSuite {
   test("does not coalesce scans with partitioning or ordering semantics") {
     val input = mockGroups(4, cost = 10)
 
-    assert(coalesce(input, hasOutputOrdering = true)() eq input)
-    assert(coalesce(input, hasKeyGroupedPartitioning = true)() eq input)
-    assert(coalesce(input, hasCommonPartitionValues = true)() eq input)
-    assert(coalesce(input, applyPartialClustering = true)() eq input)
-    assert(coalesce(input, replicatePartitions = true)() eq input)
-    assert(coalesce(input, outputPartitioning = SinglePartition)() eq input)
+    assert(
+      coalesce(input, eligibility = defaultEligibility.copy(hasOutputOrdering = true))() eq input)
+    assert(
+      coalesce(input, eligibility = defaultEligibility.copy(hasKeyGroupedPartitioning = true))() eq
+        input)
+    assert(
+      coalesce(input, eligibility = defaultEligibility.copy(hasCommonPartitionValues = true))() eq
+        input)
+    assert(
+      coalesce(input, eligibility = defaultEligibility.copy(requiresPartitionIdentity = true))() eq
+        input)
+    assert(
+      coalesce(
+        input,
+        eligibility = defaultEligibility.copy(outputPartitioning = SinglePartition))() eq
+        input)
   }
 
   test("only coalesces MPP scans outside single-task mode") {
     val input = mockGroups(4, cost = 10)
 
-    assert(coalesce(input, mppEnabled = false)() eq input)
-    assert(coalesce(input, singleTaskMode = true)() eq input)
+    assert(coalesce(input, eligibility = defaultEligibility.copy(mppEnabled = false))() eq input)
+    assert(coalesce(input, eligibility = defaultEligibility.copy(singleTaskMode = true))() eq input)
   }
 
   test("does not combine adjacent partitions with different file formats") {
@@ -138,17 +148,20 @@ class InputPartitionCoalescerSuite extends AnyFunSuite {
     (0 until count).map(index => Seq(MockInputPartition(index, cost)))
   }
 
+  private val defaultEligibility = InputPartitionCoalescer.Eligibility(
+    mppEnabled = true,
+    singleTaskMode = false,
+    outputPartitioning = UnknownPartitioning(4),
+    hasOutputOrdering = false,
+    hasKeyGroupedPartitioning = false,
+    hasCommonPartitionValues = false,
+    requiresPartitionIdentity = false
+  )
+
   private def coalesce(
       input: Seq[Seq[InputPartition]],
       targetBytes: Long = 100,
-      mppEnabled: Boolean = true,
-      singleTaskMode: Boolean = false,
-      outputPartitioning: Partitioning = UnknownPartitioning(4),
-      hasOutputOrdering: Boolean = false,
-      hasKeyGroupedPartitioning: Boolean = false,
-      hasCommonPartitionValues: Boolean = false,
-      applyPartialClustering: Boolean = false,
-      replicatePartitions: Boolean = false)(
+      eligibility: InputPartitionCoalescer.Eligibility = defaultEligibility)(
       partitionInfo: InputPartition => Option[(Long, String)] = {
         case partition: MockInputPartition => Some((partition.cost, partition.fileFormat))
         case _ => None
@@ -156,14 +169,7 @@ class InputPartitionCoalescerSuite extends AnyFunSuite {
     InputPartitionCoalescer.coalesceAdjacentIfSupported(
       input,
       targetBytes,
-      mppEnabled,
-      singleTaskMode,
-      outputPartitioning,
-      hasOutputOrdering,
-      hasKeyGroupedPartitioning,
-      hasCommonPartitionValues,
-      applyPartialClustering,
-      replicatePartitions
+      eligibility
     )(partitionInfo)
   }
 

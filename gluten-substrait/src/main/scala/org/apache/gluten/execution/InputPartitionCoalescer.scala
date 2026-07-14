@@ -25,23 +25,26 @@ import scala.util.control.NonFatal
 /** Coalesces adjacent V2 input partitions without changing their child order. */
 private[execution] object InputPartitionCoalescer {
 
-  def coalesceAdjacentIfSupported(
-      partitions: Seq[Seq[InputPartition]],
-      targetBytes: Long,
+  private[execution] case class Eligibility(
       mppEnabled: Boolean,
       singleTaskMode: Boolean,
       outputPartitioning: Partitioning,
       hasOutputOrdering: Boolean,
       hasKeyGroupedPartitioning: Boolean,
       hasCommonPartitionValues: Boolean,
-      applyPartialClustering: Boolean,
-      replicatePartitions: Boolean)(
+      requiresPartitionIdentity: Boolean)
+
+  def coalesceAdjacentIfSupported(
+      partitions: Seq[Seq[InputPartition]],
+      targetBytes: Long,
+      eligibility: Eligibility)(
       partitionInfo: InputPartition => Option[(Long, String)]): Seq[Seq[InputPartition]] = {
     if (
-      targetBytes <= 0 || !mppEnabled || singleTaskMode ||
-      !outputPartitioning.isInstanceOf[UnknownPartitioning] || hasOutputOrdering ||
-      hasKeyGroupedPartitioning || hasCommonPartitionValues || applyPartialClustering ||
-      replicatePartitions || partitions.size <= 1
+      targetBytes <= 0 || !eligibility.mppEnabled || eligibility.singleTaskMode ||
+      !eligibility.outputPartitioning.isInstanceOf[UnknownPartitioning] ||
+      eligibility.hasOutputOrdering || eligibility.hasKeyGroupedPartitioning ||
+      eligibility.hasCommonPartitionValues || eligibility.requiresPartitionIdentity ||
+      partitions.size <= 1
     ) {
       return partitions
     }

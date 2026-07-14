@@ -89,14 +89,15 @@ case class IcebergScanTransformer(
     val coalesced = InputPartitionCoalescer.coalesceAdjacentIfSupported(
       inputPartitionGroups,
       targetBytes,
-      mppEnabled,
-      singleTaskMode,
-      outputPartitioning,
-      outputOrdering.nonEmpty,
-      keyGroupedPartitioning.isDefined,
-      commonPartitionValues.isDefined,
-      applyPartialClustering,
-      replicatePartitions
+      InputPartitionCoalescer.Eligibility(
+        mppEnabled,
+        singleTaskMode,
+        outputPartitioning,
+        outputOrdering.nonEmpty,
+        keyGroupedPartitioning.isDefined,
+        commonPartitionValues.isDefined,
+        applyPartialClustering || replicatePartitions
+      )
     )(
       inputPartition =>
         GlutenIcebergSourceUtil.inputPartitionPlanningInfo(inputPartition, openCostInBytes))
