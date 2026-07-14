@@ -19,6 +19,7 @@ package org.apache.gluten.extension.columnar.offload
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution._
+import org.apache.gluten.expression.ExpressionTransformerProvider
 import org.apache.gluten.extension.columnar.FallbackTags
 import org.apache.gluten.logging.LogLevelUtil
 import org.apache.gluten.sql.shims.SparkShimLoader
@@ -195,6 +196,23 @@ object OffloadOthers {
     TreeNodeTag[String]("gluten.python.arrowScalarNormalization.rejection")
   private val ARROW_SCALAR_NULL_PRESERVING_INPUT_CAPABILITY =
     "spark.gluten.sql.columnar.arrowUdf.nullPreservingInput"
+
+  private[offload] def isConservativeArrowInputExpression(input: Expression): Boolean = {
+    if (input.find(_.isInstanceOf[PythonUDF]).isDefined) {
+      return false
+    }
+    input match {
+      case _: AttributeReference | _: Literal => true
+      // External providers may opt in an application expression only after establishing the same
+      // serializer and native-evaluation contract used by their transformer.
+      case external if ExpressionTransformerProvider.isSafeArrowPreProjection(external) =>
+        true
+      // Materialize only simple casts whose leaf is already a safe input. Broader deterministic
+      // expressions can be added with explicit serializer-parity tests.
+      case cast: Cast => isConservativeArrowInputExpression(cast.child)
+      case _ => false
+    }
+  }
 
   // Utility to replace single node within transformed Gluten node.
   // Children will be preserved as they are as children of the output node.
@@ -537,19 +555,6 @@ object OffloadOthers {
       SQLConf.get
         .getConfString(ARROW_SCALAR_NULL_PRESERVING_INPUT_CAPABILITY, "false")
         .toBoolean
-
-    private def isConservativeArrowInputExpression(input: Expression): Boolean = {
-      if (input.find(_.isInstanceOf[PythonUDF]).isDefined) {
-        return false
-      }
-      input match {
-        case _: AttributeReference | _: Literal => true
-        // Materialize only simple casts whose leaf is already a safe input. Broader deterministic
-        // expressions can be added with explicit serializer-parity tests.
-        case cast: Cast => isConservativeArrowInputExpression(cast.child)
-        case _ => false
-      }
-    }
 
     private def rewriteScalarUdfEvalType(udf: PythonUDF, evalType: Int): PythonUDF = {
       val rewrittenChildren = udf.children.map {

@@ -165,7 +165,6 @@ set(VELOX_SRCS
     memory/VeloxMemoryManager.cc
     operators/functions/RegistrationAllFunctions.cc
     operators/functions/NetflixDateTime.cc
-    operators/functions/NetflixJson.cc
     operators/functions/RowConstructorWithNull.cc
     operators/functions/SparkExprToSubfieldFilterParser.cc
     operators/plannodes/RowVectorStream.cc
@@ -543,10 +542,20 @@ if(ENABLE_GPU)
   # Velox's top-level CPM bootstrap, so load the already-generated CPM module
   # before importing cuDF.
   if(NOT COMMAND CPMFindPackage)
+    # CPM records initialization in a GLOBAL property, but CMake command
+    # definitions are directory-scoped. Another subproject can therefore set
+    # the property without making CPMFindPackage visible in this directory.
+    # Clear the stale marker before including CPM in the Velox backend scope.
+    set_property(GLOBAL PROPERTY CPM_INITIALIZED)
     if(DEFINED CPM_FILE AND EXISTS "${CPM_FILE}")
+      get_filename_component(CPM_FILE "${CPM_FILE}" REALPATH)
+      get_filename_component(CPM_DIRECTORY "${CPM_FILE}" DIRECTORY)
       include("${CPM_FILE}")
     elseif(EXISTS "${VELOX_BUILD_PATH}/cmake/CPM_0.42.0.cmake")
-      include("${VELOX_BUILD_PATH}/cmake/CPM_0.42.0.cmake")
+      set(CPM_FILE "${VELOX_BUILD_PATH}/cmake/CPM_0.42.0.cmake")
+      get_filename_component(CPM_FILE "${CPM_FILE}" REALPATH)
+      get_filename_component(CPM_DIRECTORY "${CPM_FILE}" DIRECTORY)
+      include("${CPM_FILE}")
     else()
       message(FATAL_ERROR "CPMFindPackage is required to import the cuDF build tree")
     endif()

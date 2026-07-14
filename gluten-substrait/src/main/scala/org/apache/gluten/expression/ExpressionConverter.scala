@@ -290,6 +290,11 @@ object ExpressionConverter extends SQLConfHelper with Logging {
         replaceWithExpressionTransformer0(_, attributeSeq, expressionsMap),
         conf.sessionLocalTimeZone)
       .orElse {
+        ExpressionTransformerProvider.tryTransform(
+          expr,
+          replaceWithExpressionTransformer0(_, attributeSeq, expressionsMap))
+      }
+      .orElse {
         Option {
           expr match {
             case pythonUDF: PythonUDF =>
