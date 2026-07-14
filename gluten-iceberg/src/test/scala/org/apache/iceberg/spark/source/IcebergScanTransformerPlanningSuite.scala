@@ -32,7 +32,7 @@ import org.apache.iceberg.types.Types
 
 import scala.collection.JavaConverters._
 
-class IcebergScanTransformerPlanningSuite extends QueryTest with SharedSparkSession {
+abstract class IcebergScanTransformerPlanningSuite extends QueryTest with SharedSparkSession {
 
   private val key = AttributeReference("id", IntegerType, nullable = false)()
   private val schema = new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()))
