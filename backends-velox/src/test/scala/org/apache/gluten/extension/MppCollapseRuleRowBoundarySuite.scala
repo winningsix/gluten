@@ -17,15 +17,17 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
-import org.apache.gluten.execution.{LocalTableScanExecTransformer, ProjectExecTransformer, RowToVeloxColumnarExec, VeloxColumnarToRowExec}
+import org.apache.gluten.execution.{HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, ProjectExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, VeloxColumnarToRowExec}
+import org.apache.gluten.extension.columnar.FallbackTags
 
 import org.apache.spark.SparkFunSuite
-import org.apache.spark.sql.catalyst.expressions.AttributeReference
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, AttributeReference, Cast, EqualTo, If, Literal, Multiply, NamedExpression, NullsFirst, SortOrder}
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Partial, Sum}
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
-import org.apache.spark.sql.execution.{ColumnarShuffleExchangeExec, ColumnarToRowExec, SparkPlan}
-import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
+import org.apache.spark.sql.execution.{ColumnarShuffleExchangeExec, ColumnarToRowExec, ProjectExec, SparkPlan}
+import org.apache.spark.sql.execution.aggregate.{BaseAggregateExec, HashAggregateExec}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.sql.types.{DoubleType, IntegerType, LongType, StringType}
 
 import org.mockito.Mockito.{mock, when, withSettings}
 
@@ -109,6 +111,89 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(!rule.isFullyNativeSupported(ColumnarToRowExec(child)))
     assert(!rule.isFullyNativeSupported(VeloxColumnarToRowExec(child)))
     assert(!rule.isFullyNativeSupported(RowToVeloxColumnarExec(child)))
+  }
+
+  test("strict row-boundary diagnostic reports the row child and its fallback reason") {
+    val child = nativeLeaf()
+    val rowChild = ProjectExec(child.output, child)
+    FallbackTags.add(rowChild, "unsupported expression nf_example")
+    val boundary = RowToVeloxColumnarExec(rowChild)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val diagnostic = rule.describeExecutionBoundary(boundary, "row-to-native")
+
+    assert(diagnostic.contains("RowToVeloxColumnarExec: row-to-native execution boundary"))
+    assert(diagnostic.contains("child=ProjectExec"))
+    assert(diagnostic.contains("firstFallback=ProjectExec: unsupported expression nf_example"))
+  }
+
+  test("strict normalization materializes computed sort keys and removes stale transitions") {
+    val child = nativeLeaf()
+    val rowInput = ColumnarToRowExec(child)
+    val computedOrder =
+      SortOrder(Cast(rowInput.output.head, LongType), Ascending, NullsFirst, Seq.empty)
+    val rowSort = org.apache.spark.sql.execution
+      .SortExec(Seq(computedOrder), global = false, rowInput, testSpillFrequency = 0)
+    val stalePlan = RowToVeloxColumnarExec(rowSort)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val normalized = rule.normalizeMppNativeOperators(stalePlan)
+
+    assert(normalized.find(_.isInstanceOf[RowToVeloxColumnarExec]).isEmpty)
+    assert(normalized.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
+    val nativeSort = normalized
+      .find(_.isInstanceOf[SortExecTransformer])
+      .get
+      .asInstanceOf[SortExecTransformer]
+    assert(nativeSort.sortOrder.forall(_.child.isInstanceOf[AttributeReference]))
+    assert(normalized.find(_.isInstanceOf[ProjectExecTransformer]).isDefined)
+    assert(rule.isFullyNativeSupported(normalized))
+  }
+
+  test("strict normalization materializes aggregate grouping and function expressions") {
+    val metric = AttributeReference("metric_name", StringType, nullable = true)()
+    val value = AttributeReference("metric_value", DoubleType, nullable = true)()
+    val child = LocalTableScanExecTransformer(Seq(metric, value), Seq.empty)
+    val rowInput = ColumnarToRowExec(child)
+    val grouping = Alias(Literal("Global"), "global")()
+    val conditionalValue = If(
+      EqualTo(metric, Literal("view_hours_1d")),
+      Multiply(value, Literal(3600.0d)),
+      Literal.create(null, DoubleType))
+    val aggregate = AggregateExpression(
+      Sum(conditionalValue),
+      Partial,
+      isDistinct = false,
+      filter = None,
+      resultId = NamedExpression.newExprId)
+    val rowAggregate = HashAggregateExec(
+      requiredChildDistributionExpressions = None,
+      isStreaming = false,
+      numShufflePartitions = None,
+      groupingExpressions = Seq(grouping),
+      aggregateExpressions = Seq(aggregate),
+      aggregateAttributes = Seq(aggregate.resultAttribute),
+      initialInputBufferOffset = 0,
+      resultExpressions = Seq(grouping.toAttribute, aggregate.resultAttribute),
+      child = rowInput
+    )
+    val stalePlan = RowToVeloxColumnarExec(rowAggregate)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val normalized = rule.normalizeMppNativeOperators(stalePlan)
+
+    assert(normalized.find(_.isInstanceOf[RowToVeloxColumnarExec]).isEmpty)
+    assert(normalized.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
+    val nativeAggregate = normalized
+      .find(_.isInstanceOf[HashAggregateExecBaseTransformer])
+      .get
+      .asInstanceOf[HashAggregateExecBaseTransformer]
+    assert(nativeAggregate.groupingExpressions.forall(_.isInstanceOf[AttributeReference]))
+    assert(
+      nativeAggregate.aggregateExpressions.forall(
+        _.aggregateFunction.children.forall(_.isInstanceOf[AttributeReference])))
+    assert(normalized.find(_.isInstanceOf[ProjectExecTransformer]).isDefined)
+    assert(rule.isFullyNativeSupported(normalized))
   }
 
   test("bounded scalar result recognizes only a global aggregate without grouping") {

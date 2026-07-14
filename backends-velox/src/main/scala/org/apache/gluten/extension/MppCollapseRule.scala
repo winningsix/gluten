@@ -16,11 +16,13 @@
  */
 package org.apache.gluten.extension
 
+import org.apache.gluten.backendsapi.velox.VeloxBatchType
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution._
-import org.apache.gluten.extension.columnar.UnionTransformerRule
+import org.apache.gluten.extension.columnar.{FallbackTags, UnionTransformerRule}
 import org.apache.gluten.extension.columnar.offload.OffloadOthers.ARROW_SCALAR_NORMALIZATION_REJECTION_TAG
 import org.apache.gluten.extension.columnar.rewrite.PullOutPreProject
+import org.apache.gluten.extension.columnar.transition.InsertTransitions
 
 import org.apache.spark.api.python.ColumnarArrowEvalPythonExec
 import org.apache.spark.internal.Logging
@@ -473,7 +475,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     Some(MppNativeQueryExec(child = rewritten, fragments = fragments, exchanges = exchanges))
   }
 
-  private def normalizeMppNativeOperators(plan: SparkPlan): SparkPlan = {
+  private[extension] def normalizeMppNativeOperators(plan: SparkPlan): SparkPlan = {
     // Spark may insert RowToColumnar(ColumnarToRow(nativeChild)) solely to reconcile the
     // convention expected by an exchange or V2 writer. MPP absorbs that boundary, so eliminate
     // the adjacent inverse transitions before validating/extracting fragments. This preserves the
@@ -492,25 +494,38 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
             s"${coalesce.numPartitions}) inside MPP query")
         coalesce.child
     }
+    // Native aggregate and sort relations require their computed arguments to be materialized as
+    // fields. The normal heuristic rewrite may leave a row operator behind after one sibling
+    // fails validation, so repeat the official pre-project rewrite before force-offloading the
+    // strict-MPP subtree. This is expression-preserving and does not broaden native validation.
+    val preProjected = coalesceElided.transformUp {
+      case agg: BaseAggregateExec if !agg.isInstanceOf[HashAggregateExecBaseTransformer] =>
+        PullOutPreProject.rewrite(agg)
+      case sort: SortExec if !sort.global => PullOutPreProject.rewrite(sort)
+    }
     // RAS may leave a vanilla Spark aggregate behind when its generic
     // profitability/validation pass declines a very wide aggregate. MPP has a
     // stricter end-to-end contract and validates the generated native/cuDF plan
     // later, so materialize the native aggregate transformer here instead of
     // accepting a row/BSP island.
-    val aggregateRewritten = coalesceElided.transformUp {
+    val aggregateRewritten = preProjected.transformUp {
       case agg: BaseAggregateExec if !agg.isInstanceOf[HashAggregateExecBaseTransformer] =>
         HashAggregateExecBaseTransformer.from(agg)
     }
-    val sortProjected = aggregateRewritten.transformUp {
-      case sort: SortExec if !sort.global => PullOutPreProject.rewrite(sort)
-    }
-    val lateOffloaded = sortProjected.transformUp {
+    val lateOffloaded = aggregateRewritten.transformUp {
       case project: ProjectExec => ProjectExecTransformer(project.projectList, project.child)
       case filter: FilterExec => FilterExecTransformer(filter.condition, filter.child)
       case sort: SortExec if !sort.global =>
         SortExecTransformer(sort.sortOrder, global = false, sort.child, sort.testSpillFrequency)
     }
-    val unionRewritten = rewriteMppNativeUnion(lateOffloaded)
+    // The incoming plan's transitions were selected before the row aggregate/sort/project was
+    // replaced above. Re-run Gluten's convention planner so it removes only stale transitions and
+    // re-inserts every boundary still required by a genuine row operator. This keeps DataFrame.rdd
+    // and other real row consumers as strict-MPP negatives.
+    val retransitioned = InsertTransitions
+      .create(outputsColumnar = lateOffloaded.supportsColumnar, VeloxBatchType)
+      .apply(lateOffloaded)
+    val unionRewritten = rewriteMppNativeUnion(retransitioned)
     MppReplicatedCartesianRule()(unionRewritten)
   }
 
@@ -586,22 +601,22 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case c2r: ColumnarToRowExecBase =>
         logWarning(
           s"MppCollapseRule: BLOCKED by native-to-row execution boundary: " +
-            s"${c2r.getClass.getSimpleName}")
+            describeExecutionBoundary(c2r, "native-to-row"))
         false
       case c2r: ColumnarToRowExec =>
         logWarning(
           s"MppCollapseRule: BLOCKED by native-to-row execution boundary: " +
-            s"${c2r.getClass.getSimpleName}")
+            describeExecutionBoundary(c2r, "native-to-row"))
         false
       case r2c: RowToColumnarExecBase =>
         logWarning(
           s"MppCollapseRule: BLOCKED by row-to-native execution boundary: " +
-            s"${r2c.getClass.getSimpleName}")
+            describeExecutionBoundary(r2c, "row-to-native"))
         false
       case r2c: RowToColumnarExec =>
         logWarning(
           s"MppCollapseRule: BLOCKED by row-to-native execution boundary: " +
-            s"${r2c.getClass.getSimpleName}")
+            describeExecutionBoundary(r2c, "row-to-native"))
         false
 
       // Gluten-internal columnar-to-columnar nodes (batch resize, etc.) - look through
@@ -675,13 +690,13 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case _: TransformSupport =>
         plan.children.flatMap(findFirstUnsupportedOperator).headOption
       case c2r: ColumnarToRowExecBase =>
-        Some(s"${c2r.getClass.getSimpleName}: native-to-row execution boundary")
+        Some(describeExecutionBoundary(c2r, "native-to-row"))
       case c2r: ColumnarToRowExec =>
-        Some(s"${c2r.getClass.getSimpleName}: native-to-row execution boundary")
+        Some(describeExecutionBoundary(c2r, "native-to-row"))
       case r2c: RowToColumnarExecBase =>
-        Some(s"${r2c.getClass.getSimpleName}: row-to-native execution boundary")
+        Some(describeExecutionBoundary(r2c, "row-to-native"))
       case r2c: RowToColumnarExec =>
-        Some(s"${r2c.getClass.getSimpleName}: row-to-native execution boundary")
+        Some(describeExecutionBoundary(r2c, "row-to-native"))
       case _: ColumnarToColumnarExec =>
         plan.children.flatMap(findFirstUnsupportedOperator).headOption
       case cia: ColumnarInputAdapter =>
@@ -695,6 +710,37 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case other =>
         Some(s"${other.getClass.getSimpleName}: ${other.simpleString(20)}")
     }
+  }
+
+  /**
+   * Report the row operator and Gluten validation tag hidden immediately below a convention
+   * transition. A transition class alone is not actionable: it says where native execution ends,
+   * but not why Spark created the row island. Keep this diagnostic read-only; a real row operator
+   * is still rejected by strict MPP.
+   */
+  private[extension] def describeExecutionBoundary(
+      boundary: SparkPlan,
+      direction: String): String = {
+    val child = boundary.children.headOption
+    val childText = child
+      .map(plan => s"child=${plan.getClass.getSimpleName}(${plan.simpleString(100)})")
+      .getOrElse("child=<none>")
+    val fallbackText = child
+      .flatMap(firstFallbackReason)
+      .map {
+        case (node, reason) =>
+          s"; firstFallback=${node.getClass.getSimpleName}: $reason"
+      }
+      .getOrElse("")
+    s"${boundary.getClass.getSimpleName}: $direction execution boundary; " +
+      s"$childText$fallbackText"
+  }
+
+  private def firstFallbackReason(plan: SparkPlan): Option[(SparkPlan, String)] = {
+    plan.collect {
+      case node if FallbackTags.nonEmpty(node) =>
+        (node, FallbackTags.get(node).reason())
+    }.headOption
   }
 
   private def arrowScalarNormalizationRejection(plan: SparkPlan): Option[String] = {
