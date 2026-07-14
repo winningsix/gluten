@@ -284,9 +284,7 @@ object ExpressionConverter extends Logging {
       attributeSeq: Seq[Attribute],
       expressionsMap: Map[Class[_], String]): Option[ExpressionTransformer] = {
     ExpressionTransformerProvider
-      .tryTransform(
-        expr,
-        replaceWithExpressionTransformer0(_, attributeSeq, expressionsMap))
+      .tryTransform(expr, replaceWithExpressionTransformer0(_, attributeSeq, expressionsMap))
       .orElse {
         Option {
           expr match {
