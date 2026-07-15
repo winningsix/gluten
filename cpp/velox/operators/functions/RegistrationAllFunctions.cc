@@ -17,6 +17,7 @@
 #include "operators/functions/RegistrationAllFunctions.h"
 
 #include "operators/functions/Arithmetic.h"
+#include "operators/functions/CheckOverflowInTableInsert.h"
 #include "operators/functions/RowConstructorWithNull.h"
 #include "operators/functions/RowFunctionWithNull.h"
 #include "velox/expression/SpecialFormRegistry.h"
@@ -92,6 +93,7 @@ void registerAllFunctions() {
   // Using function overwrite to handle function names mismatch between Spark
   // and Velox.
   registerFunctionOverwrite();
+  registerCheckOverflowInTableInsert();
 
   velox::functions::iceberg::registerFunctions();
 }

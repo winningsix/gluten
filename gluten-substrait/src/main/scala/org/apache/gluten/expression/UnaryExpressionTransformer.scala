@@ -94,6 +94,35 @@ case class CheckOverflowTransformer(
   }
 }
 
+/**
+ * Preserves Spark's checked table-insert cast as a distinct native expression.
+ *
+ * Spark represents this as CheckOverflowInTableInsert(Cast(source, target), columnName). The
+ * regular Cast node must not be emitted as a child: a GPU evaluator would execute the narrowing
+ * cast before it can check for overflow and the original value would already be lost. Emit the raw
+ * source and column name instead, while retaining the Cast target as the function output type.
+ */
+case class CheckOverflowInTableInsertTransformer(
+    substraitExprName: String,
+    source: ExpressionTransformer,
+    columnName: String,
+    original: Expression)
+  extends ExpressionTransformer {
+
+  private val columnNameLiteral = LiteralTransformer(columnName)
+
+  override def children: Seq[ExpressionTransformer] = Seq(source, columnNameLiteral)
+
+  override def doTransform(context: SubstraitContext): ExpressionNode = {
+    val functionId = context.registerFunction(
+      ConverterUtils.makeFuncName(substraitExprName, children.map(_.dataType)))
+    val expressionNodes =
+      Lists.newArrayList(source.doTransform(context), columnNameLiteral.doTransform(context))
+    val typeNode = ConverterUtils.getTypeNode(dataType, nullable)
+    ExpressionBuilder.makeScalarFunction(functionId, expressionNodes, typeNode)
+  }
+}
+
 case class GetStructFieldTransformer(
     substraitExprName: String,
     child: ExpressionTransformer,

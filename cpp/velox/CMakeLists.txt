@@ -163,6 +163,7 @@ set(VELOX_SRCS
     memory/BufferOutputStream.cc
     memory/VeloxColumnarBatch.cc
     memory/VeloxMemoryManager.cc
+    operators/functions/CheckOverflowInTableInsert.cc
     operators/functions/RegistrationAllFunctions.cc
     operators/functions/RowConstructorWithNull.cc
     operators/functions/SparkExprToSubfieldFilterParser.cc
@@ -208,6 +209,7 @@ if(ENABLE_GPU)
   list(
     APPEND
     VELOX_SRCS
+    cudf/CheckOverflowInTableInsertCudf.cc
     cudf/CudfPlanValidator.cc
     cudf/GpuLock.cc
     cudf/GpuMemoryTracker.cc

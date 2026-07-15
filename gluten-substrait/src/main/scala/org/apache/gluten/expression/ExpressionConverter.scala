@@ -40,6 +40,9 @@ trait Transformable {
 
 object ExpressionConverter extends Logging {
 
+  private val CheckOverflowInTableInsertUnsupported =
+    "CheckOverflowInTableInsert native support is limited to ANSI BIGINT -> INT table assignments."
+
   def replaceWithExpressionTransformer(
       exprs: Seq[Expression],
       attributeSeq: Seq[Attribute]): Seq[ExpressionTransformer] = {
@@ -141,6 +144,47 @@ object ExpressionConverter extends Logging {
     val rightChild =
       replaceWithExpressionTransformer0(right, attributeSeq, expressionsMap)
     DecimalArithmeticExpressionTransformer(substraitName, leftChild, rightChild, resultType, b)
+  }
+
+  private def genCheckOverflowInTableInsertTransformer(
+      substraitName: String,
+      expression: Expression,
+      attributeSeq: Seq[Attribute],
+      expressionsMap: Map[Class[_], String]): ExpressionTransformer = {
+    val cast = expression.children.headOption match {
+      case Some(c: Cast) => c
+      // Spark may wrap a Cast in ExpressionProxy when subexpression elimination is enabled.
+      case Some(proxy) if proxy.getClass.getSimpleName == "ExpressionProxy" =>
+        proxy.children.headOption match {
+          case Some(c: Cast) => c
+          case _ => throw new GlutenNotSupportException(CheckOverflowInTableInsertUnsupported)
+        }
+      case _ => throw new GlutenNotSupportException(CheckOverflowInTableInsertUnsupported)
+    }
+
+    if (
+      cast.child.dataType != LongType || cast.dataType != IntegerType ||
+      !SparkShimLoader.getSparkShims.withAnsiEvalMode(cast)
+    ) {
+      throw new GlutenNotSupportException(CheckOverflowInTableInsertUnsupported)
+    }
+
+    val columnName =
+      try {
+        expression.getClass.getMethod("columnName").invoke(expression).asInstanceOf[String]
+      } catch {
+        case _: ReflectiveOperationException =>
+          throw new GlutenNotSupportException(CheckOverflowInTableInsertUnsupported)
+      }
+    if (columnName == null) {
+      throw new GlutenNotSupportException(CheckOverflowInTableInsertUnsupported)
+    }
+
+    CheckOverflowInTableInsertTransformer(
+      substraitName,
+      replaceWithExpressionTransformer0(cast.child, attributeSeq, expressionsMap),
+      columnName,
+      expression)
   }
 
   // Mapping for Iceberg static invoke functions
@@ -645,9 +689,7 @@ object ExpressionConverter extends Logging {
           replaceWithExpressionTransformer0(c.child, attributeSeq, expressionsMap),
           c)
       case c if c.getClass.getSimpleName.equals("CheckOverflowInTableInsert") =>
-        throw new GlutenNotSupportException(
-          "CheckOverflowInTableInsert is used in ANSI mode, but Gluten does not support ANSI mode."
-        )
+        genCheckOverflowInTableInsertTransformer(substraitExprName, c, attributeSeq, expressionsMap)
       case b: BinaryArithmetic if DecimalArithmeticUtil.isDecimalArithmetic(b) =>
         val exprName = BackendsApiManager.getSparkPlanExecApiInstance.getDecimalArithmeticExprName(
           substraitExprName)

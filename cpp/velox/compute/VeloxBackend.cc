@@ -30,6 +30,7 @@
 #include "utils/qat/QatCodec.h"
 #endif
 #ifdef GLUTEN_ENABLE_GPU
+#include "cudf/CheckOverflowInTableInsertCudf.h"
 #include "operators/plannodes/CudfVectorStream.h"
 #include "ucs/config/global_opts.h"
 #include "ucs/debug/debug.h"
@@ -283,6 +284,8 @@ void VeloxBackend::init(
     auto& cudfConfig = velox::cudf_velox::CudfConfig::getInstance();
     cudfConfig.initialize(std::move(options));
     velox::cudf_velox::registerCudf();
+    registerCheckOverflowInTableInsertCudfFunction(
+        cudfConfig.functionNamePrefix);
     velox::exec::Operator::registerOperator(std::make_unique<CudfVectorStreamOperatorTranslator>());
 
     // Initialize the UCX Communicator once per process. Required so that
