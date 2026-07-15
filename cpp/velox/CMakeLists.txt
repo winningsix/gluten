@@ -423,7 +423,11 @@ if(BUILD_TESTS)
     facebook::velox::exec_test_lib
     INTERFACE facebook::velox::vector_test_lib
               facebook::velox::dwio_common_test
-              facebook::velox::file_test_utils facebook::velox::temp_path)
+              facebook::velox::file_test_utils facebook::velox::temp_path
+              # QueryAssertions and OperatorTestBase in exec_test_lib call
+              # DuckDB directly. Keep DuckDB after the importing archive on
+              # one-pass GNU linker command lines.
+              duckdb_static)
   target_link_libraries(velox PUBLIC facebook::velox::exec_test_lib)
 endif()
 
