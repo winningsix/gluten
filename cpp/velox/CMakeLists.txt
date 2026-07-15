@@ -383,9 +383,37 @@ if(BUILD_TESTS)
   import_library(
     facebook::velox::file_test_utils
     ${VELOX_BUILD_PATH}/velox/common/file/tests/libvelox_file_test_utils.a)
-  import_library(
-    facebook::velox::temp_path
-    ${VELOX_BUILD_PATH}/velox/exec/tests/utils/libvelox_temp_path.a)
+  set(VELOX_TEMP_PATH_LIBRARY
+      ${VELOX_BUILD_PATH}/velox/exec/tests/utils/libvelox_temp_path.a)
+  set(VELOX_EXEC_TEST_UTILS_CMAKE
+      ${VELOX_HOME}/velox/exec/tests/utils/CMakeLists.txt)
+  if(EXISTS ${VELOX_EXEC_TEST_UTILS_CMAKE})
+    file(
+      STRINGS ${VELOX_EXEC_TEST_UTILS_CMAKE} VELOX_TEMP_PATH_INTERFACE_DEFINITION
+      REGEX "velox_add_library\\(velox_temp_path[ \\t]+INTERFACE")
+  endif()
+  if(VELOX_TEMP_PATH_INTERFACE_DEFINITION)
+    foreach(VELOX_TEMP_PATH_HEADER TempDirectoryPath.h TempFilePath.h)
+      if(NOT EXISTS
+         ${VELOX_HOME}/velox/exec/tests/utils/${VELOX_TEMP_PATH_HEADER})
+        message(
+          FATAL_ERROR
+            "Velox header-only temp_path is missing ${VELOX_TEMP_PATH_HEADER}")
+      endif()
+    endforeach()
+    add_library(facebook::velox::temp_path INTERFACE IMPORTED)
+    set_target_properties(
+      facebook::velox::temp_path PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
+                                              ${VELOX_HOME})
+    message(STATUS "Importing Velox temp_path as a header-only target")
+  elseif(EXISTS ${VELOX_TEMP_PATH_LIBRARY})
+    import_library(facebook::velox::temp_path ${VELOX_TEMP_PATH_LIBRARY})
+  else()
+    message(
+      FATAL_ERROR
+        "Velox temp_path archive is missing, but the source target is not header-only: ${VELOX_TEMP_PATH_LIBRARY}"
+    )
+  endif()
   import_library(
     facebook::velox::exec_test_lib
     ${VELOX_BUILD_PATH}/velox/exec/tests/utils/libvelox_exec_test_lib.a)
