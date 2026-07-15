@@ -150,7 +150,7 @@ add_velox_test(
 # VeloxSubstraitRoundTripTest directly calls folly::init and Folly APIs.  A
 # shared Folly build must therefore be on this executable's link line instead
 # of relying on libgluten.so's private dependency.
-target_link_libraries(velox_plan_conversion_test Folly::folly)
+target_link_libraries(velox_plan_conversion_test Folly::folly duckdb_static)
 add_velox_test(spark_functions_test SOURCES SparkFunctionTest.cc
                FunctionTest.cc)
 target_link_libraries(spark_functions_test Folly::folly)
