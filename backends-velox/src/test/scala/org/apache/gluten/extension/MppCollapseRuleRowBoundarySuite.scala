@@ -18,7 +18,7 @@ package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.exception.GlutenException
-import org.apache.gluten.execution.{ColumnarUnionExec, FlushableHashAggregateExecTransformer, GenerateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, MppExistingRddStreamInput, MppNativeQueryExec, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, UnionExecTransformer, VeloxColumnarToRowExec}
+import org.apache.gluten.execution.{ColumnarUnionExec, FlushableHashAggregateExecTransformer, GenerateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, MppJvmStreamInputMatcher, MppNativeQueryExec, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, UnionExecTransformer, VeloxColumnarToRowExec}
 import org.apache.gluten.expression.aggregate.VeloxCollectList
 import org.apache.gluten.extension.columnar.FallbackTags
 
@@ -272,7 +272,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(collapsed.isInstanceOf[DeserializeToObjectExec])
     assert(collapsed.children.head.isInstanceOf[MppNativeQueryExec])
     assert(collapsed.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
-    assert(collapsed.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+    assert(collapsed.find(node => MppJvmStreamInputMatcher.scan(node).contains(scan)).isDefined)
   }
 
   test("root DeserializeToObject composes Gluten C2R with the exact ExistingRDD ingress hybrid") {
@@ -289,7 +289,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val c2r = collapsed.children.head
     assert(c2r.isInstanceOf[VeloxColumnarToRowExec])
     assert(c2r.children.head.isInstanceOf[MppNativeQueryExec])
-    assert(c2r.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+    assert(c2r.find(node => MppJvmStreamInputMatcher.scan(node).contains(scan)).isDefined)
   }
 
   test("root DeserializeToObject repairs a sortable row shell over ExistingRDD ingress") {
@@ -314,7 +314,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(mpp.isInstanceOf[MppNativeQueryExec])
     assert(mpp.find(_.isInstanceOf[SortExecTransformer]).isDefined)
     assert(mpp.find(_.isInstanceOf[VeloxColumnarToRowExec]).isEmpty)
-    assert(mpp.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+    assert(mpp.find(node => MppJvmStreamInputMatcher.scan(node).contains(scan)).isDefined)
   }
 
   test("nested DeserializeToObject remains a strict MPP rejection") {
@@ -357,7 +357,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(collapsed.isInstanceOf[MppNativeQueryExec])
     val mpp = collapsed.asInstanceOf[MppNativeQueryExec]
     assert(collapsed.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
-    assert(mpp.child.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+    assert(mpp.child.find(node => MppJvmStreamInputMatcher.scan(node).contains(scan)).isDefined)
   }
 
   test("an ingress-only ExistingRDD plan gets an identity native fragment anchor") {
@@ -372,7 +372,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val mpp = collapsed.asInstanceOf[MppNativeQueryExec]
     assert(mpp.child.isInstanceOf[ProjectExecTransformer])
     assert(mpp.child.output.map(_.exprId) == ingress.output.map(_.exprId))
-    assert(mpp.child.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+    assert(mpp.child.find(node => MppJvmStreamInputMatcher.scan(node).contains(scan)).isDefined)
   }
 
   test("a nested native-to-row boundary cannot activate MPP") {
@@ -470,10 +470,10 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
     assert(!rule.isFullyNativeSupported(nativeSuffix))
-    assert(rule.isSupportedExistingRddHybridPlan(nativeSuffix))
-    assert(MppExistingRddStreamInput.scan(ingress).contains(scan))
+    assert(rule.isSupportedJvmStreamHybridPlan(nativeSuffix))
+    assert(MppJvmStreamInputMatcher.scan(ingress).contains(scan))
     assert(
-      MppExistingRddStreamInput
+      MppJvmStreamInputMatcher
         .scan(ColumnarInputAdapter(ingress))
         .contains(scan))
   }
@@ -489,10 +489,10 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
     assert(!rule.isFullyNativeSupported(nativeSuffix))
-    assert(rule.isSupportedExistingRddHybridPlan(nativeSuffix))
-    assert(MppExistingRddStreamInput.rowInput(ingress).contains(serializer))
+    assert(rule.isSupportedJvmStreamHybridPlan(nativeSuffix))
+    assert(MppJvmStreamInputMatcher.rowInput(ingress).contains(serializer))
     assert(
-      MppExistingRddStreamInput
+      MppJvmStreamInputMatcher
         .rowInput(ColumnarInputAdapter(ingress))
         .contains(serializer))
 
@@ -500,10 +500,10 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(collapsed.isInstanceOf[MppNativeQueryExec])
     assert(
       collapsed
-        .find(node => MppExistingRddStreamInput.rowInput(node).contains(serializer))
+        .find(node => MppJvmStreamInputMatcher.rowInput(node).contains(serializer))
         .isDefined)
 
-    val guardOutcomes = MppExistingRddStreamInput.objectIngressGuardOutcomes(nativeSuffix)
+    val guardOutcomes = MppJvmStreamInputMatcher.objectIngressGuardOutcomes(nativeSuffix)
     assert(guardOutcomes.size == 1)
     val guardOutcome = guardOutcomes.head
     assert(guardOutcome.contains("childShape=ExternalRDDScanExec"))
@@ -527,14 +527,14 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
     assert(!rule.isFullyNativeSupported(nativeSuffix))
-    assert(rule.isSupportedExistingRddHybridPlan(nativeSuffix))
-    assert(MppExistingRddStreamInput.rowInput(ingress).contains(serializer))
+    assert(rule.isSupportedJvmStreamHybridPlan(nativeSuffix))
+    assert(MppJvmStreamInputMatcher.rowInput(ingress).contains(serializer))
 
     val collapsed = rule(nativeSuffix)
     assert(collapsed.isInstanceOf[MppNativeQueryExec])
     assert(
       collapsed
-        .find(node => MppExistingRddStreamInput.rowInput(node).contains(serializer))
+        .find(node => MppJvmStreamInputMatcher.rowInput(node).contains(serializer))
         .isDefined)
   }
 
@@ -569,9 +569,9 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
       SerializeFromObjectExec(Seq(Alias(foreignAttr, "foreign")()), InputAdapter(external))
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
-    assert(MppExistingRddStreamInput.rowInput(directExternalIngress).isEmpty)
+    assert(MppJvmStreamInputMatcher.rowInput(directExternalIngress).isEmpty)
     assert(
-      !rule.isSupportedExistingRddHybridPlan(
+      !rule.isSupportedJvmStreamHybridPlan(
         ProjectExecTransformer(directExternalIngress.output, directExternalIngress)))
 
     Seq(
@@ -589,13 +589,13 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     ).foreach {
       serializer =>
         val ingress = RowToVeloxColumnarExec(serializer)
-        assert(MppExistingRddStreamInput.rowInput(ingress).isEmpty)
+        assert(MppJvmStreamInputMatcher.rowInput(ingress).isEmpty)
         assert(
-          !rule.isSupportedExistingRddHybridPlan(ProjectExecTransformer(ingress.output, ingress)))
+          !rule.isSupportedJvmStreamHybridPlan(ProjectExecTransformer(ingress.output, ingress)))
     }
 
     val adapterGuards =
-      MppExistingRddStreamInput.objectIngressGuardOutcomes(doubleInputAdapterSerializer)
+      MppJvmStreamInputMatcher.objectIngressGuardOutcomes(doubleInputAdapterSerializer)
     assert(adapterGuards.size == 1)
     val adapterGuard = adapterGuards.head
     assert(adapterGuard.contains("childShape=InputAdapter->InputAdapter"))
@@ -603,7 +603,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(adapterGuard.contains("accepted=false"))
 
     val referenceGuards =
-      MppExistingRddStreamInput.objectIngressGuardOutcomes(foreignReferencedSerializer)
+      MppJvmStreamInputMatcher.objectIngressGuardOutcomes(foreignReferencedSerializer)
     assert(referenceGuards.size == 1)
     val referenceGuard = referenceGuards.head
     assert(referenceGuard.contains("childShape=ExternalRDDScanExec"))
@@ -623,7 +623,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
     assert(!rule.isFullyNativeSupported(exchange))
-    assert(rule.isSupportedExistingRddHybridPlan(exchange))
+    assert(rule.isSupportedJvmStreamHybridPlan(exchange))
     val collapsed = rule(exchange)
     assert(collapsed.isInstanceOf[MppNativeQueryExec])
     val nativePlan = collapsed.asInstanceOf[MppNativeQueryExec].child
@@ -633,7 +633,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
       .asInstanceOf[ColumnarShuffleExchangeExec]
     assert(anchoredExchange.child.isInstanceOf[ProjectExecTransformer])
     assert(anchoredExchange.child.output.map(_.exprId) == ingress.output.map(_.exprId))
-    assert(nativePlan.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+    assert(nativePlan.find(node => MppJvmStreamInputMatcher.scan(node).contains(scan)).isDefined)
   }
 
   test("ExistingRDD hybrid repairs a computed collect-list aggregate before strict validation") {
@@ -678,7 +678,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
       nativeAggregate.aggregateExpressions.forall(
         _.aggregateFunction.children.forall(_.isInstanceOf[AttributeReference])))
     assert(nativeAggregate.child.isInstanceOf[ProjectExecTransformer])
-    assert(nativePlan.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+    assert(nativePlan.find(node => MppJvmStreamInputMatcher.scan(node).contains(scan)).isDefined)
     assert(nativePlan.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
   }
 
@@ -731,7 +731,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(nativePlan.find(_.isInstanceOf[SortExecTransformer]).isDefined)
     assert(nativePlan.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
     assert(nativePlan.find(_.isInstanceOf[VeloxColumnarToRowExec]).isEmpty)
-    assert(nativePlan.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+    assert(nativePlan.find(node => MppJvmStreamInputMatcher.scan(node).contains(scan)).isDefined)
   }
 
   test("ExistingRDD hybrid materializes computed keys on an already-native sort") {
@@ -754,7 +754,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(rewrittenSort.sortOrder.forall(_.child.isInstanceOf[AttributeReference]))
     assert(nativePlan.collect { case _: ProjectExecTransformer => 1 }.sum >= 2)
     assert(nativePlan.output == ingress.output)
-    assert(nativePlan.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+    assert(nativePlan.find(node => MppJvmStreamInputMatcher.scan(node).contains(scan)).isDefined)
   }
 
   test("ExistingRDD hybrid normalizes a collect-list row shell across a native union") {
@@ -797,7 +797,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
 
     val normalized = rule.normalizeMppNativeOperators(
       stalePlan,
-      preserveExistingRddIngress = true,
+      preserveJvmStreamIngress = true,
       rewriteNativeUnion = _.transformUp {
         case union: ColumnarUnionExec => UnionExecTransformer(union.children)
       })
@@ -814,7 +814,7 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
       nativeAggregate.aggregateExpressions.forall(
         _.aggregateFunction.children.forall(_.isInstanceOf[AttributeReference])))
     assert(nativeAggregate.child.isInstanceOf[ProjectExecTransformer])
-    assert(normalized.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+    assert(normalized.find(node => MppJvmStreamInputMatcher.scan(node).contains(scan)).isDefined)
   }
 
   test("ExistingRDD matcher rejects non-Existing RDDScan names") {
@@ -824,8 +824,8 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val nativeSuffix = ProjectExecTransformer(ingress.output, ingress)
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
-    assert(MppExistingRddStreamInput.scan(ingress).isEmpty)
-    assert(!rule.isSupportedExistingRddHybridPlan(nativeSuffix))
+    assert(MppJvmStreamInputMatcher.scan(ingress).isEmpty)
+    assert(!rule.isSupportedJvmStreamHybridPlan(nativeSuffix))
   }
 
   test("ExistingRDD matcher rejects Spark 4 streaming RDDScan") {
@@ -851,8 +851,8 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
         val nativeSuffix = ProjectExecTransformer(ingress.output, ingress)
         val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
-        assert(MppExistingRddStreamInput.scan(ingress).isEmpty)
-        assert(!rule.isSupportedExistingRddHybridPlan(nativeSuffix))
+        assert(MppJvmStreamInputMatcher.scan(ingress).isEmpty)
+        assert(!rule.isSupportedJvmStreamHybridPlan(nativeSuffix))
       case None =>
         // Spark 3.x has no streaming RDDScanExec form; keep this cross-version suite meaningful
         // there by asserting that the accessor itself is absent.
@@ -868,14 +868,14 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val nativeSuffix = ProjectExecTransformer(ingress.output, ingress)
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
-    assert(!rule.isSupportedExistingRddHybridPlan(nativeSuffix))
-    assert(MppExistingRddStreamInput.scan(ingress).isEmpty)
+    assert(!rule.isSupportedJvmStreamHybridPlan(nativeSuffix))
+    assert(MppJvmStreamInputMatcher.scan(ingress).isEmpty)
 
     val exchange = ColumnarShuffleExchangeExec(
       outputPartitioning = HashPartitioning(Seq(attr), 4),
       child = ingress,
       projectOutputAttributes = ingress.output)
-    assert(!rule.isSupportedExistingRddHybridPlan(exchange))
+    assert(!rule.isSupportedJvmStreamHybridPlan(exchange))
   }
 
   test("ExistingRDD matcher rejects a native-to-row round trip") {
@@ -884,9 +884,9 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     val roundTrip = RowToVeloxColumnarExec(ColumnarToRowExec(RowToVeloxColumnarExec(scan)))
     val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
 
-    assert(MppExistingRddStreamInput.scan(roundTrip).isEmpty)
+    assert(MppJvmStreamInputMatcher.scan(roundTrip).isEmpty)
     assert(
-      !rule.isSupportedExistingRddHybridPlan(ProjectExecTransformer(roundTrip.output, roundTrip)))
+      !rule.isSupportedJvmStreamHybridPlan(ProjectExecTransformer(roundTrip.output, roundTrip)))
   }
 
   test("strict row-boundary diagnostic reports the row child and its fallback reason") {

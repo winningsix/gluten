@@ -349,7 +349,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case c2r: ColumnarToRowExec =>
         collapseTerminalRowEgress(c2r, c2r.child)
       case _ =>
-        tryCollapseExistingRddHybrid(plan)
+        tryCollapseJvmStreamHybrid(plan)
           .orElse(tryCollapseMpp(plan))
           .orElse(tryCollapseArrowPythonBoundary(plan))
     }
@@ -358,7 +358,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   private def collapseTerminalRowEgress(
       boundary: SparkPlan,
       child: SparkPlan): Option[SparkPlan] = {
-    tryCollapseExistingRddHybrid(child).orElse(tryCollapseMpp(child)).map {
+    tryCollapseJvmStreamHybrid(child).orElse(tryCollapseMpp(child)).map {
       nativeChild =>
         val (rowOutput, transitionMessage) = boundary match {
           case c2r: ColumnarToRowExecBase =>
@@ -387,7 +387,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case c2r: ColumnarToRowExecBase =>
         collapseTerminalObjectEgressThroughC2r(boundary, c2r, c2r.child)
       case c2r: ColumnarToRowExec =>
-        tryCollapseExistingRddHybrid(c2r.child).orElse(tryCollapseMpp(c2r.child)).map {
+        tryCollapseJvmStreamHybrid(c2r.child).orElse(tryCollapseMpp(c2r.child)).map {
           nativeChild =>
             logWarning(
               "MppCollapseRule: *** INTENTIONAL TERMINAL NATIVE OBJECT OUTPUT *** " +
@@ -402,7 +402,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       boundary: DeserializeToObjectExec,
       directRowTransition: SparkPlan,
       relationalChild: SparkPlan): Option[SparkPlan] = {
-    tryCollapseExistingRddHybrid(relationalChild).orElse(tryCollapseMpp(relationalChild)).map {
+    tryCollapseJvmStreamHybrid(relationalChild).orElse(tryCollapseMpp(relationalChild)).map {
       nativeChild =>
         val objectInput = directRowTransition.withNewChildren(Seq(nativeChild))
         logWarning(
@@ -525,7 +525,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     val normalized = normalizeMppNativeOperators(repaired)
     tryCollapseNormalizedMpp(
       normalized,
-      allowExistingRddIngress = false,
+      allowJvmStreamIngress = false,
       mode = "fully native-supported")
   }
 
@@ -535,21 +535,21 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    * arbitrary nested row consumer as a convention adapter.
    */
   private def repairRecoverableRowShells(plan: SparkPlan): SparkPlan =
-    repairRecoverableRowShells(plan, preserveExistingRddIngress = false)
+    repairRecoverableRowShells(plan, preserveJvmStreamIngress = false)
 
   private def repairRecoverableRowShells(
       plan: SparkPlan,
-      preserveExistingRddIngress: Boolean): SparkPlan =
+      preserveJvmStreamIngress: Boolean): SparkPlan =
     plan.transformUp {
       case r2c: RowToColumnarExecBase if isRecoverableRowOperator(r2c.child) =>
         normalizeMppNativeOperators(
           r2c,
-          preserveExistingRddIngress,
+          preserveJvmStreamIngress,
           recoverGenerate = isRecoverableGenerateRowIsland(r2c.child))
       case r2c: RowToColumnarExec if isRecoverableRowOperator(r2c.child) =>
         normalizeMppNativeOperators(
           r2c,
-          preserveExistingRddIngress,
+          preserveJvmStreamIngress,
           recoverGenerate = isRecoverableGenerateRowIsland(r2c.child))
     }
 
@@ -587,7 +587,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     case _ => false
   }
 
-  private def tryCollapseExistingRddHybrid(plan: SparkPlan): Option[MppNativeQueryExec] = {
+  private def tryCollapseJvmStreamHybrid(plan: SparkPlan): Option[MppNativeQueryExec] = {
     // Keep the hybrid fail-closed: only run row-shell repair after proving that the original plan
     // contains an exact JVM-backed ingress. A computed aggregate above that ingress can be left as
     // C2R -> row aggregate -> R2C by ordinary Gluten validation; repairing it here composes the two
@@ -596,7 +596,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     if (!originalHasIngress) {
       return None
     }
-    val repaired = repairRecoverableRowShells(plan, preserveExistingRddIngress = true)
+    val repaired = repairRecoverableRowShells(plan, preserveJvmStreamIngress = true)
     logHybridIngressTransition("row-shell-repair", plan, repaired)
     // Do not run InsertTransitions over this hybrid. Its first step deliberately removes every
     // transition, including the exact R2C that identifies the JVM-backed ingress; rebuilding that
@@ -646,7 +646,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     logHybridIngressTransition("native-fragment-anchor", exchangeInputsAnchored, nativeAnchored)
     tryCollapseNormalizedMpp(
       nativeAnchored,
-      allowExistingRddIngress = true,
+      allowJvmStreamIngress = true,
       mode = "native with exact JVM-backed ingress")
   }
 
@@ -679,7 +679,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
   private def tryCollapseNormalizedMpp(
       unionRewritten: SparkPlan,
-      allowExistingRddIngress: Boolean,
+      allowJvmStreamIngress: Boolean,
       mode: String): Option[MppNativeQueryExec] = {
     arrowScalarNormalizationRejection(unionRewritten).foreach {
       reason =>
@@ -687,9 +687,9 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
           throw new IllegalStateException(s"MppCollapseRule: strict MPP rejected plan: $reason")
         }
     }
-    if (!isNativeSupported(unionRewritten, allowExistingRddIngress)) {
+    if (!isNativeSupported(unionRewritten, allowJvmStreamIngress)) {
       val reason =
-        findFirstUnsupportedOperator(unionRewritten, allowExistingRddIngress).getOrElse("unknown")
+        findFirstUnsupportedOperator(unionRewritten, allowJvmStreamIngress).getOrElse("unknown")
       logWarning(
         s"MppCollapseRule: plan contains non-native operators, " +
           s"cannot collapse to MPP. First blocker: $reason. " +
@@ -732,31 +732,31 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   }
 
   private[extension] def normalizeMppNativeOperators(plan: SparkPlan): SparkPlan =
-    normalizeMppNativeOperators(plan, preserveExistingRddIngress = false, recoverGenerate = false)
+    normalizeMppNativeOperators(plan, preserveJvmStreamIngress = false, recoverGenerate = false)
 
   private def normalizeMppNativeOperators(
       plan: SparkPlan,
-      preserveExistingRddIngress: Boolean,
+      preserveJvmStreamIngress: Boolean,
       recoverGenerate: Boolean = false): SparkPlan =
     normalizeMppNativeOperators(
       plan,
-      preserveExistingRddIngress,
+      preserveJvmStreamIngress,
       recoverGenerate,
       rewriteNativeUnion = rewriteMppNativeUnion)
 
   private[extension] def normalizeMppNativeOperators(
       plan: SparkPlan,
-      preserveExistingRddIngress: Boolean,
+      preserveJvmStreamIngress: Boolean,
       rewriteNativeUnion: SparkPlan => SparkPlan): SparkPlan =
     normalizeMppNativeOperators(
       plan,
-      preserveExistingRddIngress,
+      preserveJvmStreamIngress,
       recoverGenerate = false,
       rewriteNativeUnion)
 
   private def normalizeMppNativeOperators(
       plan: SparkPlan,
-      preserveExistingRddIngress: Boolean,
+      preserveJvmStreamIngress: Boolean,
       recoverGenerate: Boolean,
       rewriteNativeUnion: SparkPlan => SparkPlan): SparkPlan = {
     // Spark may insert RowToColumnar(ColumnarToRow(nativeChild)) solely to reconcile the
@@ -823,10 +823,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // otherwise its strict native-tree check retains the now-stale C2R/R2C shell. The ordinary
     // path still rewrites after transition insertion, where output partitioning is fully known.
     val unionPrepared =
-      if (preserveExistingRddIngress) rewriteNativeUnion(lateOffloaded) else lateOffloaded
+      if (preserveJvmStreamIngress) rewriteNativeUnion(lateOffloaded) else lateOffloaded
     val retransitioned =
-      if (preserveExistingRddIngress) {
-        bridgeRecoverableExistingRddTransitions(unionPrepared)
+      if (preserveJvmStreamIngress) {
+        bridgeRecoverableJvmStreamTransitions(unionPrepared)
       } else {
         InsertTransitions
           .create(outputsColumnar = unionPrepared.supportsColumnar, VeloxBatchType)
@@ -840,16 +840,16 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    * Remove only the stale transitions around a row shell that was just late-offloaded, while
    * retaining the exact R2C leaf that identifies the JVM-backed local stream.
    */
-  private def bridgeRecoverableExistingRddTransitions(plan: SparkPlan): SparkPlan = {
+  private def bridgeRecoverableJvmStreamTransitions(plan: SparkPlan): SparkPlan = {
     val withoutIngressC2r = plan.transformUp {
-      case c2r: ColumnarToRowExecBase if isSupportedExistingRddHybridPlan(c2r.child) =>
+      case c2r: ColumnarToRowExecBase if isSupportedJvmStreamHybridPlan(c2r.child) =>
         c2r.child
-      case c2r: ColumnarToRowExec if isSupportedExistingRddHybridPlan(c2r.child) => c2r.child
+      case c2r: ColumnarToRowExec if isSupportedJvmStreamHybridPlan(c2r.child) => c2r.child
     }
     withoutIngressC2r.transformUp {
-      case r2c: RowToColumnarExecBase if isSupportedExistingRddHybridPlan(r2c.child) =>
+      case r2c: RowToColumnarExecBase if isSupportedJvmStreamHybridPlan(r2c.child) =>
         r2c.child
-      case r2c: RowToColumnarExec if isSupportedExistingRddHybridPlan(r2c.child) =>
+      case r2c: RowToColumnarExec if isSupportedJvmStreamHybridPlan(r2c.child) =>
         r2c.child
     }
   }
@@ -879,23 +879,23 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    * exchange can be absorbed (both sides are TransformSupport with supported partitioning).
    */
   private[extension] def isFullyNativeSupported(plan: SparkPlan): Boolean =
-    isNativeSupported(plan, allowExistingRddIngress = false)
+    isNativeSupported(plan, allowJvmStreamIngress = false)
 
   /**
    * Validate a native suffix with one of the exact JVM-backed ingresses without weakening the
    * ordinary strict-MPP contract. At least one exact ingress must be present; every other node
    * remains subject to the same native validator.
    */
-  private[extension] def isSupportedExistingRddHybridPlan(plan: SparkPlan): Boolean =
+  private[extension] def isSupportedJvmStreamHybridPlan(plan: SparkPlan): Boolean =
     containsExactJvmStreamIngress(plan) &&
-      isNativeSupported(plan, allowExistingRddIngress = true)
+      isNativeSupported(plan, allowJvmStreamIngress = true)
 
   private def containsExactJvmStreamIngress(plan: SparkPlan): Boolean =
     plan.find(isExactJvmStreamIngress).isDefined
 
   private def logHybridIngressStage(stage: String, plan: SparkPlan): Boolean = {
     val exactIngress = containsExactJvmStreamIngress(plan)
-    val objectGuardOutcomes = MppExistingRddStreamInput.objectIngressGuardOutcomes(plan)
+    val objectGuardOutcomes = MppJvmStreamInputMatcher.objectIngressGuardOutcomes(plan)
     val candidateText =
       if (objectGuardOutcomes.isEmpty) "objectIngressCandidates=none"
       else objectGuardOutcomes.mkString("objectIngressCandidates=[", " | ", "]")
@@ -919,24 +919,24 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   }
 
   private def isExactJvmStreamIngress(plan: SparkPlan): Boolean = plan match {
-    case r2c: RowToColumnarExecBase => MppExistingRddStreamInput.rowInput(r2c).isDefined
-    case r2c: RowToColumnarExec => MppExistingRddStreamInput.rowInput(r2c).isDefined
+    case r2c: RowToColumnarExecBase => MppJvmStreamInputMatcher.rowInput(r2c).isDefined
+    case r2c: RowToColumnarExec => MppJvmStreamInputMatcher.rowInput(r2c).isDefined
     case _ => false
   }
 
-  private def isNativeSupported(plan: SparkPlan, allowExistingRddIngress: Boolean): Boolean = {
+  private def isNativeSupported(plan: SparkPlan, allowJvmStreamIngress: Boolean): Boolean = {
     plan match {
       // Exchanges that we can absorb into the MPP plan
       case exchange: ShuffleExchangeLike =>
-        canAbsorbExchange(exchange, allowExistingRddIngress) &&
-        isNativeSupported(exchange.child, allowExistingRddIngress)
+        canAbsorbExchange(exchange, allowJvmStreamIngress) &&
+        isNativeSupported(exchange.child, allowJvmStreamIngress)
 
       // Broadcast exchanges are absorbable when the build side is itself a fully
       // native TransformSupport subtree (recurse into children, same as shuffle).
       // The native MPP runtime treats BROADCAST as a distinct exchange type.
       case bc: BroadcastExchangeLike =>
-        val absorbable = canAbsorbExchange(bc, allowExistingRddIngress) &&
-          bc.children.forall(isNativeSupported(_, allowExistingRddIngress))
+        val absorbable = canAbsorbExchange(bc, allowJvmStreamIngress) &&
+          bc.children.forall(isNativeSupported(_, allowJvmStreamIngress))
         if (!absorbable) {
           logWarning(
             s"MppCollapseRule: BLOCKED by BroadcastExchangeLike: " +
@@ -946,10 +946,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
       // AQE query stage wrappers - check their underlying plan
       case stage: ShuffleQueryStageExec =>
-        isNativeSupported(stage.plan, allowExistingRddIngress)
+        isNativeSupported(stage.plan, allowJvmStreamIngress)
 
       case stage: BroadcastQueryStageExec =>
-        isNativeSupported(stage.plan, allowExistingRddIngress)
+        isNativeSupported(stage.plan, allowJvmStreamIngress)
 
       // This transformer intentionally retains Spark's row-UDF eval type because changing a
       // nullable input to the ordinary Arrow scalar protocol is not semantics-preserving. It may
@@ -964,15 +964,15 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
       // Native-supported operators
       case _: TransformSupport =>
-        plan.children.forall(isNativeSupported(_, allowExistingRddIngress))
+        plan.children.forall(isNativeSupported(_, allowJvmStreamIngress))
 
       // Exact matched rowInput is the only permitted JVM-backed input slot. Do not recurse into
       // it: MppNativeQueryExec captures and columnarizes the row plan as a local stream.
       case r2c: RowToColumnarExecBase
-          if allowExistingRddIngress && MppExistingRddStreamInput.rowInput(r2c).isDefined =>
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(r2c).isDefined =>
         true
       case r2c: RowToColumnarExec
-          if allowExistingRddIngress && MppExistingRddStreamInput.rowInput(r2c).isDefined =>
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(r2c).isDefined =>
         true
 
       // A remaining row transition is a real execution boundary. The only C2R shape that MPP may
@@ -1003,19 +1003,19 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
       // Gluten-internal columnar-to-columnar nodes (batch resize, etc.) - look through
       case c2c: ColumnarToColumnarExec =>
-        c2c.children.forall(isNativeSupported(_, allowExistingRddIngress))
+        c2c.children.forall(isNativeSupported(_, allowJvmStreamIngress))
 
       // ColumnarCollapseTransformStages places this convention adapter below an
       // InputIteratorTransformer at exchange boundaries. It is transparent to MPP fragment
       // extraction, so validate the wrapped exchange/native subtree instead of rejecting the
       // adapter itself. This is also the shape produced by the scalar-subquery broadcast rewrite.
       case cia: ColumnarInputAdapter =>
-        isNativeSupported(cia.child, allowExistingRddIngress)
+        isNativeSupported(cia.child, allowJvmStreamIngress)
 
       // TakeOrderedAndProjectExecTransformer wraps a sort+limit+project over a
       // TransformSupport child; treat it as a transparent wrapper and recurse.
       case topk: TakeOrderedAndProjectExecTransformer =>
-        isNativeSupported(topk.child, allowExistingRddIngress)
+        isNativeSupported(topk.child, allowJvmStreamIngress)
 
       // Vanilla FilterExec/ProjectExec only land here when Gluten's columnar
       // validator refused to convert them -- typically because their expression
@@ -1024,9 +1024,9 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       // injected as a Substrait literal at build time by ScalarSubqueryTransformer.
       // Whitelist these so the outer plan can collapse to MPP.
       case f: FilterExec if containsScalarSubquery(f.condition) =>
-        isNativeSupported(f.child, allowExistingRddIngress)
+        isNativeSupported(f.child, allowJvmStreamIngress)
       case p: ProjectExec if p.projectList.exists(containsScalarSubquery) =>
-        isNativeSupported(p.child, allowExistingRddIngress)
+        isNativeSupported(p.child, allowJvmStreamIngress)
 
       // Any other non-native operator means we cannot do MPP
       case other =>
@@ -1056,25 +1056,25 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    */
   private def findFirstUnsupportedOperator(
       plan: SparkPlan,
-      allowExistingRddIngress: Boolean): Option[String] = {
+      allowJvmStreamIngress: Boolean): Option[String] = {
     def findInChildren(node: SparkPlan): Option[String] =
       node.children
-        .flatMap(findFirstUnsupportedOperator(_, allowExistingRddIngress))
+        .flatMap(findFirstUnsupportedOperator(_, allowJvmStreamIngress))
         .headOption
 
     plan match {
-      case _: ShuffleExchangeLike if canAbsorbExchange(plan, allowExistingRddIngress) =>
+      case _: ShuffleExchangeLike if canAbsorbExchange(plan, allowJvmStreamIngress) =>
         findInChildren(plan)
-      case _: BroadcastExchangeLike if canAbsorbExchange(plan, allowExistingRddIngress) =>
+      case _: BroadcastExchangeLike if canAbsorbExchange(plan, allowJvmStreamIngress) =>
         findInChildren(plan)
       case _: ShuffleQueryStageExec =>
         findFirstUnsupportedOperator(
           plan.asInstanceOf[ShuffleQueryStageExec].plan,
-          allowExistingRddIngress)
+          allowJvmStreamIngress)
       case _: BroadcastQueryStageExec =>
         findFirstUnsupportedOperator(
           plan.asInstanceOf[BroadcastQueryStageExec].plan,
-          allowExistingRddIngress)
+          allowJvmStreamIngress)
       case python: EvalPythonExecTransformer
           if python.getTagValue(ARROW_SCALAR_NORMALIZATION_REJECTION_TAG).isDefined =>
         Some(
@@ -1083,10 +1083,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case _: TransformSupport =>
         findInChildren(plan)
       case r2c: RowToColumnarExecBase
-          if allowExistingRddIngress && MppExistingRddStreamInput.rowInput(r2c).isDefined =>
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(r2c).isDefined =>
         None
       case r2c: RowToColumnarExec
-          if allowExistingRddIngress && MppExistingRddStreamInput.rowInput(r2c).isDefined =>
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(r2c).isDefined =>
         None
       case c2r: ColumnarToRowExecBase =>
         Some(describeExecutionBoundary(c2r, "native-to-row"))
@@ -1099,7 +1099,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case _: ColumnarToColumnarExec =>
         findInChildren(plan)
       case cia: ColumnarInputAdapter =>
-        findFirstUnsupportedOperator(cia.child, allowExistingRddIngress)
+        findFirstUnsupportedOperator(cia.child, allowJvmStreamIngress)
       case _: TakeOrderedAndProjectExecTransformer =>
         findInChildren(plan)
       case f: FilterExec if containsScalarSubquery(f.condition) =>
@@ -1189,7 +1189,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    *   - The partitioning type is one we support for GPU streaming exchange
    *   - There are no UDFs that require JVM execution in the exchange
    */
-  private def canAbsorbExchange(exchange: SparkPlan, allowExistingRddIngress: Boolean): Boolean = {
+  private def canAbsorbExchange(exchange: SparkPlan, allowJvmStreamIngress: Boolean): Boolean = {
     exchange match {
       case shuffle: ShuffleExchangeLike =>
         val partitioningSupported = isSupportedPartitioning(shuffle.outputPartitioning)
@@ -1197,7 +1197,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
           shuffle.child.isInstanceOf[ShuffleQueryStageExec] ||
           shuffle.child.isInstanceOf[BroadcastQueryStageExec] ||
           shuffle.child.isInstanceOf[ColumnarToColumnarExec] ||
-          (allowExistingRddIngress && isExactJvmStreamIngress(shuffle.child))
+          (allowJvmStreamIngress && isExactJvmStreamIngress(shuffle.child))
 
         if (!partitioningSupported) {
           logWarning(

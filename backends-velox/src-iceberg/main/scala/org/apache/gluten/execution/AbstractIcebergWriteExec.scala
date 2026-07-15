@@ -19,8 +19,8 @@ package org.apache.gluten.execution
 import org.apache.gluten.IcebergNestedFieldVisitor
 import org.apache.gluten.connector.write.{ColumnarBatchDataWriterFactory, ColumnarStreamingDataWriterFactory, IcebergDataWriteFactory}
 
-import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import org.apache.iceberg.SerializableTable

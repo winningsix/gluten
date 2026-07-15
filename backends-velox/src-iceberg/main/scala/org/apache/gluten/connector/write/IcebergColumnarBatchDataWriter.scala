@@ -67,8 +67,9 @@ case class IcebergColumnarBatchDataWriter(
 
   private def parseDataFile(json: String, spec: PartitionSpec, sortOrder: SortOrder): DataFile = {
     val dataFile = mapper.readValue(json, classOf[DataFileJson])
-    val footerMetrics =
-      ParquetUtil.fileMetrics(table.io().newInputFile(dataFile.path), MetricsConfig.forTable(table))
+    val footerMetrics = ParquetUtil.fileMetrics(
+      table.io().newInputFile(dataFile.path),
+      MetricsConfig.forTable(table))
     if (
       dataFile.metrics != null &&
       dataFile.metrics.metrics().recordCount() != footerMetrics.recordCount()

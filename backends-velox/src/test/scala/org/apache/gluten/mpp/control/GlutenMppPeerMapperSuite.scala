@@ -106,7 +106,8 @@ class GlutenMppPeerMapperSuite extends AnyFunSuite {
   }
 
   test("host selection falls through to URI host when blockManagerHost empty") {
-    val infos = Seq(info("e1", host = "infoHost", blockManagerHost = "", ucxHost = "ucxHost"))
+    val infos = Seq(
+      info("e1", host = "infoHost", blockManagerHost = "", ucxHost = "ucxHost"))
     val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 1)
     assert(out.head.host == "ucxHost")
     assert(out.head.preferredLocation == "executor_ucxHost_e1")

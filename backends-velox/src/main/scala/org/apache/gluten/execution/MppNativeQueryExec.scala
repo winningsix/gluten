@@ -125,14 +125,18 @@ private[execution] case class MppLocalStreamInput(
 private[execution] case class MppLocalStreamSlot(fragmentId: Int, slotIdx: Int)
 
 /**
- * Exact matcher for the JVM-backed stream shapes admitted by strict MPP.
+ * Fail-closed matcher for the JVM-backed stream shapes admitted by strict MPP.
+ *
+ * MPP already feeds a Spark `RDDScanExec` into its existing local `InputIterator` bridge. This
+ * matcher does not introduce another transport or execution path: it narrows that legacy admission
+ * to a batch "ExistingRDD" leaf and extends the same bridge to one encoded object-RDD shape.
  *
  * An application that leaves Spark SQL through `Dataset.rdd` and later calls `toDF` produces an
- * [[RDDScanExec]] ("ExistingRDD") at the new query's leaf. The MPP runtime can feed that leaf into
- * an InputIterator slot. A typed Dataset materialized as `RDD[Row]` and registered as a view has a
- * second exact leaf shape: SerializeFromObjectExec over ExternalRDDScanExec. Spark whole-stage
- * codegen may insert exactly one row InputAdapter between those operators. Capturing the serializer
- * itself preserves Spark's encoder semantics before columnarizing its relational rows.
+ * [[RDDScanExec]] ("ExistingRDD") at the new query's leaf. A typed Dataset materialized as
+ * `RDD[Row]` and registered as a view has the second exact leaf shape: SerializeFromObjectExec over
+ * ExternalRDDScanExec. Spark whole-stage codegen may insert exactly one row InputAdapter between
+ * those operators. Capturing the serializer preserves Spark's encoder semantics before
+ * columnarizing its relational rows.
  *
  * Do not treat an arbitrary row subtree as equivalent to either ingress. Keep this matcher
  * deliberately unary and transparent: conversion/adaptor nodes are accepted; C2R, Python,
@@ -141,7 +145,7 @@ private[execution] case class MppLocalStreamSlot(fragmentId: Int, slotIdx: Int)
  * batch form. Spark 3.x has no such accessor, so the reflective check below is a cross-version
  * compatibility guard rather than a relaxation.
  */
-private[gluten] object MppExistingRddStreamInput {
+private[gluten] object MppJvmStreamInputMatcher {
 
   private case class ObjectIngressGuardOutcome(
       childShape: String,
@@ -560,7 +564,7 @@ case class MppNativeQueryExec(
 
       val preparedExtractedExchanges =
         try {
-          prepareMppRangeExchanges(extractedExchanges, rangeBoundsCache)
+          prepareHybridMppRangeExchanges(extractedExchanges, rangeBoundsCache)
         } catch {
           case NonFatal(e) =>
             return delegateToBsp(
@@ -706,7 +710,7 @@ case class MppNativeQueryExec(
 
     val preparedExchanges =
       try {
-        prepareMppRangeExchanges(exchanges, rangeBoundsCache)
+        prepareHybridMppRangeExchanges(exchanges, rangeBoundsCache)
       } catch {
         case NonFatal(e) =>
           return delegateToBsp(
@@ -1839,11 +1843,11 @@ case class MppNativeQueryExec(
   }
 
   private def isJvmBackedStreamInput(plan: SparkPlan): Boolean = {
-    MppExistingRddStreamInput.rowInput(plan).isDefined
+    MppJvmStreamInputMatcher.rowInput(plan).isDefined
   }
 
   private def executeJvmBackedStreamColumnar(plan: SparkPlan): RDD[ColumnarBatch] = {
-    val rowInput = MppExistingRddStreamInput.rowInput(plan).getOrElse {
+    val rowInput = MppJvmStreamInputMatcher.rowInput(plan).getOrElse {
       throw new IllegalArgumentException(
         s"Expected an exact JVM-backed stream input, got ${plan.getClass.getSimpleName}")
     }
@@ -3424,7 +3428,17 @@ case class MppNativeQueryExec(
     }
   }
 
-  private def prepareMppRangeExchanges(
+  /**
+   * Populate native RANGE exchanges with Spark-compatible global bounds.
+   *
+   * Catalyst's [[RangePartitioning]] carries ordering and partition count, but Spark creates the
+   * actual bounds later inside its `RangePartitioner`. MPP removes that Spark shuffle, so the
+   * bounds are unavailable to the native exchange. Until native peers can sample, merge, and
+   * broadcast bounds themselves, this correctness bridge executes the producer as a bounded Spark
+   * sampling pre-action. Consequently any launch entering this method is hybrid preparation, not
+   * end-to-end fully-MPP execution.
+   */
+  private def prepareHybridMppRangeExchanges(
       exchanges: Seq[ExchangeSpec],
       rangeBoundsCache: MppRangeBoundsGenerator.QueryCache): Seq[ExchangeSpec] = {
     exchanges.map {
