@@ -606,8 +606,18 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // native rewrites.
     val transitionBridged = MppColumnarTransitionBridge()(repaired)
     logHybridIngressTransition("columnar-transition-bridge", repaired, transitionBridged)
-    val nativeUnionRewritten = rewriteMppNativeUnion(transitionBridged)
-    logHybridIngressTransition("native-union-rewrite", transitionBridged, nativeUnionRewritten)
+    val nativeSortKeysProjected = transitionBridged.transformUp {
+      case sort: SortExecTransformer => MppComputedSortKeyProjection.rewrite(sort)
+    }
+    logHybridIngressTransition(
+      "native-sort-key-projection",
+      transitionBridged,
+      nativeSortKeysProjected)
+    val nativeUnionRewritten = rewriteMppNativeUnion(nativeSortKeysProjected)
+    logHybridIngressTransition(
+      "native-union-rewrite",
+      nativeSortKeysProjected,
+      nativeUnionRewritten)
     val unionRewritten = MppReplicatedCartesianRule()(nativeUnionRewritten)
     logHybridIngressTransition("replicated-cartesian-rewrite", nativeUnionRewritten, unionRewritten)
     if (!containsExactJvmStreamIngress(unionRewritten)) {

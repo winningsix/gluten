@@ -734,6 +734,29 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(nativePlan.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
   }
 
+  test("ExistingRDD hybrid materializes computed keys on an already-native sort") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val scan = existingRddScan(attr)
+    val ingress = RowToVeloxColumnarExec(scan)
+    val computedOrder = SortOrder(Cast(attr, LongType), Ascending, NullsFirst, Seq.empty)
+    val nativeSort =
+      SortExecTransformer(Seq(computedOrder), global = false, ingress, testSpillFrequency = 0)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val collapsed = rule(nativeSort)
+
+    assert(collapsed.isInstanceOf[MppNativeQueryExec])
+    val nativePlan = collapsed.asInstanceOf[MppNativeQueryExec].child
+    val rewrittenSort = nativePlan
+      .find(_.isInstanceOf[SortExecTransformer])
+      .get
+      .asInstanceOf[SortExecTransformer]
+    assert(rewrittenSort.sortOrder.forall(_.child.isInstanceOf[AttributeReference]))
+    assert(nativePlan.collect { case _: ProjectExecTransformer => 1 }.sum >= 2)
+    assert(nativePlan.output == ingress.output)
+    assert(nativePlan.find(node => MppExistingRddStreamInput.scan(node).contains(scan)).isDefined)
+  }
+
   test("ExistingRDD hybrid normalizes a collect-list row shell across a native union") {
     val subject = AttributeReference("subject", StringType, nullable = true)()
     val predicate = AttributeReference("predicate", StringType, nullable = true)()
