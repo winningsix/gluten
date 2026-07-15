@@ -69,7 +69,7 @@ case class MppExchangeSourceTransformer(
     TransformContext(outputAttributes, readRel)
   }
 
-  override def metricsUpdater(): MetricsUpdater = MetricsUpdater.None
+  override def metricsUpdater(): MetricsUpdater = MetricsUpdater.Terminate
 
   override def getSplitInfos: Seq[SplitInfo] = Seq.empty
 

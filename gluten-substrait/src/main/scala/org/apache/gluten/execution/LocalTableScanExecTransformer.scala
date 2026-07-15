@@ -40,7 +40,7 @@ case class LocalTableScanExecTransformer(output: Seq[Attribute], var rows: Seq[I
 
   override def outputOrdering: Seq[SortOrder] = Nil
 
-  override def metricsUpdater(): MetricsUpdater = MetricsUpdater.None
+  override def metricsUpdater(): MetricsUpdater = MetricsUpdater.Terminate
 
   override def getSplitInfos: Seq[SplitInfo] = Nil
 
