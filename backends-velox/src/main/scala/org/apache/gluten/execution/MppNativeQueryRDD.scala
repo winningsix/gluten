@@ -294,11 +294,10 @@ class MppNativeQueryRDD(
         0L
       } else {
         val tCloseStart = System.nanoTime()
-        try {
-          jniWrapper.nativeCloseMppQuery(mppHandle)
-        } finally {
-          mppClosed = true
-        }
+        MppNativeQueryRDD.closeAfterHoldingMemory(
+          () => runtime.memoryManager().hold(),
+          () => jniWrapper.nativeCloseMppQuery(mppHandle),
+          () => mppClosed = true)
         System.nanoTime() - tCloseStart
       }
     }
@@ -671,6 +670,23 @@ final private[execution] class MppSpillRootLease(val root: File, deleteRoot: Fil
 }
 
 private[execution] object MppNativeQueryRDD extends Logging {
+
+  /**
+   * Keep native memory pools alive before destroying an MPP coordinator. Returned zero-copy batches
+   * can outlive the coordinator on both success and error paths; closing first would leave their
+   * buffers pointing at an already-destroyed MemoryPool.
+   */
+  private[execution] def closeAfterHoldingMemory(
+      holdMemory: () => Unit,
+      closeNativeQuery: () => Unit,
+      markClosed: () => Unit): Unit = {
+    holdMemory()
+    try {
+      closeNativeQuery()
+    } finally {
+      markClosed()
+    }
+  }
 
   /**
    * Native MPP drivers pull JVM stream inputs from native worker threads, outside Spark's task

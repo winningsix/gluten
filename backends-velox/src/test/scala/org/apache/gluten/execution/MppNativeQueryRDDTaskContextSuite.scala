@@ -27,6 +27,45 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 class MppNativeQueryRDDTaskContextSuite extends AnyFunSuite with SQLHelper {
 
+  test("MPP close holds native memory before destroying the coordinator") {
+    var events = Vector.empty[String]
+
+    MppNativeQueryRDD.closeAfterHoldingMemory(
+      () => events :+= "hold",
+      () => events :+= "close",
+      () => events :+= "mark-closed")
+
+    assert(events == Seq("hold", "close", "mark-closed"))
+
+    val closeFailure = new IllegalStateException("native close failed")
+    events = Vector.empty
+    val thrown = intercept[IllegalStateException] {
+      MppNativeQueryRDD.closeAfterHoldingMemory(
+        () => events :+= "hold",
+        () => {
+          events :+= "close"
+          throw closeFailure
+        },
+        () => events :+= "mark-closed")
+    }
+    assert(thrown eq closeFailure)
+    assert(events == Seq("hold", "close", "mark-closed"))
+
+    val holdFailure = new IllegalStateException("memory hold failed")
+    events = Vector.empty
+    val holdThrown = intercept[IllegalStateException] {
+      MppNativeQueryRDD.closeAfterHoldingMemory(
+        () => {
+          events :+= "hold"
+          throw holdFailure
+        },
+        () => events :+= "close",
+        () => events :+= "mark-closed")
+    }
+    assert(holdThrown eq holdFailure)
+    assert(events == Seq("hold"))
+  }
+
   test("MPP input bridge binds the owning Spark task context on native callback threads") {
     var released = 0
     val ownerThread = Thread.currentThread()
