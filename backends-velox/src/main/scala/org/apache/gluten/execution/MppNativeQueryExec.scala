@@ -542,6 +542,15 @@ case class MppNativeQueryExec(
               s"(${ex.exchangeType}, ${ex.numPartitions} partitions)")
       }
 
+      val extractedRangeExchangeCount =
+        extractedExchanges.count(_.exchangeType == "RANGE")
+      logWarning(
+        s"MppNativeQueryExec: *** MPP EXECUTION TOPOLOGY EXTRACTED *** " +
+          s"fragments=${extractedFragments.size} exchanges=${extractedExchanges.size} " +
+          s"rangeExchanges=$extractedRangeExchangeCount " +
+          s"localStreamInputs=${localStreamInputs.size}. This runtime topology supersedes the " +
+          s"null-root placeholder reported during plan admission.")
+
       nativeMppFallbackReason(extractedFragments, extractedExchanges).foreach {
         reason =>
           return delegateToBsp(
@@ -3441,6 +3450,12 @@ case class MppNativeQueryExec(
         require(
           spec.rangeSamplePlan != null,
           s"MPP RANGE exchange ${spec.id} is missing its producer sampling plan")
+        logWarning(
+          s"MppNativeQueryExec: *** SPARK PRE-ACTION FOR MPP RANGE *** exchange=${spec.id} " +
+            s"F${spec.producerFragmentId}->F${spec.consumerFragmentId} requestedPartitions=" +
+            s"${spec.numPartitions}. MppRangeBoundsGenerator will execute the Spark producer " +
+            s"plan to collect bounded samples before MppNativeQueryRDD starts; this launch is " +
+            s"hybrid preparation and is not an end-to-end fully-MPP execution.")
         val (bounds, reused) = rangeBoundsCache.getOrCompute(
           spec.rangeSamplePlan,
           spec.rangeSamplePlan.output,

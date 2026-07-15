@@ -719,9 +719,11 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     val exchanges = Seq.empty[ExchangeSpec]
 
     logWarning(
-      s"MppCollapseRule: *** MPP MODE ACTIVE *** - collapsed plan into " +
-        s"${fragments.size} fragments and ${exchanges.size} exchanges. " +
-        s"All stages will run concurrently with streaming exchange. mode=$mode")
+      s"MppCollapseRule: *** MPP PLAN ADMITTED *** - operator admission passed; " +
+        s"runtime fragment extraction is pending. The temporary " +
+        s"${fragments.size}-fragment/${exchanges.size}-exchange topology contains a null-root " +
+        s"placeholder and is not an execution topology or an end-to-end fully-MPP verdict. " +
+        s"mode=$mode")
 
     // Plan D: Wrap, don't replace. Keep original plan as child so Spark's
     // shuffle/broadcast validation passes. At execution time, MppNativeQueryExec
