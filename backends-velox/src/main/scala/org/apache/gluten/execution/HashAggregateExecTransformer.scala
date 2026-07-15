@@ -57,7 +57,8 @@ abstract class HashAggregateExecTransformer(
     aggregateAttributes,
     initialInputBufferOffset,
     resultExpressions,
-    child) {
+    child)
+  with RewritableHashAggregateExecTransformer {
 
   override def output: Seq[Attribute] = {
     // TODO: We should have a check to make sure the returned schema actually matches the output

@@ -143,20 +143,6 @@ abstract class HashAggregateExecBaseTransformer(
   // Members declared in org.apache.spark.sql.execution.AliasAwareOutputPartitioning
   override protected def outputExpressions: Seq[NamedExpression] = resultExpressions
 
-  /**
-   * Rebuild this native aggregate while preserving its backend-specific execution semantics.
-   *
-   * Physical rewrite rules can still discover a computed aggregate argument after the aggregate has
-   * already been offloaded. In that case they must be able to insert the same pre-project used for
-   * a vanilla Spark aggregate without replacing a backend-specific implementation (for example,
-   * Velox's flushable aggregate) with the backend's default aggregate implementation.
-   */
-  private[gluten] def withNewAggregateExpressions(
-      newGroupingExpressions: Seq[NamedExpression],
-      newAggregateExpressions: Seq[AggregateExpression],
-      newAggregateAttributes: Seq[Attribute],
-      newResultExpressions: Seq[NamedExpression]): HashAggregateExecBaseTransformer
-
   protected def checkAggFuncModeSupport(
       aggFunc: AggregateFunction,
       mode: AggregateMode): Boolean = {
@@ -188,6 +174,23 @@ abstract class HashAggregateExecBaseTransformer(
       aggParams: AggregationParams,
       input: RelNode = null,
       validation: Boolean = false): RelNode
+}
+
+/**
+ * Backend opt-in for rebuilding an already-offloaded aggregate after a pre-project rewrite.
+ *
+ * Keep this separate from [[HashAggregateExecBaseTransformer]] so a backend is not required to
+ * implement a rewrite that it does not use. In particular, Velox strict MPP opts in while other
+ * backends retain their existing aggregate planning behavior.
+ */
+private[gluten] trait RewritableHashAggregateExecTransformer {
+  self: HashAggregateExecBaseTransformer =>
+
+  private[gluten] def withNewAggregateExpressions(
+      newGroupingExpressions: Seq[NamedExpression],
+      newAggregateExpressions: Seq[AggregateExpression],
+      newAggregateAttributes: Seq[Attribute],
+      newResultExpressions: Seq[NamedExpression]): HashAggregateExecBaseTransformer
 }
 
 object HashAggregateExecBaseTransformer {
