@@ -750,13 +750,19 @@ if(ENABLE_GPU)
     list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_kvikio_shared}")
     message(STATUS "Using legacy shared KvikIO library: ${_gluten_kvikio_shared}")
   elseif(EXISTS "${_gluten_kvikio_static}")
-    gluten_validate_static_rapids_target(
-      kvikio::kvikio "${_gluten_kvikio_static}" TRUE)
+    # KvikIO is a PRIVATE cuDF dependency, so the installed cuDF package does
+    # not export kvikio::kvikio even though its PIC archive is absorbed into
+    # libcudf.so.  Validate the shared cuDF artifact instead of requiring a
+    # target that must not be in cuDF's public interface.
     get_target_property(_gluten_cudf_type cudf::cudf TYPE)
-    if(NOT _gluten_cudf_type STREQUAL "SHARED_LIBRARY")
+    get_target_property(_gluten_cudf_location cudf::cudf
+                        IMPORTED_LOCATION_RELEASE)
+    if(NOT _gluten_cudf_type STREQUAL "SHARED_LIBRARY" OR
+       NOT EXISTS "${_gluten_cudf_location}")
       message(FATAL_ERROR
               "Static KvikIO is expected to be absorbed by shared cudf::cudf; "
-              "observed cuDF type=${_gluten_cudf_type}")
+              "observed cuDF type=${_gluten_cudf_type}, "
+              "location=${_gluten_cudf_location}")
     endif()
     message(STATUS
             "Using static KvikIO absorbed by shared cuDF: ${_gluten_kvikio_static}")
