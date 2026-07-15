@@ -769,7 +769,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // fields. The normal heuristic rewrite may leave a row operator behind after one sibling
     // fails validation, so repeat the official pre-project rewrite before force-offloading the
     // strict-MPP subtree. This is expression-preserving and does not broaden native validation.
-    val preProjected = coalesceElided.transformUp {
+    val nativeSortKeysProjected = coalesceElided.transformUp {
+      case sort: SortExecTransformer => MppComputedSortKeyProjection.rewrite(sort)
+    }
+    val preProjected = nativeSortKeysProjected.transformUp {
       case agg: BaseAggregateExec => PullOutPreProject.rewrite(agg)
       case sort: SortExec if !sort.global => PullOutPreProject.rewrite(sort)
       case generate: GenerateExec if recoverGenerate => PullOutPreProject.rewrite(generate)

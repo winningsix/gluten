@@ -903,6 +903,26 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(rule.isFullyNativeSupported(normalized))
   }
 
+  test("strict normalization materializes computed keys on an already-native sort") {
+    val child = nativeLeaf()
+    val computedOrder =
+      SortOrder(Cast(child.output.head, LongType), Ascending, NullsFirst, Seq.empty)
+    val nativeSort =
+      SortExecTransformer(Seq(computedOrder), global = false, child, testSpillFrequency = 0)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val normalized = rule.normalizeMppNativeOperators(nativeSort)
+
+    val rewrittenSort = normalized
+      .find(_.isInstanceOf[SortExecTransformer])
+      .get
+      .asInstanceOf[SortExecTransformer]
+    assert(rewrittenSort.sortOrder.forall(_.child.isInstanceOf[AttributeReference]))
+    assert(normalized.collect { case _: ProjectExecTransformer => 1 }.sum >= 2)
+    assert(normalized.output == child.output)
+    assert(rule.isFullyNativeSupported(normalized))
+  }
+
   test("strict normalization materializes aggregate grouping and function expressions") {
     val metric = AttributeReference("metric_name", StringType, nullable = true)()
     val value = AttributeReference("metric_value", DoubleType, nullable = true)()

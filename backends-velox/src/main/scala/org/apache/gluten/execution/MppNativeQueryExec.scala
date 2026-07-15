@@ -1850,7 +1850,11 @@ case class MppNativeQueryExec(
   }
 
   private def offloadLocalSorts(plan: SparkPlan): SparkPlan = {
-    val withSortPreProjects = plan.transformUp {
+    val withNativeSortPreProjects = plan.transformUp {
+      case sort: SortExecTransformer => MppComputedSortKeyProjection.rewrite(sort)
+    }
+
+    val withSortPreProjects = withNativeSortPreProjects.transformUp {
       case sort: SortExec if !sort.global =>
         PullOutPreProject.rewrite(sort)
     }
