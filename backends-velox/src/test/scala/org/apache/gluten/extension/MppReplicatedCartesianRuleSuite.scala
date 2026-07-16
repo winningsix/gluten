@@ -21,10 +21,10 @@ import org.apache.gluten.extension.MppReplicatedCartesianRule.{MAX_BUILD_BYTES_K
 
 import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, GreaterThan}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, GreaterThan, Literal}
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
 import org.apache.spark.sql.catalyst.plans.logical.{LeafNode, Statistics}
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, LocalTableScanExec, SparkPlan}
+import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, FilterExec, LocalTableScanExec, SparkPlan}
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.IntegerType
 
@@ -139,6 +139,18 @@ class MppReplicatedCartesianRuleSuite extends QueryTest with SharedSparkSession 
   test("non-strict mode retains Spark partition-pair Cartesian when unsafe") {
     withSQLConf(MAX_BUILD_BYTES_KEY -> "1kb", "spark.gluten.mpp.failOnFallback" -> "false") {
       val original = cartesian(scan("l", 2048, Some(128)), scan("r", 4096, Some(256)))
+      assert(MppReplicatedCartesianRule()(original) eq original)
+    }
+  }
+
+  test("unlinked unary operators do not inherit child statistics") {
+    withSQLConf(MAX_BUILD_BYTES_KEY -> "1kb", "spark.gluten.mpp.failOnFallback" -> "false") {
+      val wrappedSmall = FilterExec(Literal.TrueLiteral, scan("l", 128, Some(8)))
+      val original = cartesian(wrappedSmall, scan("r", 4096, Some(256)))
+
+      // The manually constructed unary node has no logical link. Its child statistics are not a
+      // valid upper bound for every unary operator (for example Generate can expand rows), so the
+      // rule must fail closed instead of authorizing a replicated build from the child's size.
       assert(MppReplicatedCartesianRule()(original) eq original)
     }
   }

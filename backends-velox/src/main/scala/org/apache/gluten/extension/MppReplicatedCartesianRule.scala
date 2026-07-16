@@ -188,15 +188,10 @@ object MppReplicatedCartesianRule {
   private def planStats(plan: SparkPlan): Option[SideStats] = {
     plan.logicalLink
       .flatMap(logical => fromStatistics(logical.stats, "physical subtree logical link"))
-      .orElse {
-        // Propagating through a unary convention wrapper is safe. Do not synthesize stats for a
-        // multi-child relational operator: joins and Cartesian products can expand beyond the sum
-        // of their inputs, so treating that sum as an upper bound could authorize an unsafe build.
-        plan.children match {
-          case Seq(child) => planStats(child)
-          case _ => None
-        }
-      }
+    // Do not inherit a child's statistics merely because this node is unary. Generate, projection,
+    // and other unary operators can increase row count or row width, so the child's size is not an
+    // upper bound for the complete physical subtree. A convention wrapper that wants to participate
+    // must retain the logical link for the subtree it transparently represents.
   }
 
   private def fromStatistics(stats: Statistics, source: String): Option[SideStats] = {
