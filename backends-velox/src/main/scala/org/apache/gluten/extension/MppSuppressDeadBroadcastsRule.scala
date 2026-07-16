@@ -16,83 +16,35 @@
  */
 package org.apache.gluten.extension
 
-import org.apache.gluten.execution.{MppNativeQueryExec, MppPreparedChildExec}
+import org.apache.gluten.execution.MppNativeQueryExec
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, SparkPlan}
-import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
-import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
+import org.apache.spark.sql.execution.SparkPlan
 
 /**
- * Mark every ColumnarBroadcastExchangeExec inside an MppNativeQueryExec subtree as superseded by
- * the enclosing native fragment.
+ * Defer dead-broadcast suppression until native MPP execution is committed.
  *
- * Why: Plan C MPP single-task merge inlines BROADCAST-source plans directly into the consumer
- * fragment (MppJniWrapper "single-task merge BROADCAST, no LocalPartition wrap"), so the
- * driver-side ColumnarBroadcastExchangeExec.relationFuture collect is dead work. Without this rule
- * the framework's SparkPlan.prepare() still walks the entire child subtree and triggers
- * relationFuture, which materializes ColumnarBatchSerializeResult arrays in driver heap. Across
- * iterations the arrays accumulate (~5 GB / iter on Q14 SF1000 with autoBroadcastJoinThreshold=2GB)
- * and OOM the 20 GB driver heap by iter 3, then race against a Spark shutdown hook that resets
- * VeloxBackend's globalMemoryManager and crash with SIGSEGV at gluten::defaultLeafVeloxMemoryPool.
+ * This is intentionally a non-mutating final rule. RANGE preparation executes a bounded Spark
+ * sample of the exchange producer and that producer may contain broadcast exchanges. Suppression is
+ * irreversible: it fails the relation promise and may cancel an already-started broadcast job. A
+ * final planning rule cannot reliably decide that an exchange is dead because the same exchange can
+ * be reached through reused, shared, adaptive, or subquery plan topology.
  *
- * The marker pattern (transient var on the exchange) is used instead of replacing the node so that
- * Catalyst tree walks, schema introspection, and the BSP fallback path that does need
- * executeBroadcast are unaffected.
+ * [[MppNativeQueryExec]] owns the commit point instead. It first completes RANGE preparation,
+ * Substrait generation, and every validation path that may still delegate to BSP; only then does it
+ * call `suppressDeadBroadcastsForNativeMpp`. Thus BSP fallback and RANGE sampling retain live
+ * broadcasts, while committed native MPP still avoids the dead driver-side collect.
  *
- * Gated by spark.gluten.mpp.suppressDeadBroadcast (default: true). Set to false only to retain the
- * legacy driver-collect path for diagnostic comparison.
+ * Keep this rule in the final-rule chain as an explicit lifecycle boundary and compatibility point
+ * for deployments that already refer to its class name.
  */
 case class MppSuppressDeadBroadcastsRule() extends Rule[SparkPlan] with Logging {
-  private val confKey = "spark.gluten.mpp.suppressDeadBroadcast"
-  private val confDefault = "true"
-
   override def apply(plan: SparkPlan): SparkPlan = {
-    val sess = org.apache.spark.sql.SparkSession.getActiveSession
-    val enabled = sess.exists(_.conf.get(confKey, confDefault).toBoolean)
-    if (!enabled) {
-      return plan
-    }
-
-    def markBroadcasts(plan: SparkPlan): Int = {
-      var marked = 0
-
-      def visit(node: SparkPlan): Unit = {
-        node match {
-          case prepared: MppPreparedChildExec =>
-            visit(prepared.hiddenPlan)
-          case stage: BroadcastQueryStageExec =>
-            visit(stage.plan)
-          case stage: ShuffleQueryStageExec =>
-            visit(stage.plan)
-          case reused: ReusedExchangeExec =>
-            visit(reused.child)
-          case bex: ColumnarBroadcastExchangeExec =>
-            if (bex.suppressForMppNativeExecution()) {
-              marked += 1
-            }
-            visit(bex.child)
-          case other =>
-            other.children.foreach(visit)
-        }
-      }
-
-      visit(plan)
-      marked
-    }
-
-    var markedCount = 0
-    plan.foreach {
-      case mpp: MppNativeQueryExec => markedCount += markBroadcasts(mpp.child)
-      case _ =>
-    }
-
-    if (markedCount > 0) {
+    if (plan.exists(_.isInstanceOf[MppNativeQueryExec])) {
       logDebug(
-        s"MppSuppressDeadBroadcastsRule: marked $markedCount ColumnarBroadcastExchangeExec " +
-          s"node(s) as dead under MppNativeQueryExec; driver-side relationFuture collect " +
-          s"will be skipped")
+        "MppSuppressDeadBroadcastsRule: deferring irreversible broadcast suppression " +
+          "until MppNativeQueryExec completes fallback-capable validation")
     }
     plan
   }

@@ -513,6 +513,27 @@ const ::substrait::Expression_Literal& VeloxToSubstraitExprConvertor::toSubstrai
     google::protobuf::Arena& arena,
     const std::shared_ptr<const core::ConstantTypedExpr>& constExpr,
     ::substrait::Expression_Literal_Struct* litValue) {
+  // DATE uses INTEGER as its physical TypeKind in Velox. Dispatching only on
+  // the variant kind therefore serializes a DATE constant as Substrait i32,
+  // and a round trip produces invalid calls such as greaterthan(DATE,
+  // INTEGER). Preserve the logical type before the physical-kind dispatch.
+  if (constExpr->type()->isDate()) {
+    auto* literalExpr =
+        google::protobuf::Arena::CreateMessage<::substrait::Expression_Literal>(&arena);
+    if (constExpr->isNull()) {
+      auto* nullValue = google::protobuf::Arena::CreateMessage<::substrait::Type_Date>(&arena);
+      nullValue->set_nullability(::substrait::Type_Nullability_NULLABILITY_NULLABLE);
+      literalExpr->mutable_null()->set_allocated_date(nullValue);
+      literalExpr->set_nullable(true);
+    } else {
+      const auto days = constExpr->hasValueVector()
+          ? constExpr->valueVector()->as<SimpleVector<int32_t>>()->valueAt(0)
+          : constExpr->value().value<TypeKind::INTEGER>();
+      literalExpr->set_date(days);
+      literalExpr->set_nullable(false);
+    }
+    return *literalExpr;
+  }
   if (constExpr->hasValueVector()) {
     return toSubstraitLiteral(arena, constExpr->valueVector(), litValue);
   } else {

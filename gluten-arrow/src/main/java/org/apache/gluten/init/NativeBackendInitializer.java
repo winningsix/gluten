@@ -37,6 +37,7 @@ public final class NativeBackendInitializer {
   private static final Map<String, NativeBackendInitializer> instances = new ConcurrentHashMap<>();
 
   private final AtomicBoolean initialized = new AtomicBoolean(false);
+  private final AtomicBoolean shutDown = new AtomicBoolean(false);
   private final String backendName;
 
   private NativeBackendInitializer(String backendName) {
@@ -88,5 +89,17 @@ public final class NativeBackendInitializer {
 
   private native String getUcxListenerEndpoint0(String advertisedHost);
 
-  private native void shutdown();
+  public void shutdown() {
+    if (!initialized.get() || !shutDown.compareAndSet(false, true)) {
+      return;
+    }
+    try {
+      shutdown0();
+    } catch (RuntimeException | Error e) {
+      shutDown.set(false);
+      throw e;
+    }
+  }
+
+  private native void shutdown0();
 }

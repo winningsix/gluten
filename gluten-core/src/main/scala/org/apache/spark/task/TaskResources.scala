@@ -125,6 +125,35 @@ object TaskResources extends TaskListener with Logging {
     }
   }
 
+  /**
+   * Run a callback on a non-Spark thread with the resource registry owned by an active Spark task.
+   *
+   * Native engines may invoke JVM-backed input iterators from their own worker threads. Spark's
+   * task context is thread-local, so those callbacks would otherwise be unable to look up resources
+   * registered for the Spark task that created the iterator. This method only binds the supplied
+   * context for the duration of the callback; it deliberately does not initialize or release the
+   * context's resource registry, whose lifecycle remains owned by the Spark task.
+   */
+  def runWithTaskContext[T](context: TaskContext)(body: => T): T = {
+    if (context == null) {
+      throw new IllegalArgumentException("Task context must not be null")
+    }
+    val previous = getLocalTaskContext()
+    if (previous eq context) {
+      return body
+    }
+    if (previous != null) {
+      throw new IllegalStateException(
+        "Cannot bind a different Spark task context to the current thread")
+    }
+    TaskContext.setTaskContext(context)
+    try {
+      body
+    } finally {
+      TaskContext.unset()
+    }
+  }
+
   private val RESOURCE_REGISTRIES =
     new java.util.IdentityHashMap[TaskContext, TaskResourceRegistry]()
 

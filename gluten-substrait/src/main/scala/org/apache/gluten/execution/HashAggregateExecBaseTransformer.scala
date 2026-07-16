@@ -176,6 +176,23 @@ abstract class HashAggregateExecBaseTransformer(
       validation: Boolean = false): RelNode
 }
 
+/**
+ * Backend opt-in for rebuilding an already-offloaded aggregate after a pre-project rewrite.
+ *
+ * Keep this separate from [[HashAggregateExecBaseTransformer]] so a backend is not required to
+ * implement a rewrite that it does not use. In particular, Velox strict MPP opts in while other
+ * backends retain their existing aggregate planning behavior.
+ */
+private[gluten] trait RewritableHashAggregateExecTransformer {
+  self: HashAggregateExecBaseTransformer =>
+
+  private[gluten] def withNewAggregateExpressions(
+      newGroupingExpressions: Seq[NamedExpression],
+      newAggregateExpressions: Seq[AggregateExpression],
+      newAggregateAttributes: Seq[Attribute],
+      newResultExpressions: Seq[NamedExpression]): HashAggregateExecBaseTransformer
+}
+
 object HashAggregateExecBaseTransformer {
 
   private def getInitialInputBufferOffset(agg: BaseAggregateExec): Int = agg match {

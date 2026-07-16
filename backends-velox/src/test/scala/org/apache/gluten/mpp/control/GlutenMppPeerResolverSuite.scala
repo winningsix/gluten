@@ -80,6 +80,30 @@ class GlutenMppPeerResolverSuite extends AnyFunSuite {
         """{"peerId":"e2","host":"host-b","port":50197,"peerIndex":1}]""")
   }
 
+  test("resolver waits for delayed endpoint registrations within the bounded deadline") {
+    val registry = GlutenMppEndpointRegistry()
+    val service = GlutenMppDriverService.createForTests(registry, enabled = true)
+    val waitingConf = new SparkConf(loadDefaults = false)
+      .set(GlutenMppControlPlaneConfig.AwaitMinExecutorsKey, "true")
+      .set(GlutenMppControlPlaneConfig.AwaitTimeoutMsKey, "5000")
+    val registration = new Thread(
+      () => {
+        Thread.sleep(50L)
+        registry.register(record("e1", "host-a", 50100))
+        registry.register(record("e2", "host-b", 50200))
+      })
+    registration.start()
+
+    val resolved = GlutenMppPeerResolver.resolve(
+      waitingConf,
+      requestedCount = 2,
+      manualPeerEndpointsJson = "",
+      driverService = Some(service))
+    registration.join()
+
+    assert(resolved.peerInfos.map(_.peerId).toSeq == Seq("e1", "e2"))
+  }
+
   test("registry with insufficient endpoints fails fast (no probe fallback)") {
     val error = intercept[IllegalStateException] {
       GlutenMppPeerResolver.resolve(

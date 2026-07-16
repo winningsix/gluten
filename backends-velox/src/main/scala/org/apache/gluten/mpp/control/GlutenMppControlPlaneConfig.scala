@@ -44,7 +44,10 @@ object GlutenMppControlPlaneConfig {
   /** Maximum time (ms) the resolver waits for the registry to populate. */
   val AwaitTimeoutMsKey: String =
     "spark.gluten.mpp.controlPlane.endpointRegistry.awaitTimeoutMs"
-  val AwaitTimeoutMsDefault: Long = 10000L
+  // Cold standalone executors may spend more than ten seconds fetching the Gluten bundle and
+  // loading the native Velox/UCX runtime before they can publish a listener endpoint. Keep peer
+  // discovery bounded, but cover that normal initialization window.
+  val AwaitTimeoutMsDefault: Long = 60000L
 
   // ---- Query cancellation ----
 

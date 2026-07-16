@@ -40,6 +40,10 @@
     _ZSt8to_charsPcS_DF128_;
     _ZSt8to_charsPcS_DF128_St12chars_format;
     _ZSt8to_charsPcS_DF128_St12chars_formati;
+    # Velox test utilities call its HugeInt.cpp extension directly.  Keep the
+    # ABI-tagged GNU symbol visible without re-linking the monolithic Velox
+    # archive (and re-registering its process-wide state) in every consumer.
+    _ZSt9to_stringB5cxx11n;
 
     Java_org_apache_gluten_*;
     JNI_OnLoad;

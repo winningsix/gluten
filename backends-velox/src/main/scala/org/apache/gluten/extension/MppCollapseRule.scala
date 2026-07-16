@@ -16,21 +16,27 @@
  */
 package org.apache.gluten.extension
 
+import org.apache.gluten.backendsapi.BackendsApiManager
+import org.apache.gluten.backendsapi.velox.VeloxBatchType
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution._
-import org.apache.gluten.extension.columnar.UnionTransformerRule
-import org.apache.gluten.extension.columnar.rewrite.PullOutPreProject
+import org.apache.gluten.extension.columnar.{FallbackTags, UnionTransformerRule}
+import org.apache.gluten.extension.columnar.offload.OffloadOthers.ARROW_SCALAR_NORMALIZATION_REJECTION_TAG
+import org.apache.gluten.extension.columnar.rewrite.{PullOutPostProject, PullOutPreProject}
+import org.apache.gluten.extension.columnar.transition.InsertTransitions
 
+import org.apache.spark.api.python.ColumnarArrowEvalPythonExec
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, PlanExpression}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, PlanExpression, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.execution.{ColumnarInputAdapter, CommandResultExec, FilterExec, ProjectExec, ScalarSubquery, SortExec, SparkPlan}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExecBase, ColumnarToRowExec, CommandResultExec, DeserializeToObjectExec, FilterExec, GenerateExec, ProjectExec, RowToColumnarExec, ScalarSubquery, SortExec, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.command.{DataWritingCommandExec, ExecutedCommandExec}
 import org.apache.spark.sql.execution.datasources.v2.{V2CommandExec, V2TableWriteExec}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, ShuffleExchangeLike}
+import org.apache.spark.sql.execution.python.EvalPythonExecTransformer
 import org.apache.spark.sql.internal.SQLConf
 
 import java.util.concurrent.atomic.AtomicInteger
@@ -78,7 +84,11 @@ case class ExchangeSpec(
     consumerFragmentId: Int,
     exchangeType: String,
     numPartitions: Int,
-    partitionKeys: Seq[Attribute])
+    partitionKeys: Seq[Attribute],
+    rangeOrdering: Seq[SortOrder] = Seq.empty,
+    @transient rangeSamplePlan: SparkPlan = null,
+    rangeBoundsJson: Option[String] = None,
+    rangeEffectivePartitions: Option[Int] = None)
 
 /**
  * MPP plan collapse rule that replaces [[ColumnarCollapseTransformStages]] for queries that can be
@@ -198,7 +208,15 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         // the V2 writer as the thin commit boundary and collapse its query child;
         // all scans, relational operators, and exchanges still execute in one MPP
         // query and feed the V2 writer through the normal columnar transition.
-        tryCollapseMpp(v2.query) match {
+        val writeNormalization = MppCollapseRule.normalizeV2WriteExchangeAdapters(v2.query)
+        if (writeNormalization.strippedAdapters > 0) {
+          logInfo(
+            s"MppCollapseRule: removed ${writeNormalization.strippedAdapters} " +
+              "V2-write-only ColumnarToRow convention adapter(s); " +
+              "the V2 writer remains the row/commit boundary and MppNativeQueryExec.doExecute " +
+              "performs its final native-to-row conversion")
+        }
+        collapseMppOrArrowHybrid(writeNormalization.plan) match {
           case Some(mppQuery) =>
             logWarning(
               s"MppCollapseRule: *** MPP MODE ACTIVE UNDER V2 WRITE *** " +
@@ -259,7 +277,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         // were handled above by the more specific V2TableWriteExec case.
         preRewritten
       case _ =>
-        tryCollapseMpp(preRewritten).getOrElse {
+        collapseMppOrArrowHybrid(preRewritten).getOrElse {
           val reason = "MppCollapseRule: FALLBACK TO BSP"
           logWarning(reason)
           if (failOnFallback) throw new IllegalStateException(reason)
@@ -285,46 +303,393 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   }
 
   /**
+   * Collapse a fully native query, or split it at an explicitly supported columnar Arrow Python
+   * boundary. The latter is Phase B1: the native producer runs as MPP, the unchanged Python
+   * function runs in the external Arrow worker, and the already-columnar Spark/native suffix stays
+   * outside that producer. This is an intentional hybrid boundary, not BSP fallback.
+   */
+  private def collapseMppOrArrowHybrid(plan: SparkPlan): Option[SparkPlan] = {
+    plan match {
+      // Dataset.rdd is represented by a terminal DeserializeToObjectExec. Keep exactly that
+      // object-producing root and its direct C2R outside MPP while requiring the relational
+      // producer below them to satisfy the ordinary fully-native contract. Object operators at any
+      // nested position, and every other root object operator, remain rejected by the strict
+      // recursive validator.
+      case deserialize: DeserializeToObjectExec =>
+        collapseTerminalObjectEgress(deserialize)
+      // Spark materializes an uncorrelated scalar subquery through a final C2R even when its
+      // producer is entirely native. A global aggregate without grouping emits at most one row,
+      // so retain that semantically required driver boundary while collapsing its child to MPP.
+      // This avoids a BSP stage and never introduces the expensive C2R -> R2C round trip.
+      case c2r: ColumnarToRowExecBase if MppCollapseRule.isBoundedScalarResult(c2r.child) =>
+        collapseMppOrArrowHybrid(c2r.child).map {
+          nativeChild =>
+            logWarning(
+              "MppCollapseRule: *** MPP MODE ACTIVE UNDER BOUNDED SCALAR ROW OUTPUT *** " +
+                s"boundary=${c2r.getClass.getSimpleName}; final C2R converts at most one row")
+            c2r.withNewChildren(Seq(nativeChild))
+        }
+      case c2r: ColumnarToRowExec if MppCollapseRule.isBoundedScalarResult(c2r.child) =>
+        collapseMppOrArrowHybrid(c2r.child).map {
+          nativeChild =>
+            logWarning(
+              "MppCollapseRule: *** MPP MODE ACTIVE UNDER BOUNDED SCALAR ROW OUTPUT *** " +
+                s"boundary=${c2r.getClass.getSimpleName}; Spark C2R removed and " +
+                "MppNativeQueryExec performs the final JNI row conversion")
+            nativeChild
+        }
+      // A terminal root C2R is Spark's row-consumer boundary (for example Dataset.rdd /
+      // javaToPython, collect, head, or toLocalIterator). The physical plan does not retain which
+      // action requested it, so define the contract by its exact position: keep only the plan-root
+      // adapter outside MppNativeQueryExec while requiring its entire child to be either native or
+      // the separately validated batch ExistingRDD-input hybrid. A nested C2R still reaches the
+      // strict validator and is rejected.
+      case c2r: ColumnarToRowExecBase =>
+        collapseTerminalRowEgress(c2r, c2r.child)
+      case c2r: ColumnarToRowExec =>
+        collapseTerminalRowEgress(c2r, c2r.child)
+      case _ =>
+        tryCollapseJvmStreamHybrid(plan)
+          .orElse(tryCollapseMpp(plan))
+          .orElse(tryCollapseArrowPythonBoundary(plan))
+    }
+  }
+
+  private def collapseTerminalRowEgress(
+      boundary: SparkPlan,
+      child: SparkPlan): Option[SparkPlan] = {
+    tryCollapseJvmStreamHybrid(child).orElse(tryCollapseMpp(child)).map {
+      nativeChild =>
+        val (rowOutput, transitionMessage) = boundary match {
+          case c2r: ColumnarToRowExecBase =>
+            (c2r.withNewChildren(Seq(nativeChild)), "the Gluten C2R remains outside MPP")
+          case _: ColumnarToRowExec =>
+            (nativeChild, "Spark C2R removed; MppNativeQueryExec performs JNI row conversion")
+        }
+        logWarning(
+          "MppCollapseRule: *** INTENTIONAL TERMINAL NATIVE ROW OUTPUT *** " +
+            s"boundary=${boundary.getClass.getSimpleName}; $transitionMessage")
+        rowOutput
+    }
+  }
+
+  /**
+   * Collapse the relational producer of a root Dataset.rdd object adapter.
+   *
+   * Spark's InsertTransitions contract places one direct C2R between DeserializeToObjectExec and a
+   * columnar child. Preserve that required transition outside MPP, but peel it before validating
+   * the relational subtree so it is not mistaken for a nested row island. This direct adjacency is
+   * defined by Spark's transition contract; diagnostic plan strings can be truncated before the
+   * child tree and are not evidence for accepting any looser object shape.
+   */
+  private def collapseTerminalObjectEgress(boundary: DeserializeToObjectExec): Option[SparkPlan] =
+    boundary.child match {
+      case c2r: ColumnarToRowExecBase =>
+        collapseTerminalObjectEgressThroughC2r(boundary, c2r, c2r.child)
+      case c2r: ColumnarToRowExec =>
+        tryCollapseJvmStreamHybrid(c2r.child).orElse(tryCollapseMpp(c2r.child)).map {
+          nativeChild =>
+            logWarning(
+              "MppCollapseRule: *** INTENTIONAL TERMINAL NATIVE OBJECT OUTPUT *** " +
+                s"boundary=${boundary.getClass.getSimpleName}; direct Spark C2R removed and " +
+                "MppNativeQueryExec performs the JNI row conversion")
+            boundary.withNewChildren(Seq(nativeChild))
+        }
+      case _ => None
+    }
+
+  private def collapseTerminalObjectEgressThroughC2r(
+      boundary: DeserializeToObjectExec,
+      directRowTransition: SparkPlan,
+      relationalChild: SparkPlan): Option[SparkPlan] = {
+    tryCollapseJvmStreamHybrid(relationalChild).orElse(tryCollapseMpp(relationalChild)).map {
+      nativeChild =>
+        val objectInput = directRowTransition.withNewChildren(Seq(nativeChild))
+        logWarning(
+          "MppCollapseRule: *** INTENTIONAL TERMINAL NATIVE OBJECT OUTPUT *** " +
+            s"boundary=${boundary.getClass.getSimpleName}; the root object adapter and its " +
+            s"direct ${directRowTransition.getClass.getSimpleName} remain outside MPP")
+        boundary.withNewChildren(Seq(objectInput))
+    }
+  }
+
+  private def tryCollapseArrowPythonBoundary(plan: SparkPlan): Option[SparkPlan] = {
+    var sawArrowBoundary = false
+    var failedProducer = false
+
+    val normalized = normalizeMppNativeOperators(plan)
+    val rewritten = normalized.transformUp {
+      case arrow: ColumnarArrowEvalPythonExec =>
+        sawArrowBoundary = true
+        collapseArrowProducer(arrow.child) match {
+          case Some(producer) => arrow.withNewChildren(Seq(producer))
+          case None =>
+            failedProducer = true
+            arrow
+        }
+    }
+
+    if (!sawArrowBoundary || failedProducer || !isSupportedArrowHybridPlan(rewritten)) {
+      None
+    } else {
+      logWarning(
+        "MppCollapseRule: *** INTENTIONAL COLUMNAR ARROW PYTHON MPP BOUNDARY *** " +
+          "native producer -> ColumnarArrowEvalPythonExec -> columnar native/Spark suffix; " +
+          "no row conversion or BSP fallback was introduced")
+      Some(rewritten)
+    }
+  }
+
+  /**
+   * Preserve leading batch-to-batch conversion nodes required by the Arrow operator. Collapsing
+   * those conversions inside MppNativeQueryExec would make MPP advertise/output its native batch
+   * convention directly to a child that requires ArrowJavaBatchType.
+   */
+  private def collapseArrowProducer(plan: SparkPlan): Option[SparkPlan] = plan match {
+    case mpp: MppNativeQueryExec => Some(mpp)
+    case c2c: ColumnarToColumnarExec =>
+      collapseArrowProducer(c2c.child).map(child => c2c.withNewChildren(Seq(child)))
+    case _: ColumnarToRowExecBase | _: RowToColumnarExecBase =>
+      None
+    case nativeProducer =>
+      tryCollapseMpp(nativeProducer)
+  }
+
+  /**
+   * Validate the B1 suffix without pretending the external Arrow worker is serializable as
+   * Substrait. Every other operator must remain columnar/native-compatible, and row transitions are
+   * rejected even if normal non-MPP Gluten would otherwise insert them.
+   */
+  private def isSupportedArrowHybridPlan(plan: SparkPlan): Boolean =
+    isSupportedArrowHybridPlan(plan, allowDriverRowOutput = true)
+
+  private def isSupportedArrowHybridPlan(plan: SparkPlan, allowDriverRowOutput: Boolean): Boolean =
+    plan match {
+      case _: MppNativeQueryExec => true
+      case arrow: ColumnarArrowEvalPythonExec =>
+        arrow.child.find {
+          case _: ColumnarToRowExecBase | _: RowToColumnarExecBase => true
+          case _ => false
+        }.isEmpty && containsMppProducer(arrow.child)
+      case exchange: ShuffleExchangeLike =>
+        isSupportedPartitioning(exchange.outputPartitioning) &&
+        exchange.children.forall(isSupportedArrowHybridPlan(_, allowDriverRowOutput = false))
+      case exchange: BroadcastExchangeLike =>
+        exchange.children.forall(isSupportedArrowHybridPlan(_, allowDriverRowOutput = false))
+      case stage: ShuffleQueryStageExec =>
+        isSupportedArrowHybridPlan(stage.plan, allowDriverRowOutput = false)
+      case stage: BroadcastQueryStageExec =>
+        isSupportedArrowHybridPlan(stage.plan, allowDriverRowOutput = false)
+      case c2r: ColumnarToRowExecBase if allowDriverRowOutput =>
+        isSupportedArrowHybridPlan(c2r.child, allowDriverRowOutput = false)
+      case _: ColumnarToRowExecBase | _: RowToColumnarExecBase => false
+      case c2c: ColumnarToColumnarExec =>
+        isSupportedArrowHybridPlan(c2c.child, allowDriverRowOutput = false)
+      case cia: ColumnarInputAdapter =>
+        isSupportedArrowHybridPlan(cia.child, allowDriverRowOutput = false)
+      case _: TransformSupport =>
+        plan.children.forall(isSupportedArrowHybridPlan(_, allowDriverRowOutput = false))
+      case topk: TakeOrderedAndProjectExecTransformer =>
+        isSupportedArrowHybridPlan(topk.child, allowDriverRowOutput = false)
+      case _ => false
+    }
+
+  private def containsMppProducer(plan: SparkPlan): Boolean = plan match {
+    case _: MppNativeQueryExec => true
+    case other => other.children.exists(containsMppProducer)
+  }
+
+  /**
    * Attempt to collapse the entire plan into a single MppNativeQueryExec.
    *
    * Returns None if any part of the plan cannot be handled in MPP mode (i.e., contains
    * non-TransformSupport operators that are not exchanges).
    */
   private def tryCollapseMpp(plan: SparkPlan): Option[MppNativeQueryExec] = {
-    // Spark's DataFrame.coalesce(N>1) is only a narrow RDD/file-count hint; it
-    // neither changes rows nor establishes a semantic distribution.  Keeping
-    // ColumnarCoalesceExec would create a Spark scheduling island inside an
-    // otherwise native query when applications request more output files than physical peers.
-    // MPP owns peer parallelism and the Iceberg-required exchange immediately
-    // above this node still enforces the actual write partitioning.
-    val coalesceElided = plan.transformUp {
-      case coalesce: ColumnarCoalesceExec if coalesce.numPartitions > 1 =>
-        logInfo(
-          s"MppCollapseRule: eliding non-semantic ColumnarCoalesceExec(" +
-            s"${coalesce.numPartitions}) inside MPP query")
-        coalesce.child
+    // Gluten's ordinary validation can leave a temporary C2R -> row aggregate/sort/project/filter
+    // -> R2C shell when a native operator has a computed argument. Repair only those explicit
+    // late-offload shapes before checking row boundaries. Running the broad transition normalizer
+    // first would also erase an unrelated nested C2R and weaken the strict-MPP contract.
+    val repaired = repairRecoverableRowShells(plan)
+    findUnpairedNestedRowOutput(repaired) match {
+      case Some(boundary) =>
+        logWarning(
+          "MppCollapseRule: refusing to normalize an unpaired nested C2R; " +
+            "only the explicit root row-output path may retain that boundary. " +
+            s"Offending boundary: ${describeExecutionBoundary(boundary, "native-to-row")}. " +
+            s"Ancestor path: ${describeAncestorPath(repaired, boundary)}. " +
+            s"Subtree: ${boundary.treeString.take(500)}")
+        return None
+      case None => ()
     }
-    // RAS may leave a vanilla Spark aggregate behind when its generic
-    // profitability/validation pass declines a very wide aggregate. MPP has a
-    // stricter end-to-end contract and validates the generated native/cuDF plan
-    // later, so materialize the native aggregate transformer here instead of
-    // accepting a row/BSP island.
-    val aggregateRewritten = coalesceElided.transformUp {
-      case agg: BaseAggregateExec if !agg.isInstanceOf[HashAggregateExecBaseTransformer] =>
-        HashAggregateExecBaseTransformer.from(agg)
+    val normalized = normalizeMppNativeOperators(repaired)
+    tryCollapseNormalizedMpp(
+      normalized,
+      allowJvmStreamIngress = false,
+      mode = "fully native-supported")
+  }
+
+  /**
+   * Apply the existing strict native normalizer only to row shells it explicitly knows how to
+   * late-offload. This makes computed aggregate/sort expressions reachable without treating an
+   * arbitrary nested row consumer as a convention adapter.
+   */
+  private def repairRecoverableRowShells(plan: SparkPlan): SparkPlan =
+    repairRecoverableRowShells(plan, preserveJvmStreamIngress = false)
+
+  private def repairRecoverableRowShells(
+      plan: SparkPlan,
+      preserveJvmStreamIngress: Boolean): SparkPlan =
+    plan.transformUp {
+      case r2c: RowToColumnarExecBase if isRecoverableRowOperator(r2c.child) =>
+        normalizeMppNativeOperators(
+          r2c,
+          preserveJvmStreamIngress,
+          recoverGenerate = isRecoverableGenerateRowIsland(r2c.child))
+      case r2c: RowToColumnarExec if isRecoverableRowOperator(r2c.child) =>
+        normalizeMppNativeOperators(
+          r2c,
+          preserveJvmStreamIngress,
+          recoverGenerate = isRecoverableGenerateRowIsland(r2c.child))
     }
-    val sortProjected = aggregateRewritten.transformUp {
-      case sort: SortExec if !sort.global => PullOutPreProject.rewrite(sort)
+
+  private def isRecoverableRowOperator(plan: SparkPlan): Boolean = plan match {
+    case _: BaseAggregateExec => true
+    case sort: SortExec if !sort.global => true
+    case _: ProjectExec | _: FilterExec => true
+    case _ => false
+  }
+
+  /**
+   * Recognize the exact closed row island left when Generate's computed input fails the ordinary
+   * heuristic offload as a unit:
+   *
+   * R2C -> (Project/Filter)* -> Generate -> C2R -> native child
+   *
+   * The enclosing R2C is matched by [[repairRecoverableRowShells]]. Requiring a supported
+   * generator, direct schema-identical C2R, and a columnar child keeps this repair distinct from an
+   * arbitrary nested row consumer. The latter must continue to fail strict MPP validation.
+   */
+  private def isRecoverableGenerateRowIsland(plan: SparkPlan): Boolean = plan match {
+    case project: ProjectExec => isRecoverableGenerateRowIsland(project.child)
+    case filter: FilterExec => isRecoverableGenerateRowIsland(filter.child)
+    case generate: GenerateExec if GenerateExecTransformer.supportsGenerate(generate.generator) =>
+      generate.child match {
+        case c2r: ColumnarToRowExecBase if c2r.children.size == 1 =>
+          val nativeChild = c2r.children.head
+          nativeChild.supportsColumnar &&
+          MppCollapseRule.sameOutput(c2r.output, nativeChild.output)
+        case c2r: ColumnarToRowExec =>
+          c2r.child.supportsColumnar &&
+          MppCollapseRule.sameOutput(c2r.output, c2r.child.output)
+        case _ => false
+      }
+    case _ => false
+  }
+
+  private def tryCollapseJvmStreamHybrid(plan: SparkPlan): Option[MppNativeQueryExec] = {
+    // Keep the hybrid fail-closed: only run row-shell repair after proving that the original plan
+    // contains an exact JVM-backed ingress. A computed aggregate above that ingress can be left as
+    // C2R -> row aggregate -> R2C by ordinary Gluten validation; repairing it here composes the two
+    // independently supported shapes without admitting an arbitrary row subtree.
+    val originalHasIngress = logHybridIngressStage("original", plan)
+    if (!originalHasIngress) {
+      return None
     }
-    val lateOffloaded = sortProjected.transformUp {
-      case project: ProjectExec => ProjectExecTransformer(project.projectList, project.child)
-      case filter: FilterExec => FilterExecTransformer(filter.condition, filter.child)
-      case sort: SortExec if !sort.global =>
-        SortExecTransformer(sort.sortOrder, global = false, sort.child, sort.testSpillFrequency)
+    val repaired = repairRecoverableRowShells(plan, preserveJvmStreamIngress = true)
+    logHybridIngressTransition("row-shell-repair", plan, repaired)
+    // Do not run InsertTransitions over this hybrid. Its first step deliberately removes every
+    // transition, including the exact R2C that identifies the JVM-backed ingress; rebuilding that
+    // transition is not guaranteed before backend component initialization and would erase the
+    // boundary this path is required to validate. The plan has already passed Gluten's
+    // post-transform rules, so retain the explicit ingress while applying only the transition-safe
+    // native rewrites.
+    val transitionBridged = MppColumnarTransitionBridge()(repaired)
+    logHybridIngressTransition("columnar-transition-bridge", repaired, transitionBridged)
+    val nativeSortKeysProjected = transitionBridged.transformUp {
+      case sort: SortExecTransformer => MppComputedSortKeyProjection.rewrite(sort)
     }
-    val unionRewritten = rewriteMppNativeUnion(lateOffloaded)
-    if (!isFullyNativeSupported(unionRewritten)) {
-      val reason = findFirstUnsupportedOperator(unionRewritten).getOrElse("unknown")
+    logHybridIngressTransition(
+      "native-sort-key-projection",
+      transitionBridged,
+      nativeSortKeysProjected)
+    val nativeUnionRewritten = rewriteMppNativeUnion(nativeSortKeysProjected)
+    logHybridIngressTransition(
+      "native-union-rewrite",
+      nativeSortKeysProjected,
+      nativeUnionRewritten)
+    val unionRewritten = MppReplicatedCartesianRule()(nativeUnionRewritten)
+    logHybridIngressTransition("replicated-cartesian-rewrite", nativeUnionRewritten, unionRewritten)
+    if (!containsExactJvmStreamIngress(unionRewritten)) {
+      return None
+    }
+    // An exchange directly over a JVM-backed ingress still needs a native producer fragment on its
+    // side. Without this identity anchor, dynamic extraction sees the consumer ReadRel slot but
+    // has neither a producer fragment nor a captured local stream for it. Anchor only the exact
+    // R2C child that the strict hybrid validator already admits.
+    val exchangeInputsAnchored = unionRewritten.transformUp {
+      case exchange: ShuffleExchangeLike if isExactJvmStreamIngress(exchange.child) =>
+        exchange.withNewChildren(Seq(ProjectExecTransformer(exchange.child.output, exchange.child)))
+    }
+    logHybridIngressTransition("exchange-input-anchor", unionRewritten, exchangeInputsAnchored)
+    // A DataFrame created directly from a JVM-backed input can reach a V2 writer without any native
+    // relational suffix. The exact R2C ingress is a local stream input, not a native fragment by
+    // itself, so anchor this otherwise transparent plan with an identity native project.  This
+    // preserves output attributes and gives ColumnarCollapseTransformStages a TransformSupport
+    // consumer from which dynamic MPP extraction can build one real fragment.
+    val nativeAnchored =
+      if (exchangeInputsAnchored.find(_.isInstanceOf[TransformSupport]).isEmpty) {
+        ProjectExecTransformer(exchangeInputsAnchored.output, exchangeInputsAnchored)
+      } else {
+        exchangeInputsAnchored
+      }
+    logHybridIngressTransition("native-fragment-anchor", exchangeInputsAnchored, nativeAnchored)
+    tryCollapseNormalizedMpp(
+      nativeAnchored,
+      allowJvmStreamIngress = true,
+      mode = "native with exact JVM-backed ingress")
+  }
+
+  /**
+   * An isolated C2R below another operator is an execution boundary, not a convention adapter.
+   * Permit only the two existing normalization shapes: an adjacent R2C(C2R(native)) pair, or the
+   * identity C2R immediately below a Gluten columnar shuffle. The explicit terminal root C2R has
+   * already been peeled by [[collapseTerminalRowEgress]] before this check.
+   */
+  private[extension] def findUnpairedNestedRowOutput(plan: SparkPlan): Option[SparkPlan] = {
+    def isC2r(node: SparkPlan): Boolean = node match {
+      case _: ColumnarToRowExecBase | _: ColumnarToRowExec => true
+      case _ => false
+    }
+
+    def childOf(node: SparkPlan): SparkPlan = node.children.head
+
+    def loop(node: SparkPlan): Option[SparkPlan] = node match {
+      case r2c: RowToColumnarExecBase if isC2r(r2c.child) => loop(childOf(r2c.child))
+      case r2c: RowToColumnarExec if isC2r(r2c.child) => loop(childOf(r2c.child))
+      case exchange: ColumnarShuffleExchangeExecBase if isC2r(exchange.child) =>
+        loop(childOf(exchange.child))
+      case c2r: ColumnarToRowExecBase => Some(c2r)
+      case c2r: ColumnarToRowExec => Some(c2r)
+      case other => other.children.iterator.map(loop).collectFirst { case Some(found) => found }
+    }
+
+    loop(plan)
+  }
+
+  private def tryCollapseNormalizedMpp(
+      unionRewritten: SparkPlan,
+      allowJvmStreamIngress: Boolean,
+      mode: String): Option[MppNativeQueryExec] = {
+    arrowScalarNormalizationRejection(unionRewritten).foreach {
+      reason =>
+        if (failOnFallback) {
+          throw new IllegalStateException(s"MppCollapseRule: strict MPP rejected plan: $reason")
+        }
+    }
+    if (!isNativeSupported(unionRewritten, allowJvmStreamIngress)) {
+      val reason =
+        findFirstUnsupportedOperator(unionRewritten, allowJvmStreamIngress).getOrElse("unknown")
       logWarning(
         s"MppCollapseRule: plan contains non-native operators, " +
           s"cannot collapse to MPP. First blocker: $reason. " +
@@ -333,7 +698,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       return None
     }
 
-    logWarning("MppCollapseRule: plan is fully native-supported, wrapping with MppNativeQueryExec")
+    logWarning(s"MppCollapseRule: plan is $mode, wrapping with MppNativeQueryExec")
 
     // Rewrite any whitelisted vanilla FilterExec/ProjectExec (only present because
     // of a ScalarSubquery in their expressions) into their transformer counterparts
@@ -354,14 +719,139 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     val exchanges = Seq.empty[ExchangeSpec]
 
     logWarning(
-      s"MppCollapseRule: *** MPP MODE ACTIVE *** - collapsed plan into " +
-        s"${fragments.size} fragments and ${exchanges.size} exchanges. " +
-        s"All stages will run concurrently with streaming exchange.")
+      s"MppCollapseRule: *** MPP PLAN ADMITTED *** - operator admission passed; " +
+        s"runtime fragment extraction is pending. The temporary " +
+        s"${fragments.size}-fragment/${exchanges.size}-exchange topology contains a null-root " +
+        s"placeholder and is not an execution topology or an end-to-end fully-MPP verdict. " +
+        s"mode=$mode")
 
     // Plan D: Wrap, don't replace. Keep original plan as child so Spark's
     // shuffle/broadcast validation passes. At execution time, MppNativeQueryExec
     // bypasses child.executeColumnar() and runs via MppQueryCoordinator instead.
     Some(MppNativeQueryExec(child = rewritten, fragments = fragments, exchanges = exchanges))
+  }
+
+  private[extension] def normalizeMppNativeOperators(plan: SparkPlan): SparkPlan =
+    normalizeMppNativeOperators(plan, preserveJvmStreamIngress = false, recoverGenerate = false)
+
+  private def normalizeMppNativeOperators(
+      plan: SparkPlan,
+      preserveJvmStreamIngress: Boolean,
+      recoverGenerate: Boolean = false): SparkPlan =
+    normalizeMppNativeOperators(
+      plan,
+      preserveJvmStreamIngress,
+      recoverGenerate,
+      rewriteNativeUnion = rewriteMppNativeUnion)
+
+  private[extension] def normalizeMppNativeOperators(
+      plan: SparkPlan,
+      preserveJvmStreamIngress: Boolean,
+      rewriteNativeUnion: SparkPlan => SparkPlan): SparkPlan =
+    normalizeMppNativeOperators(
+      plan,
+      preserveJvmStreamIngress,
+      recoverGenerate = false,
+      rewriteNativeUnion)
+
+  private def normalizeMppNativeOperators(
+      plan: SparkPlan,
+      preserveJvmStreamIngress: Boolean,
+      recoverGenerate: Boolean,
+      rewriteNativeUnion: SparkPlan => SparkPlan): SparkPlan = {
+    // Spark may insert RowToColumnar(ColumnarToRow(nativeChild)) solely to reconcile the
+    // convention expected by an exchange or V2 writer. MPP absorbs that boundary, so eliminate
+    // the adjacent inverse transitions before validating/extracting fragments. This preserves the
+    // original ColumnarBatch stream; it does not whitelist a real row execution island.
+    val transitionBridged = MppColumnarTransitionBridge()(plan)
+    // Spark's DataFrame.coalesce(N>1) is only a narrow RDD/file-count hint; it
+    // neither changes rows nor establishes a semantic distribution.  Keeping
+    // ColumnarCoalesceExec would create a Spark scheduling island inside an
+    // otherwise native query when applications request more output files than physical peers.
+    // MPP owns peer parallelism and the Iceberg-required exchange immediately
+    // above this node still enforces the actual write partitioning.
+    val coalesceElided = transitionBridged.transformUp {
+      case coalesce: ColumnarCoalesceExec if coalesce.numPartitions > 1 =>
+        logInfo(
+          s"MppCollapseRule: eliding non-semantic ColumnarCoalesceExec(" +
+            s"${coalesce.numPartitions}) inside MPP query")
+        coalesce.child
+    }
+    // Native aggregate and sort relations require their computed arguments to be materialized as
+    // fields. The normal heuristic rewrite may leave a row operator behind after one sibling
+    // fails validation, so repeat the official pre-project rewrite before force-offloading the
+    // strict-MPP subtree. This is expression-preserving and does not broaden native validation.
+    val nativeSortKeysProjected = coalesceElided.transformUp {
+      case sort: SortExecTransformer => MppComputedSortKeyProjection.rewrite(sort)
+    }
+    val preProjected = nativeSortKeysProjected.transformUp {
+      case agg: BaseAggregateExec => PullOutPreProject.rewrite(agg)
+      case sort: SortExec if !sort.global => PullOutPreProject.rewrite(sort)
+      case generate: GenerateExec if recoverGenerate => PullOutPreProject.rewrite(generate)
+    }
+    val postProjected = preProjected.transformUp {
+      case generate: GenerateExec if recoverGenerate => PullOutPostProject.rewrite(generate)
+    }
+    // RAS may leave a vanilla Spark aggregate behind when its generic
+    // profitability/validation pass declines a very wide aggregate. MPP has a
+    // stricter end-to-end contract and validates the generated native/cuDF plan
+    // later, so materialize the native aggregate transformer here instead of
+    // accepting a row/BSP island.
+    val aggregateRewritten = postProjected.transformUp {
+      case agg: BaseAggregateExec if !agg.isInstanceOf[HashAggregateExecBaseTransformer] =>
+        HashAggregateExecBaseTransformer.from(agg)
+    }
+    val lateOffloaded = aggregateRewritten.transformUp {
+      case project: ProjectExec => ProjectExecTransformer(project.projectList, project.child)
+      case filter: FilterExec => FilterExecTransformer(filter.condition, filter.child)
+      case sort: SortExec if !sort.global =>
+        SortExecTransformer(sort.sortOrder, global = false, sort.child, sort.testSpillFrequency)
+      case generate: GenerateExec
+          if recoverGenerate && GenerateExecTransformer.supportsGenerate(generate.generator) =>
+        BackendsApiManager.getSparkPlanExecApiInstance.genGenerateTransformer(
+          generate.generator,
+          generate.requiredChildOutput,
+          generate.outer,
+          generate.generatorOutput,
+          generate.child)
+    }
+    // The incoming plan's transitions were selected before the row aggregate/sort/project was
+    // replaced above. Re-run Gluten's convention planner so it removes only stale transitions and
+    // re-inserts every boundary still required by a genuine row operator. This keeps DataFrame.rdd
+    // and other real row consumers as strict-MPP negatives.
+    // ExistingRDD recovery must see a validated native union rather than ColumnarUnionExec;
+    // otherwise its strict native-tree check retains the now-stale C2R/R2C shell. The ordinary
+    // path still rewrites after transition insertion, where output partitioning is fully known.
+    val unionPrepared =
+      if (preserveJvmStreamIngress) rewriteNativeUnion(lateOffloaded) else lateOffloaded
+    val retransitioned =
+      if (preserveJvmStreamIngress) {
+        bridgeRecoverableJvmStreamTransitions(unionPrepared)
+      } else {
+        InsertTransitions
+          .create(outputsColumnar = unionPrepared.supportsColumnar, VeloxBatchType)
+          .apply(unionPrepared)
+      }
+    val unionRewritten = rewriteNativeUnion(retransitioned)
+    MppReplicatedCartesianRule()(unionRewritten)
+  }
+
+  /**
+   * Remove only the stale transitions around a row shell that was just late-offloaded, while
+   * retaining the exact R2C leaf that identifies the JVM-backed local stream.
+   */
+  private def bridgeRecoverableJvmStreamTransitions(plan: SparkPlan): SparkPlan = {
+    val withoutIngressC2r = plan.transformUp {
+      case c2r: ColumnarToRowExecBase if isSupportedJvmStreamHybridPlan(c2r.child) =>
+        c2r.child
+      case c2r: ColumnarToRowExec if isSupportedJvmStreamHybridPlan(c2r.child) => c2r.child
+    }
+    withoutIngressC2r.transformUp {
+      case r2c: RowToColumnarExecBase if isSupportedJvmStreamHybridPlan(r2c.child) =>
+        r2c.child
+      case r2c: RowToColumnarExec if isSupportedJvmStreamHybridPlan(r2c.child) =>
+        r2c.child
+    }
   }
 
   private def rewriteMppNativeUnion(plan: SparkPlan): SparkPlan = {
@@ -388,17 +878,65 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    * A plan is fully native-supported when every non-exchange node is a TransformSupport, and every
    * exchange can be absorbed (both sides are TransformSupport with supported partitioning).
    */
-  private def isFullyNativeSupported(plan: SparkPlan): Boolean = {
+  private[extension] def isFullyNativeSupported(plan: SparkPlan): Boolean =
+    isNativeSupported(plan, allowJvmStreamIngress = false)
+
+  /**
+   * Validate a native suffix with one of the exact JVM-backed ingresses without weakening the
+   * ordinary strict-MPP contract. At least one exact ingress must be present; every other node
+   * remains subject to the same native validator.
+   */
+  private[extension] def isSupportedJvmStreamHybridPlan(plan: SparkPlan): Boolean =
+    containsExactJvmStreamIngress(plan) &&
+      isNativeSupported(plan, allowJvmStreamIngress = true)
+
+  private def containsExactJvmStreamIngress(plan: SparkPlan): Boolean =
+    plan.find(isExactJvmStreamIngress).isDefined
+
+  private def logHybridIngressStage(stage: String, plan: SparkPlan): Boolean = {
+    val exactIngress = containsExactJvmStreamIngress(plan)
+    val objectGuardOutcomes = MppJvmStreamInputMatcher.objectIngressGuardOutcomes(plan)
+    val candidateText =
+      if (objectGuardOutcomes.isEmpty) "objectIngressCandidates=none"
+      else objectGuardOutcomes.mkString("objectIngressCandidates=[", " | ", "]")
+    val message =
+      s"MppCollapseRule: exact JVM stream ingress diagnostic: stage=$stage; " +
+        s"exactIngress=$exactIngress; $candidateText"
+    if (objectGuardOutcomes.nonEmpty && !exactIngress) logWarning(message) else logInfo(message)
+    exactIngress
+  }
+
+  private def logHybridIngressTransition(
+      stage: String,
+      before: SparkPlan,
+      after: SparkPlan): Unit = {
+    val beforeHasIngress = containsExactJvmStreamIngress(before)
+    val afterHasIngress = logHybridIngressStage(stage, after)
+    if (beforeHasIngress && !afterHasIngress) {
+      logWarning(
+        s"MppCollapseRule: exact JVM stream ingress LOST after hybrid normalization stage=$stage")
+    }
+  }
+
+  private def isExactJvmStreamIngress(plan: SparkPlan): Boolean = plan match {
+    case r2c: RowToColumnarExecBase => MppJvmStreamInputMatcher.rowInput(r2c).isDefined
+    case r2c: RowToColumnarExec => MppJvmStreamInputMatcher.rowInput(r2c).isDefined
+    case _ => false
+  }
+
+  private def isNativeSupported(plan: SparkPlan, allowJvmStreamIngress: Boolean): Boolean = {
     plan match {
       // Exchanges that we can absorb into the MPP plan
       case exchange: ShuffleExchangeLike =>
-        canAbsorbExchange(exchange) && isFullyNativeSupported(exchange.child)
+        canAbsorbExchange(exchange, allowJvmStreamIngress) &&
+        isNativeSupported(exchange.child, allowJvmStreamIngress)
 
       // Broadcast exchanges are absorbable when the build side is itself a fully
       // native TransformSupport subtree (recurse into children, same as shuffle).
       // The native MPP runtime treats BROADCAST as a distinct exchange type.
       case bc: BroadcastExchangeLike =>
-        val absorbable = canAbsorbExchange(bc) && bc.children.forall(isFullyNativeSupported)
+        val absorbable = canAbsorbExchange(bc, allowJvmStreamIngress) &&
+          bc.children.forall(isNativeSupported(_, allowJvmStreamIngress))
         if (!absorbable) {
           logWarning(
             s"MppCollapseRule: BLOCKED by BroadcastExchangeLike: " +
@@ -408,42 +946,76 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
       // AQE query stage wrappers - check their underlying plan
       case stage: ShuffleQueryStageExec =>
-        isFullyNativeSupported(stage.plan)
+        isNativeSupported(stage.plan, allowJvmStreamIngress)
 
       case stage: BroadcastQueryStageExec =>
-        isFullyNativeSupported(stage.plan)
+        isNativeSupported(stage.plan, allowJvmStreamIngress)
+
+      // This transformer intentionally retains Spark's row-UDF eval type because changing a
+      // nullable input to the ordinary Arrow scalar protocol is not semantics-preserving. It may
+      // implement TransformSupport for registered native UDFs in general, but this tagged instance
+      // must not be mistaken for the safe external Arrow B1 boundary.
+      case python: EvalPythonExecTransformer
+          if python.getTagValue(ARROW_SCALAR_NORMALIZATION_REJECTION_TAG).isDefined =>
+        logWarning(
+          s"MppCollapseRule: BLOCKED by unsafe ordinary Arrow scalar normalization: " +
+            python.getTagValue(ARROW_SCALAR_NORMALIZATION_REJECTION_TAG).get)
+        false
 
       // Native-supported operators
       case _: TransformSupport =>
-        plan.children.forall(isFullyNativeSupported)
+        plan.children.forall(isNativeSupported(_, allowJvmStreamIngress))
 
-      // ColumnarToRow at the top of the plan is OK - Spark always adds this
-      // to convert columnar output to rows for the driver. Look through it.
+      // Exact matched rowInput is the only permitted JVM-backed input slot. Do not recurse into
+      // it: MppNativeQueryExec captures and columnarizes the row plan as a local stream.
+      case r2c: RowToColumnarExecBase
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(r2c).isDefined =>
+        true
+      case r2c: RowToColumnarExec
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(r2c).isDefined =>
+        true
+
+      // A remaining row transition is a real execution boundary. The only C2R shape that MPP may
+      // elide is an identity C2R directly over Gluten's ColumnarExchange under a V2 write; that
+      // narrowly-scoped normalization runs before this validation. In particular, a top-level
+      // terminal root consumer is admitted only by collapseTerminalRowEgress, outside this strict
+      // recursive validator; the same C2R at any nested position remains rejected.
       case c2r: ColumnarToRowExecBase =>
-        c2r.children.forall(isFullyNativeSupported)
-
-      // Spark/Gluten inserts RowToVeloxColumnar below a ColumnarExchange and
-      // VeloxColumnarToRow above it to satisfy convention requirements. MPP
-      // absorbs that exchange, so the conversion pair is transparent. Recurse
-      // to ensure an actual row-only child is still rejected.
+        logWarning(
+          s"MppCollapseRule: BLOCKED by native-to-row execution boundary: " +
+            describeExecutionBoundary(c2r, "native-to-row"))
+        false
+      case c2r: ColumnarToRowExec =>
+        logWarning(
+          s"MppCollapseRule: BLOCKED by native-to-row execution boundary: " +
+            describeExecutionBoundary(c2r, "native-to-row"))
+        false
       case r2c: RowToColumnarExecBase =>
-        r2c.children.forall(isFullyNativeSupported)
+        logWarning(
+          s"MppCollapseRule: BLOCKED by row-to-native execution boundary: " +
+            describeExecutionBoundary(r2c, "row-to-native"))
+        false
+      case r2c: RowToColumnarExec =>
+        logWarning(
+          s"MppCollapseRule: BLOCKED by row-to-native execution boundary: " +
+            describeExecutionBoundary(r2c, "row-to-native"))
+        false
 
       // Gluten-internal columnar-to-columnar nodes (batch resize, etc.) - look through
       case c2c: ColumnarToColumnarExec =>
-        c2c.children.forall(isFullyNativeSupported)
+        c2c.children.forall(isNativeSupported(_, allowJvmStreamIngress))
 
       // ColumnarCollapseTransformStages places this convention adapter below an
       // InputIteratorTransformer at exchange boundaries. It is transparent to MPP fragment
       // extraction, so validate the wrapped exchange/native subtree instead of rejecting the
       // adapter itself. This is also the shape produced by the scalar-subquery broadcast rewrite.
       case cia: ColumnarInputAdapter =>
-        isFullyNativeSupported(cia.child)
+        isNativeSupported(cia.child, allowJvmStreamIngress)
 
       // TakeOrderedAndProjectExecTransformer wraps a sort+limit+project over a
       // TransformSupport child; treat it as a transparent wrapper and recurse.
       case topk: TakeOrderedAndProjectExecTransformer =>
-        isFullyNativeSupported(topk.child)
+        isNativeSupported(topk.child, allowJvmStreamIngress)
 
       // Vanilla FilterExec/ProjectExec only land here when Gluten's columnar
       // validator refused to convert them -- typically because their expression
@@ -452,9 +1024,9 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       // injected as a Substrait literal at build time by ScalarSubqueryTransformer.
       // Whitelist these so the outer plan can collapse to MPP.
       case f: FilterExec if containsScalarSubquery(f.condition) =>
-        isFullyNativeSupported(f.child)
+        isNativeSupported(f.child, allowJvmStreamIngress)
       case p: ProjectExec if p.projectList.exists(containsScalarSubquery) =>
-        isFullyNativeSupported(p.child)
+        isNativeSupported(p.child, allowJvmStreamIngress)
 
       // Any other non-native operator means we cannot do MPP
       case other =>
@@ -482,35 +1054,131 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    * Find the first operator in the plan tree that is not natively supported, for diagnostic logging
    * purposes.
    */
-  private def findFirstUnsupportedOperator(plan: SparkPlan): Option[String] = {
+  private def findFirstUnsupportedOperator(
+      plan: SparkPlan,
+      allowJvmStreamIngress: Boolean): Option[String] = {
+    def findInChildren(node: SparkPlan): Option[String] =
+      node.children
+        .flatMap(findFirstUnsupportedOperator(_, allowJvmStreamIngress))
+        .headOption
+
     plan match {
-      case _: ShuffleExchangeLike if canAbsorbExchange(plan) =>
-        plan.children.flatMap(findFirstUnsupportedOperator).headOption
-      case _: BroadcastExchangeLike if canAbsorbExchange(plan) =>
-        plan.children.flatMap(findFirstUnsupportedOperator).headOption
+      case _: ShuffleExchangeLike if canAbsorbExchange(plan, allowJvmStreamIngress) =>
+        findInChildren(plan)
+      case _: BroadcastExchangeLike if canAbsorbExchange(plan, allowJvmStreamIngress) =>
+        findInChildren(plan)
       case _: ShuffleQueryStageExec =>
-        findFirstUnsupportedOperator(plan.asInstanceOf[ShuffleQueryStageExec].plan)
+        findFirstUnsupportedOperator(
+          plan.asInstanceOf[ShuffleQueryStageExec].plan,
+          allowJvmStreamIngress)
       case _: BroadcastQueryStageExec =>
-        findFirstUnsupportedOperator(plan.asInstanceOf[BroadcastQueryStageExec].plan)
+        findFirstUnsupportedOperator(
+          plan.asInstanceOf[BroadcastQueryStageExec].plan,
+          allowJvmStreamIngress)
+      case python: EvalPythonExecTransformer
+          if python.getTagValue(ARROW_SCALAR_NORMALIZATION_REJECTION_TAG).isDefined =>
+        Some(
+          s"${python.getClass.getSimpleName}: " +
+            python.getTagValue(ARROW_SCALAR_NORMALIZATION_REJECTION_TAG).get)
       case _: TransformSupport =>
-        plan.children.flatMap(findFirstUnsupportedOperator).headOption
-      case _: ColumnarToRowExecBase =>
-        plan.children.flatMap(findFirstUnsupportedOperator).headOption
-      case _: RowToColumnarExecBase =>
-        plan.children.flatMap(findFirstUnsupportedOperator).headOption
+        findInChildren(plan)
+      case r2c: RowToColumnarExecBase
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(r2c).isDefined =>
+        None
+      case r2c: RowToColumnarExec
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(r2c).isDefined =>
+        None
+      case c2r: ColumnarToRowExecBase =>
+        Some(describeExecutionBoundary(c2r, "native-to-row"))
+      case c2r: ColumnarToRowExec =>
+        Some(describeExecutionBoundary(c2r, "native-to-row"))
+      case r2c: RowToColumnarExecBase =>
+        Some(describeExecutionBoundary(r2c, "row-to-native"))
+      case r2c: RowToColumnarExec =>
+        Some(describeExecutionBoundary(r2c, "row-to-native"))
       case _: ColumnarToColumnarExec =>
-        plan.children.flatMap(findFirstUnsupportedOperator).headOption
+        findInChildren(plan)
       case cia: ColumnarInputAdapter =>
-        findFirstUnsupportedOperator(cia.child)
+        findFirstUnsupportedOperator(cia.child, allowJvmStreamIngress)
       case _: TakeOrderedAndProjectExecTransformer =>
-        plan.children.flatMap(findFirstUnsupportedOperator).headOption
+        findInChildren(plan)
       case f: FilterExec if containsScalarSubquery(f.condition) =>
-        plan.children.flatMap(findFirstUnsupportedOperator).headOption
+        findInChildren(plan)
       case p: ProjectExec if p.projectList.exists(containsScalarSubquery) =>
-        plan.children.flatMap(findFirstUnsupportedOperator).headOption
+        findInChildren(plan)
       case other =>
         Some(s"${other.getClass.getSimpleName}: ${other.simpleString(20)}")
     }
+  }
+
+  /**
+   * Report the row operator and Gluten validation tag hidden immediately below a convention
+   * transition. A transition class alone is not actionable: it says where native execution ends,
+   * but not why Spark created the row island. Keep this diagnostic read-only; a real row operator
+   * is still rejected by strict MPP.
+   */
+  private[extension] def describeExecutionBoundary(
+      boundary: SparkPlan,
+      direction: String): String = {
+    val child = boundary.children.headOption
+    val childText = child
+      .map(plan => s"child=${plan.getClass.getSimpleName}(${plan.simpleString(100)})")
+      .getOrElse("child=<none>")
+    val fallbackText = child
+      .flatMap(firstFallbackReason)
+      .map {
+        case (node, reason) =>
+          s"; firstFallback=${node.getClass.getSimpleName}: $reason"
+      }
+      .getOrElse("")
+    s"${boundary.getClass.getSimpleName}: $direction execution boundary; " +
+      s"$childText$fallbackText"
+  }
+
+  /** Describe the exact child-index path to a rejected nested execution boundary. */
+  private[extension] def describeAncestorPath(root: SparkPlan, boundary: SparkPlan): String = {
+    def loop(node: SparkPlan): Option[Seq[(SparkPlan, Option[Int])]] = {
+      if (node eq boundary) {
+        Some(Seq((node, None)))
+      } else {
+        node.children.zipWithIndex.iterator
+          .map {
+            case (child, index) =>
+              loop(child).map(path => (node, Some(index)) +: path)
+          }
+          .collectFirst { case Some(path) => path }
+      }
+    }
+
+    loop(root) match {
+      case Some(path) =>
+        path.zipWithIndex
+          .map {
+            case ((node, _), 0) => s"root=${node.getClass.getSimpleName}"
+            case ((node, _), index) =>
+              val childIndex = path(index - 1)._2.get
+              s"child[$childIndex]=${node.getClass.getSimpleName}"
+          }
+          .mkString(" -> ")
+      case None =>
+        s"boundary ${boundary.getClass.getSimpleName} is not reachable from " +
+          s"root ${root.getClass.getSimpleName}"
+    }
+  }
+
+  private def firstFallbackReason(plan: SparkPlan): Option[(SparkPlan, String)] = {
+    plan.collect {
+      case node if FallbackTags.nonEmpty(node) =>
+        (node, FallbackTags.get(node).reason())
+    }.headOption
+  }
+
+  private def arrowScalarNormalizationRejection(plan: SparkPlan): Option[String] = {
+    plan.collect {
+      case python: EvalPythonExecTransformer
+          if python.getTagValue(ARROW_SCALAR_NORMALIZATION_REJECTION_TAG).isDefined =>
+        python.getTagValue(ARROW_SCALAR_NORMALIZATION_REJECTION_TAG).get
+    }.headOption
   }
 
   /**
@@ -521,14 +1189,15 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
    *   - The partitioning type is one we support for GPU streaming exchange
    *   - There are no UDFs that require JVM execution in the exchange
    */
-  private def canAbsorbExchange(exchange: SparkPlan): Boolean = {
+  private def canAbsorbExchange(exchange: SparkPlan, allowJvmStreamIngress: Boolean): Boolean = {
     exchange match {
       case shuffle: ShuffleExchangeLike =>
         val partitioningSupported = isSupportedPartitioning(shuffle.outputPartitioning)
         val childSupported = shuffle.child.isInstanceOf[TransformSupport] ||
           shuffle.child.isInstanceOf[ShuffleQueryStageExec] ||
           shuffle.child.isInstanceOf[BroadcastQueryStageExec] ||
-          shuffle.child.isInstanceOf[ColumnarToColumnarExec]
+          shuffle.child.isInstanceOf[ColumnarToColumnarExec] ||
+          (allowJvmStreamIngress && isExactJvmStreamIngress(shuffle.child))
 
         if (!partitioningSupported) {
           logWarning(
@@ -701,7 +1370,12 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
             consumerFragmentId = consumerFragmentId,
             exchangeType = exchangeType,
             numPartitions = shuffle.outputPartitioning.numPartitions,
-            partitionKeys = partitionKeys
+            partitionKeys = partitionKeys,
+            rangeOrdering = shuffle.outputPartitioning match {
+              case range: RangePartitioning => range.ordering
+              case _ => Seq.empty
+            },
+            rangeSamplePlan = shuffle.child
           )
 
           consumerFragmentId
@@ -863,4 +1537,69 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         SQLConf.get.getConfString("spark.sql.shuffle.partitions", "200").toInt
     }
   }
+}
+
+object MppCollapseRule {
+
+  private[extension] case class V2WriteQueryNormalization(plan: SparkPlan, strippedAdapters: Int)
+
+  /** True only when a final row adapter is statically bounded to a single global-aggregate row. */
+  private[extension] def isBoundedScalarResult(plan: SparkPlan): Boolean = plan match {
+    case aggregate: BaseAggregateExec => aggregate.groupingExpressions.isEmpty
+    case _ => false
+  }
+
+  /**
+   * Remove convention adapters Spark inserts while preparing a V2 write query.
+   *
+   * This is deliberately scoped to the V2-write call site. Its schema-identical top-level C2R is
+   * not an observable row consumer: the V2 writer immediately consumes the rows, and
+   * MppNativeQueryExec.doExecute supplies that one required native-to-row conversion. Removing the
+   * explicit adapter lets the complete columnar query (including sort and exchange) collapse to MPP
+   * without an intermediate C2R -> R2C round trip. Exact C2R(ColumnarShuffleExchange) adapters may
+   * also appear below the root and remain safe to remove. Any adapter around a real row child
+   * remains untouched.
+   */
+  private[extension] def normalizeV2WriteExchangeAdapters(
+      plan: SparkPlan): V2WriteQueryNormalization = {
+    var stripped = 0
+    val withoutTopLevelAdapter = plan match {
+      case c2r: ColumnarToRowExec if isTransparentTopLevelWriteAdapter(c2r, c2r.child) =>
+        stripped += 1
+        c2r.child
+      case c2r: ColumnarToRowExecBase
+          if c2r.children.size == 1 &&
+            isTransparentTopLevelWriteAdapter(c2r, c2r.children.head) =>
+        stripped += 1
+        c2r.children.head
+      case other => other
+    }
+    val normalized = withoutTopLevelAdapter.transformUp {
+      case c2r: ColumnarToRowExec if isTransparentWriteExchangeAdapter(c2r, c2r.child) =>
+        stripped += 1
+        c2r.child
+      case c2r: ColumnarToRowExecBase
+          if c2r.children.size == 1 &&
+            isTransparentWriteExchangeAdapter(c2r, c2r.children.head) =>
+        stripped += 1
+        c2r.children.head
+    }
+    V2WriteQueryNormalization(normalized, stripped)
+  }
+
+  private def isTransparentTopLevelWriteAdapter(adapter: SparkPlan, child: SparkPlan): Boolean =
+    child.supportsColumnar && sameOutput(adapter.output, child.output)
+
+  private def isTransparentWriteExchangeAdapter(adapter: SparkPlan, child: SparkPlan): Boolean =
+    child match {
+      case exchange: ColumnarShuffleExchangeExecBase =>
+        exchange.supportsColumnar && sameOutput(adapter.output, exchange.output)
+      case _ => false
+    }
+
+  private def sameOutput(left: Seq[Attribute], right: Seq[Attribute]): Boolean =
+    left.length == right.length && left.zip(right).forall {
+      case (l, r) =>
+        l.exprId == r.exprId && l.dataType == r.dataType && l.nullable == r.nullable
+    }
 }

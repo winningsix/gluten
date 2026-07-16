@@ -136,7 +136,7 @@ JNIEXPORT void JNICALL Java_org_apache_gluten_init_NativeBackendInitializer_init
   JNI_METHOD_END()
 }
 
-JNIEXPORT void JNICALL Java_org_apache_gluten_init_NativeBackendInitializer_shutdown( // NOLINT
+JNIEXPORT void JNICALL Java_org_apache_gluten_init_NativeBackendInitializer_shutdown0( // NOLINT
     JNIEnv* env,
     jclass) {
   JNI_METHOD_START

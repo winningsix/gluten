@@ -97,6 +97,22 @@ if(ENABLE_GPU)
                      VeloxGpuShuffleWriterTest.cc)
   add_velox_gpu_test(velox_gpu_buffer_scatter_bench SOURCES
                      GpuBufferScatterBench.cc)
+  add_executable(check_overflow_in_table_insert_gpu_test
+                 CheckOverflowInTableInsertGpuTest.cc)
+  target_include_directories(
+    check_overflow_in_table_insert_gpu_test
+    PRIVATE ${CMAKE_SOURCE_DIR}/velox ${CMAKE_SOURCE_DIR}/src)
+  target_compile_definitions(
+    check_overflow_in_table_insert_gpu_test
+    PUBLIC LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
+  target_link_libraries(check_overflow_in_table_insert_gpu_test
+                        PRIVATE velox cudf::cudf velox_curl GTest::gtest
+                                GTest::gtest_main Folly::folly)
+  gtest_discover_tests(
+    check_overflow_in_table_insert_gpu_test
+    DISCOVERY_MODE PRE_TEST
+    PROPERTIES LABELS "cuda_driver"
+    TIMEOUT 3000)
 endif()
 
 set(VELOX_TEST_COMMON_SRCS JsonToProtoConverter.cc FilePathGenerator.cc)
@@ -131,9 +147,13 @@ add_velox_test(
   VeloxSubstraitRoundTripTest.cc
   VeloxSubstraitSignatureTest.cc
   VeloxToSubstraitTypeTest.cc)
+# VeloxSubstraitRoundTripTest directly calls folly::init and Folly APIs.  A
+# shared Folly build must therefore be on this executable's link line instead
+# of relying on libgluten.so's private dependency.
 target_link_libraries(velox_plan_conversion_test Folly::folly)
 add_velox_test(spark_functions_test SOURCES SparkFunctionTest.cc
                FunctionTest.cc)
+target_link_libraries(spark_functions_test Folly::folly)
 add_velox_test(runtime_test SOURCES RuntimeTest.cc)
 add_velox_test(velox_memory_test SOURCES MemoryManagerTest.cc)
 add_velox_test(buffer_outputstream_test SOURCES BufferOutputStreamTest.cc)

@@ -24,7 +24,6 @@ import org.apache.gluten.utils.DecimalArithmeticUtil
 
 import org.apache.spark.{SPARK_REVISION, SPARK_VERSION_SHORT}
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.SQLConfHelper
 import org.apache.spark.sql.catalyst.expressions.{StringTrimBoth, _}
 import org.apache.spark.sql.catalyst.expressions.objects.{Invoke, StaticInvoke, StructsToJsonInvoke}
 import org.apache.spark.sql.catalyst.optimizer.NormalizeNaNAndZero
@@ -39,7 +38,10 @@ trait Transformable {
   def getTransformer(childrenTransformers: Seq[ExpressionTransformer]): ExpressionTransformer
 }
 
-object ExpressionConverter extends SQLConfHelper with Logging {
+object ExpressionConverter extends Logging {
+
+  private val CheckOverflowInTableInsertUnsupported =
+    "CheckOverflowInTableInsert native support is limited to ANSI BIGINT -> INT table assignments."
 
   def replaceWithExpressionTransformer(
       exprs: Seq[Expression],
@@ -142,6 +144,47 @@ object ExpressionConverter extends SQLConfHelper with Logging {
     val rightChild =
       replaceWithExpressionTransformer0(right, attributeSeq, expressionsMap)
     DecimalArithmeticExpressionTransformer(substraitName, leftChild, rightChild, resultType, b)
+  }
+
+  private def genCheckOverflowInTableInsertTransformer(
+      substraitName: String,
+      expression: Expression,
+      attributeSeq: Seq[Attribute],
+      expressionsMap: Map[Class[_], String]): ExpressionTransformer = {
+    val cast = expression.children.headOption match {
+      case Some(c: Cast) => c
+      // Spark may wrap a Cast in ExpressionProxy when subexpression elimination is enabled.
+      case Some(proxy) if proxy.getClass.getSimpleName == "ExpressionProxy" =>
+        proxy.children.headOption match {
+          case Some(c: Cast) => c
+          case _ => throw new GlutenNotSupportException(CheckOverflowInTableInsertUnsupported)
+        }
+      case _ => throw new GlutenNotSupportException(CheckOverflowInTableInsertUnsupported)
+    }
+
+    if (
+      cast.child.dataType != LongType || cast.dataType != IntegerType ||
+      !SparkShimLoader.getSparkShims.withAnsiEvalMode(cast)
+    ) {
+      throw new GlutenNotSupportException(CheckOverflowInTableInsertUnsupported)
+    }
+
+    val columnName =
+      try {
+        expression.getClass.getMethod("columnName").invoke(expression).asInstanceOf[String]
+      } catch {
+        case _: ReflectiveOperationException =>
+          throw new GlutenNotSupportException(CheckOverflowInTableInsertUnsupported)
+      }
+    if (columnName == null) {
+      throw new GlutenNotSupportException(CheckOverflowInTableInsertUnsupported)
+    }
+
+    CheckOverflowInTableInsertTransformer(
+      substraitName,
+      replaceWithExpressionTransformer0(cast.child, attributeSeq, expressionsMap),
+      columnName,
+      expression)
   }
 
   // Mapping for Iceberg static invoke functions
@@ -284,22 +327,30 @@ object ExpressionConverter extends SQLConfHelper with Logging {
       expr: Expression,
       attributeSeq: Seq[Attribute],
       expressionsMap: Map[Class[_], String]): Option[ExpressionTransformer] = {
-    Option {
-      expr match {
-        case pythonUDF: PythonUDF =>
-          replacePythonUDFWithExpressionTransformer(pythonUDF, attributeSeq, expressionsMap)
-        case scalaUDF: ScalaUDF =>
-          replaceScalaUDFWithExpressionTransformer(scalaUDF, attributeSeq, expressionsMap)
-        case _ if HiveUDFTransformer.isHiveUDF(expr) =>
-          BackendsApiManager.getSparkPlanExecApiInstance.genHiveUDFTransformer(expr, attributeSeq)
-        case staticInvoke: StaticInvoke =>
-          replaceStaticInvokeWithExpressionTransformer(staticInvoke, attributeSeq, expressionsMap)
-        case invoke: Invoke =>
-          replaceInvokeWithExpressionTransformer(invoke, attributeSeq, expressionsMap)
-        case _ =>
-          null
+    ExpressionTransformerProvider
+      .tryTransform(expr, replaceWithExpressionTransformer0(_, attributeSeq, expressionsMap))
+      .orElse {
+        Option {
+          expr match {
+            case pythonUDF: PythonUDF =>
+              replacePythonUDFWithExpressionTransformer(pythonUDF, attributeSeq, expressionsMap)
+            case scalaUDF: ScalaUDF =>
+              replaceScalaUDFWithExpressionTransformer(scalaUDF, attributeSeq, expressionsMap)
+            case _ if HiveUDFTransformer.isHiveUDF(expr) =>
+              BackendsApiManager.getSparkPlanExecApiInstance
+                .genHiveUDFTransformer(expr, attributeSeq)
+            case staticInvoke: StaticInvoke =>
+              replaceStaticInvokeWithExpressionTransformer(
+                staticInvoke,
+                attributeSeq,
+                expressionsMap)
+            case invoke: Invoke =>
+              replaceInvokeWithExpressionTransformer(invoke, attributeSeq, expressionsMap)
+            case _ =>
+              null
+          }
+        }
       }
-    }
   }
 
   private def transformExpression(
@@ -638,9 +689,7 @@ object ExpressionConverter extends SQLConfHelper with Logging {
           replaceWithExpressionTransformer0(c.child, attributeSeq, expressionsMap),
           c)
       case c if c.getClass.getSimpleName.equals("CheckOverflowInTableInsert") =>
-        throw new GlutenNotSupportException(
-          "CheckOverflowInTableInsert is used in ANSI mode, but Gluten does not support ANSI mode."
-        )
+        genCheckOverflowInTableInsertTransformer(substraitExprName, c, attributeSeq, expressionsMap)
       case b: BinaryArithmetic if DecimalArithmeticUtil.isDecimalArithmetic(b) =>
         val exprName = BackendsApiManager.getSparkPlanExecApiInstance.getDecimalArithmeticExprName(
           substraitExprName)

@@ -20,7 +20,8 @@ import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.events.{GlutenMppPlanEvent, GlutenMppPlanFragmentEvent}
 import org.apache.gluten.expression.ConverterUtils
-import org.apache.gluten.extension.{ExchangeSpec, FlushableHashAggregateRule, MppFinalAggTopNPartialRule, MppParallelSortSplitRule, MppRemoveRedundantShuffleRule, MppSinglePartitionSortRule, NativeFragment, RewriteUncorrelatedScalarSubquery}
+import org.apache.gluten.extension.{ExchangeSpec, FlushableHashAggregateRule, MppFinalAggTopNPartialRule, MppParallelSortSplitRule, MppRemoveRedundantShuffleRule, MppReplicatedCartesianRule, MppSinglePartitionSortRule, NativeFragment, RewriteUncorrelatedScalarSubquery}
+import org.apache.gluten.extension.MppReplicatedCartesianRule.REPLICATED_CARTESIAN_MAX_BUILD_BYTES_TAG
 import org.apache.gluten.extension.columnar.UnionTransformerRule
 import org.apache.gluten.extension.columnar.heuristic.HeuristicTransform
 import org.apache.gluten.extension.columnar.rewrite.{PullOutPostProject, PullOutPreProject}
@@ -47,14 +48,16 @@ import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide
 import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ColumnarShuffleExchangeExec, ExecSubqueryExpression, FilterExec, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
+import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ColumnarShuffleExchangeExec, ExecSubqueryExpression, ExternalRDDScanExec, FilterExec, InputAdapter, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeExec, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BuildSideRelation, HashedRelationBroadcastMode, ShuffledHashJoinExec}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.ui.GlutenUIUtils
+import org.apache.spark.sql.execution.utils.MppRangeBoundsGenerator
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.{ArrayType, DataType, MapType, ObjectType, StructType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import com.google.common.collect.Lists
@@ -120,6 +123,153 @@ private[execution] case class MppLocalStreamInput(
     rdd: RDD[ColumnarBatch])
 
 private[execution] case class MppLocalStreamSlot(fragmentId: Int, slotIdx: Int)
+
+/**
+ * Fail-closed matcher for the JVM-backed stream shapes admitted by strict MPP.
+ *
+ * MPP already feeds a Spark `RDDScanExec` into its existing local `InputIterator` bridge. This
+ * matcher does not introduce another transport or execution path: it narrows that legacy admission
+ * to a batch "ExistingRDD" leaf and extends the same bridge to one encoded object-RDD shape.
+ *
+ * An application that leaves Spark SQL through `Dataset.rdd` and later calls `toDF` produces an
+ * [[RDDScanExec]] ("ExistingRDD") at the new query's leaf. A typed Dataset materialized as
+ * `RDD[Row]` and registered as a view has the second exact leaf shape: SerializeFromObjectExec over
+ * ExternalRDDScanExec. Spark whole-stage codegen may insert exactly one row InputAdapter between
+ * those operators. Capturing the serializer preserves Spark's encoder semantics before
+ * columnarizing its relational rows.
+ *
+ * Do not treat an arbitrary row subtree as equivalent to either ingress. Keep this matcher
+ * deliberately unary and transparent: conversion/adaptor nodes are accepted; C2R, Python,
+ * projections, filters, whole stages, nested object operators, and every other row operator are
+ * not. Spark 4 also carries an optional streaming source on RDDScanExec; strict MPP admits only the
+ * batch form. Spark 3.x has no such accessor, so the reflective check below is a cross-version
+ * compatibility guard rather than a relaxation.
+ */
+private[gluten] object MppJvmStreamInputMatcher {
+
+  private case class ObjectIngressGuardOutcome(
+      childShape: String,
+      directExternalObjectScan: Boolean,
+      externalOutputArity: Option[Int],
+      exactlyOneObjectInput: Boolean,
+      serializerReferencesWithinInput: Boolean,
+      outputContainsNoObjectType: Boolean) {
+
+    def accepted: Boolean =
+      directExternalObjectScan &&
+        exactlyOneObjectInput &&
+        serializerReferencesWithinInput &&
+        outputContainsNoObjectType
+
+    def diagnostic: String =
+      s"SerializeFromObjectExec guard outcomes: childShape=$childShape; " +
+        s"directExternalObjectScan=$directExternalObjectScan; " +
+        s"externalOutputArity=${externalOutputArity.map(_.toString).getOrElse("unavailable")}; " +
+        s"exactlyOneObjectInput=$exactlyOneObjectInput; " +
+        s"serializerReferencesWithinInput=$serializerReferencesWithinInput; " +
+        s"outputContainsNoObjectType=$outputContainsNoObjectType; accepted=$accepted"
+  }
+
+  def rowInput(plan: SparkPlan): Option[SparkPlan] = plan match {
+    case existing: RDDScanExec if isBatchExistingRddScan(existing) => Some(existing)
+    case serializer: SerializeFromObjectExec if isExternalObjectSerializerIngress(serializer) =>
+      Some(serializer)
+    case cia: ColumnarInputAdapter => rowInput(cia.child)
+    case c2c: ColumnarToColumnarExec => rowInput(c2c.child)
+    case r2c: RowToColumnarExecBase => rowInput(r2c.child)
+    case r2c: org.apache.spark.sql.execution.RowToColumnarExec => rowInput(r2c.child)
+    case _ => None
+  }
+
+  // Kept for callers that specifically need the legacy relational ExistingRDD leaf.
+  def scan(plan: SparkPlan): Option[RDDScanExec] =
+    rowInput(plan).collect { case existing: RDDScanExec => existing }
+
+  /**
+   * Explain every SerializeFromObject candidate without changing the exact ingress matcher. Keeping
+   * each guard outcome explicit makes a strict-MPP rejection actionable while preserving the
+   * fail-closed contract.
+   */
+  def objectIngressGuardOutcomes(plan: SparkPlan): Seq[String] =
+    plan.collect {
+      case serializer: SerializeFromObjectExec => evaluateObjectIngress(serializer).diagnostic
+    }
+
+  private def isExternalObjectSerializerIngress(serializer: SerializeFromObjectExec): Boolean =
+    evaluateObjectIngress(serializer).accepted
+
+  private def evaluateObjectIngress(
+      serializer: SerializeFromObjectExec): ObjectIngressGuardOutcome = {
+    val external = directExternalObjectScan(serializer.child)
+    ObjectIngressGuardOutcome(
+      childShape = describeObjectIngressChild(serializer.child),
+      directExternalObjectScan = external.isDefined,
+      externalOutputArity = external.map(_.output.size),
+      exactlyOneObjectInput = external.exists {
+        scan => scan.output.size == 1 && scan.output.head.dataType.isInstanceOf[ObjectType]
+      },
+      serializerReferencesWithinInput = external.exists {
+        scan => serializer.serializer.forall(_.references.subsetOf(scan.outputSet))
+      },
+      outputContainsNoObjectType =
+        serializer.output.forall(attr => !containsObjectType(attr.dataType))
+    )
+  }
+
+  private def describeObjectIngressChild(plan: SparkPlan): String = plan match {
+    case adapter: InputAdapter =>
+      s"InputAdapter->${adapter.child.getClass.getSimpleName}"
+    case other => other.getClass.getSimpleName
+  }
+
+  private def directExternalObjectScan(plan: SparkPlan): Option[ExternalRDDScanExec[_]] =
+    plan match {
+      case external: ExternalRDDScanExec[_] => Some(external)
+      // Spark's CollapseCodegenStages inserts this row adapter at a whole-stage boundary.
+      // Accept only one direct adapter here; making InputAdapter generally transparent would
+      // admit arbitrary row subtrees as strict-MPP local streams. ColumnarInputAdapter is a
+      // separate Gluten convention adapter and is intentionally not accepted in this
+      // serializer-specific position.
+      case adapter: InputAdapter =>
+        adapter.child match {
+          case external: ExternalRDDScanExec[_] => Some(external)
+          case _ => None
+        }
+      case _ => None
+    }
+
+  private def containsObjectType(dataType: DataType): Boolean = dataType match {
+    case _: ObjectType => true
+    case array: ArrayType => containsObjectType(array.elementType)
+    case map: MapType =>
+      containsObjectType(map.keyType) || containsObjectType(map.valueType)
+    case struct: StructType => struct.fields.exists(field => containsObjectType(field.dataType))
+    case _ => false
+  }
+
+  private def isBatchExistingRddScan(scan: RDDScanExec): Boolean = {
+    if (scan.name != "ExistingRDD") {
+      return false
+    }
+
+    // RDDScanExec.stream was added in Spark 4. Referencing it directly would break the common
+    // Spark 3.5 build, where every RDDScanExec is batch-only. If Spark exposes the accessor, fail
+    // closed unless it returns an empty scala.Option.
+    scan.getClass.getMethods
+      .find(method => method.getName == "stream" && method.getParameterCount == 0) match {
+      case None => true
+      case Some(streamAccessor) =>
+        try {
+          streamAccessor.invoke(scan) match {
+            case stream: Option[_] => stream.isEmpty
+            case _ => false
+          }
+        } catch {
+          case NonFatal(_) => false
+        }
+    }
+  }
+}
 
 private case class MppReplicatedJoinBuildInput(child: SparkPlan) extends UnaryTransformSupport {
 
@@ -309,6 +459,13 @@ case class MppNativeQueryExec(
 
   private def executeColumnarInternal(keepDeviceOutput: Boolean): RDD[ColumnarBatch] = {
     val executionChild = preparedChildPlan
+    // Scope generated RANGE bounds to this MPP launch. A new action gets a new cache even if it
+    // reuses the same SparkPlan object; equivalent exchanges inside this launch join one
+    // generation.
+    val rangeBoundsCache = new MppRangeBoundsGenerator.QueryCache(
+      Option(sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY))
+        .filter(_.nonEmpty)
+        .getOrElse(s"untracked-${UUID.randomUUID()}"))
     logDebug(
       s"MppNativeQueryExec: executing with ${fragments.size} fragments " +
         s"and ${exchanges.size} exchanges")
@@ -389,6 +546,15 @@ case class MppNativeQueryExec(
               s"(${ex.exchangeType}, ${ex.numPartitions} partitions)")
       }
 
+      val extractedRangeExchangeCount =
+        extractedExchanges.count(_.exchangeType == "RANGE")
+      logWarning(
+        s"MppNativeQueryExec: *** MPP EXECUTION TOPOLOGY EXTRACTED *** " +
+          s"fragments=${extractedFragments.size} exchanges=${extractedExchanges.size} " +
+          s"rangeExchanges=$extractedRangeExchangeCount " +
+          s"localStreamInputs=${localStreamInputs.size}. This runtime topology supersedes the " +
+          s"null-root placeholder reported during plan admission.")
+
       nativeMppFallbackReason(extractedFragments, extractedExchanges).foreach {
         reason =>
           return delegateToBsp(
@@ -396,11 +562,15 @@ case class MppNativeQueryExec(
             s"MppNativeQueryExec: delegating to BSP because extracted MPP plan is unsafe: $reason")
       }
 
-      // Once the extracted plan is committed to native MPP, Spark-side broadcast exchange
-      // materialization is dead work. Mark before Substrait generation: some transform paths can
-      // touch broadcast lazy state while building value-stream inputs.
-      suppressDeadBroadcastsForNativeMpp(childForMpp)
-      suppressDeadBroadcastsForNativeMpp(extractedPlan)
+      val preparedExtractedExchanges =
+        try {
+          prepareHybridMppRangeExchanges(extractedExchanges, rangeBoundsCache)
+        } catch {
+          case NonFatal(e) =>
+            return delegateToBsp(
+              executionChild,
+              s"MppNativeQueryExec: RANGE exchange preparation failed: ${exceptionSummary(e)}")
+        }
 
       // Generate Substrait plan for each fragment
       val fragmentSubstraitPlans =
@@ -434,7 +604,7 @@ case class MppNativeQueryExec(
       validateMppStreamInputs(
         fragmentSubstraitPlans,
         extractedFragments,
-        extractedExchanges,
+        preparedExtractedExchanges,
         fusedBroadcastsByConsumer,
         localStreamInputs).foreach {
         reason =>
@@ -449,21 +619,29 @@ case class MppNativeQueryExec(
       metrics("numFragments") += extractedFragments.size
       metrics("numExchanges") += extractedExchanges.size
 
+      // Irreversible commit: every validation path that can still delegate to BSP is now complete,
+      // including RANGE sampling, Substrait generation, and stream-input validation. Suppressing
+      // earlier would fail the broadcast promise that a non-strict BSP fallback still needs.
+      suppressDeadBroadcastsForNativeMpp(childForMpp)
+      suppressDeadBroadcastsForNativeMpp(extractedPlan)
+
       logDebug(
         s"MppNativeQueryExec: *** PHASE 3 MPP EXECUTION *** " +
-          s"${extractedFragments.size} fragments, ${extractedExchanges.size} exchanges")
+          s"${extractedFragments.size} fragments, ${preparedExtractedExchanges.size} exchanges")
 
       val fragmentPlans = fragmentSubstraitPlans.toArray
       val numDriversPerFragment = extractedFragments.map(_.parallelism).toArray
-      val exchangeSpecsJson = serializeExchangeSpecs(extractedExchanges, extractedFragments)
+      val exchangeSpecsJson =
+        serializeExchangeSpecs(preparedExtractedExchanges, extractedFragments)
       val mppQueryId = newNativeMppQueryId()
-      val broadcastProducerFragmentIds = broadcastProducerIds(extractedExchanges)
+      val broadcastProducerFragmentIds = broadcastProducerIds(preparedExtractedExchanges)
+      val replicatedCartesianMaxBuildBytes = replicatedCartesianBuildLimit(extractedPlan)
 
       val requestedSparkPartitionCount = mppSparkPartitionCount
       val sparkPartitionCount =
         effectiveMppSparkPartitionCount(
           requestedSparkPartitionCount,
-          extractedExchanges,
+          preparedExtractedExchanges,
           childForMpp.find(_.isInstanceOf[WriteFilesExecTransformer]).isDefined)
       val peerResolution = resolveMppPeers(sparkPartitionCount)
       val peerInfos = peerResolution.peerInfos
@@ -487,14 +665,14 @@ case class MppNativeQueryExec(
         fragmentPlans,
         numDriversPerFragment,
         extractedFragments,
-        extractedExchanges,
+        preparedExtractedExchanges,
         exchangeSpecsJson,
         fragmentSplitInfos)
       postMppPlanEvent(
         fragmentPlans,
         numDriversPerFragment,
         extractedFragments,
-        extractedExchanges,
+        preparedExtractedExchanges,
         exchangeSpecsJson,
         fragmentSplitInfos,
         fusedBroadcastsByConsumer)
@@ -514,6 +692,7 @@ case class MppNativeQueryExec(
         sparkPartitionCount,
         broadcastProducerFragmentIds,
         keepDeviceOutput,
+        replicatedCartesianMaxBuildBytes,
         longMetric("totalQueryTimeMs"),
         longMetric("outputRows"),
         longMetric("outputBatches")
@@ -529,11 +708,19 @@ case class MppNativeQueryExec(
             reason)
     }
 
-    suppressDeadBroadcastsForNativeMpp(childForMpp)
+    val preparedExchanges =
+      try {
+        prepareHybridMppRangeExchanges(exchanges, rangeBoundsCache)
+      } catch {
+        case NonFatal(e) =>
+          return delegateToBsp(
+            executionChild,
+            s"MppNativeQueryExec: RANGE exchange preparation failed: ${exceptionSummary(e)}")
+      }
 
     // Update fragment/exchange count metrics.
     metrics("numFragments") += fragments.size
-    metrics("numExchanges") += exchanges.size
+    metrics("numExchanges") += preparedExchanges.size
 
     // Generate Substrait plans on the DRIVER side where sparkContext is available.
     val fragmentPlans: Array[Array[Byte]] =
@@ -548,13 +735,14 @@ case class MppNativeQueryExec(
       }
 
     val numDriversPerFragment = fragments.map(_.parallelism).toArray
-    val exchangeSpecsJson = serializeExchangeSpecs(exchanges, fragments)
+    val exchangeSpecsJson = serializeExchangeSpecs(preparedExchanges, fragments)
     val mppQueryId = newNativeMppQueryId()
-    val broadcastProducerFragmentIds = broadcastProducerIds(exchanges)
+    val broadcastProducerFragmentIds = broadcastProducerIds(preparedExchanges)
+    val replicatedCartesianMaxBuildBytes = replicatedCartesianBuildLimit(childForMpp)
 
     logDebug(s"MppNativeQueryExec: generated ${fragmentPlans.length} Substrait plans on driver")
 
-    validateMppStreamInputs(fragmentPlans.toSeq, fragments, exchanges, Map.empty, Seq.empty)
+    validateMppStreamInputs(fragmentPlans.toSeq, fragments, preparedExchanges, Map.empty, Seq.empty)
       .foreach {
         reason =>
           return delegateToBsp(
@@ -563,11 +751,15 @@ case class MppNativeQueryExec(
               reason)
       }
 
+    // Irreversible commit after the last fallback-capable validation. RANGE preparation and BSP
+    // fallback must retain a live broadcast promise.
+    suppressDeadBroadcastsForNativeMpp(childForMpp)
+
     val requestedSparkPartitionCount = mppSparkPartitionCount
     val sparkPartitionCount =
       effectiveMppSparkPartitionCount(
         requestedSparkPartitionCount,
-        exchanges,
+        preparedExchanges,
         childForMpp.find(_.isInstanceOf[WriteFilesExecTransformer]).isDefined)
     val peerResolution = resolveMppPeers(sparkPartitionCount)
     val peerInfos = peerResolution.peerInfos
@@ -585,14 +777,14 @@ case class MppNativeQueryExec(
       fragmentPlans,
       numDriversPerFragment,
       fragments,
-      exchanges,
+      preparedExchanges,
       exchangeSpecsJson,
       fragmentSplitInfos)
     postMppPlanEvent(
       fragmentPlans,
       numDriversPerFragment,
       fragments,
-      exchanges,
+      preparedExchanges,
       exchangeSpecsJson,
       fragmentSplitInfos,
       Map.empty[Int, Seq[FusedBroadcast]])
@@ -615,11 +807,28 @@ case class MppNativeQueryExec(
       sparkPartitionCount,
       broadcastProducerFragmentIds,
       keepDeviceOutput,
+      replicatedCartesianMaxBuildBytes,
       longMetric("totalQueryTimeMs"),
       longMetric("outputRows"),
       longMetric("outputBatches")
     )
     mppRdd
+  }
+
+  /**
+   * Returns the canonical byte limit carried by replicated-Cartesian joins in this query. A single
+   * query-level cap is intentionally conservative: it applies to every native nested-loop join when
+   * the query contains a replicated Cartesian, while queries without that rewrite remain unbounded.
+   */
+  private def replicatedCartesianBuildLimit(plan: SparkPlan): Long = {
+    val limits = plan.collect {
+      case node if node.getTagValue(REPLICATED_CARTESIAN_MAX_BUILD_BYTES_TAG).isDefined =>
+        node.getTagValue(REPLICATED_CARTESIAN_MAX_BUILD_BYTES_TAG).get
+    }.distinct
+    require(
+      limits.size <= 1,
+      s"MPP query has inconsistent replicated-Cartesian build limits: ${limits.mkString(", ")}")
+    limits.headOption.getOrElse(0L)
   }
 
   // --- Explain / toString ---
@@ -827,13 +1036,13 @@ case class MppNativeQueryExec(
                         t
                       )
                   }
-                case None if producerFragId < 0 && isExistingRddStreamInput(child) =>
+                case None if producerFragId < 0 && isJvmBackedStreamInput(child) =>
                   localStreamInputs += MppLocalStreamInput(
                     fragmentId = fragId,
                     slotIdx = slotIdx,
-                    rdd = executeExistingRddColumnar(child))
+                    rdd = executeJvmBackedStreamColumnar(child))
                   logInfo(
-                    s"MppNativeQueryExec: captured local ExistingRDD stream at " +
+                    s"MppNativeQueryExec: captured local JVM-backed stream at " +
                       s"consumerF=$fragId slot=$slotIdx")
                 case _ if producerFragId < 0 =>
                   // Non-broadcast collapse (e.g. collapseSingleGather sentinel).
@@ -861,7 +1070,13 @@ case class MppNativeQueryExec(
                     consumerFragmentId = fragId,
                     exchangeType = exchangeType,
                     numPartitions = numPartitions,
-                    partitionKeys = partitionKeys
+                    partitionKeys = partitionKeys,
+                    rangeOrdering = exchangeNode.outputPartitioning match {
+                      case range: RangePartitioning if !forceBroadcast => range.ordering
+                      case _ => Seq.empty
+                    },
+                    rangeSamplePlan =
+                      if (forceBroadcast) null else exchangeNode.children.headOption.orNull
                   )
                 case None if unwrapToTopN(child).isDefined =>
                   // Top-N input slot: this slot's subtree was already walked into a
@@ -1083,7 +1298,10 @@ case class MppNativeQueryExec(
     val afterNativeUnion =
       UnionTransformerRule(requireSameNumPartitions = false, requireNativeUnionEnabled = false)(
         afterNativePostProject)
-    val afterSort = sortRule(afterNativeUnion)
+    // Plan C wraps the subtree before MppCollapseRule can normalize Cartesian products. Apply the
+    // same replicated-build rewrite here; Plan D is already rewritten and this remains a no-op.
+    val afterReplicatedCartesian = MppReplicatedCartesianRule()(afterNativeUnion)
+    val afterSort = sortRule(afterReplicatedCartesian)
     val afterSkipShuffle = skipShuffleRule(afterSort)
     // parallelSortSplit must run AFTER MppSinglePartitionSortRule so the
     // RangePartitioning -> SinglePartition rewrite has already happened.
@@ -1571,28 +1789,16 @@ case class MppNativeQueryExec(
     }
   }
 
-  private def isExistingRddStreamInput(plan: SparkPlan): Boolean = {
-    existingRddScan(plan).isDefined
+  private def isJvmBackedStreamInput(plan: SparkPlan): Boolean = {
+    MppJvmStreamInputMatcher.rowInput(plan).isDefined
   }
 
-  private def existingRddScan(plan: SparkPlan): Option[RDDScanExec] = {
-    plan match {
-      case scan: RDDScanExec => Some(scan)
-      case wst: WholeStageTransformer => existingRddScan(wst.child)
-      case cia: ColumnarInputAdapter => existingRddScan(cia.child)
-      case c2c: ColumnarToColumnarExec => existingRddScan(c2c.child)
-      case c2r: ColumnarToRowExecBase => existingRddScan(c2r.child)
-      case r2c: RowToColumnarExecBase => existingRddScan(r2c.child)
-      case _ => None
-    }
-  }
-
-  private def executeExistingRddColumnar(plan: SparkPlan): RDD[ColumnarBatch] = {
-    val scan = existingRddScan(plan).getOrElse {
+  private def executeJvmBackedStreamColumnar(plan: SparkPlan): RDD[ColumnarBatch] = {
+    val rowInput = MppJvmStreamInputMatcher.rowInput(plan).getOrElse {
       throw new IllegalArgumentException(
-        s"Expected an ExistingRDD stream input, got ${plan.getClass.getSimpleName}")
+        s"Expected an exact JVM-backed stream input, got ${plan.getClass.getSimpleName}")
     }
-    RowToVeloxColumnarExec(scan).executeColumnar()
+    RowToVeloxColumnarExec(rowInput).executeColumnar()
   }
 
   private def alignLocalStreamInputs(
@@ -1604,7 +1810,11 @@ case class MppNativeQueryExec(
   }
 
   private def offloadLocalSorts(plan: SparkPlan): SparkPlan = {
-    val withSortPreProjects = plan.transformUp {
+    val withNativeSortPreProjects = plan.transformUp {
+      case sort: SortExecTransformer => MppComputedSortKeyProjection.rewrite(sort)
+    }
+
+    val withSortPreProjects = withNativeSortPreProjects.transformUp {
       case sort: SortExec if !sort.global =>
         PullOutPreProject.rewrite(sort)
     }
@@ -2976,10 +3186,7 @@ case class MppNativeQueryExec(
     join.logicalLink.flatMap {
       case logicalJoin: Join =>
         SparkShimLoader.getSparkShims
-          .getBroadcastBuildSide(
-            logicalJoin,
-            hintOnly = false,
-            SQLConf.get)
+          .getBroadcastBuildSide(logicalJoin, hintOnly = false, SQLConf.get)
           .orElse {
             SparkShimLoader.getSparkShims.getShuffleHashJoinBuildSide(
               logicalJoin,
@@ -3152,7 +3359,7 @@ case class MppNativeQueryExec(
         exchanges.map {
           spec =>
             if (
-              (spec.exchangeType == "HASH" || spec.exchangeType == "RANGE") &&
+              spec.exchangeType == "HASH" &&
               spec.numPartitions > cap
             ) {
               logDebug(
@@ -3165,6 +3372,76 @@ case class MppNativeQueryExec(
             }
         }
       case None => exchanges
+    }
+  }
+
+  /**
+   * Populate native RANGE exchanges with Spark-compatible global bounds.
+   *
+   * Catalyst's [[RangePartitioning]] carries ordering and partition count, but Spark creates the
+   * actual bounds later inside its `RangePartitioner`. MPP removes that Spark shuffle, so the
+   * bounds are unavailable to the native exchange. Until native peers can sample, merge, and
+   * broadcast bounds themselves, this correctness bridge executes the producer as a bounded Spark
+   * sampling pre-action. Consequently any launch entering this method is hybrid preparation, not
+   * end-to-end fully-MPP execution.
+   */
+  private def prepareHybridMppRangeExchanges(
+      exchanges: Seq[ExchangeSpec],
+      rangeBoundsCache: MppRangeBoundsGenerator.QueryCache): Seq[ExchangeSpec] = {
+    exchanges.map {
+      case spec if spec.exchangeType == "RANGE" && spec.rangeBoundsJson.isDefined =>
+        require(
+          spec.rangeEffectivePartitions.exists(_ > 0),
+          s"MPP RANGE exchange ${spec.id} has serialized bounds but no effective partition count")
+        require(
+          spec.rangeEffectivePartitions.get <= spec.numPartitions,
+          s"MPP RANGE exchange ${spec.id} effective partitions " +
+            s"${spec.rangeEffectivePartitions.get} exceed requested ${spec.numPartitions}"
+        )
+        spec
+      case spec if spec.exchangeType == "RANGE" =>
+        require(
+          spec.rangeOrdering.nonEmpty,
+          s"MPP RANGE exchange ${spec.id} is missing SortOrder metadata")
+        require(
+          spec.partitionKeys.size == spec.rangeOrdering.size,
+          s"MPP RANGE exchange ${spec.id} lost sort keys: attributes=${spec.partitionKeys.size}, " +
+            s"ordering=${spec.rangeOrdering.size}"
+        )
+        require(
+          spec.rangeSamplePlan != null,
+          s"MPP RANGE exchange ${spec.id} is missing its producer sampling plan")
+        logWarning(
+          s"MppNativeQueryExec: *** SPARK PRE-ACTION FOR MPP RANGE *** exchange=${spec.id} " +
+            s"F${spec.producerFragmentId}->F${spec.consumerFragmentId} requestedPartitions=" +
+            s"${spec.numPartitions}. MppRangeBoundsGenerator will execute the Spark producer " +
+            s"plan to collect bounded samples before MppNativeQueryRDD starts; this launch is " +
+            s"hybrid preparation and is not an end-to-end fully-MPP execution.")
+        val (bounds, reused) = rangeBoundsCache.getOrCompute(
+          spec.rangeSamplePlan,
+          spec.rangeSamplePlan.output,
+          spec.rangeOrdering,
+          spec.numPartitions) {
+          MppRangeBoundsGenerator.generate(
+            spec.rangeSamplePlan,
+            spec.rangeSamplePlan.output,
+            spec.rangeOrdering,
+            spec.numPartitions)
+        }
+        require(
+          bounds.effectivePartitions <= spec.numPartitions,
+          s"MPP RANGE exchange ${spec.id} computed ${bounds.effectivePartitions} effective " +
+            s"partitions for ${spec.numPartitions} requested partitions"
+        )
+        logInfo(s"MppNativeQueryExec: RANGE exchange ${spec.id} " +
+          (if (reused) "reused" else "computed") + " " +
+          s"${bounds.boundaryCount} Spark-compatible boundaries from bounded samples " +
+          s"(${bounds.effectivePartitions}/${spec.numPartitions} effective/requested partitions, " +
+          s"execution=${rangeBoundsCache.queryExecutionId})")
+        spec.copy(
+          rangeBoundsJson = Some(bounds.json),
+          rangeEffectivePartitions = Some(bounds.effectivePartitions))
+      case spec => spec
     }
   }
 
@@ -3533,7 +3810,24 @@ case class MppNativeQueryExec(
     }
   }
 
-  private def suppressDeadBroadcastsForNativeMpp(plan: SparkPlan): Unit = {
+  /**
+   * Irreversibly suppress Spark-side broadcast collection for a plan committed to native MPP.
+   *
+   * This method must only be called after every branch that can delegate to BSP has completed. Keep
+   * the diagnostic switch semantics formerly enforced by MppSuppressDeadBroadcastsRule: when
+   * disabled, native MPP retains the legacy driver-side collect path for comparison.
+   */
+  private[gluten] def suppressDeadBroadcastsForNativeMpp(plan: SparkPlan): Unit = {
+    val enabled = SQLConf.get
+      .getConfString("spark.gluten.mpp.suppressDeadBroadcast", "true")
+      .toBoolean
+    if (!enabled) {
+      logDebug(
+        "MppNativeQueryExec: dead-broadcast suppression disabled by " +
+          "spark.gluten.mpp.suppressDeadBroadcast=false")
+      return
+    }
+
     var markedCount = 0
 
     def mark(plan: SparkPlan): Unit = {
@@ -4027,9 +4321,24 @@ case class MppNativeQueryExec(
    * native side uses these indices directly as Velox keyChannels (Velox synthesizes its own column
    * names like n<frag>_<idx>, so Spark-style names such as "l_returnflag#84" would never match).
    */
+  private def quoteJson(value: String): String = {
+    val escaped = new StringBuilder(value.length + 2)
+    value.foreach {
+      case '\\' => escaped.append("\\\\")
+      case '"' => escaped.append("\\\"")
+      case '\n' => escaped.append("\\n")
+      case '\r' => escaped.append("\\r")
+      case '\t' => escaped.append("\\t")
+      case ch if ch < 0x20 => escaped.append(f"\\u${ch.toInt}%04x")
+      case ch => escaped.append(ch)
+    }
+    "\"" + escaped.toString() + "\""
+  }
+
   private def serializeExchangeSpecs(
       specs: Seq[ExchangeSpec],
       producerFragments: Seq[NativeFragment]): String = {
+
     val entries = specs.map {
       spec =>
         val producerOutput =
@@ -4052,6 +4361,27 @@ case class MppNativeQueryExec(
             }
         }
         val keyIndicesJson = indices.mkString("[", ", ", "]")
+        if (spec.exchangeType == "RANGE" && indices.size != spec.partitionKeys.size) {
+          throw new IllegalStateException(
+            s"MPP RANGE exchange ${spec.id} cannot resolve every sort key against producer " +
+              s"fragment ${spec.producerFragmentId}; refusing hash/round-robin degradation")
+        }
+        val rangeFields =
+          if (spec.exchangeType == "RANGE") {
+            val bounds = spec.rangeBoundsJson.getOrElse {
+              throw new IllegalStateException(
+                s"MPP RANGE exchange ${spec.id} has no serialized Spark boundaries")
+            }
+            val effective = spec.rangeEffectivePartitions.getOrElse {
+              throw new IllegalStateException(
+                s"MPP RANGE exchange ${spec.id} has no effective partition count")
+            }
+            s""",
+               |  "rangeBoundsJson": ${quoteJson(bounds)},
+               |  "rangeEffectivePartitions": $effective""".stripMargin
+          } else {
+            ""
+          }
         s"""{
            |  "id": ${spec.id},
            |  "producerFragmentId": ${spec.producerFragmentId},
@@ -4059,7 +4389,7 @@ case class MppNativeQueryExec(
            |  "exchangeType": "${spec.exchangeType}",
            |  "numPartitions": ${spec.numPartitions},
            |  "exchangeNodeId": "mpp_exchange_source_${spec.id}",
-           |  "partitionKeyIndices": $keyIndicesJson
+           |  "partitionKeyIndices": $keyIndicesJson$rangeFields
            |}""".stripMargin
     }
     entries.mkString("[", ", ", "]")

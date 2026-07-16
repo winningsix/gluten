@@ -16,7 +16,8 @@
  */
 package org.apache.gluten.extension
 
-import org.apache.gluten.execution.{MppNativeQueryExec, MppPreparedChildExec, VeloxWholeStageTransformerSuite, WholeStageTransformer}
+import org.apache.gluten.execution.{LocalTableScanExecTransformer, MppExchangeSourceTransformer, MppNativeQueryExec, MppPreparedChildExec, VeloxWholeStageTransformerSuite, WholeStageTransformer}
+import org.apache.gluten.metrics.MetricsUpdater
 
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
@@ -82,6 +83,17 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
 
     walk(plan)
     (fragments.toSeq, exchanges.toSeq)
+  }
+
+  test("MppStrategy: native leaf nodes terminate metrics traversal") {
+    val output = spark.range(1).queryExecution.analyzed.output
+    val localScan = LocalTableScanExecTransformer(output, Seq.empty)
+    val source = MppExchangeSourceTransformer(exchangeId = 1, output)
+
+    assert(localScan.children.isEmpty)
+    assert(localScan.metricsUpdater() eq MetricsUpdater.Terminate)
+    assert(source.children.isEmpty)
+    assert(source.metricsUpdater() eq MetricsUpdater.Terminate)
   }
 
   test("MppStrategy: simple agg query produces correct result") {
@@ -395,6 +407,8 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
       "The execution-visible child should be unwrapped")
     assert(
       preparedChild.collect { case exchange: ShuffleExchangeLike => exchange }.nonEmpty,
-      s"The execution-visible child should retain exchange boundaries:\n${preparedChild.treeString}")
+      "The execution-visible child should retain exchange boundaries:\n" +
+        preparedChild.treeString
+    )
   }
 }

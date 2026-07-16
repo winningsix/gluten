@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <numeric>
 #include <sstream>
@@ -83,6 +84,19 @@ namespace {
 /// what the Acceptor parses out of the URL, so the consumer hangs waiting
 /// for data that's already enqueued under a different key.
 constexpr const char* kTaskIdPrefix = "gpu-local-";
+
+/// Bound each CPU root-output fetch well below Velox's output-buffer limit.
+///
+/// OutputBuffer::getData() implicitly acknowledges the previous sequence, but
+/// MppQueryCoordinator::next() returns only one page to Spark at a time.  An
+/// unbounded fetch can therefore move an entire 1 GiB output buffer (roughly a
+/// thousand pages for wide rows) into pendingRootPages_.  The producer then
+/// refills to the buffer limit while Spark drains that oversized local backlog,
+/// leaving both sides in prolonged backpressure with no acknowledgement
+/// cadence.  Keep the local backlog small enough that getData() advances and
+/// releases producer memory regularly.  A single oversized page is still
+/// returned by Velox, so this is a batching limit rather than a row-size limit.
+constexpr uint64_t kRootOutputFetchMaxBytes = 64ULL << 20;
 
 int envIntOrDefault(const char* name, int defaultValue) {
   const char* value = std::getenv(name);
@@ -204,6 +218,20 @@ MppQueryCoordinator::MppQueryCoordinator(
   VELOX_CHECK_GE(peerIndex_, 0, "MPP peer index must be non-negative");
   VELOX_CHECK_GT(peerCount_, 0, "MPP peer count must be positive");
   VELOX_CHECK_LT(peerIndex_, peerCount_, "MPP peer index {} must be less than peer count {}", peerIndex_, peerCount_);
+  if (spillDiskOpts_.has_value()) {
+    auto& opts = spillDiskOpts_.value();
+    if (!opts.spillDirCreated) {
+      VELOX_CHECK_NOT_NULL(
+          opts.spillDirCreateCb,
+          "MPP spill root must either exist or provide a create callback");
+      opts.spillDirPath = opts.spillDirCreateCb();
+      opts.spillDirCreated = true;
+      opts.spillDirCreateCb = nullptr;
+    }
+    VELOX_CHECK(
+        !opts.spillDirPath.empty(), "MPP spill root path must not be empty");
+    std::filesystem::create_directories(opts.spillDirPath);
+  }
 
   // Validate that fragment ids form a contiguous 0-based sequence so we can
   // use them as vector indices.
@@ -363,6 +391,15 @@ MppQueryCoordinator::~MppQueryCoordinator() {
   {
     nvtx3::scoped_range_in<GlutenMppDomain> r{"coordinator::~destructor:fragmentTasks.clear"};
     fragmentTasks_.clear();
+  }
+  if (spillDiskOpts_.has_value()) {
+    std::error_code error;
+    std::filesystem::remove_all(spillDiskOpts_->spillDirPath, error);
+    if (error) {
+      LOG(ERROR) << "MppQueryCoordinator[" << queryId_
+                 << "]: failed to remove spill root '"
+                 << spillDiskOpts_->spillDirPath << "': " << error.message();
+    }
   }
   {
     nvtx3::scoped_range_in<GlutenMppDomain> r{"coordinator::~destructor:bufferManager.reset"};
@@ -873,6 +910,17 @@ void MppQueryCoordinator::start() {
                                                                 : std::max(1, spec.numDrivers);
     for (int32_t i = 0; i < replicas; ++i) {
       auto taskId = makeTaskId(spec.id, i);
+      std::optional<common::SpillDiskOptions> taskSpillDiskOpts;
+      if (spillDiskOpts_.has_value()) {
+        const auto taskSpillDir =
+            std::filesystem::path(spillDiskOpts_->spillDirPath) /
+            fmt::format("fragment-{}-replica-{}", spec.id, i);
+        std::filesystem::create_directories(taskSpillDir);
+        taskSpillDiskOpts = common::SpillDiskOptions{
+            .spillDirPath = taskSpillDir.string(),
+            .spillDirCreated = true,
+            .spillDirCreateCb = nullptr};
+      }
       auto task = Task::create(
           taskId,
           spec.planFragment,
@@ -885,7 +933,7 @@ void MppQueryCoordinator::start() {
           Task::ExecutionMode::kParallel,
           /*consumer=*/Consumer{},
           /*memoryArbitrationPriority=*/0,
-          spillDiskOpts_);
+          std::move(taskSpillDiskOpts));
       fragmentTasks_[spec.id].push_back(std::move(task));
       fragmentTaskDrivers[spec.id].push_back(perReplicaDrivers);
       fragmentTaskBroadcastFanout[spec.id].push_back(bcastN);
@@ -908,6 +956,26 @@ void MppQueryCoordinator::start() {
                  << replica << "/" << fragmentTasks_[fragmentId].size() << " taskId=" << task->taskId()
                  << " drivers=" << perReplicaDrivers << " inboundN=" << inboundN
                  << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN) : std::string{});
+#ifdef GLUTEN_ENABLE_GPU
+    // Velox's generic Task lifecycle is built without the cuDF/UCX integration definition in the
+    // current library layering, while the cuDF adapter still replaces a kUcx output operator at
+    // runtime. Register its strict output queue here, before any producer driver can enqueue. The
+    // coordinator already owns UCX fanout updates and teardown, and initializeTask is idempotent
+    // with a future Task-side lifecycle hook.
+    const auto outputNode = std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+        fragmentSpecs_[fragmentId].planFragment.planNode);
+    if (outputNode != nullptr &&
+        outputNode->transportType() == core::PartitionedOutputNode::TransportType::kUcx) {
+      facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef()->initializeTask(
+          task,
+          outputNode->kind(),
+          outputNode->numPartitions(),
+          perReplicaDrivers);
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: initialized UCX output queue before task start"
+                   << " taskId=" << task->taskId() << " destinations=" << outputNode->numPartitions()
+                   << " drivers=" << perReplicaDrivers;
+    }
+#endif
     task->start(perReplicaDrivers);
     fragmentTaskStarted[fragmentId][replica] = true;
     if (lifecycleLogEnabled) {
@@ -1474,7 +1542,6 @@ bool MppQueryCoordinator::fetchNextOutputPage(std::vector<std::unique_ptr<Serial
   nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"coordinator::fetchNextOutputPage"};
   const auto rootReplicas = fragmentReplicaCount_[rootFragmentId_];
   constexpr int32_t kDestination = 0; // each root Task gathers to dest 0
-  constexpr uint64_t kMaxBytes = std::numeric_limits<uint64_t>::max();
 
   if (rootOutputSequence_.empty()) {
     rootOutputSequence_.assign(rootReplicas, 0);
@@ -1542,7 +1609,7 @@ bool MppQueryCoordinator::fetchNextOutputPage(std::vector<std::unique_ptr<Serial
     auto ok = bufferManager_->getData(
         rootTaskId,
         kDestination,
-        kMaxBytes,
+        kRootOutputFetchMaxBytes,
         requestedSeq,
         [state, idx, qid = queryId_](
             std::vector<std::unique_ptr<folly::IOBuf>> gotPages,
@@ -1891,7 +1958,7 @@ RowVectorPtr MppQueryCoordinator::next() {
   while (!noMoreData_) {
     while (!pendingRootPages_.empty()) {
       auto page = std::move(pendingRootPages_.front());
-      pendingRootPages_.erase(pendingRootPages_.begin());
+      pendingRootPages_.pop_front();
       if (!page) {
         continue;
       }

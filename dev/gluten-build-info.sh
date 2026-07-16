@@ -31,7 +31,14 @@ function echo_revision_info() {
   echo revision=$(git rev-parse HEAD)
   echo revision_time=$(git show -s --format=%ci HEAD)
   echo date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  echo url=$(git config --get remote.origin.url)
+  # Never embed credentials from a developer's local Git configuration in a
+  # distributable JAR.  Strip URL userinfo while preserving the repository URL.
+  remote_url=$(git config --get remote.origin.url)
+  remote_url=$(
+    printf '%s' "$remote_url" |
+      sed -E 's#^(https?://)[^/@]+(:[^/@]*)?@#\1#; s#[?#].*$##'
+  )
+  printf 'url=%s\n' "$remote_url"
 }
 
 function echo_velox_revision_info() {

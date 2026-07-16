@@ -195,13 +195,9 @@ class LocalPartitionWriter::PayloadMerger {
  public:
   PayloadMerger(
       arrow::MemoryPool* pool,
-      arrow::util::Codec* codec,
-      int32_t compressionThreshold,
       int32_t mergeBufferSize,
       int32_t mergeBufferMinSize)
       : pool_(pool),
-        codec_(codec),
-        compressionThreshold_(compressionThreshold),
         mergeBufferSize_(mergeBufferSize),
         mergeBufferMinSize_(mergeBufferMinSize) {}
 
@@ -212,8 +208,10 @@ class LocalPartitionWriter::PayloadMerger {
     std::vector<std::unique_ptr<InMemoryPayload>> merged{};
     if (!append->mergeable()) {
       // TODO: Merging complex type is currently not supported.
-      bool shouldCompress = codec_ != nullptr && append->numRows() >= compressionThreshold_;
-      if (reuseBuffers && !shouldCompress) {
+      // Compression can run asynchronously after cache() returns. If the
+      // shuffle writer is going to reuse its partition buffers, detach the
+      // payload first so the compression worker observes immutable data.
+      if (reuseBuffers) {
         RETURN_NOT_OK(append->copyBuffers(pool_));
       }
       merged.emplace_back(std::move(append));
@@ -231,8 +229,7 @@ class LocalPartitionWriter::PayloadMerger {
         return arrow::Status::OK();
       }
       // Commit if current buffer rows reaches merging threshold.
-      bool shouldCompress = codec_ != nullptr && append->numRows() >= compressionThreshold_;
-      if (reuseBuffers && !shouldCompress) {
+      if (reuseBuffers) {
         RETURN_NOT_OK(append->copyBuffers(pool_));
       }
       merged.emplace_back(std::move(append));
@@ -290,8 +287,6 @@ class LocalPartitionWriter::PayloadMerger {
 
  private:
   arrow::MemoryPool* pool_;
-  arrow::util::Codec* codec_;
-  int32_t compressionThreshold_;
   int32_t mergeBufferSize_;
   int32_t mergeBufferMinSize_;
   std::unordered_map<uint32_t, std::unique_ptr<InMemoryPayload>> partitionMergePayload_;
@@ -318,6 +313,15 @@ class LocalPartitionWriter::PayloadCache {
 
   ~PayloadCache() {
     for (auto& [pid, futures] : pendingFutures_) {
+      for (auto& f : futures) {
+        try {
+          auto result = f.get();
+          (void)result;
+        } catch (...) {
+        }
+      }
+    }
+    for (auto& [pid, futures] : wireFormatFutures_) {
       for (auto& f : futures) {
         try {
           auto result = f.get();
@@ -975,8 +979,6 @@ arrow::Status LocalPartitionWriter::hashEvict(
   if (!merger_) {
     merger_ = std::make_shared<PayloadMerger>(
         payloadPool_.get(),
-        codec_.get(),
-        options_->compressionThreshold,
         options_->mergeBufferSize,
         options_->mergeBufferSize * options_->mergeThreshold);
   }

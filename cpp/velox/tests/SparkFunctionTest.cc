@@ -15,9 +15,13 @@
  * limitations under the License.
  */
 
+#include <limits>
+#include <optional>
 #include <vector>
 
+#include "operators/functions/CheckOverflowInTableInsert.h"
 #include "operators/functions/RegistrationAllFunctions.h"
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/functions/sparksql/tests/SparkFunctionBaseTest.h"
 
 using namespace facebook::velox::functions::sparksql::test;
@@ -110,4 +114,49 @@ TEST_F(SparkFunctionTest, roundWithDecimal) {
   runRoundWithDecimalTest<int32_t>(testRoundWithDecIntegralData<int32_t>());
   runRoundWithDecimalTest<int16_t>(testRoundWithDecIntegralData<int16_t>());
   runRoundWithDecimalTest<int8_t>(testRoundWithDecIntegralData<int8_t>());
+}
+
+TEST_F(SparkFunctionTest, checkOverflowInTableInsertBigintToInteger) {
+  const auto input = makeNullableFlatVector<int64_t>(
+      {std::numeric_limits<int32_t>::min(), -1, 0, std::numeric_limits<int32_t>::max(), std::nullopt});
+  const auto result =
+      evaluate<SimpleVector<int32_t>>("check_overflow_in_table_insert(c0, '`target_col`')", makeRowVector({input}));
+
+  ASSERT_EQ(result->valueAt(0), std::numeric_limits<int32_t>::min());
+  ASSERT_EQ(result->valueAt(1), -1);
+  ASSERT_EQ(result->valueAt(2), 0);
+  ASSERT_EQ(result->valueAt(3), std::numeric_limits<int32_t>::max());
+  ASSERT_TRUE(result->isNullAt(4));
+}
+
+TEST_F(SparkFunctionTest, checkOverflowInTableInsertRejectsOverflow) {
+  const auto expression =
+      "check_overflow_in_table_insert(c0, "
+      "'`target_db`.`is_accounting_expired`')";
+
+  EXPECT_EQ(
+      gluten::checkOverflowInTableInsertMessage("`target_db`.`is_accounting_expired`"),
+      "[CAST_OVERFLOW_IN_TABLE_INSERT] Fail to assign a value of \"BIGINT\" "
+      "type to the \"INT\" type column or variable "
+      "`target_db`.`is_accounting_expired` due to an overflow. Use "
+      "`try_cast` on the input value to tolerate overflow and return NULL "
+      "instead. SQLSTATE: 22003");
+
+  VELOX_ASSERT_THROW(
+      evaluate<SimpleVector<int32_t>>(
+          expression,
+          makeRowVector({makeFlatVector<int64_t>({static_cast<int64_t>(std::numeric_limits<int32_t>::max()) + 1})})),
+      "[CAST_OVERFLOW_IN_TABLE_INSERT]");
+  VELOX_ASSERT_THROW(
+      evaluate<SimpleVector<int32_t>>(
+          expression,
+          makeRowVector({makeFlatVector<int64_t>({static_cast<int64_t>(std::numeric_limits<int32_t>::min()) - 1})})),
+      "`target_db`.`is_accounting_expired`");
+}
+
+TEST_F(SparkFunctionTest, checkOverflowInTableInsertFailsClosed) {
+  VELOX_ASSERT_THROW(
+      evaluate<SimpleVector<int32_t>>(
+          "check_overflow_in_table_insert(c0, '`target_col`')", makeRowVector({makeFlatVector<int32_t>({1})})),
+      "only supports (BIGINT, constant VARCHAR) -> INTEGER");
 }

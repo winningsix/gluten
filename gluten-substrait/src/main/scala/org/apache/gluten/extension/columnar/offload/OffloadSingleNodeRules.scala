@@ -19,13 +19,16 @@ package org.apache.gluten.extension.columnar.offload
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution._
+import org.apache.gluten.expression.ExpressionTransformerProvider
 import org.apache.gluten.extension.columnar.FallbackTags
 import org.apache.gluten.logging.LogLevelUtil
 import org.apache.gluten.sql.shims.SparkShimLoader
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Cast, Expression, Literal, PythonUDF}
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
 import org.apache.spark.sql.catalyst.plans.logical.Join
+import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.RDDScanTransformer
 import org.apache.spark.sql.execution.aggregate.{HashAggregateExec, ObjectHashAggregateExec, SortAggregateExec}
@@ -36,6 +39,12 @@ import org.apache.spark.sql.execution.joins._
 import org.apache.spark.sql.execution.python.{ArrowEvalPythonExec, BatchEvalPythonExec, EvalPythonExecTransformer}
 import org.apache.spark.sql.execution.window.WindowExec
 import org.apache.spark.sql.hive.HiveTableScanExecTransformer
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types._
+import org.apache.spark.util.SparkReflectionUtil
+
+import scala.collection.mutable.ArrayBuffer
+import scala.util.Try
 
 // Exchange transformation.
 case class OffloadExchange() extends OffloadSingleNode with LogLevelUtil {
@@ -183,6 +192,28 @@ case class OffloadOthers() extends OffloadSingleNode with LogLevelUtil {
 }
 
 object OffloadOthers {
+  val ARROW_SCALAR_NORMALIZATION_REJECTION_TAG: TreeNodeTag[String] =
+    TreeNodeTag[String]("gluten.python.arrowScalarNormalization.rejection")
+  private val ARROW_SCALAR_NULL_PRESERVING_INPUT_CAPABILITY =
+    "spark.gluten.sql.columnar.arrowUdf.nullPreservingInput"
+
+  private[offload] def isConservativeArrowInputExpression(input: Expression): Boolean = {
+    if (input.find(_.isInstanceOf[PythonUDF]).isDefined) {
+      return false
+    }
+    input match {
+      case _: AttributeReference | _: Literal => true
+      // External providers may opt in an application expression only after establishing the same
+      // serializer and native-evaluation contract used by their transformer.
+      case external if ExpressionTransformerProvider.isSafeArrowPreProjection(external) =>
+        true
+      // Materialize only simple casts whose leaf is already a safe input. Broader deterministic
+      // expressions can be added with explicit serializer-parity tests.
+      case cast: Cast => isConservativeArrowInputExpression(cast.child)
+      case _ => false
+    }
+  }
+
   // Utility to replace single node within transformed Gluten node.
   // Children will be preserved as they are as children of the output node.
   //
@@ -290,8 +321,24 @@ object OffloadOthers {
             plan.generatorOutput,
             child)
         case plan: BatchEvalPythonExec =>
-          val child = plan.child
-          EvalPythonExecTransformer(plan.udfs, plan.resultAttrs, child)
+          arrowOptimizedScalarUdfs(plan.udfs) match {
+            case Some((arrowUdfs, arrowEvalType)) =>
+              logInfo(
+                s"Offloading ${plan.udfs.size} ordinary scalar Python UDF(s) through the " +
+                  "columnar Arrow runner because " +
+                  "spark.sql.execution.pythonUDF.arrow.enabled=true")
+              createArrowScalarExec(plan, arrowUdfs, arrowEvalType)
+            case None =>
+              val rowTransformer =
+                EvalPythonExecTransformer(plan.udfs, plan.resultAttrs, plan.child)
+              arrowScalarNormalizationRejection(plan.udfs).foreach {
+                reason =>
+                  rowTransformer.setTagValue(ARROW_SCALAR_NORMALIZATION_REJECTION_TAG, reason)
+                  logWarning(reason)
+                  failStrictMppOnArrowNormalizationRejection(reason)
+              }
+              rowTransformer
+          }
         case plan: ArrowEvalPythonExec =>
           val child = plan.child
           // For ArrowEvalPythonExec, CH supports it through EvalPythonExecTransformer while
@@ -329,6 +376,218 @@ object OffloadOthers {
         logDebug(s"Columnar Processing for ${plan.getClass} is currently supported.")
       }
       result
+    }
+
+    /**
+     * PySpark fixes an ordinary UDF's eval type when `functions.udf` is called. Applications that
+     * define the UDF before constructing their SparkSession therefore cannot observe the session's
+     * `spark.sql.execution.pythonUDF.arrow.enabled` setting. Normalize that physical-plan artifact
+     * here, but only when the user explicitly enabled Arrow and every function/input/output type is
+     * supported by the conservative scalar Arrow contract below.
+     *
+     * `SQL_ARROW_BATCHED_UDF` was added after some Spark versions that Gluten still cross-builds.
+     * Resolve it reflectively so older profiles keep their existing row-UDF path.
+     */
+    private def arrowOptimizedScalarUdfs(udfs: Seq[PythonUDF]): Option[(Seq[PythonUDF], Int)] = {
+      if (
+        !SQLConf.get
+          .getConfString("spark.sql.execution.pythonUDF.arrow.enabled", "false")
+          .toBoolean ||
+        !BackendsApiManager.getSettings.supportColumnarArrowUdf() ||
+        !GlutenConfig.get.enableColumnarArrowUDF
+      ) {
+        return None
+      }
+
+      pythonScalarEvalTypes
+        .filter {
+          case (batchedEvalType, _) =>
+            udfs.nonEmpty && udfs.forall(isArrowScalarUdf(_, batchedEvalType))
+        }
+        .map {
+          case (_, arrowEvalType) =>
+            udfs.map(rewriteScalarUdfEvalType(_, arrowEvalType)) -> arrowEvalType
+        }
+    }
+
+    private def createArrowScalarExec(
+        plan: BatchEvalPythonExec,
+        arrowUdfs: Seq[PythonUDF],
+        arrowEvalType: Int): SparkPlan = {
+      val projectedInputs = new ArrayBuffer[(Expression, Alias)]
+
+      def materializeInput(input: Expression): Expression = input match {
+        case attribute: AttributeReference => attribute
+        case other =>
+          val alias = projectedInputs
+            .find { case (existing, _) => existing.semanticEquals(other) }
+            .map(_._2)
+            .getOrElse {
+              val created = Alias(other, s"_gluten_arrow_udf_input_${projectedInputs.size}")()
+              projectedInputs += other -> created
+              created
+            }
+          alias.toAttribute
+      }
+
+      def rewriteInputs(udf: PythonUDF): PythonUDF = {
+        val rewrittenChildren = udf.children.map {
+          case nested: PythonUDF => rewriteInputs(nested)
+          case input => materializeInput(input)
+        }
+        udf.copy(children = rewrittenChildren)
+      }
+
+      val rewrittenUdfs = arrowUdfs.map(rewriteInputs)
+      val arrowChild = if (projectedInputs.isEmpty) {
+        plan.child
+      } else {
+        ProjectExecTransformer(plan.child.output ++ projectedInputs.map(_._2), plan.child)
+      }
+      val arrowExec =
+        BackendsApiManager.getSparkPlanExecApiInstance.createColumnarArrowEvalPythonExec(
+          rewrittenUdfs,
+          plan.resultAttrs,
+          arrowChild,
+          arrowEvalType)
+
+      if (projectedInputs.isEmpty) {
+        arrowExec
+      } else {
+        // The pre-project columns are implementation details. Restore BatchEvalPythonExec's
+        // original output so callers never observe them above the Arrow boundary.
+        ProjectExecTransformer(plan.output, arrowExec)
+      }
+    }
+
+    private def failStrictMppOnArrowNormalizationRejection(reason: String): Unit = {
+      val conf = SQLConf.get
+      if (
+        conf.getConfString("spark.gluten.mpp.enabled", "false").toBoolean &&
+        conf.getConfString("spark.gluten.mpp.failOnFallback", "false").toBoolean
+      ) {
+        // EvalPythonExecTransformer validation falls back to Spark's original
+        // BatchEvalPythonExec, which cannot retain the transformer tag. Fail here while the
+        // precise semantic reason is still available.
+        throw new IllegalStateException(reason)
+      }
+    }
+
+    private lazy val pythonScalarEvalTypes: Option[(Int, Int)] = Try {
+      // PythonEvalType is private[spark] in some Spark releases even though the JVM methods are
+      // public. Reflection keeps this cross-version source outside Spark's private namespace.
+      val moduleClass =
+        SparkReflectionUtil.classForName("org.apache.spark.api.python.PythonEvalType$")
+      val module = moduleClass.getField("MODULE$").get(null)
+      val batched = moduleClass.getMethod("SQL_BATCHED_UDF").invoke(module).asInstanceOf[Int]
+      val arrow = moduleClass.getMethod("SQL_ARROW_BATCHED_UDF").invoke(module).asInstanceOf[Int]
+      batched -> arrow
+    }.toOption
+
+    private def arrowScalarNormalizationRejection(udfs: Seq[PythonUDF]): Option[String] = {
+      if (
+        !SQLConf.get
+          .getConfString("spark.sql.execution.pythonUDF.arrow.enabled", "false")
+          .toBoolean ||
+        !BackendsApiManager.getSettings.supportColumnarArrowUdf() ||
+        !GlutenConfig.get.enableColumnarArrowUDF
+      ) {
+        return None
+      }
+
+      pythonScalarEvalTypes.flatMap {
+        case (batchedEvalType, _) =>
+          udfs.iterator
+            .filter(udf => udf.evalType == batchedEvalType && isConservativeArrowType(udf.dataType))
+            .flatMap(firstUnsafeArrowInput)
+            .toSeq
+            .headOption
+            .map {
+              inputReason =>
+                "ordinary Arrow UDF semantic guard: input kept on row execution because changing " +
+                  s"its eval type is unsafe ($inputReason). Set " +
+                  s"$ARROW_SCALAR_NULL_PRESERVING_INPUT_CAPABILITY=true only when the active " +
+                  "Spark Python runtime is verified to preserve Arrow input null validity."
+            }
+      }
+    }
+
+    private def firstUnsafeArrowInput(udf: PythonUDF): Option[String] = {
+      udf.children.iterator
+        .map {
+          case _: PythonUDF =>
+            Some("a chained row UDF can produce a nullable intermediate value")
+          case input if input.nullable && !nullPreservingArrowScalarInputEnabled =>
+            Some(s"nullable input ${input.sql}:${input.dataType.catalogString} may map None to NaN")
+          case input if !isNonNullableArrowInputType(input.dataType) =>
+            Some(s"input ${input.sql}:${input.dataType.catalogString} lacks a safe Arrow contract")
+          case input if !input.deterministic =>
+            Some(s"non-deterministic input ${input.sql} cannot be safely pre-projected")
+          case input if !isConservativeArrowInputExpression(input) =>
+            Some(s"input expression ${input.sql} is outside the conservative Arrow contract")
+          case _ => None
+        }
+        .collectFirst { case Some(reason) => reason }
+    }
+
+    private def isArrowScalarUdf(udf: PythonUDF, batchedEvalType: Int): Boolean = {
+      udf.evalType == batchedEvalType &&
+      isConservativeArrowType(udf.dataType) &&
+      udf.children.forall {
+        // A chained row UDF may return null even when its original input is non-null. The Arrow
+        // scalar protocol can expose that intermediate null as pandas NaN, so do not change the
+        // eval type of a chain without a proven null-preserving contract.
+        case _: PythonUDF => false
+        // Spark 4 ordinary Arrow UDFs can expose a nullable SQL string as float NaN instead of
+        // Python None. A row UDF is allowed to distinguish these values (for example,
+        // `None if x is None else x.strip()`), hence rewriting a nullable input would silently
+        // change semantics. Keep it on Spark's original row-UDF path unless the active runtime
+        // explicitly advertises the null-preserving capability.
+        case input =>
+          (!input.nullable || nullPreservingArrowScalarInputEnabled) &&
+          input.deterministic &&
+          isNonNullableArrowInputType(input.dataType) &&
+          isConservativeArrowInputExpression(input)
+      }
+    }
+
+    private def nullPreservingArrowScalarInputEnabled: Boolean =
+      SQLConf.get
+        .getConfString(ARROW_SCALAR_NULL_PRESERVING_INPUT_CAPABILITY, "false")
+        .toBoolean
+
+    private def rewriteScalarUdfEvalType(udf: PythonUDF, evalType: Int): PythonUDF = {
+      val rewrittenChildren = udf.children.map {
+        case nested: PythonUDF => rewriteScalarUdfEvalType(nested, evalType)
+        case input => input
+      }
+      udf.copy(children = rewrittenChildren, evalType = evalType)
+    }
+
+    // Keep this deliberately narrower than Arrow's full evolving type matrix. The engine can
+    // widen the list with parity tests; unsupported types retain Spark's existing row-UDF path.
+    private def isConservativeArrowType(dataType: DataType): Boolean = dataType match {
+      case NullType | BooleanType | ByteType | ShortType | IntegerType | LongType | FloatType |
+          DoubleType | StringType | BinaryType | DateType | TimestampType =>
+        true
+      case _: DecimalType => true
+      case ArrayType(elementType, _) => isConservativeArrowType(elementType)
+      case MapType(keyType, valueType, _) =>
+        isConservativeArrowType(keyType) && isConservativeArrowType(valueType)
+      case StructType(fields) => fields.forall(field => isConservativeArrowType(field.dataType))
+      case _ => false
+    }
+
+    private def isNonNullableArrowInputType(dataType: DataType): Boolean = dataType match {
+      case ArrayType(elementType, containsNull) =>
+        !containsNull && isNonNullableArrowInputType(elementType)
+      case MapType(keyType, valueType, valueContainsNull) =>
+        !valueContainsNull &&
+        isNonNullableArrowInputType(keyType) &&
+        isNonNullableArrowInputType(valueType)
+      case StructType(fields) =>
+        fields.forall(field => !field.nullable && isNonNullableArrowInputType(field.dataType))
+      case primitive => isConservativeArrowType(primitive)
     }
   }
 }

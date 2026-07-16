@@ -19,6 +19,7 @@
 #include <arrow/io/api.h>
 
 #include "config/GlutenConfig.h"
+#include "operators/plannodes/RowVectorStream.h"
 #include "shuffle/VeloxGpuShuffleWriter.h"
 #include "shuffle/VeloxHashShuffleWriter.h"
 #include "tests/VeloxShuffleWriterTestBase.h"
@@ -29,6 +30,8 @@
 #include "memory/GpuBufferColumnarBatch.h"
 #include "utils/GpuBufferBatchResizer.h"
 
+#include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
@@ -133,7 +136,11 @@ RowVectorPtr mergeBufferColumnarBatches(std::vector<std::shared_ptr<GpuBufferCol
 
   // Convert back to Velox
   return cudf_velox::with_arrow::toVeloxColumn(
-      tableView, getDefaultMemoryManager()->getLeafMemoryPool().get(), "", vector->stream());
+      tableView,
+      getDefaultMemoryManager()->getLeafMemoryPool().get(),
+      "",
+      vector->stream(),
+      cudf_velox::get_temp_mr());
 }
 
 std::vector<GpuShuffleTestParams> getTestParams() {
@@ -743,7 +750,8 @@ class GpuPartitionHashShuffleWriterTest : public GpuVeloxShuffleWriterTest {
 
   std::shared_ptr<ColumnarBatch> toCudfBatch(const RowVectorPtr& rv) {
     auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
-    auto table = cudf_velox::with_arrow::toCudfTable(rv, pool(), stream);
+    auto table = cudf_velox::with_arrow::toCudfTable(
+        rv, pool(), stream, cudf_velox::get_output_mr());
     auto cudfVec = std::make_shared<cudf_velox::CudfVector>(
         pool(), rv->type(), rv->size(), std::move(table), stream);
     return std::make_shared<VeloxColumnarBatch>(cudfVec, rv->type()->size());
@@ -775,6 +783,43 @@ TEST_P(GpuPartitionHashShuffleWriterTest, gpuPartitionFixedWidth) {
 
   auto cudfBatch = toCudfBatch(input);
   testShuffleRoundTrip(*shuffleWriter, {cudfBatch}, 2, {blocksPid0, blocksPid1});
+}
+
+TEST_P(GpuPartitionHashShuffleWriterTest, cudfVectorCpuValueStreamGpuBoundary) {
+  auto input = makeRowVector(
+      {makeFlatVector<StringView>({"US", "CA", "GB"}),
+       makeFlatVector<int64_t>({101, 202, 303})});
+  auto cudfBatch = toCudfBatch(input);
+
+  // A CPU ValueStream boundary must explicitly materialize CudfVector on the
+  // host. CudfVector has no RowVector children, so merely re-wrapping its
+  // children would produce the invalid two-field/zero-child vector that used
+  // to crash the downstream CudfFromVelox operator.
+  auto cpuBoundary = materializeRowVectorStreamBatch(
+      pool(), cudfBatch, asRowType(input->type()));
+  ASSERT_EQ(cpuBoundary->childrenSize(), input->type()->size());
+  facebook::velox::test::assertEqualVectors(input, cpuBoundary);
+
+  // Exercise the following GPU boundary as well. This mirrors CudfFromVelox:
+  // the validated CPU RowVector must be convertible back to a device table
+  // without relying on a damaged RowVector contract.
+  auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
+  auto table = cudf_velox::with_arrow::toCudfTable(
+      cpuBoundary,
+      pool(),
+      stream,
+      cudf_velox::get_output_mr());
+  auto gpuBoundary = std::make_shared<cudf_velox::CudfVector>(
+      pool(), input->type(), input->size(), std::move(table), stream);
+  auto roundTrip = cudf_velox::with_arrow::toVeloxColumn(
+      gpuBoundary->getTableView(),
+      pool(),
+      asRowType(input->type()),
+      "",
+      stream,
+      cudf_velox::get_temp_mr());
+  stream.synchronize();
+  facebook::velox::test::assertEqualVectors(input, roundTrip);
 }
 
 TEST_P(GpuPartitionHashShuffleWriterTest, gpuPartitionVariableWidth) {
@@ -881,7 +926,8 @@ class GpuShufflePartitionBenchmark : public GpuVeloxShuffleWriterTest {
 
   std::shared_ptr<ColumnarBatch> toCudfBatch(const RowVectorPtr& rv) {
     auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
-    auto table = cudf_velox::with_arrow::toCudfTable(rv, pool(), stream);
+    auto table = cudf_velox::with_arrow::toCudfTable(
+        rv, pool(), stream, cudf_velox::get_output_mr());
     auto cudfVec = std::make_shared<cudf_velox::CudfVector>(
         pool(), rv->type(), rv->size(), std::move(table), stream);
     return std::make_shared<VeloxColumnarBatch>(cudfVec, rv->type()->size());
@@ -898,7 +944,8 @@ TEST_P(GpuShufflePartitionBenchmark, benchCpuVsGpu) {
 
   // Build CudfVector (data on GPU) — the common starting point for both paths.
   auto stream = cudf_velox::cudfGlobalStreamPool().get_stream();
-  auto gpuTable = cudf_velox::with_arrow::toCudfTable(benchData, pool(), stream);
+  auto gpuTable = cudf_velox::with_arrow::toCudfTable(
+      benchData, pool(), stream, cudf_velox::get_output_mr());
   auto cudfVec = std::make_shared<cudf_velox::CudfVector>(
       pool(), benchData->type(), benchData->size(), std::move(gpuTable), stream);
 
@@ -934,7 +981,11 @@ TEST_P(GpuShufflePartitionBenchmark, benchCpuVsGpu) {
       // Step 1: D2H — simulate what VeloxColumnarBatch::from() does for CudfVector
       auto t0 = std::chrono::high_resolution_clock::now();
       auto cpuRv = cudf_velox::with_arrow::toVeloxColumn(
-          cudfVec->getTableView(), pool(), std::string(""), cudfVec->stream());
+          cudfVec->getTableView(),
+          pool(),
+          std::string(""),
+          cudfVec->stream(),
+          cudf_velox::get_temp_mr());
       cudfVec->stream().synchronize();
       auto t1 = std::chrono::high_resolution_clock::now();
 

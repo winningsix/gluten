@@ -30,6 +30,7 @@
 #include "utils/qat/QatCodec.h"
 #endif
 #ifdef GLUTEN_ENABLE_GPU
+#include "cudf/CheckOverflowInTableInsertCudf.h"
 #include "operators/plannodes/CudfVectorStream.h"
 #include "ucs/config/global_opts.h"
 #include "ucs/debug/debug.h"
@@ -38,10 +39,6 @@
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
-#endif
-
-#ifdef GLUTEN_ENABLE_GPU
-DEFINE_bool(velox_ucx_exchange, false, "Enable Velox UCX exchange.");
 #endif
 
 #include "compute/VeloxRuntime.h"
@@ -299,6 +296,8 @@ void VeloxBackend::init(
     auto& cudfConfig = velox::cudf_velox::CudfConfig::getInstance();
     cudfConfig.initialize(std::move(options));
     velox::cudf_velox::registerCudf();
+    registerCheckOverflowInTableInsertCudfFunction(
+        cudfConfig.functionNamePrefix);
     velox::exec::Operator::registerOperator(std::make_unique<CudfVectorStreamOperatorTranslator>());
 
     // Initialize the UCX Communicator once per process. Required so that
@@ -505,38 +504,52 @@ VeloxBackend* VeloxBackend::get() {
 }
 
 void VeloxBackend::tearDown() {
+  if (tornDown_.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  try {
 #ifdef GLUTEN_ENABLE_GPU
-  if (ucxCommunicator_) {
-    ucxCommunicator_->stop();
-  }
-  if (ucxCommunicatorThread_.joinable()) {
-    ucxCommunicatorThread_.join();
-  }
-  ucxCommunicator_.reset();
+    if (ucxCommunicator_) {
+      ucxCommunicator_->stop();
+    }
+    if (ucxCommunicatorThread_.joinable()) {
+      ucxCommunicatorThread_.join();
+    }
+    // The progress thread is now gone. Drain all communicator-owned children
+    // and UCXX resources while the backend and singleton still provide stable
+    // keepalive references, then release both owners in that order.
+    facebook::velox::ucx_exchange::Communicator::shutdown();
+    ucxCommunicator_.reset();
 #endif
 
 #ifdef ENABLE_HDFS
-  for (const auto& [_, filesystem] : facebook::velox::filesystems::registeredFilesystems) {
-    filesystem->close();
-  }
+    for (const auto& [_, filesystem] : facebook::velox::filesystems::registeredFilesystems) {
+      filesystem->close();
+    }
 #endif
 
-  // Destruct IOThreadPoolExecutor will join all threads.
-  // On threads exit, thread local variables can be constructed with referencing global variables.
-  // So, we need to destruct IOThreadPoolExecutor and stop the threads before global variables get destructed.
-  ioExecutor_.reset();
-  globalMemoryManager_.reset();
+    // Destruct IOThreadPoolExecutor will join all threads.
+    // On threads exit, thread local variables can be constructed with referencing global variables.
+    // So, we need to destruct IOThreadPoolExecutor and stop the threads before global variables get destructed.
+    ioExecutor_.reset();
+    globalMemoryManager_.reset();
 
-  // dump cache stats on exit if enabled
-  if (dynamic_cast<facebook::velox::cache::AsyncDataCache*>(asyncDataCache_.get())) {
-    LOG(INFO) << asyncDataCache_->toString();
-    for (const auto& entry : std::filesystem::directory_iterator(cachePathPrefix_)) {
-      if (entry.path().filename().string().find(cacheFilePrefix_) != std::string::npos) {
-        LOG(INFO) << "Removing cache file " << entry.path().filename().string();
-        std::filesystem::remove(cachePathPrefix_ + "/" + entry.path().filename().string());
+    // dump cache stats on exit if enabled
+    if (dynamic_cast<facebook::velox::cache::AsyncDataCache*>(asyncDataCache_.get())) {
+      LOG(INFO) << asyncDataCache_->toString();
+      for (const auto& entry : std::filesystem::directory_iterator(cachePathPrefix_)) {
+        if (entry.path().filename().string().find(cacheFilePrefix_) != std::string::npos) {
+          LOG(INFO) << "Removing cache file " << entry.path().filename().string();
+          std::filesystem::remove(cachePathPrefix_ + "/" + entry.path().filename().string());
+        }
       }
+      asyncDataCache_->shutdown();
     }
-    asyncDataCache_->shutdown();
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Ignoring terminal VeloxBackend teardown failure: "
+               << e.what();
+  } catch (...) {
+    LOG(ERROR) << "Ignoring unknown terminal VeloxBackend teardown failure";
   }
 }
 

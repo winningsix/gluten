@@ -25,7 +25,7 @@ import org.apache.gluten.substrait.rel.LocalFilesNode.ReadFileFormat
 
 import org.apache.spark.softaffinity.SoftAffinity
 import org.apache.spark.sql.catalyst.catalog.ExternalCatalogUtils
-import org.apache.spark.sql.connector.read.Scan
+import org.apache.spark.sql.connector.read.{InputPartition, Scan}
 import org.apache.spark.sql.types.StructType
 
 import org.apache.iceberg._
@@ -35,8 +35,21 @@ import java.lang.{Class, Long => JLong}
 import java.util.{ArrayList => JArrayList, HashMap => JHashMap, List => JList, Map => JMap}
 
 import scala.collection.JavaConverters._
+import scala.util.control.NonFatal
 
 object GlutenIcebergSourceUtil {
+
+  private[source] case class IcebergSplitMetadata(
+      path: String,
+      start: Long,
+      length: Long,
+      partitionColumns: JMap[String, String],
+      deleteFiles: JList[DeleteFile],
+      fileFormat: FileFormat)
+
+  private[source] case class IcebergPartitionMetadata(
+      splits: Seq[IcebergSplitMetadata],
+      preferredLocations: Seq[String])
 
   def getClassOfSparkBatchQueryScan(): Class[SparkBatchQueryScan] = {
     classOf[SparkBatchQueryScan]
@@ -51,6 +64,68 @@ object GlutenIcebergSourceUtil {
     }
   }
 
+  /**
+   * Returns the scan cost and file-format merge key of one native Iceberg input partition. The open
+   * cost is charged once per physical data or delete file, matching Spark's file partition planning
+   * model.
+   */
+  def inputPartitionPlanningInfo(
+      inputPartition: InputPartition,
+      openCostInBytes: Long): Option[(Long, String)] = {
+    if (
+      inputPartition == null || inputPartition.getClass != classOf[SparkInputPartition] ||
+      openCostInBytes < 0
+    ) {
+      return None
+    }
+
+    try {
+      val tasks = inputPartition
+        .asInstanceOf[SparkInputPartition]
+        .taskGroup[ScanTask]()
+        .tasks()
+        .asScala
+        .toList
+      if (tasks.isEmpty) {
+        return None
+      }
+
+      val fileTasks = asFileScanTask(tasks)
+      if (fileTasks.isEmpty) {
+        return None
+      }
+      val fileFormat = fileTasks.head.file().format()
+      if (fileFormat == null || fileTasks.exists(_.file().format() != fileFormat)) {
+        return None
+      }
+
+      var total = 0L
+      fileTasks.foreach {
+        task =>
+          val taskBytes = task.sizeBytes()
+          if (taskBytes < 0 || taskBytes > Long.MaxValue - total) {
+            return None
+          }
+          total += taskBytes
+          val fileCount = task.filesCount()
+          if (
+            fileCount <= 0 ||
+            (openCostInBytes > 0 && fileCount.toLong > Long.MaxValue / openCostInBytes)
+          ) {
+            return None
+          }
+          val taskOpenCost = openCostInBytes * fileCount.toLong
+          if (taskOpenCost > Long.MaxValue - total) {
+            return None
+          }
+          total += taskOpenCost
+      }
+      Some((total, fileFormat.toString))
+    } catch {
+      case NonFatal(_) => None
+    }
+  }
+
   def genSplitInfo(
       partition: SparkDataSourceRDDPartition,
       readPartitionSchema: StructType,
@@ -62,29 +137,22 @@ object GlutenIcebergSourceUtil {
     val deleteFilesList = new JArrayList[JList[DeleteFile]]()
     var fileFormat = ReadFileFormat.UnknownFormat
 
-    partition.inputPartitions.foreach {
-      case partition: SparkInputPartition =>
-        val tasks = partition.taskGroup[ScanTask]().tasks().asScala
-        asFileScanTask(tasks.toList).foreach {
-          task =>
-            paths.add(
-              BackendsApiManager.getTransformerApiInstance
-                .encodeFilePathIfNeed(ContentFileUtil.getFilePath(task.file())))
-            starts.add(task.start())
-            lengths.add(task.length())
-            partitionColumns.add(getPartitionColumns(task, readPartitionSchema))
-            deleteFilesList.add(task.deletes())
-            val currentFileFormat = convertFileFormat(task.file().format())
-            if (fileFormat == ReadFileFormat.UnknownFormat) {
-              fileFormat = currentFileFormat
-            } else if (fileFormat != currentFileFormat) {
-              throw new UnsupportedOperationException(
-                s"Only one file format is supported, " +
-                  s"find different file format $fileFormat and $currentFileFormat")
-            }
+    val metadata = collectPartitionMetadata(partition, readPartitionSchema)
+    metadata.splits.foreach {
+      split =>
+        paths.add(BackendsApiManager.getTransformerApiInstance.encodeFilePathIfNeed(split.path))
+        starts.add(split.start)
+        lengths.add(split.length)
+        partitionColumns.add(split.partitionColumns)
+        deleteFilesList.add(split.deleteFiles)
+        val currentFileFormat = convertFileFormat(split.fileFormat)
+        if (fileFormat == ReadFileFormat.UnknownFormat) {
+          fileFormat = currentFileFormat
+        } else if (fileFormat != currentFileFormat) {
+          throw new UnsupportedOperationException(
+            s"Only one file format is supported, " +
+              s"find different file format $fileFormat and $currentFileFormat")
         }
-      case o =>
-        throw new GlutenNotSupportException(s"Unsupported input partition type: $o")
     }
     if (fileFormat == ReadFileFormat.UnknownFormat) {
       fileFormat = defaultFileFormat
@@ -97,11 +165,33 @@ object GlutenIcebergSourceUtil {
       partitionColumns,
       fileFormat,
       SoftAffinity
-        .getFilePartitionLocations(paths.asScala.toArray, partition.preferredLocations())
+        .getFilePartitionLocations(paths.asScala.toArray, metadata.preferredLocations.toArray)
         .toList
         .asJava,
       deleteFilesList
     )
+  }
+
+  private[source] def collectPartitionMetadata(
+      partition: SparkDataSourceRDDPartition,
+      readPartitionSchema: StructType): IcebergPartitionMetadata = {
+    val splits = partition.inputPartitions.flatMap {
+      case inputPartition: SparkInputPartition =>
+        val tasks = inputPartition.taskGroup[ScanTask]().tasks().asScala
+        asFileScanTask(tasks.toList).map {
+          task =>
+            IcebergSplitMetadata(
+              ContentFileUtil.getFilePath(task.file()),
+              task.start(),
+              task.length(),
+              getPartitionColumns(task, readPartitionSchema),
+              task.deletes(),
+              task.file().format())
+        }
+      case other =>
+        throw new GlutenNotSupportException(s"Unsupported input partition type: $other")
+    }
+    IcebergPartitionMetadata(splits, partition.preferredLocations().toSeq)
   }
 
   def genEmptySplitInfo(defaultFileFormat: ReadFileFormat): SplitInfo =
