@@ -636,6 +636,7 @@ if(ENABLE_GPU)
   target_link_libraries(
     velox
     PRIVATE -Wl,--whole-archive
+            ${VELOX_BUILD_PATH}/velox/experimental/cudf/libvelox_cudf_common.a
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/exec/libvelox_cudf_exec.a
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/vector/libvelox_cudf_vector.a
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/libvelox_cudf_hive_connector.a

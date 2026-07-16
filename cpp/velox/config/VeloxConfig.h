@@ -266,6 +266,20 @@ const std::string kCudfConcatOptimizationEnabled =
     "spark.gluten.sql.columnar.backend.velox.cudf.concat_optimization_enabled";
 const std::string kCudfConcatOptimizationEnabledDefault = "false";
 
+// Enables cuDF's persistent FINAL streaming groupby with a fixed distinct-key
+// capacity. Zero keeps the all-GPU levelled aggregation path.
+const std::string kCudfGroupbyStreamingMaxDistinctKeys =
+    "spark.gluten.sql.columnar.backend.velox.cudf.groupbyStreamingMaxDistinctKeys";
+const std::string kCudfGroupbyStreamingMaxDistinctKeysDefault = "0";
+
+const std::string kCudfOrderBySortedRunBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.orderBySortedRunBytes";
+const std::string kCudfOrderBySortedRunBytesDefault = "268435456";
+
+const std::string kCudfOrderByMergeFanIn =
+    "spark.gluten.sql.columnar.backend.velox.cudf.orderByMergeFanIn";
+const std::string kCudfOrderByMergeFanInDefault = "8";
+
 // Forward to IBM CudfConfig::kCudfBatchSizeMinThreshold. Target minimum row
 // count CudfBatchConcat coalesces upstream batches up to. Only used when
 // kCudfConcatOptimizationEnabled is true. Default 100000 matches velox's

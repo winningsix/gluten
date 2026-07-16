@@ -1194,6 +1194,85 @@ const core::WindowNode::Frame SubstraitToVeloxPlanConverter::createWindowFrame(
   return frame;
 }
 
+bool detail::isPartitionedRankLikeWindow(
+    const std::vector<core::WindowNode::Function>& functions,
+    const std::vector<core::FieldAccessTypedExprPtr>& partitionKeys,
+    const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys) {
+  return !functions.empty() && !partitionKeys.empty() &&
+      !sortingKeys.empty() &&
+      std::all_of(
+          functions.begin(),
+          functions.end(),
+          [](const core::WindowNode::Function& function) {
+            const auto& name = function.functionCall->name();
+            return (name == "row_number" || name == "rank") &&
+                function.functionCall->inputs().empty() &&
+                !function.ignoreNulls &&
+                function.frame.startType ==
+                core::WindowNode::BoundType::kUnboundedPreceding &&
+                function.frame.endType ==
+                core::WindowNode::BoundType::kCurrentRow &&
+                function.frame.startValue == nullptr &&
+                function.frame.endValue == nullptr;
+          });
+}
+
+bool detail::orderByMatchesWindow(
+    const core::OrderByNode& orderBy,
+    const std::vector<core::FieldAccessTypedExprPtr>& partitionKeys,
+    const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys,
+    const std::vector<core::SortOrder>& sortingOrders) {
+  const auto expectedKeys = partitionKeys.size() + sortingKeys.size();
+  if (orderBy.isPartial() ||
+      orderBy.sortingKeys().size() != expectedKeys ||
+      orderBy.sortingOrders().size() != expectedKeys) {
+    return false;
+  }
+  for (size_t i = 0; i < partitionKeys.size(); ++i) {
+    const auto& order = orderBy.sortingOrders()[i];
+    if (orderBy.sortingKeys()[i]->name() != partitionKeys[i]->name() ||
+        !order.isAscending() || !order.isNullsFirst()) {
+      return false;
+    }
+  }
+  for (size_t i = 0; i < sortingKeys.size(); ++i) {
+    const auto orderIndex = partitionKeys.size() + i;
+    const auto& actualOrder = orderBy.sortingOrders()[orderIndex];
+    const auto& expectedOrder = sortingOrders[i];
+    if (orderBy.sortingKeys()[orderIndex]->name() != sortingKeys[i]->name() ||
+        actualOrder.isAscending() != expectedOrder.isAscending() ||
+        actualOrder.isNullsFirst() != expectedOrder.isNullsFirst()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+detail::WindowInputOrdering detail::selectWindowInputOrdering(
+    const core::PlanNodePtr& input,
+    const std::vector<core::WindowNode::Function>& functions,
+    const std::vector<core::FieldAccessTypedExprPtr>& partitionKeys,
+    const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys,
+    const std::vector<core::SortOrder>& sortingOrders) {
+  const auto isStreamingRank =
+      isPartitionedRankLikeWindow(functions, partitionKeys, sortingKeys);
+  if (auto orderBy =
+          std::dynamic_pointer_cast<const core::OrderByNode>(input)) {
+    if (isStreamingRank &&
+        orderByMatchesWindow(
+            *orderBy, partitionKeys, sortingKeys, sortingOrders)) {
+      return {input, true};
+    }
+
+    VELOX_CHECK_EQ(orderBy->sources().size(), 1);
+    return {orderBy->sources().front(), false};
+  }
+
+  // Rank input is sorted only when a matching OrderBy proves the complete
+  // ordering contract. Preserve the legacy behavior for all other Windows.
+  return {input, !isStreamingRank};
+}
+
 core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::WindowRel& windowRel) {
   core::PlanNodePtr childNode;
   if (windowRel.has_input()) {
@@ -1264,19 +1343,16 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
     }
   }
 
-  // Spark normally places a Sort immediately below Window.  Velox Window can
-  // consume unsorted input and owns the partition/order semantics itself.  In
-  // particular, the cuDF implementation uses this form to hash-spill complete
-  // partitions before sorting each spill bucket.  Keeping the standalone
-  // OrderBy here would first materialize the whole relation on the device and
-  // defeat the bounded-memory Window implementation.
-  bool inputsSorted = true;
-  if (auto orderBy =
-          std::dynamic_pointer_cast<const core::OrderByNode>(childNode)) {
-    VELOX_CHECK_EQ(orderBy->sources().size(), 1);
-    childNode = orderBy->sources().front();
-    inputsSorted = false;
-  }
+  // Generic native conversion can stream any partitioned rank-like Window
+  // whose child OrderBy proves the complete contract: partition keys ASC
+  // NULLS FIRST followed by the Window order keys. This decision is independent
+  // of the optional Spark WindowGroupLimit pruning rewrite.
+  const auto windowInput = detail::selectWindowInputOrdering(
+      childNode,
+      windowNodeFunctions,
+      partitionKeys,
+      sortingKeys,
+      sortingOrders);
 
   return std::make_shared<core::WindowNode>(
       nextPlanNodeId(),
@@ -1285,8 +1361,8 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
       sortingOrders,
       windowColumnNames,
       windowNodeFunctions,
-      inputsSorted,
-      childNode);
+      windowInput.inputsSorted,
+      windowInput.input);
 }
 
 core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(
