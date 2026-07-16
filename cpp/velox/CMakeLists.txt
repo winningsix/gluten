@@ -270,12 +270,21 @@ set(GLUTEN_UCX_INCLUDE_DIR "")
 set(GLUTEN_UCX_LIBRARIES /usr/lib64/libucp.so /usr/lib64/libuct.so
                          /usr/lib64/libucs.so)
 if(DEFINED GLUTEN_UCX_HOME AND NOT "${GLUTEN_UCX_HOME}" STREQUAL "")
-  set(GLUTEN_UCX_INCLUDE_DIR ${GLUTEN_UCX_HOME})
-  set(GLUTEN_UCX_LIBRARIES ${GLUTEN_UCX_HOME}/libucp.so
-                           ${GLUTEN_UCX_HOME}/libuct.so
-                           ${GLUTEN_UCX_HOME}/libucs.so)
-  if(EXISTS "${GLUTEN_UCX_HOME}/libucm.so")
-    list(APPEND GLUTEN_UCX_LIBRARIES ${GLUTEN_UCX_HOME}/libucm.so)
+  # Accept either a standard UCX installation prefix (include/ + lib/) or
+  # the legacy flat directory containing both headers and shared libraries.
+  if(EXISTS "${GLUTEN_UCX_HOME}/include/ucp/api/ucp.h")
+    set(GLUTEN_UCX_INCLUDE_DIR ${GLUTEN_UCX_HOME}/include)
+    set(GLUTEN_UCX_LIBRARY_DIR ${GLUTEN_UCX_HOME}/lib)
+  else()
+    set(GLUTEN_UCX_INCLUDE_DIR ${GLUTEN_UCX_HOME})
+    set(GLUTEN_UCX_LIBRARY_DIR ${GLUTEN_UCX_HOME})
+  endif()
+  set(GLUTEN_UCX_LIBRARIES ${GLUTEN_UCX_LIBRARY_DIR}/libucp.so
+                           ${GLUTEN_UCX_LIBRARY_DIR}/libuct.so
+                           ${GLUTEN_UCX_LIBRARY_DIR}/libucs.so)
+  if(EXISTS "${GLUTEN_UCX_LIBRARY_DIR}/libucm.so")
+    list(APPEND GLUTEN_UCX_LIBRARIES
+         ${GLUTEN_UCX_LIBRARY_DIR}/libucm.so)
   endif()
 elseif(EXISTS /usr/lib64/libucm.so)
   list(APPEND GLUTEN_UCX_LIBRARIES /usr/lib64/libucm.so)
@@ -636,7 +645,6 @@ if(ENABLE_GPU)
   target_link_libraries(
     velox
     PRIVATE -Wl,--whole-archive
-            ${VELOX_BUILD_PATH}/velox/experimental/cudf/libvelox_cudf_common.a
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/exec/libvelox_cudf_exec.a
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/vector/libvelox_cudf_vector.a
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/libvelox_cudf_hive_connector.a

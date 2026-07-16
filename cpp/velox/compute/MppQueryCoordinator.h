@@ -34,7 +34,7 @@
 #include "velox/core/QueryCtx.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/SerializedPage.h"
-#include "velox/exec/OutputBufferManager.h"
+#include "velox/exec/DefaultOutputBufferManager.h"
 #include "velox/exec/Task.h"
 
 namespace gluten {
@@ -287,7 +287,8 @@ class MppQueryCoordinator {
   /// Output buffer reading state for the root fragment. When root is
   /// replicated we track per-replica sequence + atEnd. Drain strategy is
   /// selected at start() time based on root's inbound exchange type.
-  std::shared_ptr<facebook::velox::exec::OutputBufferManager> bufferManager_;
+  std::shared_ptr<facebook::velox::exec::DefaultOutputBufferManager>
+      bufferManager_;
   std::vector<int64_t> rootOutputSequence_;
   std::vector<bool> rootReplicaAtEnd_;
   std::deque<std::unique_ptr<facebook::velox::exec::SerializedPageBase>>
