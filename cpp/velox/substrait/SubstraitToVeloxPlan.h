@@ -27,6 +27,33 @@
 namespace gluten {
 class ResultIterator;
 
+namespace detail {
+
+bool isPartitionedRankLikeWindow(
+    const std::vector<core::WindowNode::Function>& functions,
+    const std::vector<core::FieldAccessTypedExprPtr>& partitionKeys,
+    const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys);
+
+bool orderByMatchesWindow(
+    const core::OrderByNode& orderBy,
+    const std::vector<core::FieldAccessTypedExprPtr>& partitionKeys,
+    const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys,
+    const std::vector<core::SortOrder>& sortingOrders);
+
+struct WindowInputOrdering {
+  core::PlanNodePtr input;
+  bool inputsSorted;
+};
+
+WindowInputOrdering selectWindowInputOrdering(
+    const core::PlanNodePtr& input,
+    const std::vector<core::WindowNode::Function>& functions,
+    const std::vector<core::FieldAccessTypedExprPtr>& partitionKeys,
+    const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys,
+    const std::vector<core::SortOrder>& sortingOrders);
+
+} // namespace detail
+
 struct SplitInfo {
   enum class LeafType {
     /// A streaming node that accepts iterator splits.

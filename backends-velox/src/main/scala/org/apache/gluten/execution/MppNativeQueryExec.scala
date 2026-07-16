@@ -40,7 +40,7 @@ import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeSet, DenseRank, Expression, Literal, NamedExpression, Rank, RowNumber, WindowExpression}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression, NamedExpression}
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Complete, Final, Partial}
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
@@ -1096,9 +1096,25 @@ case class MppNativeQueryExec(
     val afterFinalAggSplit = splitFinalAggBeforeJoinHub(afterFinalAggTopNPartial)
     val afterExistenceSplit = splitExistenceFinalBeforeJoinHub(afterFinalAggSplit)
     val afterNativeLocalSorts = offloadLocalSorts(afterExistenceSplit)
-    val afterRedundantRankWindow =
-      eliminateRankWindowAfterFinalGroupLimit(afterNativeLocalSorts)
-    val afterNativeHashJoins = offloadLocalHashJoins(afterRedundantRankWindow)
+    // Remove Spark's WindowGroupLimit pruning operators by default only for cuDF MPP. Generic
+    // Substrait-to-Velox conversion independently enables streaming for a partitioned rank Window
+    // whose retained OrderBy proves the complete required ordering. An explicit false setting is a
+    // kill switch; non-cuDF MPP retains the existing physical plan unless explicitly enabled.
+    val rankFilterWindowEnabled = MppRankFilterWindowRewrite.isEnabled(
+      optionalBooleanConf(MppRankFilterWindowRewrite.EnabledKey),
+      GlutenConfig.get.enableColumnarCudf)
+    val (afterRankFilterWindow, rankFilterWindowStats) = MppRankFilterWindowRewrite(
+      afterNativeLocalSorts,
+      enabled = rankFilterWindowEnabled,
+      numPartitions = mppSparkPartitionCount)
+    if (rankFilterWindowStats.rewrittenWindows > 0) {
+      logInfo(
+        s"MppNativeQueryExec: selected native Window for " +
+          rankFilterWindowStats.rewrittenWindows + " rank-filter subtree(s); retained or " +
+          s"inserted HASH distribution (inserted " +
+          rankFilterWindowStats.insertedHashExchanges + " exchange(s))")
+    }
+    val afterNativeHashJoins = offloadLocalHashJoins(afterRankFilterWindow)
     val afterSmjHashJoinRewrite = rewriteMppSortMergeJoinToHashJoin(afterNativeHashJoins)
     val afterBuildSideNormalization = normalizeMppJoinBuildSide(afterSmjHashJoinRewrite)
     val afterBroadcastPushdown =
@@ -1175,75 +1191,6 @@ case class MppNativeQueryExec(
         FilterExecTransformer(filter.condition, filter.child)
       case project: ProjectExec if project.child.isInstanceOf[TransformSupport] =>
         ProjectExecTransformer(project.projectList, project.child)
-    }
-  }
-
-  /**
-   * Spark keeps WindowGroupLimit(Final, limit=1) as a pruning operator below the original
-   * Window(row_number/rank/dense_rank) and Filter(rank=1). After the final group limit every
-   * remaining row is already in the first peer group, so the required local Sort and Window are
-   * redundant: the rank column is exactly one. Keeping the Sort defeats the bounded cuDF
-   * TopNRowNumber implementation by buffering every emitted spill bucket again.
-   *
-   * Preserve the rank attribute's ExprId so the existing Filter and upper Project remain valid;
-   * later native project/filter folding removes the now-constant predicate.
-   */
-  private def eliminateRankWindowAfterFinalGroupLimit(plan: SparkPlan): SparkPlan = {
-    def findFinalLimitOneGroupLimit(child: SparkPlan): Option[WindowGroupLimitExecTransformer] = {
-      child match {
-        case groupLimit: WindowGroupLimitExecTransformer
-            if groupLimit.limit == 1 &&
-              groupLimit.mode == org.apache.spark.sql.execution.window.GlutenFinal =>
-          Some(groupLimit)
-        // PullOutPreProject materializes non-trivial partition/order expressions
-        // between Sort and WindowGroupLimit.  The project must remain in the
-        // output path, but it must not hide the bounded ranking operator from
-        // this rewrite.
-        case project: ProjectExecTransformer =>
-          findFinalLimitOneGroupLimit(project.child)
-        case project: ProjectExec =>
-          findFinalLimitOneGroupLimit(project.child)
-        case _ => None
-      }
-    }
-
-    plan.transformUp {
-      case window: WindowExecTransformer
-          if window.child.isInstanceOf[SortExecTransformer] &&
-            isLimitOneRankWindow(window) =>
-        val sort = window.child.asInstanceOf[SortExecTransformer]
-        findFinalLimitOneGroupLimit(sort.child) match {
-          case Some(groupLimit)
-              if sameExpressions(groupLimit.partitionSpec, window.partitionSpec) &&
-                sameExpressions(groupLimit.orderSpec, window.orderSpec) =>
-            val rankOnes = window.windowExpression.map {
-              expression =>
-                Alias(Literal.create(1, expression.dataType), expression.name)(
-                  exprId = expression.exprId,
-                  qualifier = expression.qualifier,
-                  explicitMetadata = Some(expression.metadata))
-            }
-            logInfo(
-              "MppNativeQueryExec: eliminated redundant Sort+rank Window above " +
-                "WindowGroupLimit(Final, limit=1)")
-            ProjectExecTransformer(sort.child.output ++ rankOnes, sort.child)
-          case _ => window
-        }
-    }
-  }
-
-  private def isLimitOneRankWindow(window: WindowExecTransformer): Boolean = {
-    window.windowExpression.nonEmpty && window.windowExpression.forall {
-      case Alias(WindowExpression(_: RowNumber, _), _) => true
-      case Alias(WindowExpression(_: Rank, _), _) => true
-      case Alias(WindowExpression(_: DenseRank, _), _) => true
-      case _ => false
-    }
-  }
-
-  private def sameExpressions(left: Seq[Expression], right: Seq[Expression]): Boolean = {
-    left.length == right.length && left.zip(right).forall {
-      case (leftExpression, rightExpression) => leftExpression.semanticEquals(rightExpression)
     }
   }
 

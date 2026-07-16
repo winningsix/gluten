@@ -693,6 +693,33 @@ object VeloxConfig extends ConfigRegistry {
       .intConf
       .createWithDefault(50)
 
+  val CUDF_GROUPBY_STREAMING_MAX_DISTINCT_KEYS =
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.groupbyStreamingMaxDistinctKeys")
+      .doc(
+        "Maximum distinct keys retained by cuDF FINAL streaming groupby. " +
+          "Set to 0 to keep the all-GPU levelled aggregation path. A positive value also " +
+          "requires every input batch to be no larger than the capacity and capacity plus " +
+          "batch rows to be at most 2147483647.")
+      .intConf
+      .checkValue(
+        value => value >= 0 && value <= Integer.MAX_VALUE,
+        "must be between 0 and 2147483647")
+      .createWithDefault(0)
+
+  val CUDF_ORDER_BY_SORTED_RUN_BYTES =
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.orderBySortedRunBytes")
+      .doc("Approximate bytes buffered before cuDF OrderBy spills a sorted run.")
+      .longConf
+      .checkValue(_ > 0, "must be positive")
+      .createWithDefault(256L * 1024 * 1024)
+
+  val CUDF_ORDER_BY_MERGE_FAN_IN =
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.orderByMergeFanIn")
+      .doc("Number of sorted runs compacted by one cuDF OrderBy merge group.")
+      .intConf
+      .checkValue(value => value >= 2 && value <= 64, "must be between 2 and 64")
+      .createWithDefault(8)
+
   val CUDF_TIMESTAMP_UNIT =
     buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.timestampUnit")
       .doc("cuDF timestamp unit. Spark timestamps use microseconds by default.")

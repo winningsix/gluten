@@ -271,6 +271,18 @@ void VeloxBackend::init(
         // concat-with-bufferedResult_ cost in high-cardinality groupbys.
         {velox::cudf_velox::CudfConfig::kCudfConcatOptimizationEnabled,
          backendConf_->get(kCudfConcatOptimizationEnabled, kCudfConcatOptimizationEnabledDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys,
+         backendConf_->get(
+             kCudfGroupbyStreamingMaxDistinctKeys,
+             kCudfGroupbyStreamingMaxDistinctKeysDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfOrderBySortedRunBytes,
+         backendConf_->get(
+             kCudfOrderBySortedRunBytes,
+             kCudfOrderBySortedRunBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfOrderByMergeFanIn,
+         backendConf_->get(
+             kCudfOrderByMergeFanIn,
+             kCudfOrderByMergeFanInDefault)},
         {velox::cudf_velox::CudfConfig::kCudfBatchSizeMinThreshold,
          backendConf_->get(kCudfBatchSizeMinThreshold, kCudfBatchSizeMinThresholdDefault)},
         // Forward the ucx-exchange VLOG level so CudfConfig.exchangeLogLevel is

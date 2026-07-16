@@ -131,6 +131,7 @@ add_velox_test(
   VeloxSubstraitRoundTripTest.cc
   VeloxSubstraitSignatureTest.cc
   VeloxToSubstraitTypeTest.cc)
+target_link_libraries(velox_plan_conversion_test Folly::folly)
 add_velox_test(spark_functions_test SOURCES SparkFunctionTest.cc
                FunctionTest.cc)
 add_velox_test(runtime_test SOURCES RuntimeTest.cc)
