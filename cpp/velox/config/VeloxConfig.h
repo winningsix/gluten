@@ -264,7 +264,7 @@ const std::string kCudfAstExpressionEnabledDefault = "true";
 // non-converging groupbys such as Q18 lineitem-by-l_orderkey).
 const std::string kCudfConcatOptimizationEnabled =
     "spark.gluten.sql.columnar.backend.velox.cudf.concat_optimization_enabled";
-const std::string kCudfConcatOptimizationEnabledDefault = "false";
+const std::string kCudfConcatOptimizationEnabledDefault = "true";
 
 // Enables cuDF's persistent FINAL streaming groupby with a fixed distinct-key
 // capacity. Zero keeps the all-GPU levelled aggregation path.
@@ -288,6 +288,12 @@ const std::string kCudfOrderByMergeFanInDefault = "8";
 const std::string kCudfBatchSizeMinThreshold =
     "spark.gluten.sql.columnar.backend.velox.cudf.batch_size_min_threshold";
 const std::string kCudfBatchSizeMinThresholdDefault = "100000";
+
+// Byte threshold for CudfBatchConcat.  Keep this independent from the row
+// guard so a wide GPU batch is forwarded as soon as it reaches the compute
+// target even when its row count is small.
+const std::string kCudfBatchSizeMinThresholdBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.batch_size_min_threshold_bytes";
 
 const std::string kCudfGpuTargetBatchRows = "spark.gluten.sql.columnar.backend.velox.cudf.gpuTargetBatchRows";
 const std::string kCudfGpuTargetBatchRowsDefault = "1000000";

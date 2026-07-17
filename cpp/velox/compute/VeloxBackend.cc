@@ -282,6 +282,11 @@ void VeloxBackend::init(
              kCudfOrderByMergeFanInDefault)},
         {velox::cudf_velox::CudfConfig::kCudfBatchSizeMinThreshold,
          backendConf_->get(kCudfBatchSizeMinThreshold, kCudfBatchSizeMinThresholdDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfBatchSizeMinThresholdBytes,
+         backendConf_->get(
+             kCudfBatchSizeMinThresholdBytes,
+             backendConf_->get(
+                 kCudfGpuTargetBatchBytes, kCudfGpuTargetBatchBytesDefault))},
         // Forward the ucx-exchange VLOG level so CudfConfig.exchangeLogLevel is
         // populated BEFORE the once-per-process Communicator starts here at
         // backend init (Communicator::start reads it and calls
