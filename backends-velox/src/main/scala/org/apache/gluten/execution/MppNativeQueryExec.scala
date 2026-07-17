@@ -46,11 +46,13 @@ import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Complete, Final, Partial}
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
 import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi, RightOuter}
-import org.apache.spark.sql.catalyst.plans.logical.{Join, Statistics}
+import org.apache.spark.sql.catalyst.plans.logical.{Join, LeafNode, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
+import org.apache.spark.sql.connector.read.SupportsReportStatistics
 import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ColumnarShuffleExchangeExec, ExecSubqueryExpression, ExternalRDDScanExec, FilterExec, InputAdapter, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
+import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeExec, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BuildSideRelation, HashedRelationBroadcastMode, ShuffledHashJoinExec}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
@@ -2213,7 +2215,11 @@ case class MppNativeQueryExec(
 
   private case class BuildSideChoice(side: BuildSide, reason: String)
 
-  private case class JoinSideStats(sizeInBytes: BigInt, rowCount: Option[BigInt], source: String)
+  private case class JoinSideStats(
+      sizeInBytes: BigInt,
+      rowCount: Option[BigInt],
+      rowCountIsDirect: Boolean,
+      source: String)
 
   /**
    * Align MPP hash-join fragmenting with Presto's replicated join shape. When one side is small
@@ -2781,7 +2787,7 @@ case class MppNativeQueryExec(
    * streamed/build input order. This rule decides the build side in the Spark/Gluten physical plan
    * layer rather than relying on table-name special cases or native operators to reinterpret it.
    */
-  private def normalizeMppJoinBuildSide(plan: SparkPlan): SparkPlan = {
+  private[execution] def normalizeMppJoinBuildSide(plan: SparkPlan): SparkPlan = {
     if (!normalizeMppJoinBuildSideEnabled) {
       return plan
     }
@@ -2978,6 +2984,9 @@ case class MppNativeQueryExec(
       }
       .orElse {
         selectiveAggregateFilterBuildSide(join)
+      }
+      .orElse {
+        smallPreservedScanOuterBuildSide(join)
       }
       .orElse {
         statsBuildSide(join)
@@ -3209,17 +3218,149 @@ case class MppNativeQueryExec(
   private def statsBuildSide(join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
     Seq(logicalJoinStats(join), childLogicalStats(join)).flatten.flatMap {
       case (leftStats, rightStats) =>
-        chooseSmallerBuildSide(leftStats, rightStats).map {
+        chooseSmallerBuildSide(leftStats, rightStats).flatMap {
           side =>
-            BuildSideChoice(
-              side,
-              s"${leftStats.source} selected smaller build side " +
-                s"(leftSize=${leftStats.sizeInBytes}, rightSize=${rightStats.sizeInBytes}, " +
-                s"leftRows=${leftStats.rowCount.getOrElse("unknown")}, " +
-                s"rightRows=${rightStats.rowCount.getOrElse("unknown")})"
-            )
+            if (!isStatsBuildSideFlipSafe(join, side, leftStats, rightStats)) {
+              None
+            } else {
+              Some(
+                BuildSideChoice(
+                  side,
+                  s"${leftStats.source} selected smaller build side " +
+                    s"(leftSize=${leftStats.sizeInBytes}, rightSize=${rightStats.sizeInBytes}, " +
+                    s"leftRows=${leftStats.rowCount.getOrElse("unknown")}, " +
+                    s"rightRows=${rightStats.rowCount.getOrElse("unknown")})"
+                ))
+            }
         }
     }.headOption
+  }
+
+  /**
+   * Select a preserved outer side when it is a non-row-amplifying scan pipeline and both its
+   * scan-reported row estimate and projected-size estimates are below conservative eligibility
+   * thresholds. This does not compare the candidate with the untrusted current build; relative
+   * choices remain in [[statsBuildSide]], where both estimates must be trustworthy.
+   *
+   * These thresholds guard the physical-plan choice; they are not runtime hash-table memory bounds.
+   */
+  private def smallPreservedScanOuterBuildSide(
+      join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
+    val (candidateSide, candidatePlan, currentBuildPlan) = (join.joinType, join.buildSide) match {
+      case (LeftOuter, BuildRight) => (BuildLeft, join.left, join.right)
+      case (RightOuter, BuildLeft) => (BuildRight, join.right, join.left)
+      case _ => return None
+    }
+
+    val maxBytes = outerJoinSmallScanMaxEstimatedBytes
+    val maxRows = outerJoinSmallScanMaxEstimatedRows
+    if (maxBytes <= 0 || !isSimpleScanStatsPipeline(candidatePlan)) {
+      return None
+    }
+
+    val candidates = joinSideStatsCandidates(join)
+    val currentBuildIsTrusted = candidates.exists {
+      case (leftStats, rightStats) =>
+        val currentStats = if (join.buildSide == BuildLeft) leftStats else rightStats
+        isJoinSideStatsTrusted(currentBuildPlan, currentStats)
+    }
+    if (currentBuildIsTrusted) {
+      return None
+    }
+
+    val candidateSize = candidates.iterator
+      .map {
+        case (leftStats, rightStats) =>
+          if (candidateSide == BuildLeft) leftStats.sizeInBytes else rightStats.sizeInBytes
+      }
+      .find(isConfidentSize) match {
+      case Some(size) if size <= maxBytes => size
+      case _ => return None
+    }
+
+    scanReportedRowEstimate(candidatePlan) match {
+      case Some(rows) if rows >= 0 && rows <= maxRows =>
+        Some(
+          BuildSideChoice(
+            candidateSide,
+            s"small preserved scan selected as outer build without comparing the " +
+              s"untrusted current build " +
+              s"(estimatedSize=$candidateSize, " +
+              s"scanEstimatedRows=$rows, maxEstimatedBytes=$maxBytes, " +
+              s"maxEstimatedRows=$maxRows)"
+          ))
+      case _ => None
+    }
+  }
+
+  private def isStatsBuildSideFlipSafe(
+      join: ShuffledHashJoinExecTransformer,
+      candidateSide: BuildSide,
+      leftStats: JoinSideStats,
+      rightStats: JoinSideStats): Boolean = {
+    if (candidateSide == join.buildSide) {
+      return true
+    }
+    join.joinType match {
+      case LeftOuter | RightOuter =>
+      case _ => return true
+    }
+
+    Seq(join.left -> leftStats, join.right -> rightStats).forall {
+      case (plan, stats) => isJoinSideStatsTrusted(plan, stats)
+    }
+  }
+
+  private def isJoinSideStatsTrusted(plan: SparkPlan, stats: JoinSideStats): Boolean = {
+    stats.rowCountIsDirect || isSimpleScanStatsPipeline(plan)
+  }
+
+  private def isSimpleScanStatsPipeline(plan: SparkPlan): Boolean = plan match {
+    case _: ReusedExchangeExec | _: BroadcastQueryStageExec | _: ShuffleQueryStageExec |
+        _: InMemoryTableScanExec | _: MppPreparedChildExec |
+        _: org.apache.gluten.extension.MppSchemaOnlyExec =>
+      false
+    case _: BasicScanExecTransformer | _: LocalTableScanExec | _: LocalTableScanExecTransformer =>
+      true
+    case leaf: LeafExecNode => leaf.logicalLink.exists(_.isInstanceOf[LeafNode])
+    case _: ProjectExec | _: ProjectExecTransformer | _: FilterExec | _: FilterExecTransformer |
+        _: SortExec | _: SortExecTransformer | _: WholeStageTransformer | _: Exchange |
+        _: InputIteratorTransformer | _: ColumnarInputAdapter =>
+      plan.children match {
+        case Seq(child) => isSimpleScanStatsPipeline(child)
+        case _ => false
+      }
+    case _ => false
+  }
+
+  private def scanReportedRowEstimate(plan: SparkPlan): Option[BigInt] = {
+    val reports = plan.collect {
+      case scan: BatchScanExecTransformerBase =>
+        try {
+          scan.logicalLink
+            .flatMap(_.stats.rowCount)
+            .orElse {
+              scan.scan match {
+                case source: SupportsReportStatistics =>
+                  val rows = source.estimateStatistics().numRows()
+                  if (rows.isPresent && rows.getAsLong >= 0) Some(BigInt(rows.getAsLong)) else None
+                case _ => None
+              }
+            }
+        } catch {
+          case NonFatal(e) =>
+            logDebug(
+              s"MppNativeQueryExec: source row statistics unavailable for ${scan.nodeName}",
+              e)
+            None
+        }
+      case scan: DatasourceScanTransformer => scan.logicalLink.flatMap(_.stats.rowCount)
+    }.flatten
+
+    reports match {
+      case Seq(rows) => Some(rows)
+      case _ => None
+    }
   }
 
   private def logicalJoinStats(
@@ -3230,8 +3371,16 @@ case class MppNativeQueryExec(
         val rightStats = logicalJoin.right.stats
         Some(
           (
-            JoinSideStats(leftStats.sizeInBytes, leftStats.rowCount, "logical join stats"),
-            JoinSideStats(rightStats.sizeInBytes, rightStats.rowCount, "logical join stats")))
+            JoinSideStats(
+              leftStats.sizeInBytes,
+              leftStats.rowCount,
+              leftStats.rowCount.isDefined,
+              "logical join stats"),
+            JoinSideStats(
+              rightStats.sizeInBytes,
+              rightStats.rowCount,
+              rightStats.rowCount.isDefined,
+              "logical join stats")))
       case _ => None
     }
   }
@@ -3243,8 +3392,16 @@ case class MppNativeQueryExec(
       right <- planLogicalStats(join.right)
     } yield {
       (
-        JoinSideStats(left.sizeInBytes, left.rowCount, "physical subtree stats"),
-        JoinSideStats(right.sizeInBytes, right.rowCount, "physical subtree stats"))
+        JoinSideStats(
+          left.sizeInBytes,
+          left.rowCount,
+          join.left.logicalLink.exists(_.stats.rowCount.isDefined),
+          "physical subtree stats"),
+        JoinSideStats(
+          right.sizeInBytes,
+          right.rowCount,
+          join.right.logicalLink.exists(_.stats.rowCount.isDefined),
+          "physical subtree stats"))
     }
   }
 
@@ -3305,7 +3462,7 @@ case class MppNativeQueryExec(
   }
 
   private def normalizeMppOuterJoinBuildSideEnabled: Boolean = {
-    booleanConf("spark.gluten.mpp.normalizeOuterJoinBuildSide", defaultValue = false)
+    booleanConf("spark.gluten.mpp.normalizeOuterJoinBuildSide", defaultValue = true)
   }
 
   private def forceMppOuterJoinPreservedBuildSideEnabled: Boolean = {
@@ -3351,6 +3508,15 @@ case class MppNativeQueryExec(
 
   private def factBroadcastMaxBuildBytes: BigInt = {
     bytesConf("spark.gluten.mpp.factBroadcastMaxBuildBytes", BigInt(8L) << 30)
+  }
+
+  private def outerJoinSmallScanMaxEstimatedBytes: BigInt = {
+    bytesConf("spark.gluten.mpp.outerJoinSmallScanMaxEstimatedBytes", BigInt(64L) << 20)
+  }
+
+  private def outerJoinSmallScanMaxEstimatedRows: BigInt = {
+    BigInt(
+      positiveIntConf("spark.gluten.mpp.outerJoinSmallScanMaxEstimatedRows").getOrElse(1000000))
   }
 
   private def capLocalHashExchangeTasks(exchanges: Seq[ExchangeSpec]): Seq[ExchangeSpec] = {
