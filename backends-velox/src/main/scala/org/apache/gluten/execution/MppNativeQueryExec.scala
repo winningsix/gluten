@@ -1334,7 +1334,14 @@ case class MppNativeQueryExec(
           s"inserted HASH distribution (inserted " +
           rankFilterWindowStats.insertedHashExchanges + " exchange(s))")
     }
-    val afterNativeHashJoins = offloadLocalHashJoins(afterRankFilterWindow)
+    val (afterWindowInputOrdering, windowInputOrderingStats) =
+      MppWindowInputOrdering(afterRankFilterWindow)
+    if (windowInputOrderingStats.markedWindows > 0) {
+      logInfo(
+        s"MppNativeQueryExec: preserved verified local ordering for " +
+          windowInputOrderingStats.markedWindows + " native Window subtree(s)")
+    }
+    val afterNativeHashJoins = offloadLocalHashJoins(afterWindowInputOrdering)
     val afterSmjHashJoinRewrite = rewriteMppSortMergeJoinToHashJoin(afterNativeHashJoins)
     val afterBuildSideNormalization = normalizeMppJoinBuildSide(afterSmjHashJoinRewrite)
     val afterBroadcastPushdown =

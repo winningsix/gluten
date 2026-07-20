@@ -19,15 +19,19 @@ package org.apache.gluten.execution
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.expression._
 import org.apache.gluten.metrics.MetricsUpdater
+import org.apache.gluten.substrait.`type`.TypeBuilder
 import org.apache.gluten.substrait.SubstraitContext
 import org.apache.gluten.substrait.expression.WindowFunctionNode
+import org.apache.gluten.substrait.extensions.{AdvancedExtensionNode, ExtensionBuilder}
 import org.apache.gluten.substrait.rel.{RelBuilder, RelNode}
 
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.physical.{AllTuples, ClusteredDistribution, Distribution, Partitioning}
+import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.window.WindowExecBase
 
+import com.google.protobuf.StringValue
 import io.substrait.proto.SortField
 
 import java.util.{ArrayList => JArrayList}
@@ -109,7 +113,8 @@ case class WindowExecTransformer(
           builder.setDirectionValue(SortExecTransformer.transformSortDirection(order))
           builder.build()
       }.asJava
-    if (!validation) {
+    val extensionNode = makeExtensionNode(originalInputAttributes, validation)
+    if (extensionNode == null) {
       RelBuilder.makeWindowRel(
         input,
         windowExpressions,
@@ -123,9 +128,36 @@ case class WindowExecTransformer(
         windowExpressions,
         partitionsExpressions,
         sortFieldList,
-        RelBuilder.createExtensionNode(originalInputAttributes.asJava),
+        extensionNode,
         context,
         operatorId)
+    }
+  }
+
+  private def makeExtensionNode(
+      inputAttributes: Seq[Attribute],
+      validation: Boolean): AdvancedExtensionNode = {
+    val optimization =
+      if (!validation && WindowExecTransformer.inputsSorted(this)) {
+        BackendsApiManager.getTransformerApiInstance.packPBMessage(
+          StringValue.newBuilder.setValue("inputsSorted=1").build)
+      } else {
+        null
+      }
+    val enhancement =
+      if (validation) {
+        val inputTypeNodeList = inputAttributes
+          .map(attr => ConverterUtils.getTypeNode(attr.dataType, attr.nullable))
+          .asJava
+        BackendsApiManager.getTransformerApiInstance.packPBMessage(
+          TypeBuilder.makeStruct(false, inputTypeNodeList).toProtobuf)
+      } else {
+        null
+      }
+    if (optimization == null && enhancement == null) {
+      null
+    } else {
+      ExtensionBuilder.makeAdvancedExtension(optimization, enhancement)
     }
   }
 
@@ -158,4 +190,15 @@ case class WindowExecTransformer(
 
   override protected def withNewChildInternal(newChild: SparkPlan): WindowExecTransformer =
     copy(child = newChild)
+}
+
+object WindowExecTransformer {
+  private val InputsSortedTag =
+    TreeNodeTag[Boolean]("org.apache.gluten.execution.WindowExecTransformer.inputsSorted")
+
+  private[execution] def markInputsSorted(window: WindowExecTransformer): Unit =
+    window.setTagValue(InputsSortedTag, true)
+
+  private[execution] def inputsSorted(window: WindowExecTransformer): Boolean =
+    window.getTagValue(InputsSortedTag).contains(true)
 }

@@ -285,94 +285,36 @@ TEST_F(Substrait2VeloxPlanConversionTest, filterUpper) {
       planNode->toString(true, true));
 }
 
-TEST(SubstraitWindowOrderingContractTest, retainOnlyMatchingRankOrderBy) {
+TEST(SubstraitWindowOrderingContractTest, followsPhysicalPlanMarker) {
   auto partitionKey =
       std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "k");
   auto orderKey =
       std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "o");
-  std::vector<core::FieldAccessTypedExprPtr> partitionKeys{partitionKey};
-  std::vector<core::FieldAccessTypedExprPtr> sortingKeys{orderKey};
-  std::vector<core::SortOrder> sortingOrders{core::kDescNullsLast};
-
-  const core::WindowNode::Frame defaultFrame{
-      core::WindowNode::WindowType::kRange,
-      core::WindowNode::BoundType::kUnboundedPreceding,
-      nullptr,
-      core::WindowNode::BoundType::kCurrentRow,
-      nullptr};
-  auto rowNumber = std::make_shared<core::CallTypedExpr>(
-      BIGINT(), std::vector<core::TypedExprPtr>{}, "row_number");
-  std::vector<core::WindowNode::Function> rankFunctions{
-      {rowNumber, defaultFrame, false}};
-
-  auto matchingOrderBy = std::make_shared<core::OrderByNode>(
-      "matching",
+  auto orderBy = std::make_shared<core::OrderByNode>(
+      "ordered",
       std::vector<core::FieldAccessTypedExprPtr>{partitionKey, orderKey},
       std::vector<core::SortOrder>{
           core::kAscNullsFirst, core::kDescNullsLast},
       false,
       nullptr);
-  auto wrongPartitionNullOrder = std::make_shared<core::OrderByNode>(
-      "wrong_nulls",
-      std::vector<core::FieldAccessTypedExprPtr>{partitionKey, orderKey},
-      std::vector<core::SortOrder>{
-          core::kAscNullsLast, core::kDescNullsLast},
-      false,
-      nullptr);
-  auto wrongKeyOrder = std::make_shared<core::OrderByNode>(
-      "wrong_keys",
-      std::vector<core::FieldAccessTypedExprPtr>{orderKey, partitionKey},
-      std::vector<core::SortOrder>{
-          core::kDescNullsLast, core::kAscNullsFirst},
-      false,
-      nullptr);
 
-  auto shouldRetain =
-      [&](const std::vector<core::WindowNode::Function>& functions,
-          const core::OrderByNode& orderBy,
-          const std::vector<core::FieldAccessTypedExprPtr>& partitions) {
-        return detail::isPartitionedRankLikeWindow(
-                   functions, partitions, sortingKeys) &&
-            detail::orderByMatchesWindow(
-                   orderBy, partitions, sortingKeys, sortingOrders);
-      };
+  const auto marked =
+      detail::selectWindowInputOrdering(orderBy, true);
+  EXPECT_EQ(marked.input, orderBy);
+  EXPECT_TRUE(marked.inputsSorted);
 
-  EXPECT_TRUE(shouldRetain(rankFunctions, *matchingOrderBy, partitionKeys));
-  EXPECT_FALSE(
-      shouldRetain(rankFunctions, *wrongPartitionNullOrder, partitionKeys));
-  EXPECT_FALSE(shouldRetain(rankFunctions, *wrongKeyOrder, partitionKeys));
-  EXPECT_FALSE(shouldRetain(rankFunctions, *matchingOrderBy, {}));
+  const auto unmarked =
+      detail::selectWindowInputOrdering(orderBy, false);
+  EXPECT_EQ(unmarked.input, nullptr);
+  EXPECT_FALSE(unmarked.inputsSorted);
 
-  auto selectInput = [&](const core::PlanNodePtr& input) {
-    return detail::selectWindowInputOrdering(
-        input, rankFunctions, partitionKeys, sortingKeys, sortingOrders);
-  };
-  const auto matching = selectInput(matchingOrderBy);
-  EXPECT_EQ(matching.input, matchingOrderBy);
-  EXPECT_TRUE(matching.inputsSorted);
+  const auto missingOrder =
+      detail::selectWindowInputOrdering(nullptr, false);
+  EXPECT_EQ(missingOrder.input, nullptr);
+  EXPECT_FALSE(missingOrder.inputsSorted);
 
-  for (const auto& mismatched :
-       {core::PlanNodePtr{wrongPartitionNullOrder},
-        core::PlanNodePtr{wrongKeyOrder}}) {
-    const auto selected = selectInput(mismatched);
-    EXPECT_EQ(selected.input, nullptr);
-    EXPECT_FALSE(selected.inputsSorted);
-  }
-
-  const auto missing = selectInput(nullptr);
-  EXPECT_EQ(missing.input, nullptr);
-  EXPECT_FALSE(missing.inputsSorted);
-
-  auto sum = std::make_shared<core::CallTypedExpr>(
-      BIGINT(),
-      std::vector<core::TypedExprPtr>{orderKey},
-      "sum");
-  std::vector<core::WindowNode::Function> nonRankFunctions{
-      {sum, defaultFrame, false}};
-  EXPECT_FALSE(
-      shouldRetain(nonRankFunctions, *matchingOrderBy, partitionKeys));
-  EXPECT_FALSE(detail::isPartitionedRankLikeWindow(
-      {}, partitionKeys, sortingKeys));
+  EXPECT_ANY_THROW(
+      detail::selectWindowInputOrdering(nullptr, true));
 }
 
 } // namespace gluten

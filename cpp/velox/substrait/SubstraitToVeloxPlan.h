@@ -29,17 +29,6 @@ class ResultIterator;
 
 namespace detail {
 
-bool isPartitionedRankLikeWindow(
-    const std::vector<core::WindowNode::Function>& functions,
-    const std::vector<core::FieldAccessTypedExprPtr>& partitionKeys,
-    const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys);
-
-bool orderByMatchesWindow(
-    const core::OrderByNode& orderBy,
-    const std::vector<core::FieldAccessTypedExprPtr>& partitionKeys,
-    const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys,
-    const std::vector<core::SortOrder>& sortingOrders);
-
 struct WindowInputOrdering {
   core::PlanNodePtr input;
   bool inputsSorted;
@@ -47,10 +36,7 @@ struct WindowInputOrdering {
 
 WindowInputOrdering selectWindowInputOrdering(
     const core::PlanNodePtr& input,
-    const std::vector<core::WindowNode::Function>& functions,
-    const std::vector<core::FieldAccessTypedExprPtr>& partitionKeys,
-    const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys,
-    const std::vector<core::SortOrder>& sortingOrders);
+    bool preserveSortedInput);
 
 } // namespace detail
 
