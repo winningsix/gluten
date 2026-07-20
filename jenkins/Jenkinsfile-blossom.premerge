@@ -40,9 +40,9 @@ pipeline {
 
     parameters {
         string(name: 'REF', defaultValue: 'dev',
-            description: 'Gluten branch, tag, or full merged-PR SHA to verify.')
+            description: 'Gluten ref for manual runs; ignored when GITHUB_DATA is set.')
         string(name: 'GITHUB_DATA', defaultValue: '',
-            description: 'GitHub event JSON from the router. Leave empty for manual runs.')
+            description: 'GitHub event JSON from Blossom CI. Leave empty for manual runs.')
 
         string(name: 'COLT_REPO_URL',
             defaultValue: 'https://gitlab-master.nvidia.com/alfxu/colt.git',
@@ -60,8 +60,6 @@ pipeline {
             description: 'cuDF-pinned Colt prebuild image. A matching image is required.')
         string(name: 'GPU_TYPE', defaultValue: 'RESERVED_POOL',
             description: 'Blossom lockable GPU pool label. One GPU is allocated to DinD.')
-        string(name: 'CUDA_ARCH', defaultValue: '120-real',
-            description: 'CUDA architecture to compile for.')
         string(name: 'COLT_RUNNER_IMAGE',
             defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/" +
                 'gluten-colt-runner:docker25-v3',
@@ -97,11 +95,6 @@ pipeline {
                         def mergedSha = githubHelper.getMergedSHA()?.trim()
                         if (!mergedSha) {
                             error('GitHub event did not resolve to a merged PR SHA')
-                        }
-                        if (requestedRef && requestedRef != mergedSha) {
-                            error(
-                                "Router REF does not match GitHub merged SHA: " +
-                                    "${requestedRef} != ${mergedSha}")
                         }
                         env.GLUTEN_SOURCE_REF = mergedSha
                         githubHelper.updateCommitStatus(
@@ -158,10 +151,27 @@ pipeline {
                             script {
                                 deleteDir()
 
-                                // The downstream job SCM owns the GitHub PR
-                                // merge refspec and resolves params.REF.
+                                // Blossom CI supplies only GITHUB_DATA. Event builds
+                                // fetch the merged PR SHA directly; manual runs keep
+                                // using the job SCM configured from params.REF.
                                 dir(env.GLUTEN_SOURCE_DIR) {
-                                    checkout scm
+                                    if (githubHelper != null) {
+                                        checkout(
+                                            changelog: false,
+                                            poll: false,
+                                            scm: [
+                                                $class: 'GitSCM',
+                                                branches: [[name: env.GLUTEN_SOURCE_REF]],
+                                                userRemoteConfigs: [[
+                                                    credentialsId: 'github-token',
+                                                    url: githubHelper.getCloneUrl(),
+                                                    refspec: '+refs/pull/*/merge:' +
+                                                        'refs/remotes/origin/pr/*'
+                                                ]]
+                                            ])
+                                    } else {
+                                        checkout scm
+                                    }
                                     env.GLUTEN_SHA = sh(
                                         script: 'git rev-parse HEAD',
                                         returnStdout: true).trim()
@@ -210,25 +220,11 @@ pipeline {
                                 if (!prebuildImage) {
                                     error('PREBUILD_IMAGE is required')
                                 }
-                                def effectivePrebuildImage =
-                                    "gluten-prebuild-cccl:${env.BUILD_NUMBER}"
                                 sh """
                                     set -eu
                                     docker pull '${prebuildImage}'
-                                    if docker run --rm --entrypoint /usr/bin/test \
-                                         '${prebuildImage}' \
-                                         -f /usr/local/include/cuda/version; then
-                                      docker tag '${prebuildImage}' '${effectivePrebuildImage}'
-                                    else
-                                      echo 'PREBUILD_IMAGE is missing CCCL headers; building a local repair layer.'
-                                      docker build --network=host \
-                                        --build-arg 'BASE_IMAGE=${prebuildImage}' \
-                                        --tag '${effectivePrebuildImage}' \
-                                        --file '${env.GLUTEN_SOURCE_DIR}/jenkins/cccl-overlay.dockerfile' \
-                                        '${env.GLUTEN_SOURCE_DIR}/jenkins'
-                                    fi
                                     docker run --rm --entrypoint /usr/bin/test \
-                                      '${effectivePrebuildImage}' \
+                                      '${prebuildImage}' \
                                       -f /usr/local/include/cuda/version
                                     PYTHONUNBUFFERED=1 '${env.COLT_ROOT}/colt' workflow verify \
                                       --mode=run \
@@ -240,9 +236,9 @@ pipeline {
                                       --gluten-sha='${env.GLUTEN_SHA}' \
                                       --velox-repo='${params.VELOX_REPO_URL.trim()}' \
                                       --velox-ref='${params.VELOX_REF.trim()}' \
-                                      --prebuild-image='${effectivePrebuildImage}' \
+                                      --prebuild-image='${prebuildImage}' \
                                       --require-prebuild-match \
-                                      --cuda-arch='${params.CUDA_ARCH.trim()}' \
+                                      --cuda-arch=75 \
                                       --workspace='${env.COLT_WORKSPACE}' \
                                       --run-dir='${env.COLT_RUN_DIR}' \
                                       --result-file='${env.COLT_RUN_DIR}/result.json' \
