@@ -160,6 +160,18 @@ const uint64_t kMppMaxOutputBufferSizeDefault = 1L << 30;
 const std::string kMppSingleTaskMaxDrivers =
     "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMaxDrivers";
 const int32_t kMppSingleTaskMaxDriversDefault = 2;
+
+// Number of local Velox driver lanes for a distributed HASH exchange that
+// feeds a keyed FINAL aggregation. Values > 1 insert a LocalPartitionNode
+// between the remote ExchangeNode and the aggregation, hashing by the same
+// keys as the remote exchange before starting multiple consumer drivers.
+// Keep disabled by default until the extra local hash pass has been measured
+// across all queries; it is primarily an escape hatch for very large FINAL
+// group-bys whose single driver would exceed cuDF's row/contiguous-allocation
+// limits.
+const std::string kMppKeyedFinalLocalDrivers =
+    "spark.gluten.sql.columnar.backend.velox.mpp.keyedFinalLocalDrivers";
+const int32_t kMppKeyedFinalLocalDriversDefault = 1;
 const std::string kVeloxAsyncTimeoutOnTaskStopping =
     "spark.gluten.sql.columnar.backend.velox.asyncTimeoutOnTaskStopping";
 const int32_t kVeloxAsyncTimeoutOnTaskStoppingDefault = 30000; // 30s
@@ -256,15 +268,19 @@ const std::string kCudfAstExpressionEnabled =
 const std::string kCudfAstExpressionEnabledDefault = "true";
 
 // Forward to IBM CudfConfig::kCudfConcatOptimizationEnabled. When true,
-// OperatorAdapters inserts a CudfBatchConcat operator before every
-// CudfHashAggregation, coalescing upstream batches until their cumulative
-// row count reaches kCudfBatchSizeMinThreshold before forwarding to the
-// agg. Lets the per-batch concat-with-bufferedResult_ cost be amortized
-// across multiple raw input batches (reduces D2D for high-cardinality
-// non-converging groupbys such as Q18 lineitem-by-l_orderkey).
+// OperatorAdapters inserts a CudfBatchConcat operator after ordinary UCX
+// Exchange sources and before CudfHashAggregation. This keeps all-to-all
+// destination slices from reaching joins as thousands of small probe batches
+// and amortizes per-batch aggregation work.
 const std::string kCudfConcatOptimizationEnabled =
     "spark.gluten.sql.columnar.backend.velox.cudf.concat_optimization_enabled";
 const std::string kCudfConcatOptimizationEnabledDefault = "true";
+
+// Independently gate post-UCX concat. Aggregation concat can remain enabled
+// when a plan already has efficient exchange batch boundaries.
+const std::string kCudfExchangeConcatOptimizationEnabled =
+    "spark.gluten.sql.columnar.backend.velox.cudf.exchange_concat_optimization_enabled";
+const std::string kCudfExchangeConcatOptimizationEnabledDefault = "true";
 
 // Enables cuDF's persistent FINAL streaming groupby with a fixed distinct-key
 // capacity. Zero keeps the all-GPU levelled aggregation path.
@@ -275,25 +291,45 @@ const std::string kCudfGroupbyStreamingMaxDistinctKeysDefault = "0";
 const std::string kCudfOrderBySortedRunBytes =
     "spark.gluten.sql.columnar.backend.velox.cudf.orderBySortedRunBytes";
 const std::string kCudfOrderBySortedRunBytesDefault = "268435456";
+const std::string kCudfOrderBySortedRunBytesMppDefault = "3221225472";
 
 const std::string kCudfOrderByMergeFanIn =
     "spark.gluten.sql.columnar.backend.velox.cudf.orderByMergeFanIn";
 const std::string kCudfOrderByMergeFanInDefault = "8";
 
+const std::string kCudfOrderByOutputChunkBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.orderByOutputChunkBytes";
+const std::string kCudfOrderByOutputChunkBytesDefault = "33554432";
+const std::string kCudfOrderByOutputChunkBytesMppDefault = "3221225472";
+
+const std::string kCudfOrderByMaxOutputRows =
+    "spark.gluten.sql.columnar.backend.velox.cudf.orderByMaxOutputRows";
+const std::string kCudfOrderByMaxOutputRowsDefault = "262144";
+const std::string kCudfOrderByMaxOutputRowsMppDefault = "2147483647";
+
 // Forward to IBM CudfConfig::kCudfBatchSizeMinThreshold. Target minimum row
 // count CudfBatchConcat coalesces upstream batches up to. Only used when
-// kCudfConcatOptimizationEnabled is true. Default 100000 matches velox's
-// internal default but is far too small for the typical 100M-row lineitem
-// scan; reasonable values for SF1000 are 100M-1B.
+// kCudfConcatOptimizationEnabled is true. The default is 32M rows; only the
+// final end-of-stream tail batch may be smaller.
 const std::string kCudfBatchSizeMinThreshold =
     "spark.gluten.sql.columnar.backend.velox.cudf.batch_size_min_threshold";
-const std::string kCudfBatchSizeMinThresholdDefault = "100000";
+const std::string kCudfBatchSizeMinThresholdDefault = "32000000";
 
-// Byte threshold for CudfBatchConcat.  Keep this independent from the row
-// guard so a wide GPU batch is forwarded as soon as it reaches the compute
-// target even when its row count is small.
+// Exchange-specific concat target. It is kept separate so exchange and
+// aggregation can be tuned independently, but both default to 32M: otherwise
+// aggregation-side concat would simply merge 32M exchange batches back into
+// the 100M batches that exhausted Q21 F6 memory.
+const std::string kCudfExchangeBatchSizeMinThreshold =
+    "spark.gluten.sql.columnar.backend.velox.cudf.exchange_batch_size_min_threshold";
+const std::string kCudfExchangeBatchSizeMinThresholdDefault = "32000000";
+
+// Optional byte threshold for CudfBatchConcat. Keep this independent from the
+// generic GPU target: a 2 GiB inherited default fragments aggregation input
+// and regresses Q16/Q17 at SF30000. Zero preserves the existing row threshold;
+// deployments that need a tighter memory bound can opt in explicitly.
 const std::string kCudfBatchSizeMinThresholdBytes =
     "spark.gluten.sql.columnar.backend.velox.cudf.batch_size_min_threshold_bytes";
+const std::string kCudfBatchSizeMinThresholdBytesDefault = "0";
 
 const std::string kCudfGpuTargetBatchRows = "spark.gluten.sql.columnar.backend.velox.cudf.gpuTargetBatchRows";
 const std::string kCudfGpuTargetBatchRowsDefault = "1000000";

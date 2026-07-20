@@ -34,7 +34,7 @@
 #include "velox/core/QueryCtx.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/SerializedPage.h"
-#include "velox/exec/OutputBufferManager.h"
+#include "velox/exec/DefaultOutputBufferManager.h"
 #include "velox/exec/Task.h"
 
 namespace gluten {
@@ -42,7 +42,7 @@ namespace gluten {
 /// Describes a single plan fragment to be executed as a Velox Task.
 /// The root fragment is the one whose id never appears as a
 /// producerFragmentId in any MppExchangeSpec. Its output is consumed by
-/// the coordinator via OutputBufferManager::getData().
+/// the coordinator via DefaultOutputBufferManager::getData().
 struct MppFragmentSpec {
   /// Fragment identifier. Fragments are numbered contiguously starting
   /// at 0; the root is NOT necessarily id 0 (Scala-side emission typically
@@ -56,6 +56,20 @@ struct MppFragmentSpec {
   /// For replicated consumers (replicas > 1) this is interpreted per-replica;
   /// today we override to 1/replica when replicated. TODO: scale with N/cores.
   int32_t numDrivers{1};
+
+  /// True when every remote HASH input that directly feeds a keyed FINAL
+  /// aggregation is protected by an intra-task LocalPartition(kRepartition).
+  /// This makes it correct to run the consumer task with numDrivers > 1:
+  /// equal group keys are assigned to exactly one local driver lane.
+  bool keyedFinalLocalRepartition{false};
+
+  /// True only for a HASH consumer whose native plan is composed of
+  /// exchange inputs, inner joins, exactly two non-null-aware RIGHT SEMI
+  /// PROJECT joins, projections, filters and one keyed PARTIAL aggregation.
+  /// Hash-join bridges and partial aggregation are driver-safe within one
+  /// task, so a single owned task may use the Scala-supplied driver budget
+  /// without creating duplicate final results.
+  bool rightSemiProjectMultiDriverSafe{false};
 
   /// Scan split information for table scan nodes in this fragment.
   /// Only populated for scan-containing (leaf) fragments.
@@ -122,12 +136,12 @@ struct MppExchangeSpec {
 };
 
 /// Coordinates execution of multiple Velox Task fragments within a single
-/// process, wiring them together via OutputBufferManager for streaming
+/// process, wiring them together via DefaultOutputBufferManager for streaming
 /// data exchange.
 ///
 /// This is architecturally equivalent to Presto's AllAtOnceExecutionSchedule:
 /// all fragments are started concurrently, and exchange data flows through
-/// the existing OutputBufferManager + ExchangeClient mechanism.
+/// the existing DefaultOutputBufferManager + ExchangeClient mechanism.
 ///
 /// Usage:
 ///   auto coord = MppQueryCoordinator::create(queryId, fragments, exchanges,
@@ -231,7 +245,7 @@ class MppQueryCoordinator {
   /// Fetch the next page of serialized data from the root task's output buffer.
   /// Returns true if data was fetched, false if at end-of-stream.
   /// Populates `pages` with the received SerializedPageBase objects. Wraps
-  /// OutputBufferManager::getData() (IOBuf-callback in IBM-baseline) by
+  /// DefaultOutputBufferManager::getData() (IOBuf-callback in IBM-baseline) by
   /// constructing PrestoSerializedPage around each IOBuf so the consumer
   /// path (prepareStreamForDeserialize -> VectorStreamGroup::read) is
   /// unchanged.
@@ -287,7 +301,8 @@ class MppQueryCoordinator {
   /// Output buffer reading state for the root fragment. When root is
   /// replicated we track per-replica sequence + atEnd. Drain strategy is
   /// selected at start() time based on root's inbound exchange type.
-  std::shared_ptr<facebook::velox::exec::OutputBufferManager> bufferManager_;
+  std::shared_ptr<facebook::velox::exec::DefaultOutputBufferManager>
+      bufferManager_;
   std::vector<int64_t> rootOutputSequence_;
   std::vector<bool> rootReplicaAtEnd_;
   std::deque<std::unique_ptr<facebook::velox::exec::SerializedPageBase>>

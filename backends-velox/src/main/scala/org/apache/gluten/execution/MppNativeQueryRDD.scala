@@ -189,11 +189,25 @@ class MppNativeQueryRDD(
               s"${expected.peerId}, but Spark scheduled it on $actualExecutorId")
         }
     }
+    val effectivePeerEndpointsJson =
+      if (
+        mppPartition.totalPartitions == 1 &&
+        Option(configuredPeerEndpointsJson).forall(_.trim.isEmpty)
+      ) {
+        GlutenMppExecutorService.localPeerEndpointsJson(actualExecutorId).getOrElse {
+          logWarning(
+            s"MppNativeQueryRDD: no registered local UCX endpoint for one-peer query " +
+              s"$nativeMppQueryId on executor $actualExecutorId; native fallback will apply")
+          configuredPeerEndpointsJson
+        }
+      } else {
+        configuredPeerEndpointsJson
+      }
     val mppPeerSpecJson =
       MppNativeQueryRDD.buildPeerSpecJson(
         nativeMppQueryId,
         localPeerId,
-        configuredPeerEndpointsJson,
+        effectivePeerEndpointsJson,
         mppPartition.index,
         mppPartition.totalPartitions)
     logInfo(s"MppNativeQueryRDD: peer spec JSON: $mppPeerSpecJson")

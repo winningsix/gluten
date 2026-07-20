@@ -37,6 +37,7 @@ import org.apache.spark.sql.execution.command.{DataWritingCommandExec, ExecutedC
 import org.apache.spark.sql.execution.datasources.v2.{V2CommandExec, V2TableWriteExec}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, ShuffleExchangeLike}
 import org.apache.spark.sql.execution.python.EvalPythonExecTransformer
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, ShuffledHashJoinExec}
 import org.apache.spark.sql.internal.SQLConf
 
 import java.util.concurrent.atomic.AtomicInteger
@@ -1028,6 +1029,18 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case p: ProjectExec if p.projectList.exists(containsScalarSubquery) =>
         isNativeSupported(p.child, allowJvmStreamIngress)
 
+      // Write commands are planned before MppNativeQueryExec gets a chance to run its
+      // cross-cut rewrites. Spark can therefore leave vanilla shuffled or broadcast hash joins
+      // below WriteFilesExecTransformer even though the same query is fully native for collect().
+      // MppNativeQueryExec.offloadLocalHashJoins converts these exact nodes to their transformer
+      // equivalents before fragment extraction and also normalizes shuffled-join build sides.
+      // Accept them here so Q11's Parquet-write plan does not fall back to BSP with the large
+      // partsupp input as BuildLeft.
+      case join: ShuffledHashJoinExec =>
+        join.children.forall(isNativeSupported(_, allowJvmStreamIngress))
+      case join: BroadcastHashJoinExec =>
+        join.children.forall(isNativeSupported(_, allowJvmStreamIngress))
+
       // Any other non-native operator means we cannot do MPP
       case other =>
         logWarning(
@@ -1105,6 +1118,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case f: FilterExec if containsScalarSubquery(f.condition) =>
         findInChildren(plan)
       case p: ProjectExec if p.projectList.exists(containsScalarSubquery) =>
+        findInChildren(plan)
+      case _: ShuffledHashJoinExec =>
+        findInChildren(plan)
+      case _: BroadcastHashJoinExec =>
         findInChildren(plan)
       case other =>
         Some(s"${other.getClass.getSimpleName}: ${other.simpleString(20)}")

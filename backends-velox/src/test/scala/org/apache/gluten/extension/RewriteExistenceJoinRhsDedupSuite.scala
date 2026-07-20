@@ -17,7 +17,7 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
-import org.apache.gluten.extension.columnar.RewriteExistenceJoinRhsDedup
+import org.apache.gluten.extension.columnar.{RegisterMppExistencePostSubqueryRules, RewriteExistenceJoinRhsDedup}
 
 import org.apache.spark.sql.{QueryTest, Row}
 import org.apache.spark.sql.catalyst.plans.{LeftAnti, LeftSemi}
@@ -104,7 +104,7 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
     RewriteExistenceJoinRhsDedup(spark).apply(plan)
   }
 
-  test("self-registers post-subquery optimizer pass") {
+  test("registration-only analyzer pass installs post-subquery optimizer rule") {
     val experimental = spark.experimental
     val originalExtraOptimizations = experimental.extraOptimizations
     try {
@@ -127,7 +127,8 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
           |order by id, supp
           |""".stripMargin
 
-      rewrite(spark.sql(sql).queryExecution.analyzed)
+      RegisterMppExistencePostSubqueryRules(spark)
+        .apply(spark.sql(sql).queryExecution.analyzed)
 
       assert(
         experimental.extraOptimizations.count(_.isInstanceOf[RewriteExistenceJoinRhsDedup]) == 1,

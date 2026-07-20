@@ -43,4 +43,14 @@ class SparkConfigUtilSuite extends AnyFunSuiteLike {
     assert(SparkConfigUtil.get(conf, GlutenConfig.SHUFFLE_WRITER_BUFFER_SIZE) === Some(1024 * 1024))
     assert(SparkConfigUtil.get(conf, GlutenConfig.GLUTEN_LOAD_LIB_OS).isEmpty)
   }
+
+  test("GlutenConfig preserves MPP mode in native backend config") {
+    val mppEnabled = "spark.gluten.mpp.enabled"
+    val nativeConf = GlutenConfig.getNativeBackendConf(
+      "velox",
+      Map(mppEnabled -> "true", "spark.unrelated.config" -> "ignored"))
+
+    assert(nativeConf.get(mppEnabled) === "true")
+    assert(!nativeConf.containsKey("spark.unrelated.config"))
+  }
 }

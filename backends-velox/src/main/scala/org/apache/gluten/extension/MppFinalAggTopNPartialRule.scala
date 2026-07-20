@@ -23,7 +23,7 @@ import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Complete, Final}
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.execution.{ProjectExec, SparkPlan}
+import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 
 /**
@@ -50,13 +50,21 @@ case class MppFinalAggTopNPartialRule() extends Rule[SparkPlan] with Logging {
     if (!enabled) {
       return plan
     }
-    rewriteRoot(plan)
+    rewriteAll(plan)
   }
 
-  private def rewriteRoot(node: SparkPlan): SparkPlan = node match {
+  /**
+   * Rewrite every query block, not just the outer result spine. A TakeOrderedAndProject may be the
+   * broadcast side of a later dimension join (TPC-H Q10's fact Top20, for example). Stopping at the
+   * first multi-child node leaves that nested TopN behind a SINGLE gather of the full final
+   * aggregate output.
+   */
+  private def rewriteAll(node: SparkPlan): SparkPlan = node match {
     case aqe: AdaptiveSparkPlanExec => aqe
     case topk: TakeOrderedAndProjectExecTransformer if topk.offset == 0 =>
-      val rewrittenChild = insertPartialTopNOnSpine(topk.child, topk.limit, topk.sortOrder)
+      val childWithNestedTopN = rewriteAll(topk.child)
+      val rewrittenChild =
+        insertPartialTopNOnSpine(childWithNestedTopN, topk.limit, topk.sortOrder)
       if (rewrittenChild.fastEquals(topk.child)) {
         topk
       } else {
@@ -65,18 +73,22 @@ case class MppFinalAggTopNPartialRule() extends Rule[SparkPlan] with Logging {
             s"after final aggregate before SINGLE gather")
         topk.copy(child = rewrittenChild)
       }
-    case p: ProjectExec => p.withNewChildren(Seq(rewriteRoot(p.child)))
-    case other if other.children.size == 1 && isRootSpine(other) =>
-      other.withNewChildren(Seq(rewriteRoot(other.children.head)))
+    case other if other.children.nonEmpty =>
+      val rewrittenChildren = other.children.map(rewriteAll)
+      if (
+        rewrittenChildren.zip(other.children).forall {
+          case (rewritten, original) =>
+            rewritten.eq(original)
+        }
+      ) {
+        // Preserve object identity, SparkPlan tags and exchange-reuse bookkeeping for query
+        // blocks that contain no matching TopN. Rebuilding an otherwise unchanged join tree can
+        // alter later physical exchange recognition even though its printed shape is identical.
+        other
+      } else {
+        other.withNewChildren(rewrittenChildren)
+      }
     case other => other
-  }
-
-  private def isRootSpine(p: SparkPlan): Boolean = p match {
-    case _: TakeOrderedAndProjectExecTransformer | _: ProjectExec => true
-    case _ =>
-      val n = p.getClass.getSimpleName
-      n.contains("ColumnarToRow") || n.contains("InputIteratorTransformer") ||
-      n.contains("RowToVeloxColumnar") || n.contains("WholeStageTransformer")
   }
 
   /** Walk the single-child spine under the TakeOrdered producer and splice partial TopN once. */

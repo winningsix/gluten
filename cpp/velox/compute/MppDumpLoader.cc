@@ -523,7 +523,8 @@ MppDumpLoadResult loadMppQueryFromDump(
       //     → kUcx so the consumer's UcxExchange picks it up via
       //     IntraNodeTransferRegistry.
       //   - root fragment (outboundExchange==nullptr, output goes to the
-      //     coordinator) → kHttp so OutputBufferManager receives pages.
+      //     coordinator) → kHttp so DefaultOutputBufferManager receives
+      //     pages.
       const auto transportType = (outboundExchange != nullptr)
           ? velox::core::PartitionedOutputNode::TransportType::kUcx
           : velox::core::PartitionedOutputNode::TransportType::kHttp;

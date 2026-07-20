@@ -29,10 +29,11 @@ import java.net.URI
  *   - take(requestedCount) of sortBy(executorId)-ordered endpoints
  *   - parse `nativeUcxListenerEndpoint` URI to extract listenerPort
  *   - reject listenerPort <= 3
- *   - host selection: blockManagerHost (when non-empty) falls through to the URI host, then to
+ *   - UCX connection host selection: listener URI host falls through to blockManagerHost, then to
  *     `info.host`
  *   - `port = listenerPort - 3` (this is the "remote connector port" native convention)
- *   - `preferredLocation = executor_<host>_<executorId>`
+ *   - Spark placement remains `executor_<blockManagerHost>_<executorId>` so executor affinity is
+ *     independent of the network address advertised to UCX
  *
  * JSON serialisation (toPeerEndpointsJson) produces the contract consumed by the native JNI side:
  *
@@ -62,12 +63,18 @@ object GlutenMppPeerMapper {
         val endpointHost = Option(endpoint.getHost).filter(_.nonEmpty)
         val blockManagerHost = Option(info.blockManagerHost)
           .filter(_.nonEmpty)
-        val host = blockManagerHost.getOrElse(endpointHost.getOrElse(info.host))
+        // Native listener endpoints already advertise the routable address selected by UCX.
+        // Prefer that address for peer connections: feeding short Spark hostnames back through
+        // UCXX is both unnecessary and can fail hostname parsing under concurrent TableWrite
+        // startup. Spark task affinity must still use BlockManager's host string because that is
+        // the identity understood by TaskSchedulerImpl.
+        val connectionHost = endpointHost.getOrElse(blockManagerHost.getOrElse(info.host))
+        val placementHost = blockManagerHost.getOrElse(info.host)
         MppPeerInfo(
           peerId = info.executorId,
-          host = host,
+          host = connectionHost,
           port = listenerPort - 3,
-          preferredLocation = s"executor_${host}_${info.executorId}")
+          preferredLocation = s"executor_${placementHost}_${info.executorId}")
     }
   }
 

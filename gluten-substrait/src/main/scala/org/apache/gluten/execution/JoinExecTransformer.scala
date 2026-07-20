@@ -166,7 +166,7 @@ trait HashJoinLikeExecTransformer extends BaseJoinExec with TransformSupport {
     case BuildLeft =>
       joinType match {
         case _: InnerLike => expandPartitioning(right.outputPartitioning)
-        case LeftSemi => left.outputPartitioning
+        case LeftSemi | _: ExistenceJoin => left.outputPartitioning
         case RightOuter => right.outputPartitioning
         case LeftOuter => left.outputPartitioning
         // LeftSingle (Spark 4.0+) - same as LeftOuter

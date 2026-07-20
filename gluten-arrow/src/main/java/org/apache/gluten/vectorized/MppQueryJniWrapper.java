@@ -24,7 +24,8 @@ import org.apache.gluten.runtime.RuntimeAware;
  * exchange.
  *
  * <p>This enables Velox-native multi-stage query execution (MPP) within a single process. Multiple
- * plan fragments are wired together via Velox's OutputBufferManager / ExchangeClient mechanism.
+ * plan fragments are wired together via Velox's DefaultOutputBufferManager / ExchangeClient
+ * mechanism.
  *
  * <p>Lifecycle:
  *

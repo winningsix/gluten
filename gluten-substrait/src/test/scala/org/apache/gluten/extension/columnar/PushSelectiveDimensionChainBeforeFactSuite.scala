@@ -20,10 +20,12 @@ import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.sql.shims.SparkShimLoader
 
 import org.apache.spark.sql.{GlutenQueryTest, SQLContext}
-import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeReference}
+import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, AttributeReference, AttributeSet}
 import org.apache.spark.sql.catalyst.expressions.{EqualTo, Expression, GreaterThan, Literal}
-import org.apache.spark.sql.catalyst.plans.Inner
-import org.apache.spark.sql.catalyst.plans.logical.{BROADCAST, Filter, HintInfo, Join}
+import org.apache.spark.sql.catalyst.expressions.aggregate.Min
+import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, FullOuter, Inner, JoinType}
+import org.apache.spark.sql.catalyst.plans.{LeftAnti, LeftOuter, LeftSemi, RightOuter}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, BROADCAST, Filter, HintInfo, Join}
 import org.apache.spark.sql.catalyst.plans.logical.{JoinHint, LeafNode, LogicalPlan}
 import org.apache.spark.sql.catalyst.plans.logical.{Project, UnaryNode}
 import org.apache.spark.sql.catalyst.plans.logical.Statistics
@@ -33,6 +35,8 @@ import org.apache.spark.sql.types.{DateType, DoubleType, IntegerType, LongType}
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
 
 class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with SharedSparkSession {
+
+  import testImplicits._
 
   private val confKey = GlutenConfig.PUSH_DIMENSION_CHAIN_BEFORE_FACT_ENABLED.key
 
@@ -189,6 +193,19 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
       s"fact-ward high-NDV predicate must remain:\n$rewritten")
   }
 
+  test("keeps the original competing-filter guard for a base-range chain without a spine") {
+    val p = directChainVictimPlan(filterOrders = true, includeOrderState = true)
+
+    var rewritten: LogicalPlan = null
+    withSQLConf(confKey -> "true") {
+      rewritten = PushSelectiveDimensionChainBeforeFact(spark)(p.plan)
+    }
+
+    assert(
+      rewritten.fastEquals(p.plan),
+      "a second selective entrance must retain the pre-cost-rule conservative behavior")
+  }
+
   test("allows a moderate chain dimension when a tiny seed prunes a much larger victim") {
     val p = directChainVictimPlan(chainRows = 50000000L)
 
@@ -202,6 +219,340 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
       findVictimPrunedByChainSeed(rewritten, "l_orderkey", "s_suppkey", "n_nationkey").isDefined,
       s"expected victim JOIN (chain JOIN filtered seed) subtree in:\n$rewritten"
     )
+  }
+
+  test("large configured chain requires multiple high-NDV fact-ward exits") {
+    val singleExit = directChainVictimPlan(chainRows = 300000000L)
+    val twoExits = directChainVictimPlan(chainRows = 300000000L, includeOrderState = true)
+    val maxRowsKey =
+      "spark.gluten.sql.columnar.pushDimensionChainBeforeFact.maxChainRows"
+    val maxBytesKey =
+      "spark.gluten.sql.columnar.pushDimensionChainBeforeFact.maxChainBytes"
+
+    withSQLConf(confKey -> "true", maxRowsKey -> "1000000000", maxBytesKey -> "64g") {
+      val rule = PushSelectiveDimensionChainBeforeFact(spark)
+      assert(
+        rule(singleExit.plan).fastEquals(singleExit.plan),
+        "an extended-range chain with only one downstream exit should retain the CBO plan")
+      assert(
+        !rule(twoExits.plan).fastEquals(twoExits.plan),
+        "multiple high-NDV exits should justify the extended-range chain rewrite")
+    }
+  }
+
+  test("cost admits a large chain only when multiple exits repay worst-case MPP broadcast") {
+    val singleExit = directChainVictimPlan(chainRows = 300000000L, victimRows = 180000000000L)
+    val twoExits = directChainVictimPlan(
+      chainRows = 300000000L,
+      victimRows = 180000000000L,
+      includeOrderState = true)
+    val maxRowsKey =
+      "spark.gluten.sql.columnar.pushDimensionChainBeforeFact.maxChainRows"
+    val maxBytesKey =
+      "spark.gluten.sql.columnar.pushDimensionChainBeforeFact.maxChainBytes"
+
+    withSQLConf(
+      confKey -> "true",
+      maxRowsKey -> "10000000",
+      maxBytesKey -> "1g",
+      "spark.sql.autoBroadcastJoinThreshold" -> "12g",
+      "spark.gluten.mpp.multiExecutor.numPartitions" -> "32"
+    ) {
+      val rule = PushSelectiveDimensionChainBeforeFact(spark)
+      assert(
+        rule(singleExit.plan).fastEquals(singleExit.plan),
+        "a single fact-ward exit must not open the cost-based large-chain path")
+      assert(
+        !rule(twoExits.plan).fastEquals(twoExits.plan),
+        "two exits over a much larger victim should repay the broadcast-adjusted chain cost")
+    }
+  }
+
+  test("cost rejects a large chain when broadcast-adjusted benefit is too small") {
+    val lowBenefit = directChainVictimPlan(
+      chainRows = 300000000L,
+      victimRows = 6000000000L,
+      includeOrderState = true)
+    val maxRowsKey =
+      "spark.gluten.sql.columnar.pushDimensionChainBeforeFact.maxChainRows"
+    val maxBytesKey =
+      "spark.gluten.sql.columnar.pushDimensionChainBeforeFact.maxChainBytes"
+
+    withSQLConf(
+      confKey -> "true",
+      maxRowsKey -> "10000000",
+      maxBytesKey -> "1g",
+      "spark.sql.autoBroadcastJoinThreshold" -> "12g",
+      "spark.gluten.mpp.multiExecutor.numPartitions" -> "32"
+    ) {
+      assert(
+        PushSelectiveDimensionChainBeforeFact(spark)(lowBenefit.plan).fastEquals(lowBenefit.plan),
+        "the old size gate should remain closed when avoided work cannot repay broadcast cost"
+      )
+    }
+  }
+
+  test("cost rejects a large chain whose filtered estimate exceeds broadcast budget") {
+    val p = directChainVictimPlan(
+      chainRows = 300000000L,
+      victimRows = 180000000000L,
+      includeOrderState = true)
+    val maxRowsKey =
+      "spark.gluten.sql.columnar.pushDimensionChainBeforeFact.maxChainRows"
+    val maxBytesKey =
+      "spark.gluten.sql.columnar.pushDimensionChainBeforeFact.maxChainBytes"
+
+    withSQLConf(
+      confKey -> "true",
+      maxRowsKey -> "10000000",
+      maxBytesKey -> "1g",
+      "spark.sql.autoBroadcastJoinThreshold" -> "2g",
+      "spark.gluten.mpp.multiExecutor.numPartitions" -> "32"
+    ) {
+      assert(
+        PushSelectiveDimensionChainBeforeFact(spark)(p.plan).fastEquals(p.plan),
+        "large-chain cost path must respect Spark's broadcast threshold")
+    }
+  }
+
+  test("extended cost path keeps competing selective entrances without a probe spine") {
+    val p = directChainVictimPlan(
+      chainRows = 300000000L,
+      victimRows = 180000000000L,
+      filterOrders = true,
+      includeOrderState = true,
+      filterOrderState = true)
+    withCanonicalCostConf {
+      assert(
+        PushSelectiveDimensionChainBeforeFact(spark)(p.plan).fastEquals(p.plan),
+        "the Q21 multi-exit exemption must not widen ordinary inner-only clusters")
+    }
+  }
+
+  test("pushes a Project-wrapped dimension through canonical dedup-inner and anti wrappers") {
+    val p = canonicalMixedProbeSpinePlan()
+    var rewritten: LogicalPlan = null
+    var rewrittenAgain: LogicalPlan = null
+    withCanonicalCostConf {
+      val rule = PushSelectiveDimensionChainBeforeFact(spark)
+      rewritten = rule(p.plan)
+      rewrittenAgain = rule(rewritten)
+    }
+
+    assert(
+      !rewritten.fastEquals(p.plan),
+      s"canonical mixed probe spine was not rewritten:\n$rewritten")
+    assert(rewritten.output == p.plan.output, "top-level output exprIds/order must be preserved")
+    assert(rewrittenAgain.fastEquals(rewritten), "mixed probe-spine rewrite must be fixed point")
+    val injectedPrune =
+      findVictimPrunedByChainSeed(rewritten, "l_orderkey", "s_suppkey", "n_nationkey").getOrElse(
+        fail(s"injected dimension prune missing:\n$rewritten"))
+    assert(
+      isBelowJoinType(rewritten, injectedPrune, LeftAnti),
+      s"supplier/nation must be inside the anti probe, not above it:\n$rewritten")
+    assert(
+      injectedPrune.asInstanceOf[Join].hint == p.expectedPruneHint,
+      s"chain-left broadcast hint must follow dimension to injected right side:\n$rewritten")
+
+    val rewrittenAnti = rewritten
+      .collectFirst {
+        case join: Join if join.joinType == LeftAnti => join
+      }
+      .getOrElse(fail(s"rewritten anti join missing:\n$rewritten"))
+    assert(rewrittenAnti.condition == p.anti.condition)
+    assert(rewrittenAnti.hint == p.anti.hint)
+    assert(
+      containsJoinWithConditionAndHint(rewrittenAnti.left, p.dedupInner),
+      s"dedup-inner type/condition/hint must survive the commute:\n$rewritten")
+    assert(
+      hasProjectPrefixWithCarriedAttr(rewritten, p.victim.output, p.sName),
+      s"attribute-only wrappers must preserve original output order and carry s_name:\n$rewritten"
+    )
+  }
+
+  test("pushes a Project-wrapped dimension through a paired existence state join") {
+    val p = pairedExistenceStateProbeSpinePlan()
+    var rewritten: LogicalPlan = null
+    var rewrittenAgain: LogicalPlan = null
+    withCanonicalCostConf {
+      val rule = PushSelectiveDimensionChainBeforeFact(spark)
+      rewritten = rule(p.plan)
+      rewrittenAgain = rule(rewritten)
+    }
+
+    assert(
+      !rewritten.fastEquals(p.plan),
+      s"paired state probe spine was not rewritten:\n$rewritten")
+    assert(rewritten.output == p.plan.output, "top-level output exprIds/order must be preserved")
+    assert(rewrittenAgain.fastEquals(rewritten), "paired state rewrite must be fixed point")
+    val injectedPrune =
+      findVictimPrunedByChainSeed(rewritten, "l_orderkey", "s_suppkey", "n_nationkey")
+        .getOrElse(fail(s"injected dimension prune missing:\n$rewritten"))
+    assert(
+      isBelowJoinType(rewritten, injectedPrune, LeftSemi),
+      s"supplier/nation must be inside the paired state join:\n$rewritten")
+    assert(
+      hasProjectPrefixWithCarriedAttr(rewritten, p.victim.output, p.sName),
+      s"attribute-only wrappers must carry s_name through the paired state join:\n$rewritten"
+    )
+  }
+
+  test("rejects a mixed probe spine with a non-equi semi or anti residual") {
+    val p = canonicalMixedProbeSpinePlan(antiResidual = true)
+    withCanonicalCostConf {
+      assert(
+        PushSelectiveDimensionChainBeforeFact(spark)(p.plan).fastEquals(p.plan),
+        "non-equi existence residual must block probe-spine commute")
+    }
+  }
+
+  test("probe-spine guard rejects RHS and conditions that reference a dimension attribute") {
+    val p = canonicalMixedProbeSpinePlan(rhsReferencesDimension = true)
+    withCanonicalCostConf {
+      val rule = PushSelectiveDimensionChainBeforeFact(spark)
+      val victimAttr = p.victim.output.find(_.name == "l_suppkey").get
+      assert(
+        !rule.probeSpineCanCommuteForTesting(p.victim, AttributeSet(Seq(p.sName)), victimAttr),
+        "a wrapper RHS that captures a dimension attr must block the commute"
+      )
+      val clean = canonicalMixedProbeSpinePlan()
+      val cleanVictimAttr = clean.victim.output.find(_.name == "l_suppkey").get
+      val conditionCapture = clean.anti.copy(
+        condition = Some(And(clean.anti.condition.get, EqualTo(clean.sName, clean.sName))))
+      val capturedVictim = Project(conditionCapture.output, conditionCapture)
+      assert(
+        !rule.probeSpineCanCommuteForTesting(
+          capturedVictim,
+          AttributeSet(Seq(clean.sName)),
+          cleanVictimAttr),
+        "a wrapper condition that captures a dimension attr must block the commute"
+      )
+    }
+  }
+
+  test("commutes through LeftSemi and ExistenceJoin without changing type or output identities") {
+    val existsAttr = AttributeReference("exists", org.apache.spark.sql.types.BooleanType)()
+    Seq[JoinType](LeftSemi, ExistenceJoin(existsAttr)).foreach {
+      wrapperType =>
+        val p = canonicalMixedProbeSpinePlan(firstWrapperType = wrapperType)
+        withCanonicalCostConf {
+          val rewritten = PushSelectiveDimensionChainBeforeFact(spark)(p.plan)
+          assert(!rewritten.fastEquals(p.plan), s"$wrapperType spine should be rewritten")
+          assert(rewritten.output == p.plan.output)
+          val matching = rewritten
+            .collectFirst {
+              case join: Join if join.joinType == wrapperType => join
+            }
+            .getOrElse(fail(s"$wrapperType missing after commute:\n$rewritten"))
+          assert(matching.condition == p.dedupInner.condition)
+          assert(matching.hint == p.dedupInner.hint)
+          wrapperType match {
+            case ExistenceJoin(originalExists) =>
+              val rewrittenExists = matching.joinType.asInstanceOf[ExistenceJoin].exists
+              assert(rewrittenExists.exprId == originalExists.exprId)
+            case _ =>
+          }
+        }
+    }
+  }
+
+  test("pure-equi probe-spine commute preserves duplicate and NULL bag semantics") {
+    val probe = Seq(
+      (Some(1L), Some(10L), "p1"),
+      (Some(1L), Some(10L), "p1"),
+      (Some(2L), Some(20L), "p2"),
+      (Some(2L), Some(20L), "p2"),
+      (Some(3L), None, "p3"),
+      (Some(4L), Some(40L), "p4"),
+      (Some(5L), Some(50L), "p5"),
+      (Some(6L), None, "p6")
+    ).toDF("l_orderkey", "l_suppkey", "payload")
+    val rawInnerRhs =
+      Seq(Some(1L), Some(1L), Some(2L), Some(3L), Some(4L), Some(5L), Some(6L), None)
+        .toDF("i_orderkey")
+    val uniqueInnerRhs = rawInnerRhs.groupBy("i_orderkey").count().drop("count")
+    val antiRhs = Seq(
+      (Some(1L), Some(99L)),
+      (Some(1L), Some(99L)),
+      (Some(3L), Some(30L)),
+      (Some(4L), Some(99L)),
+      (None, Some(40L))).toDF("a_orderkey", "a_suppkey")
+    val dimension = Seq(
+      (Some(10L), "d10a"),
+      (Some(10L), "d10b"),
+      (Some(20L), "d20a"),
+      (Some(20L), "d20b"),
+      (None, "d-null"),
+      (Some(40L), "d40"),
+      (Some(50L), "d50")).toDF("d_suppkey", "d_name")
+
+    def addExistenceWrappers(left: org.apache.spark.sql.DataFrame): org.apache.spark.sql.DataFrame =
+      left
+        .join(uniqueInnerRhs, left("l_orderkey") === uniqueInnerRhs("i_orderkey"), "inner")
+        .join(antiRhs, left("l_orderkey") === antiRhs("a_orderkey"), "left_anti")
+
+    val original = addExistenceWrappers(probe)
+      .join(dimension, probe("l_suppkey") === dimension("d_suppkey"), "inner")
+      .select("l_orderkey", "l_suppkey", "payload", "d_name")
+    val probeWithDimension = probe
+      .join(dimension, probe("l_suppkey") === dimension("d_suppkey"), "inner")
+    val commuted = addExistenceWrappers(probeWithDimension)
+      .select("l_orderkey", "l_suppkey", "payload", "d_name")
+
+    val originalRows = original.collect()
+    val commutedRows = commuted.collect()
+    def rowBag(rows: Array[org.apache.spark.sql.Row]): Map[org.apache.spark.sql.Row, Int] =
+      rows.groupBy(identity).map { case (row, copies) => row -> copies.length }
+
+    assert(originalRows.length == 5, "expected duplicate probe and dimension rows to survive")
+    assert(rowBag(originalRows) == rowBag(commutedRows), "commute must preserve the row multiset")
+  }
+
+  test("does not count low-NDV probe wrappers as avoided high-NDV work") {
+    val p = canonicalMixedProbeSpinePlan(lowNdvWrappers = true)
+    withCanonicalCostConf {
+      assert(
+        PushSelectiveDimensionChainBeforeFact(spark)(p.plan).fastEquals(p.plan),
+        "low-NDV state wrappers must not inflate the extended-chain cost benefit")
+    }
+  }
+
+  test("rejects non-deduplicated inner and every outer-join probe wrapper") {
+    val nonDedup = canonicalMixedProbeSpinePlan(deduplicateInnerRhs = false)
+    val onlyUniqueOnWiderKey = canonicalMixedProbeSpinePlan(extraInnerGroupingKey = true)
+    withCanonicalCostConf {
+      assert(PushSelectiveDimensionChainBeforeFact(spark)(nonDedup.plan).fastEquals(nonDedup.plan))
+      assert(
+        PushSelectiveDimensionChainBeforeFact(spark)(onlyUniqueOnWiderKey.plan)
+          .fastEquals(onlyUniqueOnWiderKey.plan),
+        "GROUP BY (orderkey, suppkey) must not prove uniqueness for a join on orderkey alone"
+      )
+      Seq(LeftOuter, RightOuter, FullOuter).foreach {
+        joinType =>
+          val p = canonicalMixedProbeSpinePlan(outerWrapperType = joinType)
+          assert(
+            PushSelectiveDimensionChainBeforeFact(spark)(p.plan).fastEquals(p.plan),
+            s"$joinType probe wrapper must never commute")
+      }
+    }
+  }
+
+  test("rejects a composite prune key supplied by a probe-wrapper RHS") {
+    val p = canonicalMixedProbeSpinePlan(extraPruneKeyFromInnerRhs = true)
+    withCanonicalCostConf {
+      assert(
+        PushSelectiveDimensionChainBeforeFact(spark)(p.plan).fastEquals(p.plan),
+        "every injected prune-key reference must be available at the bottom probe")
+    }
+  }
+
+  test("rejects a mixed probe spine beyond the total unary-and-join depth bound") {
+    val p = canonicalMixedProbeSpinePlan(probeUnaryDepth = 8)
+    withCanonicalCostConf {
+      assert(
+        PushSelectiveDimensionChainBeforeFact(spark)(p.plan).fastEquals(p.plan),
+        "the mixed probe-spine matcher must stop after its bounded total depth")
+    }
   }
 
   test("does not duplicate the synthesized prune predicate in fixed point") {
@@ -385,6 +736,54 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
     }
   }
 
+  test("fact-probe broadcast hint extends the threshold only when MPP network cost wins") {
+    val twoGb = 2L << 30
+    val threeGb = 3L << 30
+    val fourGb = 4L << 30
+    val fiveGb = 5L << 30
+    val eightGb = 8L << 30
+    val twelveGb = 12L << 30
+    val sixtyFourGb = 64L << 30
+    val maxBuildKey = "spark.gluten.mpp.factProbeBroadcastHint.maxBuildBytes"
+    val partitionsKey = "spark.gluten.mpp.multiExecutor.numPartitions"
+
+    val networkWin = sizedInnerJoin(
+      leftBytes = sixtyFourGb,
+      rightBytes = twelveGb,
+      leftStatsBytes = sixtyFourGb,
+      rightStatsBytes = threeGb)
+    withSQLConf(
+      "spark.sql.autoBroadcastJoinThreshold" -> twoGb.toString,
+      maxBuildKey -> fourGb.toString,
+      partitionsKey -> "8") {
+      assert(broadcastHintSide(MppFactProbeBroadcastHint(spark)(networkWin)).contains("right"))
+    }
+
+    val networkLoss = sizedInnerJoin(
+      leftBytes = sixtyFourGb,
+      rightBytes = twelveGb,
+      leftStatsBytes = eightGb,
+      rightStatsBytes = threeGb)
+    withSQLConf(
+      "spark.sql.autoBroadcastJoinThreshold" -> twoGb.toString,
+      maxBuildKey -> fourGb.toString,
+      partitionsKey -> "8") {
+      assert(broadcastHintSide(MppFactProbeBroadcastHint(spark)(networkLoss)).isEmpty)
+    }
+
+    val overMemoryCeiling = sizedInnerJoin(
+      leftBytes = sixtyFourGb,
+      rightBytes = twelveGb,
+      leftStatsBytes = sixtyFourGb,
+      rightStatsBytes = fiveGb)
+    withSQLConf(
+      "spark.sql.autoBroadcastJoinThreshold" -> twoGb.toString,
+      maxBuildKey -> fourGb.toString,
+      partitionsKey -> "8") {
+      assert(broadcastHintSide(MppFactProbeBroadcastHint(spark)(overMemoryCeiling)).isEmpty)
+    }
+  }
+
   // ---- helpers ----
 
   private def postCboRewriteCount(experimental: org.apache.spark.sql.ExperimentalMethods): Int =
@@ -402,6 +801,42 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
     case Project(_, child) => child
     case other => other
   }
+
+  private def withCanonicalCostConf(body: => Unit): Unit = {
+    withSQLConf(
+      confKey -> "true",
+      "spark.gluten.sql.columnar.pushDimensionChainBeforeFact.maxChainRows" -> "10000000",
+      "spark.gluten.sql.columnar.pushDimensionChainBeforeFact.maxChainBytes" -> "1g",
+      "spark.sql.autoBroadcastJoinThreshold" -> "12g",
+      "spark.gluten.mpp.multiExecutor.numPartitions" -> "32"
+    )(body)
+  }
+
+  private def isBelowJoinType(root: LogicalPlan, target: LogicalPlan, joinType: JoinType): Boolean =
+    root.exists {
+      case join: Join if join.joinType == joinType =>
+        join.children.exists(child => child.exists(_ eq target))
+      case _ => false
+    }
+
+  private def containsJoinWithConditionAndHint(root: LogicalPlan, target: Join): Boolean =
+    root.exists {
+      case join: Join =>
+        join.joinType == target.joinType && join.condition == target.condition &&
+        join.hint == target.hint
+      case _ => false
+    }
+
+  private def hasProjectPrefixWithCarriedAttr(
+      root: LogicalPlan,
+      original: Seq[Attribute],
+      carried: Attribute): Boolean =
+    root.exists {
+      case Project(projectList, _) if projectList.length > original.length =>
+        projectList.take(original.length).map(_.toAttribute) == original &&
+        projectList.drop(original.length).exists(_.toAttribute.exprId == carried.exprId)
+      case _ => false
+    }
 
   private def containsPredicate(plan: LogicalPlan, target: Expression): Boolean =
     plan.expressions.exists(e => splitAnd(e).exists(_.semanticEquals(target))) ||
@@ -462,10 +897,10 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
       victimKey: String,
       chainKey: String,
       seedKey: String): Option[LogicalPlan] = plan match {
-    case j @ Join(victim, Join(chain, seed, Inner, _, _), Inner, _, _)
+    case j @ Join(victim, dimension, Inner, _, _)
         if victim.output.exists(_.name == victimKey) &&
-          chain.output.exists(_.name == chainKey) &&
-          seed.output.exists(_.name == seedKey) =>
+          dimension.exists(_.output.exists(_.name == chainKey)) &&
+          dimension.exists(_.output.exists(_.name == seedKey)) =>
       Some(j)
     case _ =>
       plan.children.iterator
@@ -566,9 +1001,173 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
 
   private case class DirectChainVictimPlan(plan: LogicalPlan, lOrderKeyEqOOrderKey: EqualTo)
 
+  private case class CanonicalMixedProbeSpinePlan(
+      plan: LogicalPlan,
+      victim: LogicalPlan,
+      dedupInner: Join,
+      anti: Join,
+      sName: Attribute,
+      expectedPruneHint: JoinHint)
+
+  private def canonicalMixedProbeSpinePlan(
+      antiResidual: Boolean = false,
+      rhsReferencesDimension: Boolean = false,
+      deduplicateInnerRhs: Boolean = true,
+      extraInnerGroupingKey: Boolean = false,
+      lowNdvWrappers: Boolean = false,
+      probeUnaryDepth: Int = 1,
+      extraPruneKeyFromInnerRhs: Boolean = false,
+      firstWrapperType: JoinType = Inner,
+      outerWrapperType: JoinType = LeftAnti): CanonicalMixedProbeSpinePlan = {
+    val sSuppKey = AttributeReference("s_suppkey", LongType)()
+    val sName = AttributeReference("s_name", StringType)()
+    val sNationKey = AttributeReference("s_nationkey", IntegerType)()
+    val nNationKey = AttributeReference("n_nationkey", IntegerType)()
+    val nName = AttributeReference("n_name", StringType)()
+    val lSuppKey = AttributeReference("l_suppkey", LongType)()
+    val lOrderKey = AttributeReference("l_orderkey", LongType)()
+    val firstStateOrderKey = AttributeReference("state1_orderkey", LongType)()
+    val firstStateSuppKey = AttributeReference("state1_suppkey", LongType)()
+    val secondStateOrderKey = AttributeReference("state2_orderkey", LongType)()
+    val secondStateSuppKey = AttributeReference("state2_suppkey", LongType)()
+    val oOrderKey = AttributeReference("o_orderkey", LongType)()
+
+    val supplier = StatRel(Seq(sSuppKey, sName, sNationKey), 300000000L)
+    val nation =
+      Filter(EqualTo(nName, Literal("SAUDI ARABIA")), StatRel(Seq(nNationKey, nName), 25L))
+    val lineitem = StatRel(Seq(lOrderKey, lSuppKey), 180000000000L)
+
+    val firstStateInput = StatRel(Seq(firstStateOrderKey, firstStateSuppKey), 180000000000L)
+    val firstState =
+      if (deduplicateInnerRhs) {
+        val keys =
+          if (lowNdvWrappers) {
+            Seq(firstStateSuppKey)
+          } else if (extraInnerGroupingKey) {
+            Seq(firstStateOrderKey, firstStateSuppKey)
+          } else {
+            Seq(firstStateOrderKey)
+          }
+        Aggregate(keys, keys, firstStateInput)
+      } else {
+        firstStateInput
+      }
+    val firstCondition =
+      if (lowNdvWrappers) EqualTo(lSuppKey, firstStateSuppKey)
+      else EqualTo(lOrderKey, firstStateOrderKey)
+    val rightBroadcast = JoinHint(None, Some(HintInfo(strategy = Some(BROADCAST))))
+    val dedupInner =
+      Join(lineitem, firstState, firstWrapperType, Some(firstCondition), rightBroadcast)
+    val projectedDedupInner = (0 until probeUnaryDepth).foldLeft(dedupInner: LogicalPlan) {
+      case (child, _) => Project(child.output, child)
+    }
+
+    val secondStateAttrs =
+      Seq(secondStateOrderKey, secondStateSuppKey) ++
+        (if (rhsReferencesDimension) Seq(sName) else Seq.empty)
+    val secondStateInput = StatRel(secondStateAttrs, 180000000000L)
+    val secondGrouping =
+      if (antiResidual) {
+        Seq(secondStateOrderKey, secondStateSuppKey)
+      } else if (lowNdvWrappers) {
+        Seq(secondStateSuppKey)
+      } else {
+        Seq(secondStateOrderKey)
+      }
+    val secondState = Aggregate(secondGrouping, secondGrouping, secondStateInput)
+    val secondEquality =
+      if (lowNdvWrappers) EqualTo(lSuppKey, secondStateSuppKey)
+      else EqualTo(lOrderKey, secondStateOrderKey)
+    val secondCondition: Expression =
+      if (antiResidual) And(secondEquality, GreaterThan(lSuppKey, secondStateSuppKey))
+      else secondEquality
+    val anti = Join(
+      projectedDedupInner,
+      secondState,
+      outerWrapperType,
+      Some(secondCondition),
+      rightBroadcast)
+    val victim = Project(anti.output, anti)
+
+    val chainLeftHint = JoinHint(Some(HintInfo(strategy = Some(BROADCAST))), None)
+    val supplierVictimCondition: Expression =
+      if (extraPruneKeyFromInnerRhs) {
+        And(EqualTo(sSuppKey, lSuppKey), EqualTo(sSuppKey, firstStateOrderKey))
+      } else {
+        EqualTo(sSuppKey, lSuppKey)
+      }
+    val supplierVictim =
+      Join(supplier, victim, Inner, Some(supplierVictimCondition), chainLeftHint)
+    val withOrders = Join(
+      supplierVictim,
+      StatRel(Seq(oOrderKey), 45000000000L),
+      Inner,
+      Some(EqualTo(lOrderKey, oOrderKey)),
+      JoinHint.NONE)
+    val withNation =
+      Join(withOrders, nation, Inner, Some(EqualTo(sNationKey, nNationKey)), JoinHint.NONE)
+
+    CanonicalMixedProbeSpinePlan(
+      Project(Seq(sName), withNation),
+      victim,
+      dedupInner,
+      anti,
+      sName,
+      JoinHint(None, chainLeftHint.leftHint))
+  }
+
+  private def pairedExistenceStateProbeSpinePlan(): CanonicalMixedProbeSpinePlan = {
+    val sSuppKey = AttributeReference("s_suppkey", LongType)()
+    val sName = AttributeReference("s_name", StringType)()
+    val sNationKey = AttributeReference("s_nationkey", IntegerType)()
+    val nNationKey = AttributeReference("n_nationkey", IntegerType)()
+    val nName = AttributeReference("n_name", StringType)()
+    val lSuppKey = AttributeReference("l_suppkey", LongType)()
+    val lOrderKey = AttributeReference("l_orderkey", LongType)()
+    val stateOrderKey = AttributeReference("state_orderkey", LongType)()
+    val stateSuppKey = AttributeReference("state_suppkey", LongType)()
+    val oOrderKey = AttributeReference("o_orderkey", LongType)()
+
+    val supplier = StatRel(Seq(sSuppKey, sName, sNationKey), 300000000L)
+    val nation =
+      Filter(EqualTo(nName, Literal("SAUDI ARABIA")), StatRel(Seq(nNationKey, nName), 25L))
+    val lineitem = StatRel(Seq(lOrderKey, lSuppKey), 180000000000L)
+    val stateInput = StatRel(Seq(stateOrderKey, stateSuppKey), 180000000000L)
+    val delayedMin = Alias(Min(stateSuppKey).toAggregateExpression(), "delayed_min_suppkey")()
+    val state = Aggregate(Seq(stateOrderKey), Seq(stateOrderKey, delayedMin), stateInput)
+    val pairedCondition =
+      And(EqualTo(lOrderKey, stateOrderKey), EqualTo(lSuppKey, delayedMin.toAttribute))
+    val rightBroadcast = JoinHint(None, Some(HintInfo(strategy = Some(BROADCAST))))
+    val pairedJoin = Join(lineitem, state, LeftSemi, Some(pairedCondition), rightBroadcast)
+    val victim = Project(lineitem.output, pairedJoin)
+
+    val chainLeftHint = JoinHint(Some(HintInfo(strategy = Some(BROADCAST))), None)
+    val supplierVictim =
+      Join(supplier, victim, Inner, Some(EqualTo(sSuppKey, lSuppKey)), chainLeftHint)
+    val withOrders = Join(
+      supplierVictim,
+      StatRel(Seq(oOrderKey), 45000000000L),
+      Inner,
+      Some(EqualTo(lOrderKey, oOrderKey)),
+      JoinHint.NONE)
+    val withNation =
+      Join(withOrders, nation, Inner, Some(EqualTo(sNationKey, nNationKey)), JoinHint.NONE)
+
+    CanonicalMixedProbeSpinePlan(
+      Project(Seq(sName), withNation),
+      victim,
+      pairedJoin,
+      pairedJoin,
+      sName,
+      JoinHint(None, chainLeftHint.leftHint))
+  }
+
   private def directChainVictimPlan(
       chainRows: Long = 2000000L,
-      filterOrders: Boolean = false): DirectChainVictimPlan = {
+      victimRows: Long = 6000000000L,
+      filterOrders: Boolean = false,
+      includeOrderState: Boolean = false,
+      filterOrderState: Boolean = false): DirectChainVictimPlan = {
     val sSuppKey = AttributeReference("s_suppkey", LongType)()
     val sNationKey = AttributeReference("s_nationkey", IntegerType)()
     val nNationKey = AttributeReference("n_nationkey", IntegerType)()
@@ -577,11 +1176,14 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
     val lOrderKey = AttributeReference("l_orderkey", LongType)()
     val oOrderKey = AttributeReference("o_orderkey", LongType)()
     val oStatus = AttributeReference("o_orderstatus", StringType)()
+    val stateOrderKey = AttributeReference("state_orderkey", LongType)()
+    val stateSuppKey = AttributeReference("state_suppkey", LongType)()
+    val stateType = AttributeReference("state_type", StringType)()
 
     val supplier = StatRel(Seq(sSuppKey, sNationKey), chainRows)
     val nation =
       Filter(EqualTo(nName, Literal("SAUDI ARABIA")), StatRel(Seq(nNationKey, nName), 25L))
-    val lineitem = StatRel(Seq(lSuppKey, lOrderKey), 6000000000L)
+    val lineitem = StatRel(Seq(lSuppKey, lOrderKey), victimRows)
     val orders: LogicalPlan =
       if (filterOrders) {
         Project(
@@ -598,7 +1200,26 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
     val supplierLineitem = Join(supplier, lineitem, Inner, Some(sSuppKeyEqLSuppKey), JoinHint.NONE)
     val withOrders =
       Join(supplierLineitem, orders, Inner, Some(lOrderKeyEqOOrderKey), JoinHint.NONE)
-    val withNation = Join(withOrders, nation, Inner, Some(sNationEqNNation), JoinHint.NONE)
+    val withOrderState =
+      if (includeOrderState) {
+        val stateInput = StatRel(Seq(stateOrderKey, stateSuppKey, stateType), victimRows)
+        val state: LogicalPlan =
+          if (filterOrderState) {
+            Filter(EqualTo(stateType, Literal("MATCH")), stateInput)
+          } else {
+            stateInput
+          }
+        Join(
+          withOrders,
+          state,
+          Inner,
+          Some(And(EqualTo(lOrderKey, stateOrderKey), EqualTo(lSuppKey, stateSuppKey))),
+          JoinHint.NONE
+        )
+      } else {
+        withOrders
+      }
+    val withNation = Join(withOrderState, nation, Inner, Some(sNationEqNNation), JoinHint.NONE)
     DirectChainVictimPlan(withNation, lOrderKeyEqOOrderKey)
   }
 

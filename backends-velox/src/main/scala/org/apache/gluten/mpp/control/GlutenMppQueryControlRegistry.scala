@@ -216,12 +216,13 @@ class GlutenMppQueryControlRegistry(
                   failRunLocked(run, s"Spark task $taskAttemptId failed: $reason", now)
                   peer.state = MppPeerState.Failed
                 } else {
-                  if (run.expectedPeerCount > 1 && !peer.outputComplete) {
-                    failRunLocked(
-                      run,
-                      s"Spark task $taskAttemptId completed before output EOS",
-                      now)
-                  }
+                  // A successful Spark task has consumed (or deliberately accepted an empty)
+                  // root output.  Treat task success as an implicit output-EOS acknowledgement.
+                  // This is important for distributed file writes: FileFormatWriter may finish an
+                  // empty/sparse output partition without another iterator hasNext() call, so the
+                  // executor's explicit OutputComplete heartbeat can race with
+                  // SparkListenerTaskEnd.
+                  peer.outputComplete = true
                   peer.state = MppPeerState.Succeeded
                 }
                 peer.terminal = true
@@ -316,7 +317,12 @@ class GlutenMppQueryControlRegistry(
         peer.lastHeartbeatMs = now
         peer.acceptedAbortSequence =
           math.max(peer.acceptedAbortSequence, snapshot.acceptedAbortSequence)
-        peer.outputComplete = peer.outputComplete || snapshot.state == MppPeerState.OutputComplete
+        // Succeeded is emitted only after the owning Spark task has accepted all of its output.
+        // Preserve that fact even if the intermediate OutputComplete heartbeat lost the race with
+        // the terminal heartbeat/task-end event.
+        peer.outputComplete = peer.outputComplete ||
+          snapshot.state == MppPeerState.OutputComplete ||
+          snapshot.state == MppPeerState.Succeeded
         peer.terminal = MppPeerState.isTerminal(snapshot.state)
       case Some(peer) =>
         failRunLocked(
@@ -345,7 +351,8 @@ class GlutenMppQueryControlRegistry(
             now,
             snapshot.acceptedAbortSequence,
             MppPeerState.isTerminal(snapshot.state),
-            snapshot.state == MppPeerState.OutputComplete
+            snapshot.state == MppPeerState.OutputComplete ||
+              snapshot.state == MppPeerState.Succeeded
           )
         )
     }

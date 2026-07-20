@@ -37,7 +37,7 @@ class MppReplicatedCartesianRuleSuite extends QueryTest with SharedSparkSession 
 
   private def scan(name: String, sizeInBytes: BigInt, rows: Option[BigInt]): LocalTableScanExec = {
     val attr = AttributeReference(name, IntegerType, nullable = true)()
-    val physical = LocalTableScanExec(Seq(attr), Seq.empty[InternalRow], None)
+    val physical = LocalTableScanExec(Seq(attr), Seq.empty[InternalRow])
     physical.setLogicalLink(SizedLeaf(Seq(attr), sizeInBytes, rows))
     physical
   }
@@ -122,12 +122,10 @@ class MppReplicatedCartesianRuleSuite extends QueryTest with SharedSparkSession 
 
       val unknownLeft = LocalTableScanExec(
         Seq(AttributeReference("l2", IntegerType, nullable = true)()),
-        Seq.empty[InternalRow],
-        None)
+        Seq.empty[InternalRow])
       val unknownRight = LocalTableScanExec(
         Seq(AttributeReference("r2", IntegerType, nullable = true)()),
-        Seq.empty[InternalRow],
-        None)
+        Seq.empty[InternalRow])
       val unknownError = intercept[IllegalStateException] {
         MppReplicatedCartesianRule()(cartesian(unknownLeft, unknownRight))
       }

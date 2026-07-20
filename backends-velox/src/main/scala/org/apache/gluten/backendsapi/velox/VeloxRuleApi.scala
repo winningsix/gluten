@@ -65,12 +65,22 @@ object VeloxRuleApi {
     injector.injectOptimizerRule(CollectRewriteRule.apply)
     injector.injectOptimizerRule(HLLRewriteRule.apply)
     injector.injectOptimizerRule(CollapseGetJsonObjectExpressionRule.apply)
-    // Keep this rule out of Spark's analyzer. Its whole-plan transforms are optimizer-safe, but
-    // Spark 3.5 rejects LogicalPlan.transformUp while running post-hoc resolution rules.
+    // Register the paired-existence rules in Spark's post-RewriteSubquery optimizer batch before
+    // the first query reaches optimization. The registrar only updates the rule list and returns
+    // the analyzer plan unchanged; the whole-plan transforms themselves remain optimizer-only.
+    injector.injectPostHocResolutionRule(RegisterMppExistencePostSubqueryRules.apply)
+    injector.injectOptimizerRule(MergeSelfCorrelatedExistenceState.apply)
+    injector.injectPreCBORule(MergeSelfCorrelatedExistenceState.apply)
     injector.injectOptimizerRule(RewriteExistenceJoinRhsDedup.apply)
     injector.injectPreCBORule(RewriteExistenceJoinRhsDedup.apply)
     injector.injectOptimizerRule(spark => PruneRedundantLeftSemiFilters(spark))
     injector.injectOptimizerRule(SelectiveDimensionJoinReorder.apply)
+    // Reassociate selective fact-to-fact joins before wide dimensions. The rule also
+    // self-registers in Spark's user optimizer batch so it can repair a post-CBO join order.
+    injector.injectOptimizerRule(ReorderFilteredFactBeforeWideDimension.apply)
+    // Reuse an already-required selective dimension key to prune the matching correlated
+    // aggregate input. Construction registers the rule for Spark's post-subquery optimizer batch.
+    injector.injectOptimizerRule(PushSelectiveDimensionFilterIntoAggregate.apply)
     // Prune a large dimension through a selective filtered dimension chain before the
     // dimension joins a large fact side. This covers multi-hop shapes that the single-hop
     // SelectiveDimensionJoinReorder above cannot reach. The rule self-registers into
@@ -79,6 +89,10 @@ object VeloxRuleApi {
     injector.injectOptimizerRule(MppFactProbeBroadcastHint.apply)
     injector.injectOptimizerRule(RewriteCastFromArray.apply)
     injector.injectOptimizerRule(RewriteUnboundedWindow.apply)
+    // Evaluate a CTE-derived aggregate once for `value = scalar(max(value))`. The
+    // tie-preserving dense-rank form also lets Spark insert Partial/Final WindowGroupLimit and
+    // avoids exact-equality failures between two independently merged floating aggregates.
+    injector.injectOptimizerRule(RewriteSelfMaxScalarToDenseRank.apply)
     // Rewrite large LeftSemi joins to Inner + DISTINCT(rightKeys). Mirrors Presto's optimizer
     // shape for EXISTS subqueries so cuDF SHJ does not have to build a multi-GB hash table on
     // the right side (default BuildRight for LeftSemi). Default on; turn off with

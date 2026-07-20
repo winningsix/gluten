@@ -24,6 +24,8 @@ import org.apache.spark.sql.catalyst.plans.logical.{JoinHint, LogicalPlan}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 
+import scala.util.Try
+
 /**
  * Keep a large fact table on the PROBE side of an inner join by forcing the small dimension side to
  * broadcast (build). This fixes the selection UPSTREAM of EnsureRequirements -- it only chooses the
@@ -36,13 +38,17 @@ import org.apache.spark.sql.execution.datasources.LogicalRelation
  * input overrides the size-based choice so the large side streams as probe.
  *
  * The REAL on-disk leaf scan size (sum of leaf relation sizeInBytes) is used only to choose which
- * side is the fact/probe side. Spark plan stats (`plan.stats.sizeInBytes`) are used for the
- * auto-broadcast threshold check, matching Spark JoinSelection behavior after filters and
+ * side is the fact/probe side. Spark plan stats (`plan.stats.sizeInBytes`) drive both Spark's
+ * normal auto-broadcast threshold and the optional MPP network-cost extension after filters and
  * projections shrink an intermediate.
  */
 case class MppFactProbeBroadcastHint(spark: SparkSession) extends Rule[LogicalPlan] with Logging {
 
   private val singleTaskModeKey = "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode"
+  private val maxBuildBytesKey = "spark.gluten.mpp.factProbeBroadcastHint.maxBuildBytes"
+  private val minNetworkSavingsRatioKey =
+    "spark.gluten.mpp.factProbeBroadcastHint.minNetworkSavingsRatio"
+  private val mppPartitionsKey = "spark.gluten.mpp.multiExecutor.numPartitions"
 
   private def enabled: Boolean =
     spark.sessionState.conf
@@ -69,11 +75,11 @@ case class MppFactProbeBroadcastHint(spark: SparkSession) extends Rule[LogicalPl
         // joins; earlier planning rules may choose SHUFFLE_HASH first when a medium
         // intermediate should stay repartitioned before it is later replicated.
         // Use leaf scan bytes to avoid choosing the fact side. Use Spark plan
-        // stats for the threshold check so filtered/projected intermediates follow
-        // the same auto-broadcast contract as Spark JoinSelection.
+        // stats for the threshold and network-cost checks so filtered/projected intermediates
+        // follow the same estimates as Spark JoinSelection.
         if (
           leftScanBytes > 0 && rightScanBytes > 0 && leftScanBytes < rightScanBytes &&
-          leftStatsBytes > 0 && leftStatsBytes <= maxBroadcastBytes
+          shouldBroadcast(leftStatsBytes, rightStatsBytes, maxBroadcastBytes)
         ) {
           logWarning(
             s"MppFactProbeBroadcastHint: broadcasting smaller LEFT side " +
@@ -83,7 +89,7 @@ case class MppFactProbeBroadcastHint(spark: SparkSession) extends Rule[LogicalPl
           join.copy(hint = JoinHint(Some(broadcastHint), None))
         } else if (
           leftScanBytes > 0 && rightScanBytes > 0 && rightScanBytes < leftScanBytes &&
-          rightStatsBytes > 0 && rightStatsBytes <= maxBroadcastBytes
+          shouldBroadcast(rightStatsBytes, leftStatsBytes, maxBroadcastBytes)
         ) {
           logWarning(
             s"MppFactProbeBroadcastHint: broadcasting smaller RIGHT side " +
@@ -108,6 +114,103 @@ case class MppFactProbeBroadcastHint(spark: SparkSession) extends Rule[LogicalPl
   }
 
   private def broadcastBytes(plan: LogicalPlan): BigInt = plan.stats.sizeInBytes
+
+  /**
+   * Extend Spark's fixed auto-broadcast threshold with an MPP network-cost decision, while keeping
+   * an independent per-peer build-memory ceiling.
+   *
+   * A hash join sends both sides through the network. A replicated join sends the build to every
+   * other peer, so its first-order network cost is `buildBytes * (peers - 1)`. Above Spark's normal
+   * threshold we only add a broadcast hint when that replicated cost is materially smaller than
+   * shuffling both inputs and the build remains below the explicit safety ceiling. The default
+   * ceiling is `auto`, which preserves Spark's threshold; launchers for large-memory MPP workers
+   * may raise it without globally changing Spark JoinSelection.
+   */
+  private def shouldBroadcast(
+      buildBytes: BigInt,
+      probeBytes: BigInt,
+      autoBroadcastBytes: BigInt): Boolean = {
+    if (buildBytes <= 0 || probeBytes <= 0) {
+      return false
+    }
+    if (buildBytes <= autoBroadcastBytes) {
+      return true
+    }
+
+    val maxBuildBytes = configuredMaxBuildBytes(autoBroadcastBytes)
+    if (buildBytes > maxBuildBytes) {
+      return false
+    }
+
+    val peers = configuredMppPartitions
+    if (peers <= 1) {
+      return false
+    }
+    val broadcastNetworkBytes = buildBytes * (peers - 1)
+    val shuffleNetworkBytes = probeBytes + buildBytes
+    val minSavingsRatio = configuredMinNetworkSavingsRatio
+    val beneficial =
+      BigDecimal(shuffleNetworkBytes) >=
+        BigDecimal(broadcastNetworkBytes) * BigDecimal(minSavingsRatio)
+    if (beneficial) {
+      logWarning(
+        s"MppFactProbeBroadcastHint: cost-gated broadcast above Spark threshold " +
+          s"(buildBytes=$buildBytes probeBytes=$probeBytes peers=$peers " +
+          s"broadcastNetworkBytes=$broadcastNetworkBytes " +
+          s"shuffleNetworkBytes=$shuffleNetworkBytes " +
+          s"minNetworkSavingsRatio=$minSavingsRatio maxBuildBytes=$maxBuildBytes " +
+          s"autoBroadcastJoinThreshold=$autoBroadcastBytes)")
+    }
+    beneficial
+  }
+
+  private def configuredMaxBuildBytes(autoBroadcastBytes: BigInt): BigInt = {
+    val raw = spark.sessionState.conf.getConfString(maxBuildBytesKey, "auto").trim
+    if (raw.isEmpty || raw.equalsIgnoreCase("auto")) {
+      autoBroadcastBytes
+    } else {
+      parseBytes(raw).getOrElse {
+        logWarning(
+          s"MppFactProbeBroadcastHint: invalid $maxBuildBytesKey=$raw; " +
+            s"using autoBroadcastJoinThreshold=$autoBroadcastBytes")
+        autoBroadcastBytes
+      }
+    }
+  }
+
+  private def configuredMppPartitions: Int = {
+    val fallback = spark.sessionState.conf.numShufflePartitions
+    Try(spark.sessionState.conf.getConfString(mppPartitionsKey, fallback.toString).toInt).toOption
+      .filter(_ > 0)
+      .getOrElse(fallback)
+  }
+
+  private def configuredMinNetworkSavingsRatio: Double = {
+    Try(
+      spark.sessionState.conf
+        .getConfString(minNetworkSavingsRatioKey, "1.25")
+        .trim
+        .toDouble).toOption
+      .filter(_ >= 1.0)
+      .getOrElse(1.25)
+  }
+
+  private def parseBytes(raw: String): Option[BigInt] = {
+    val normalized = raw.trim.toLowerCase(java.util.Locale.ROOT)
+    val BytePattern = "^([0-9]+)([kmgt]?)(i?b)?$".r
+    normalized match {
+      case BytePattern(value, unit, _) =>
+        val shift = unit match {
+          case "" => 0
+          case "k" => 10
+          case "m" => 20
+          case "g" => 30
+          case "t" => 40
+        }
+        Some(BigInt(value) << shift)
+      case _ => None
+    }
+  }
 
   private def singleTaskModeEnabled: Boolean =
     spark.sessionState.conf.getConfString(singleTaskModeKey, "false").toBoolean

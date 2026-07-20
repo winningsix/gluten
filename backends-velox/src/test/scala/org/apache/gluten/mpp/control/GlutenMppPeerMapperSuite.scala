@@ -84,25 +84,27 @@ class GlutenMppPeerMapperSuite extends AnyFunSuite {
     }
   }
 
-  test("host selection prefers non-empty blockManagerHost") {
+  test("UCX connection prefers listener IP while Spark placement uses blockManagerHost") {
     val infos = Seq(info("e1", host = "infoHost", blockManagerHost = "bmHost", ucxHost = "ucxHost"))
     val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 1)
-    assert(out.head.host == "bmHost")
+    assert(out.head.host == "ucxHost")
     assert(out.head.preferredLocation == "executor_bmHost_e1")
   }
 
-  test("host selection preserves localhost blockManagerHost") {
+  test("UCX connection does not replace listener host with localhost placement host") {
     val infos =
       Seq(info("e1", host = "infoHost", blockManagerHost = "localhost", ucxHost = "ucxHost"))
     val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 1)
-    assert(out.head.host == "localhost")
+    assert(out.head.host == "ucxHost")
+    assert(out.head.preferredLocation == "executor_localhost_e1")
   }
 
-  test("host selection preserves 127.* blockManagerHost") {
+  test("UCX connection does not replace listener host with loopback placement host") {
     val infos =
       Seq(info("e1", host = "infoHost", blockManagerHost = "127.0.0.1", ucxHost = "ucxHost"))
     val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 1)
-    assert(out.head.host == "127.0.0.1")
+    assert(out.head.host == "ucxHost")
+    assert(out.head.preferredLocation == "executor_127.0.0.1_e1")
   }
 
   test("host selection falls through to URI host when blockManagerHost empty") {
@@ -137,6 +139,28 @@ class GlutenMppPeerMapperSuite extends AnyFunSuite {
       """[{"peerId":"e1","host":"host-a","port":50097,"peerIndex":0},""" +
         """{"peerId":"e2","host":"host-b","port":50197,"peerIndex":1}]"""
     assert(json == expected, s"\n  actual:   $json\n  expected: $expected")
+  }
+
+  test("one-peer executor-local JSON uses the registered routable endpoint") {
+    val record = MppExecutorEndpointRecord(
+      executorId = "12",
+      host = "10.87.140.44",
+      blockManagerHost = "presto-gb200-gcn-09",
+      blockManagerPort = 40200,
+      ucxListenerPort = 48366,
+      remoteConnectorPort = 48363,
+      ucxEndpoint = "ucx://10.87.140.44:48366",
+      gpuResourceAddresses = Seq("1"),
+      registeredAtMs = 1L,
+      generation = 0L,
+      state = MppExecutorEndpointRecord.StateLive
+    )
+
+    assert(
+      GlutenMppExecutorService
+        .localPeerEndpointsJson(record, "12")
+        .contains("""[{"peerId":"12","host":"10.87.140.44","port":48363,"peerIndex":0}]"""))
+    assert(GlutenMppExecutorService.localPeerEndpointsJson(record, "13").isEmpty)
   }
 
   test("toPeerEndpointsJson escapes quote / backslash / control chars in peerId and host") {
