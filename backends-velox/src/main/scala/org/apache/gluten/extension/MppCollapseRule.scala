@@ -558,6 +558,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     case _: BaseAggregateExec => true
     case sort: SortExec if !sort.global => true
     case _: ProjectExec | _: FilterExec => true
+    case generate: GenerateExec => isRecoverableGenerateRowIsland(generate)
     case _ => false
   }
 
@@ -778,11 +779,27 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
             s"${coalesce.numPartitions}) inside MPP query")
         coalesce.child
     }
+    // A V2 writer can request its own distribution directly above the query's terminal shuffle
+    // (Iceberg commonly adds RANGE over an existing HASH exchange). With no relational operator
+    // between the two exchanges, the inner distribution has no consumer and is semantically
+    // redundant: the outer exchange reads every row and establishes the only distribution visible
+    // to the writer. Remove that dead boundary before fragment extraction. Besides avoiding an
+    // unnecessary network round trip, this prevents the adjacent exchanges from being mistaken for
+    // one native producer boundary and silently losing one of their partitioning specifications.
+    val adjacentShuffleElided = coalesceElided.transformUp {
+      case outer: ShuffleExchangeLike if outer.child.isInstanceOf[ShuffleExchangeLike] =>
+        val inner = outer.child.asInstanceOf[ShuffleExchangeLike]
+        logInfo(
+          s"MppCollapseRule: eliding redundant adjacent " +
+            s"${inner.outputPartitioning.getClass.getSimpleName} below " +
+            s"${outer.outputPartitioning.getClass.getSimpleName}")
+        outer.withNewChildren(Seq(inner.child))
+    }
     // Native aggregate and sort relations require their computed arguments to be materialized as
     // fields. The normal heuristic rewrite may leave a row operator behind after one sibling
     // fails validation, so repeat the official pre-project rewrite before force-offloading the
     // strict-MPP subtree. This is expression-preserving and does not broaden native validation.
-    val nativeSortKeysProjected = coalesceElided.transformUp {
+    val nativeSortKeysProjected = adjacentShuffleElided.transformUp {
       case sort: SortExecTransformer => MppComputedSortKeyProjection.rewrite(sort)
     }
     val preProjected = nativeSortKeysProjected.transformUp {
@@ -839,18 +856,24 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
   /**
    * Remove only the stale transitions around a row shell that was just late-offloaded, while
-   * retaining the exact R2C leaf that identifies the JVM-backed local stream.
+   * retaining the exact R2C leaf that identifies the JVM-backed local stream. A hybrid plan may
+   * have native-only sibling branches, so the recovered subtree itself does not have to contain the
+   * JVM ingress; it only has to satisfy the same recursive native contract with JVM ingress allowed
+   * elsewhere in the complete plan.
    */
   private def bridgeRecoverableJvmStreamTransitions(plan: SparkPlan): SparkPlan = {
     val withoutIngressC2r = plan.transformUp {
-      case c2r: ColumnarToRowExecBase if isSupportedJvmStreamHybridPlan(c2r.child) =>
+      case c2r: ColumnarToRowExecBase
+          if isNativeSupported(c2r.child, allowJvmStreamIngress = true) =>
         c2r.child
-      case c2r: ColumnarToRowExec if isSupportedJvmStreamHybridPlan(c2r.child) => c2r.child
+      case c2r: ColumnarToRowExec if isNativeSupported(c2r.child, allowJvmStreamIngress = true) =>
+        c2r.child
     }
     withoutIngressC2r.transformUp {
-      case r2c: RowToColumnarExecBase if isSupportedJvmStreamHybridPlan(r2c.child) =>
+      case r2c: RowToColumnarExecBase
+          if isNativeSupported(r2c.child, allowJvmStreamIngress = true) =>
         r2c.child
-      case r2c: RowToColumnarExec if isSupportedJvmStreamHybridPlan(r2c.child) =>
+      case r2c: RowToColumnarExec if isNativeSupported(r2c.child, allowJvmStreamIngress = true) =>
         r2c.child
     }
   }
@@ -1211,6 +1234,11 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case shuffle: ShuffleExchangeLike =>
         val partitioningSupported = isSupportedPartitioning(shuffle.outputPartitioning)
         val childSupported = shuffle.child.isInstanceOf[TransformSupport] ||
+          // Spark can stack a write-distribution exchange directly on top of an
+          // existing query exchange (for example Iceberg RANGE over HASH). Admit
+          // that shape so normalizeMppNativeOperators can remove the redundant
+          // inner boundary before native fragment extraction.
+          shuffle.child.isInstanceOf[ShuffleExchangeLike] ||
           shuffle.child.isInstanceOf[ShuffleQueryStageExec] ||
           shuffle.child.isInstanceOf[BroadcastQueryStageExec] ||
           shuffle.child.isInstanceOf[ColumnarToColumnarExec] ||

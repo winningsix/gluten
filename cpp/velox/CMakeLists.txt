@@ -275,12 +275,20 @@ add_dependencies(velox velox_jni_proto)
 set(GLUTEN_UCX_INCLUDE_DIR "")
 set(GLUTEN_UCX_LIBRARIES "")
 if(DEFINED GLUTEN_UCX_HOME AND NOT "${GLUTEN_UCX_HOME}" STREQUAL "")
-  set(GLUTEN_UCX_INCLUDE_DIR ${GLUTEN_UCX_HOME})
+  # Accept either a standard UCX installation prefix (include/ + lib/) or the
+  # legacy flat directory containing both headers and shared libraries.
+  if(EXISTS "${GLUTEN_UCX_HOME}/include/ucp/api/ucp.h")
+    set(GLUTEN_UCX_INCLUDE_DIR ${GLUTEN_UCX_HOME}/include)
+    set(GLUTEN_UCX_LIBRARY_DIR ${GLUTEN_UCX_HOME}/lib)
+  else()
+    set(GLUTEN_UCX_INCLUDE_DIR ${GLUTEN_UCX_HOME})
+    set(GLUTEN_UCX_LIBRARY_DIR ${GLUTEN_UCX_HOME})
+  endif()
   set(GLUTEN_UCX_LIBRARIES
-      ${GLUTEN_UCX_HOME}/libucp.so ${GLUTEN_UCX_HOME}/libuct.so
-      ${GLUTEN_UCX_HOME}/libucs.so)
-  if(EXISTS "${GLUTEN_UCX_HOME}/libucm.so")
-    list(APPEND GLUTEN_UCX_LIBRARIES ${GLUTEN_UCX_HOME}/libucm.so)
+      ${GLUTEN_UCX_LIBRARY_DIR}/libucp.so ${GLUTEN_UCX_LIBRARY_DIR}/libuct.so
+      ${GLUTEN_UCX_LIBRARY_DIR}/libucs.so)
+  if(EXISTS "${GLUTEN_UCX_LIBRARY_DIR}/libucm.so")
+    list(APPEND GLUTEN_UCX_LIBRARIES ${GLUTEN_UCX_LIBRARY_DIR}/libucm.so)
   endif()
 else()
   find_path(GLUTEN_UCX_INCLUDE_DIR NAMES ucp/api/ucp.h REQUIRED)

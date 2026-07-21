@@ -16,8 +16,10 @@
  */
 package org.apache.spark.sql.execution.utils
 
-import org.apache.spark.RangePartitioner
+import org.apache.spark.{RangePartitioner, ShuffleDependency}
+import org.apache.spark.internal.Logging
 import org.apache.spark.network.util.JavaUtils
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, BoundReference, Descending, NullsFirst, NullsLast, SortOrder, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.expressions.codegen.LazilyGeneratedOrdering
@@ -46,7 +48,7 @@ import scala.util.control.NonFatal
  * at least one candidate per requested RANGE peer. A future mergeable global reservoir can make
  * those unused shares transferable without another producer scan.
  */
-object MppRangeBoundsGenerator {
+object MppRangeBoundsGenerator extends Logging {
 
   private val MaxSampleRowsKey = "spark.gluten.mpp.rangeSampleMaxRows"
   private val MaxSampleBytesKey = "spark.gluten.mpp.rangeSampleMaxBytes"
@@ -208,6 +210,13 @@ object MppRangeBoundsGenerator {
       maxSampleRows,
       maxSampleBytes)
     val inputRddId = input.id
+    // A RANGE producer can contain many independent shuffle-map stages. DAGScheduler normally
+    // submits all missing parents together. Multi-peer MPP tasks cannot make progress until all
+    // peers run, so two such stages can otherwise split the available GPU slots and wait forever
+    // for peers held by the other stage. Materialize the existing shuffle boundaries in dependency
+    // order before the sampling action. This does not add a shuffle or rescan completed map stages;
+    // the subsequent collect consumes their registered map outputs.
+    materializeShuffleDependencies(input)
     val bounds = determineBounds(
       requestedPartitions,
       inputPartitions,
@@ -241,6 +250,46 @@ object MppRangeBoundsGenerator {
         .collect()
     )
     Result(encode(ordering, bounds), bounds.length)
+  }
+
+  private[utils] def materializeShuffleDependencies(rdd: RDD[_]): Unit = {
+    val dependencies = shuffleDependenciesInTopologicalOrder(rdd)
+    if (dependencies.nonEmpty) {
+      logInfo(
+        s"MPP RANGE preparation is materializing ${dependencies.size} shuffle map stage(s) " +
+          s"serially to preserve multi-peer MPP gang progress: " +
+          dependencies.map(_.shuffleId).mkString("[", ",", "]"))
+      dependencies.foreach {
+        dependency =>
+          rdd.sparkContext
+            .submitMapStage(dependency.asInstanceOf[ShuffleDependency[Any, Any, Any]])
+            .get()
+      }
+    }
+  }
+
+  private[utils] def shuffleDependenciesInTopologicalOrder(
+      rdd: RDD[_]): Seq[ShuffleDependency[_, _, _]] = {
+    val visitedRdds = mutable.HashSet.empty[Int]
+    val visitedShuffles = mutable.HashSet.empty[Int]
+    val ordered = ArrayBuffer.empty[ShuffleDependency[_, _, _]]
+
+    def visit(current: RDD[_]): Unit = {
+      if (visitedRdds.add(current.id)) {
+        current.dependencies.foreach {
+          case shuffle: ShuffleDependency[_, _, _] =>
+            visit(shuffle.rdd)
+            if (visitedShuffles.add(shuffle.shuffleId)) {
+              ordered += shuffle
+            }
+          case dependency =>
+            visit(dependency.rdd)
+        }
+      }
+    }
+
+    visit(rdd)
+    ordered.toSeq
   }
 
   private[utils] def determineBounds(

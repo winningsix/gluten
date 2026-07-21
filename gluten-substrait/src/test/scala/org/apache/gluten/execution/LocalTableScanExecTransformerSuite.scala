@@ -35,6 +35,15 @@ class LocalTableScanExecTransformerSuite extends AnyFunSuite {
     assert(plan.metricsUpdater() eq MetricsUpdater.Terminate)
   }
 
+  test("whole-stage input metrics skip a terminated native leaf") {
+    val output = Seq(AttributeReference("snapshot_date", DateType, nullable = true)())
+    val plan = LocalTableScanExecTransformer(output, Seq.empty)
+    val wholeStage = WholeStageTransformer(plan, materializeInput = false)(transformStageId = 1)
+
+    // No concrete InputMetricsWrapper is needed: the terminated leaf must not be invoked.
+    wholeStage.leafInputMetricsUpdater()(null)
+  }
+
   test("materializes local rows before plan serialization") {
     val output = Seq(AttributeReference("snapshot_date", DateType, nullable = true)())
     val sourceRow = new NonSerializableBackedRow(Array[Any](1))

@@ -421,12 +421,17 @@ case class WholeStageTransformer(child: SparkPlan, materializeInput: Boolean = f
     }
   }
 
-  private def leafInputMetricsUpdater(): InputMetricsWrapper => Unit = {
+  private[execution] def leafInputMetricsUpdater(): InputMetricsWrapper => Unit = {
     val leaves = child.collect {
       case plan: TransformSupport if plan.children.forall(!_.isInstanceOf[TransformSupport]) =>
         plan
     }
-    val leafMetricsUpdater = leaves.map(_.metricsUpdater())
+    // Terminate is a metrics-tree traversal sentinel, not an updater bound to an operator. Native
+    // virtual-table leaves (for example LocalTableScanExecTransformer and MPP exchange sources)
+    // deliberately return it. A first-stage iterator may still exhaust such a leaf while RANGE
+    // preparation scans a producer plan, so do not invoke the sentinel as an input-metrics updater.
+    val leafMetricsUpdater =
+      leaves.map(_.metricsUpdater()).filterNot(_ eq MetricsUpdater.Terminate)
 
     (inputMetrics: InputMetricsWrapper) => {
       leafMetricsUpdater.foreach(_.updateInputMetrics(inputMetrics))

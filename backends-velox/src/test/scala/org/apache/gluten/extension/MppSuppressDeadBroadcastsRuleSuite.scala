@@ -17,6 +17,7 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.execution.MppNativeQueryExec
+import org.apache.gluten.utils.LocalTableScanExecCompat
 
 import org.apache.spark.sql.{QueryTest, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
@@ -42,7 +43,7 @@ class MppSuppressDeadBroadcastsRuleSuite extends QueryTest with SharedSparkSessi
 
   private def broadcast(name: String): ColumnarBroadcastExchangeExec = {
     val attribute = AttributeReference(name, IntegerType, nullable = false)()
-    val child = LocalTableScanExec(Seq(attribute), Seq.empty[InternalRow])
+    val child = LocalTableScanExecCompat(Seq(attribute), Seq.empty[InternalRow])
     ColumnarBroadcastExchangeExec(IdentityBroadcastMode, child)
   }
 

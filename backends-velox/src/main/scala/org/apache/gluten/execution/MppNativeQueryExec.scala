@@ -127,6 +127,66 @@ private[execution] case class MppLocalStreamInput(
 private[execution] case class MppLocalStreamSlot(fragmentId: Int, slotIdx: Int)
 
 /**
+ * Applies Spark's effective RANGE partition count to the native exchange topology.
+ *
+ * Spark's RangePartitioner creates one partition per unique boundary plus one. When a sampled input
+ * has fewer distinct keys than requested partitions, destinations above that effective count are
+ * unreachable. Keeping the requested count here makes the native coordinator create tasks and
+ * output buffers that can never receive a RANGE PID.
+ */
+private[execution] object MppRangeTopology {
+  def applyEffectivePartitionCounts(exchanges: Seq[ExchangeSpec]): Seq[ExchangeSpec] = {
+    exchanges.map {
+      case spec if spec.exchangeType == "RANGE" =>
+        val effective = spec.rangeEffectivePartitions.getOrElse {
+          throw new IllegalStateException(
+            s"MPP RANGE exchange ${spec.id} has no effective partition count")
+        }
+        require(
+          effective > 0,
+          s"MPP RANGE exchange ${spec.id} has invalid effective partition count $effective")
+        require(
+          effective <= spec.numPartitions,
+          s"MPP RANGE exchange ${spec.id} effective partitions $effective exceed requested " +
+            s"${spec.numPartitions}")
+        spec.copy(numPartitions = effective)
+      case spec => spec
+    }
+  }
+}
+
+/**
+ * Removes the ordering contract that becomes redundant when a sort-merge join becomes a hash join.
+ * PullOutPreProject can leave deterministic projects between the join and its local Sort, so
+ * checking only the direct child retains an unnecessary full-row OrderBy.
+ */
+private[execution] object MppHashJoinInputSortRewrite {
+  private[execution] case class Result(plan: SparkPlan, strippedSorts: Int)
+
+  def strip(plan: SparkPlan): Result = plan match {
+    case sort: SortExec if !sort.global =>
+      Result(sort.child, 1)
+    case sort: SortExecTransformer if !sort.global =>
+      Result(sort.child, 1)
+    case project: ProjectExecTransformer if project.projectList.forall(_.deterministic) =>
+      rebuildProject(project, project.child)
+    case project: ProjectExec if project.projectList.forall(_.deterministic) =>
+      rebuildProject(project, project.child)
+    case other =>
+      Result(other, 0)
+  }
+
+  private def rebuildProject(project: SparkPlan, child: SparkPlan): Result = {
+    val stripped = strip(child)
+    if (stripped.strippedSorts == 0) {
+      Result(project, 0)
+    } else {
+      Result(project.withNewChildren(Seq(stripped.plan)), stripped.strippedSorts)
+    }
+  }
+}
+
+/**
  * Fail-closed matcher for the JVM-backed stream shapes admitted by strict MPP.
  *
  * MPP already feeds a Spark `RDDScanExec` into its existing local `InputIterator` bridge. This
@@ -302,6 +362,23 @@ private case class MppReplicatedJoinBuildInput(child: SparkPlan) extends UnaryTr
 
   override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan = {
     copy(child = newChild)
+  }
+}
+
+private[execution] object MppBspFallbackPreparation {
+
+  /**
+   * Remove metadata-only nodes introduced while shaping the native MPP graph. They deliberately
+   * have no Spark execution implementation and therefore must never reach a BSP fallback or the
+   * Spark pre-action used to sample RANGE boundaries.
+   */
+  def stripNativeOnlyMarkers(plan: SparkPlan): SparkPlan = {
+    plan.transformUp { case marker: MppReplicatedJoinBuildInput => marker.child }
+  }
+
+  /** Build the otherwise file-private marker for focused structural regression tests. */
+  private[execution] def replicatedJoinBuildMarkerForTests(child: SparkPlan): SparkPlan = {
+    MppReplicatedJoinBuildInput(child)
   }
 }
 
@@ -588,7 +665,8 @@ case class MppNativeQueryExec(
 
       val preparedExtractedExchanges =
         try {
-          prepareHybridMppRangeExchanges(extractedExchanges, rangeBoundsCache)
+          MppRangeTopology.applyEffectivePartitionCounts(
+            prepareHybridMppRangeExchanges(extractedExchanges, rangeBoundsCache))
         } catch {
           case NonFatal(e) =>
             return delegateToBsp(
@@ -734,7 +812,8 @@ case class MppNativeQueryExec(
 
     val preparedExchanges =
       try {
-        prepareHybridMppRangeExchanges(exchanges, rangeBoundsCache)
+        MppRangeTopology.applyEffectivePartitionCounts(
+          prepareHybridMppRangeExchanges(exchanges, rangeBoundsCache))
       } catch {
         case NonFatal(e) =>
           return delegateToBsp(
@@ -885,10 +964,16 @@ case class MppNativeQueryExec(
   }
 
   private def prepareColumnarBspFallbackPlan(plan: SparkPlan): SparkPlan = {
+    // Cross-cut MPP rewrites annotate replicated build inputs so fragment extraction can force
+    // only that occurrence to BROADCAST. The marker is transparent to Substrait generation but
+    // intentionally does not implement Spark execution. RANGE bound preparation executes its
+    // producer as a bounded Spark pre-action, so restore the executable child before inserting
+    // conventions; otherwise BroadcastHashJoin calls doExecuteBroadcast on the marker itself.
+    val executablePlan = MppBspFallbackPreparation.stripNativeOnlyMarkers(plan)
     val withTransitions =
       InsertTransitions
         .create(outputsColumnar = true, BackendsApiManager.getSettings.primaryBatchType)
-        .apply(plan)
+        .apply(executablePlan)
     ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(withTransitions)
   }
 
@@ -1967,15 +2052,10 @@ case class MppNativeQueryExec(
         ColumnarCollapseTransformStages.wrapInputIteratorTransformer(rawExchange)
       case other => other
     }
-    def stripHashJoinInputSort(child: SparkPlan): SparkPlan = child match {
-      case sort: SortExec if !sort.global =>
-        strippedSorts += 1
-        sort.child
-      case sort: SortExecTransformer if !sort.global =>
-        strippedSorts += 1
-        sort.child
-      case other =>
-        other
+    def stripHashJoinInputSort(child: SparkPlan): SparkPlan = {
+      val stripped = MppHashJoinInputSortRewrite.strip(child)
+      strippedSorts += stripped.strippedSorts
+      stripped.plan
     }
     val rewritten = plan.transformUp {
       case join: ShuffledHashJoinExec =>
@@ -2035,15 +2115,10 @@ case class MppNativeQueryExec(
     var rewrittenJoins = 0
     var strippedSorts = 0
 
-    def stripHashJoinInputSort(child: SparkPlan): SparkPlan = child match {
-      case sort: SortExec if !sort.global =>
-        strippedSorts += 1
-        sort.child
-      case sort: SortExecTransformer if !sort.global =>
-        strippedSorts += 1
-        sort.child
-      case other =>
-        other
+    def stripHashJoinInputSort(child: SparkPlan): SparkPlan = {
+      val stripped = MppHashJoinInputSortRewrite.strip(child)
+      strippedSorts += stripped.strippedSorts
+      stripped.plan
     }
 
     val rewritten = plan.transformUp {
@@ -3941,14 +4016,21 @@ case class MppNativeQueryExec(
             s"${spec.numPartitions}. MppRangeBoundsGenerator will execute the Spark producer " +
             s"plan to collect bounded samples before MppNativeQueryRDD starts; this launch is " +
             s"hybrid preparation and is not an end-to-end fully-MPP execution.")
+
+        // The shadow plan is shaped for native fragment extraction, not direct Spark execution.
+        // In particular, a vanilla row ShuffleExchangeExec may have a columnar transformer child
+        // after the MPP-specific rewrites. Spark rejects that tree with a column-support mismatch
+        // before the sampling action starts. Reuse the same transition repair and WST preparation
+        // as normal BSP fallback so the bounded pre-action executes a convention-correct producer.
+        val executableSamplePlan = prepareColumnarBspFallbackPlan(spec.rangeSamplePlan)
         val (bounds, reused) = rangeBoundsCache.getOrCompute(
-          spec.rangeSamplePlan,
-          spec.rangeSamplePlan.output,
+          executableSamplePlan,
+          executableSamplePlan.output,
           spec.rangeOrdering,
           spec.numPartitions) {
           MppRangeBoundsGenerator.generate(
-            spec.rangeSamplePlan,
-            spec.rangeSamplePlan.output,
+            executableSamplePlan,
+            executableSamplePlan.output,
             spec.rangeOrdering,
             spec.numPartitions)
         }

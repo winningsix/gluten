@@ -36,7 +36,8 @@ import org.apache.commons.io.FileUtils
 import java.io.File
 import java.util.{HashMap => JHashMap, Iterator => JIterator}
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -175,11 +176,17 @@ class MppNativeQueryRDD(
     val jniWrapper = MppQueryJniWrapper.create(runtime)
     val actualExecutorId = Option(SparkEnv.get).map(_.executorId).getOrElse("unknown")
     val localPeerId = mppPartition.peerInfo.map(_.peerId).getOrElse(actualExecutorId)
+    // One physical RDD can appear in more than one JVM stream slot. Spark then invokes compute()
+    // repeatedly for that RDD inside the same task while the earlier native coordinator is still
+    // live. Give those invocations distinct IDs; otherwise both the executor control registry and
+    // native UCX routing see two simultaneous peers with the same identity. The per-task ordinal is
+    // deterministic because every MPP peer traverses the aligned stream slots in the same order.
+    val invocationMppQueryId = MppNativeQueryRDD.nextInvocationQueryId(mppQueryId, context)
     val nativeMppQueryId =
       if (mppPartition.peerInfo.isEmpty && mppPartition.totalPartitions == 1) {
-        s"$mppQueryId-t${context.taskAttemptId()}"
+        s"$invocationMppQueryId-t${context.taskAttemptId()}"
       } else {
-        mppQueryId
+        invocationMppQueryId
       }
     mppPartition.peerInfo.foreach {
       expected =>
@@ -338,7 +345,8 @@ class MppNativeQueryRDD(
       case listenerFailure: Throwable => closeMppHandleAfterSetupFailure(listenerFailure)
     }
 
-    val runId = MppQueryRunId(mppQueryId, context.stageId(), context.stageAttemptNumber())
+    val runId =
+      MppQueryRunId(invocationMppQueryId, context.stageId(), context.stageAttemptNumber())
     val activeQuery =
       try {
         GlutenMppExecutorService.registerQuery(
@@ -684,6 +692,44 @@ final private[execution] class MppSpillRootLease(val root: File, deleteRoot: Fil
 }
 
 private[execution] object MppNativeQueryRDD extends Logging {
+
+  final private case class InvocationKey(
+      queryId: String,
+      stageId: Int,
+      stageAttemptNumber: Int,
+      taskAttemptId: Long)
+
+  // RDD references normally retain object identity when Spark deserializes a task, but using a
+  // process-wide key also covers independently-deserialized references to the same physical MPP
+  // RDD. The task-attempt component prevents concurrent Spark retries from sharing an ordinal.
+  private val invocationOrdinals = new ConcurrentHashMap[InvocationKey, AtomicInteger]()
+
+  private[execution] def nextInvocationQueryId(queryId: String, context: TaskContext): String = {
+    val key = invocationKey(queryId, context)
+    val proposed = new AtomicInteger(0)
+    val existing = invocationOrdinals.putIfAbsent(key, proposed)
+    val ordinal =
+      if (existing == null) {
+        try {
+          context.addTaskCompletionListener[Unit](_ => invocationOrdinals.remove(key, proposed))
+        } catch {
+          case listenerFailure: Throwable =>
+            invocationOrdinals.remove(key, proposed)
+            throw listenerFailure
+        }
+        proposed.getAndIncrement()
+      } else {
+        existing.getAndIncrement()
+      }
+    if (ordinal == 0) queryId else s"$queryId-invocation-$ordinal"
+  }
+
+  private[execution] def clearInvocationQueryIds(queryId: String, context: TaskContext): Unit = {
+    invocationOrdinals.remove(invocationKey(queryId, context))
+  }
+
+  private def invocationKey(queryId: String, context: TaskContext): InvocationKey =
+    InvocationKey(queryId, context.stageId(), context.stageAttemptNumber(), context.taskAttemptId())
 
   /**
    * Keep native memory pools alive before destroying an MPP coordinator. Returned zero-copy batches

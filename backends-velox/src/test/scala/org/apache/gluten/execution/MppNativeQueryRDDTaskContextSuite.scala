@@ -20,12 +20,40 @@ import org.apache.spark.sql.catalyst.plans.SQLHelper
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.task.{TaskResource, TaskResources}
 
+import org.mockito.Mockito.{mock, when}
 import org.scalatest.funsuite.AnyFunSuite
 
 import java.util.{Iterator => JIterator}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 class MppNativeQueryRDDTaskContextSuite extends AnyFunSuite with SQLHelper {
+
+  test("repeated MPP RDD executions in one Spark task receive distinct query IDs") {
+    val context = mock(classOf[org.apache.spark.TaskContext])
+    when(context.stageId()).thenReturn(23)
+    when(context.stageAttemptNumber()).thenReturn(0)
+    when(context.taskAttemptId()).thenReturn(26L)
+    val queryId = "spark-reused-rdd"
+
+    try {
+      assert(MppNativeQueryRDD.nextInvocationQueryId(queryId, context) == queryId)
+      assert(
+        MppNativeQueryRDD.nextInvocationQueryId(queryId, context) ==
+          s"$queryId-invocation-1")
+
+      val retryContext = mock(classOf[org.apache.spark.TaskContext])
+      when(retryContext.stageId()).thenReturn(23)
+      when(retryContext.stageAttemptNumber()).thenReturn(0)
+      when(retryContext.taskAttemptId()).thenReturn(27L)
+      try {
+        assert(MppNativeQueryRDD.nextInvocationQueryId(queryId, retryContext) == queryId)
+      } finally {
+        MppNativeQueryRDD.clearInvocationQueryIds(queryId, retryContext)
+      }
+    } finally {
+      MppNativeQueryRDD.clearInvocationQueryIds(queryId, context)
+    }
+  }
 
   test("MPP close holds native memory before destroying the coordinator") {
     var events = Vector.empty[String]

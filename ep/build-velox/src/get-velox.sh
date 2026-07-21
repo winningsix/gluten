@@ -17,9 +17,9 @@
 set -exu
 
 CURRENT_DIR=$(cd "$(dirname "$BASH_SOURCE")"; pwd)
-VELOX_REPO=https://github.com/facebookincubator/velox.git
-VELOX_BRANCH=main
-VELOX_ENHANCED_BRANCH=main
+VELOX_REPO=https://github.com/HighPerfDataAccelerator/velox.git
+VELOX_BRANCH=dev
+VELOX_ENHANCED_BRANCH=dev
 VELOX_HOME=""
 RUN_SETUP_SCRIPT=ON
 ENABLE_ENHANCED_FEATURES=OFF

@@ -18,6 +18,7 @@ package org.apache.gluten.extension
 
 import org.apache.gluten.execution.{CartesianProductExecTransformer, ColumnarCartesianProductBridge, ProjectExecTransformer, VeloxBroadcastNestedLoopJoinExecTransformer}
 import org.apache.gluten.extension.MppReplicatedCartesianRule.{MAX_BUILD_BYTES_KEY, REPLICATED_CARTESIAN_MAX_BUILD_BYTES_TAG, SideStats}
+import org.apache.gluten.utils.LocalTableScanExecCompat
 
 import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.InternalRow
@@ -37,7 +38,7 @@ class MppReplicatedCartesianRuleSuite extends QueryTest with SharedSparkSession 
 
   private def scan(name: String, sizeInBytes: BigInt, rows: Option[BigInt]): LocalTableScanExec = {
     val attr = AttributeReference(name, IntegerType, nullable = true)()
-    val physical = LocalTableScanExec(Seq(attr), Seq.empty[InternalRow])
+    val physical = LocalTableScanExecCompat(Seq(attr), Seq.empty[InternalRow])
     physical.setLogicalLink(SizedLeaf(Seq(attr), sizeInBytes, rows))
     physical
   }
@@ -120,10 +121,10 @@ class MppReplicatedCartesianRuleSuite extends QueryTest with SharedSparkSession 
       assert(overLimitError.getMessage.contains("unsafe replicated Cartesian"))
       assert(overLimitError.getMessage.contains("maxBuildBytes=1024"))
 
-      val unknownLeft = LocalTableScanExec(
+      val unknownLeft = LocalTableScanExecCompat(
         Seq(AttributeReference("l2", IntegerType, nullable = true)()),
         Seq.empty[InternalRow])
-      val unknownRight = LocalTableScanExec(
+      val unknownRight = LocalTableScanExecCompat(
         Seq(AttributeReference("r2", IntegerType, nullable = true)()),
         Seq.empty[InternalRow])
       val unknownError = intercept[IllegalStateException] {
