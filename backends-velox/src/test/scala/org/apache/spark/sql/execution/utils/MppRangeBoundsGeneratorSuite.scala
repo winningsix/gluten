@@ -285,7 +285,7 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
 
   test("query cache computes equivalent RANGE bounds once under concurrent access") {
     val key = AttributeReference("key", IntegerType, nullable = false)()
-    val plan = LocalTableScanExec(Seq(key), Seq.empty[InternalRow], None)
+    val plan = LocalTableScanExec(Seq(key), Seq.empty[InternalRow])
     val ordering = Seq(SortOrder(key, Ascending, NullsFirst, Seq.empty))
     val cache = new MppRangeBoundsGenerator.QueryCache("execution-1")
     val calls = new AtomicInteger(0)
@@ -327,7 +327,7 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
 
   test("query cache separates ordering and partition count and evicts failures") {
     val key = AttributeReference("key", IntegerType, nullable = false)()
-    val plan = LocalTableScanExec(Seq(key), Seq.empty[InternalRow], None)
+    val plan = LocalTableScanExec(Seq(key), Seq.empty[InternalRow])
     val ascending = Seq(SortOrder(key, Ascending, NullsFirst, Seq.empty))
     val descending = Seq(SortOrder(key, Descending, NullsLast, Seq.empty))
     val cache = new MppRangeBoundsGenerator.QueryCache("execution-2")
@@ -358,7 +358,7 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
 
   test("concurrent cache failure reaches all waiters before a clean retry generation") {
     val key = AttributeReference("key", IntegerType, nullable = false)()
-    val plan = LocalTableScanExec(Seq(key), Seq.empty[InternalRow], None)
+    val plan = LocalTableScanExec(Seq(key), Seq.empty[InternalRow])
     val ordering = Seq(SortOrder(key, Ascending, NullsFirst, Seq.empty))
     val cache = new MppRangeBoundsGenerator.QueryCache("execution-failure")
     val failure = new IllegalStateException("concurrent sample failed")

@@ -200,6 +200,17 @@ void VeloxBackend::init(
 
 #ifdef GLUTEN_ENABLE_GPU
   if (backendConf_->get<bool>(kCudfEnabled, kCudfEnabledDefault)) {
+    const auto mppEnabled = backendConf_->get<bool>(
+        "spark.gluten.mpp.enabled", false);
+    const auto& orderBySortedRunBytesDefault = mppEnabled
+        ? kCudfOrderBySortedRunBytesMppDefault
+        : kCudfOrderBySortedRunBytesDefault;
+    const auto& orderByOutputChunkBytesDefault = mppEnabled
+        ? kCudfOrderByOutputChunkBytesMppDefault
+        : kCudfOrderByOutputChunkBytesDefault;
+    const auto& orderByMaxOutputRowsDefault = mppEnabled
+        ? kCudfOrderByMaxOutputRowsMppDefault
+        : kCudfOrderByMaxOutputRowsDefault;
     std::unordered_map<std::string, std::string> options = {
         {velox::cudf_velox::CudfConfig::kCudfEnabled, "true"},
         {velox::cudf_velox::CudfConfig::kCudfDebugEnabled, backendConf_->get(kDebugCudf, kDebugCudfDefault)},
@@ -262,31 +273,48 @@ void VeloxBackend::init(
         {velox::cudf_velox::CudfConfig::kCudfAstExpressionEnabled,
          backendConf_->get(kCudfAstExpressionEnabled, kCudfAstExpressionEnabledDefault)},
         // Forward concat_optimization_enabled. When true, OperatorAdapters
-        // inserts CudfBatchConcat before each CudfHashAggregation to coalesce
-        // small upstream batches up to kCudfBatchSizeMinThreshold rows. Used
-        // together with maxPartialAggregationMemory to amortize per-batch
-        // concat-with-bufferedResult_ cost in high-cardinality groupbys.
+        // inserts CudfBatchConcat after ordinary UCX Exchange sources and
+        // before CudfHashAggregation. Exchange and aggregation use separate
+        // row targets to reduce fragmentation without retaining five 100M-row
+        // F6 inputs concurrently.
         {velox::cudf_velox::CudfConfig::kCudfConcatOptimizationEnabled,
          backendConf_->get(kCudfConcatOptimizationEnabled, kCudfConcatOptimizationEnabledDefault)},
         {velox::cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys,
          backendConf_->get(
              kCudfGroupbyStreamingMaxDistinctKeys,
              kCudfGroupbyStreamingMaxDistinctKeysDefault)},
-        {velox::cudf_velox::CudfConfig::kCudfOrderBySortedRunBytes,
+        {velox::cudf_velox::CudfConfig::kCudfExchangeConcatOptimizationEnabled,
          backendConf_->get(
-             kCudfOrderBySortedRunBytes,
-             kCudfOrderBySortedRunBytesDefault)},
-        {velox::cudf_velox::CudfConfig::kCudfOrderByMergeFanIn,
-         backendConf_->get(
-             kCudfOrderByMergeFanIn,
-             kCudfOrderByMergeFanInDefault)},
+             kCudfExchangeConcatOptimizationEnabled,
+             kCudfExchangeConcatOptimizationEnabledDefault)},
         {velox::cudf_velox::CudfConfig::kCudfBatchSizeMinThreshold,
          backendConf_->get(kCudfBatchSizeMinThreshold, kCudfBatchSizeMinThresholdDefault)},
         {velox::cudf_velox::CudfConfig::kCudfBatchSizeMinThresholdBytes,
          backendConf_->get(
              kCudfBatchSizeMinThresholdBytes,
-             backendConf_->get(
-                 kCudfGpuTargetBatchBytes, kCudfGpuTargetBatchBytesDefault))},
+             kCudfBatchSizeMinThresholdBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfExchangeBatchSizeMinThreshold,
+         backendConf_->get(
+             kCudfExchangeBatchSizeMinThreshold,
+             kCudfExchangeBatchSizeMinThresholdDefault)},
+        // Keep the new bounded external-sort implementation. MPP uses the
+        // previously validated 3 GiB run/output bounds so 30 TB Q2/Q11 do not
+        // spill or split already materialized local sorts into thousands of
+        // batches; non-MPP execution retains the native conservative limits.
+        {velox::cudf_velox::CudfConfig::kCudfOrderBySortedRunBytes,
+         backendConf_->get(
+             kCudfOrderBySortedRunBytes,
+             orderBySortedRunBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfOrderByMergeFanIn,
+         backendConf_->get(kCudfOrderByMergeFanIn, kCudfOrderByMergeFanInDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfOrderByOutputChunkBytes,
+         backendConf_->get(
+             kCudfOrderByOutputChunkBytes,
+             orderByOutputChunkBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfOrderByMaxOutputRows,
+         backendConf_->get(
+             kCudfOrderByMaxOutputRows,
+             orderByMaxOutputRowsDefault)},
         // Forward the ucx-exchange VLOG level so CudfConfig.exchangeLogLevel is
         // populated BEFORE the once-per-process Communicator starts here at
         // backend init (Communicator::start reads it and calls
@@ -308,10 +336,11 @@ void VeloxBackend::init(
     // Initialize the UCX Communicator once per process. Required so that
     // UcxPartitionedOutput / UcxExchange can perform the same-process
     // handshake that hands off cudf::packed_columns through the
-    // IntraNodeTransferRegistry. Port=0 lets UCXX bind an ephemeral
-    // localhost port; coordinatorURL="" because we have no remote
+    // IntraNodeTransferRegistry. CudfConfig::exchange was enabled above and is
+    // the Communicator's source of truth; HPDA Velox no longer exposes the
+    // legacy FLAGS_velox_ucx_exchange switch. Port=0 lets UCXX bind an
+    // ephemeral localhost port; coordinatorURL="" because we have no remote
     // coordinator. The Communicator owns a dedicated worker thread.
-    FLAGS_velox_ucx_exchange = true;
     velox::ContinueFuture commReady;
     ucxCommunicator_ = velox::ucx_exchange::Communicator::initAndGet(
         /*port=*/0, /*coordinatorURL=*/"", &commReady);
@@ -327,8 +356,8 @@ void VeloxBackend::init(
                    << " (intra-node-bypass enabled)";
     } else {
       LOG(WARNING) << "VeloxBackend: UCX Communicator init returned null "
-                      "(FLAGS_velox_ucx_exchange="
-                   << FLAGS_velox_ucx_exchange << ")";
+                      "(cudf.exchange="
+                   << cudfConfig.exchange << ")";
     }
   }
 #endif

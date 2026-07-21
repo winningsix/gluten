@@ -38,12 +38,14 @@ import scala.util.control.NonFatal
  */
 object GlutenMppExecutorService extends Logging {
   @volatile private var registeredContext: Option[PluginContext] = None
+  @volatile private var registeredEndpoint: Option[MppExecutorEndpointRecord] = None
   @volatile private var controlAgent: Option[GlutenMppExecutorControlAgent] = None
 
   def onExecutorStart(ctx: PluginContext): Unit = {
     controlAgent.foreach(_.shutdown())
     controlAgent = None
     registeredContext = None
+    registeredEndpoint = None
     if (GlutenMppControlPlaneConfig.queryCancellationEnabled(ctx.conf())) {
       val agent = GlutenMppExecutorControlAgent(
         executorIdOf(ctx),
@@ -65,6 +67,7 @@ object GlutenMppExecutorService extends Logging {
           ctx.ask(RegisterEndpoint(record)) match {
             case ack: RegisterEndpointAck =>
               registeredContext = Some(ctx)
+              registeredEndpoint = Some(record)
               logInfo(
                 s"GlutenMppExecutorService: registered endpoint executorId=${record.executorId} " +
                   s"generation=${ack.generation} endpoint=${record.ucxEndpoint}")
@@ -86,6 +89,7 @@ object GlutenMppExecutorService extends Logging {
     agent.foreach(_.shutdown())
     val context = registeredContext
     registeredContext = None
+    registeredEndpoint = None
     context.foreach {
       ctx =>
         try {
@@ -125,6 +129,29 @@ object GlutenMppExecutorService extends Logging {
   /** Keep the native coordinator alive until every peer reports output EOS. */
   def awaitPeerCompletion(query: ActiveMppQuery): Boolean =
     controlAgent.exists(_.awaitPeerCompletion(query))
+
+  /**
+   * Return this executor's routable UCX endpoint for an executor-local, one-peer MPP query.
+   *
+   * Such queries do not use the driver-side multi-peer resolver, but their native fragments can
+   * still contain an exchange (for example Spark runtime-bloom partial -> final aggregation). An
+   * empty peer list makes native code fall back to 127.0.0.1 even though the UCX listener is bound
+   * to the advertised interface. Reuse the endpoint that this executor already registered.
+   */
+  def localPeerEndpointsJson(executorId: String): Option[String] =
+    registeredEndpoint.flatMap(localPeerEndpointsJson(_, executorId))
+
+  private[control] def localPeerEndpointsJson(
+      record: MppExecutorEndpointRecord,
+      executorId: String): Option[String] = {
+    Option(executorId)
+      .filter(_.nonEmpty)
+      .filter(_ == record.executorId)
+      .map(
+        _ =>
+          GlutenMppPeerMapper.toPeerEndpointsJson(
+            GlutenMppPeerMapper.fromEndpointRecords(Seq(record), requestedCount = 1)))
+  }
 
   private[control] def buildEndpointRecord(
       ctx: PluginContext): Option[MppExecutorEndpointRecord] = {

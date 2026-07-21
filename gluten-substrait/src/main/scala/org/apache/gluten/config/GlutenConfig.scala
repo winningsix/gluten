@@ -143,6 +143,15 @@ class GlutenConfig(conf: SQLConf) extends GlutenCoreConfig(conf) {
   def enableExistenceJoinRhsDedup: Boolean =
     getConf(ENABLE_EXISTENCE_JOIN_RHS_DEDUP)
 
+  def enableMergePairedExistenceState: Boolean =
+    getConf(MERGE_PAIRED_EXISTENCE_STATE_ENABLED)
+
+  def candidateFirstExistenceMode: String =
+    getConf(CANDIDATE_FIRST_EXISTENCE_MODE)
+
+  def candidateFirstExistenceMinCostImprovementRatio: Double =
+    getConf(CANDIDATE_FIRST_EXISTENCE_MIN_COST_IMPROVEMENT_RATIO)
+
   def enableSelectiveDimensionJoinReorder: Boolean =
     getConf(SELECTIVE_DIMENSION_JOIN_REORDER_ENABLED)
 
@@ -649,7 +658,11 @@ object GlutenConfig extends ConfigRegistry {
       SPARK_REDACTION_REGEX,
       SQLConf.LEGACY_TIME_PARSER_POLICY.key,
       SQLConf.LEGACY_STATISTICAL_AGGREGATE.key,
-      COLUMNAR_CUDF_ENABLED.key
+      COLUMNAR_CUDF_ENABLED.key,
+      // Velox initializes process-wide cuDF operator limits before any MPP
+      // fragment exists. Preserve the top-level MPP switch in the static
+      // native config so that initialization can select its MPP defaults.
+      "spark.gluten.mpp.enabled"
     )
 
     nativeConfMap ++= conf.filter { case (k, _) => keys.contains(k) }
@@ -1439,6 +1452,51 @@ object GlutenConfig extends ConfigRegistry {
           "condition-relevant right-side columns before the join.")
       .booleanConf
       .createWithDefault(true)
+
+  val MERGE_PAIRED_EXISTENCE_STATE_ENABLED =
+    buildConf("spark.gluten.sql.optimizer.mergePairedExistenceState.enabled")
+      .doc(
+        "Merge a strictly proven pair of self-correlated EXISTS / NOT EXISTS joins into one " +
+          "source scan and one conditional MIN/MAX state aggregate.")
+      .booleanConf
+      .createWithDefault(true)
+
+  val MERGE_PAIRED_EXISTENCE_STATE_MIN_SOURCE_BYTES =
+    buildConf("spark.gluten.sql.optimizer.mergePairedExistenceState.minSourceBytes")
+      .doc("Minimum proven source size for the paired existence-state rewrite.")
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefaultString("1GB")
+
+  val MERGE_PAIRED_EXISTENCE_STATE_MIN_SCAN_REDUCTION_RATIO =
+    buildConf("spark.gluten.sql.optimizer.mergePairedExistenceState.minScanReductionRatio")
+      .doc("Minimum estimated source-scan work reduction ratio for the paired rewrite.")
+      .doubleConf
+      .checkValue(_ >= 1.0, "The minimum scan reduction ratio must be at least 1.0")
+      .createWithDefault(1.5)
+
+  val CANDIDATE_FIRST_EXISTENCE_MODE =
+    buildConf("spark.gluten.sql.optimizer.candidateFirstExistence.mode")
+      .doc(
+        "Controls candidate-first rewriting of a strictly proven paired self-correlated " +
+          "EXISTS / NOT EXISTS shape. Valid values are 'off', 'auto', and 'force'. " +
+          "Auto requires a safe inner-join chain and a minimum estimated cost improvement; " +
+          "force bypasses only the cost gate for validation.")
+      .stringConf
+      .transform(_.toLowerCase(Locale.ROOT))
+      .checkValue(
+        mode => Set("off", "auto", "force").contains(mode),
+        "Valid values are 'off', 'auto', and 'force'.")
+      .createWithDefault("auto")
+
+  val CANDIDATE_FIRST_EXISTENCE_MIN_COST_IMPROVEMENT_RATIO =
+    buildConf("spark.gluten.sql.optimizer.candidateFirstExistence.minCostImprovementRatio")
+      .doc(
+        "Minimum estimated paired-state/candidate-first work ratio required for auto mode. " +
+          "The estimate uses source-column scan bytes and physical hash aggregate, exchange, " +
+          "and join passes; unknown or untrustworthy join statistics retain paired-state.")
+      .doubleConf
+      .checkValue(_ >= 1.0, "The candidate-first cost improvement ratio must be at least 1.0")
+      .createWithDefault(1.15)
 
   val ENABLE_COLUMNAR_PROJECT_COLLAPSE =
     buildConf("spark.gluten.sql.columnar.project.collapse")

@@ -17,6 +17,7 @@
 
 #include <jni.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -429,6 +430,158 @@ void collectValueStreamNodes(
   }
 }
 
+/// Returns true when `targetNodeId` reaches a keyed FINAL aggregation through
+/// only schema-preserving/filtering unary nodes. Restricting the match to this
+/// shape is deliberate: a HASH exchange feeding a join somewhere below a
+/// FINAL aggregation is not sufficient proof that the exchange keys equal the
+/// aggregation keys. The TPC-H Q17/Q21 problem inputs are direct (optionally
+/// Project/Filter wrapped) FINAL inputs.
+bool unaryPathToValueStream(
+    const velox::core::PlanNodePtr& node,
+    const std::string& targetNodeId) {
+  if (isValueStreamNode(node)) {
+    return node->id() == targetNodeId;
+  }
+  if (node->sources().size() != 1) {
+    return false;
+  }
+  const bool allowedUnary =
+      std::dynamic_pointer_cast<const velox::core::ProjectNode>(node) != nullptr ||
+      std::dynamic_pointer_cast<const velox::core::FilterNode>(node) != nullptr;
+  return allowedUnary &&
+      unaryPathToValueStream(node->sources().front(), targetNodeId);
+}
+
+bool feedsKeyedFinalAggregation(
+    const velox::core::PlanNodePtr& node,
+    const std::string& targetNodeId) {
+  if (auto aggregation =
+          std::dynamic_pointer_cast<const velox::core::AggregationNode>(node)) {
+    if (aggregation->step() == velox::core::AggregationNode::Step::kFinal &&
+        !aggregation->groupingKeys().empty() &&
+        unaryPathToValueStream(aggregation->sources().front(), targetNodeId)) {
+      return true;
+    }
+  }
+  for (const auto& source : node->sources()) {
+    if (feedsKeyedFinalAggregation(source, targetNodeId)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Recognizes the narrow candidate-first existence fragment shape that is
+/// safe to run with multiple drivers inside one HASH-consumer task. This is
+/// deliberately an operator/capability predicate, not a query or table-name
+/// special case. Non-partial aggregation and every order-sensitive or
+/// singleton operator are rejected by the whitelist.
+struct RightSemiProjectMultiDriverShape {
+  int32_t rightSemiProjectCount{0};
+  int32_t partialAggregationCount{0};
+};
+
+bool isRightSemiProjectMultiDriverSafePlan(
+    const velox::core::PlanNodePtr& node,
+    RightSemiProjectMultiDriverShape& shape) {
+  if (auto join =
+          std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node)) {
+    if (join->joinType() == velox::core::JoinType::kRightSemiProject &&
+        !join->isNullAware()) {
+      ++shape.rightSemiProjectCount;
+    } else if (join->joinType() != velox::core::JoinType::kInner) {
+      return false;
+    }
+  } else if (auto aggregation =
+                 std::dynamic_pointer_cast<const velox::core::AggregationNode>(
+                     node)) {
+    if (aggregation->step() !=
+            velox::core::AggregationNode::Step::kPartial ||
+        aggregation->groupingKeys().empty()) {
+      return false;
+    }
+    ++shape.partialAggregationCount;
+  } else if (
+      std::dynamic_pointer_cast<const velox::core::ProjectNode>(node) ==
+          nullptr &&
+      std::dynamic_pointer_cast<const velox::core::FilterNode>(node) ==
+          nullptr &&
+      std::dynamic_pointer_cast<const velox::core::ExchangeNode>(node) ==
+          nullptr) {
+    return false;
+  }
+
+  return std::all_of(
+      node->sources().begin(),
+      node->sources().end(),
+      [&](const auto& source) {
+        return isRightSemiProjectMultiDriverSafePlan(source, shape);
+      });
+}
+
+velox::core::PlanNodePtr stripProjectAndFilter(
+    velox::core::PlanNodePtr node) {
+  while (
+      node->sources().size() == 1 &&
+      (std::dynamic_pointer_cast<const velox::core::ProjectNode>(node) !=
+           nullptr ||
+       std::dynamic_pointer_cast<const velox::core::FilterNode>(node) !=
+           nullptr)) {
+    node = node->sources().front();
+  }
+  return node;
+}
+
+bool hasNestedRightSemiProjectPartialShape(
+    const velox::core::PlanNodePtr& root) {
+  auto node = stripProjectAndFilter(root);
+  auto aggregation =
+      std::dynamic_pointer_cast<const velox::core::AggregationNode>(node);
+  if (aggregation == nullptr ||
+      aggregation->step() != velox::core::AggregationNode::Step::kPartial ||
+      aggregation->groupingKeys().empty()) {
+    return false;
+  }
+
+  node = stripProjectAndFilter(aggregation->sources().front());
+  auto outer = std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node);
+  if (outer == nullptr ||
+      outer->joinType() != velox::core::JoinType::kRightSemiProject ||
+      outer->isNullAware()) {
+    return false;
+  }
+
+  // RIGHT SEMI PROJECT preserves its right/build rows. Require the second
+  // existence join on that exact preserved spine; two unrelated sibling
+  // joins must not accidentally enable this capability.
+  node = stripProjectAndFilter(outer->sources().at(1));
+  auto inner = std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node);
+  return inner != nullptr &&
+      inner->joinType() == velox::core::JoinType::kRightSemiProject &&
+      !inner->isNullAware();
+}
+
+bool isRightSemiProjectMultiDriverSafePlan(
+    const velox::core::PlanNodePtr& node) {
+  RightSemiProjectMultiDriverShape shape;
+  return isRightSemiProjectMultiDriverSafePlan(node, shape) &&
+      shape.rightSemiProjectCount == 2 &&
+      shape.partialAggregationCount == 1 &&
+      hasNestedRightSemiProjectPartialShape(node);
+}
+
+bool hasValidHashKeys(
+    const std::vector<int32_t>& keyIndices,
+    const velox::RowTypePtr& wireType) {
+  if (wireType == nullptr || keyIndices.empty()) {
+    return false;
+  }
+  return std::all_of(
+      keyIndices.begin(), keyIndices.end(), [&](const auto index) {
+        return index >= 0 && index < static_cast<int32_t>(wireType->size());
+      });
+}
+
 /// Build a PartitionFunctionSpec from an exchange's partitionType + key
 /// indices. Reused by both the multi-task UCX path (PartitionedOutputNode)
 /// and the single-task merge path (LocalPartitionNode kRepartition).
@@ -536,7 +689,8 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
     const velox::core::PlanNodePtr& producerPlanForMerge = nullptr,
     const std::string& mergePartitionType = "SINGLE",
     const std::vector<int32_t>& mergeKeyIndices = {},
-    const std::string& mergeRangeBoundsJson = {}) {
+    const std::string& mergeRangeBoundsJson = {},
+    bool repartitionRemoteHashLocally = false) {
   // Base case: this IS the target ValueStream leaf - replace it.
   if (isValueStreamNode(node) && node->id() == targetNodeId) {
     const auto& consumerType = node->outputType();
@@ -612,6 +766,32 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
                      .transportType(
                          velox::core::ExchangeNode::TransportType::kUcx)
                      .build();
+      if (repartitionRemoteHashLocally) {
+        VELOX_CHECK_EQ(
+            mergePartitionType,
+            "HASH",
+            "Local repartition is only valid for remote HASH exchanges");
+        VELOX_CHECK(
+            hasValidHashKeys(mergeKeyIndices, wireType),
+            "Remote HASH exchange {} has no valid local repartition keys",
+            exchangeNodeId);
+        auto specPair = buildPartitionFunctionSpec(
+            mergePartitionType,
+            mergeKeyIndices,
+            wireType,
+            /*fragmentIdForLogging=*/-1);
+        LOG(WARNING) << "MppJniWrapper: wrapping remote HASH exchange '"
+                     << exchangeNodeId
+                     << "' with LocalPartition::kRepartition for keyed FINAL "
+                     << "spec=" << specPair.funcSpec->toString();
+        exchange = velox::core::LocalPartitionNode::Builder()
+                       .id(exchangeNodeId + "_keyed_final_local_hash")
+                       .type(velox::core::LocalPartitionNode::Type::kRepartition)
+                       .scaleWriter(false)
+                       .partitionFunctionSpec(specPair.funcSpec)
+                       .sources({exchange})
+                       .build();
+      }
     }
 
     // Fast path: wire schema structurally equals consumer's expected. No
@@ -640,7 +820,8 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
       if (namesEqual) {
         return exchange;
       }
-      if (producerPlanForMerge == nullptr) {
+      if (producerPlanForMerge == nullptr &&
+          !repartitionRemoteHashLocally) {
         // UCX exchange payloads are positional.  When width and child types
         // already match, expose the consumer names directly on ExchangeNode
         // instead of inserting an identity Project solely to rename fields.
@@ -655,6 +836,11 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
             .transportType(velox::core::ExchangeNode::TransportType::kUcx)
             .build();
       }
+      // A keyed FINAL with multiple local drivers wraps the remote Exchange
+      // in a LocalPartitionNode above. Rebuilding a bare Exchange here would
+      // silently discard that wrapper, allowing the same grouping key to be
+      // finalized independently by multiple drivers. Preserve the wrapper
+      // and use the Project rename path below instead.
       // Names differ - inject identity Project that just renames cols.
       std::vector<velox::core::TypedExprPtr> projections;
       std::vector<std::string> projectionNames;
@@ -733,7 +919,8 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
         producerPlanForMerge,
         mergePartitionType,
         mergeKeyIndices,
-        mergeRangeBoundsJson);
+        mergeRangeBoundsJson,
+        repartitionRemoteHashLocally);
     if (newSource.get() != source.get()) {
       anyChanged = true;
     }
@@ -943,7 +1130,8 @@ velox::core::PlanNodePtr rewriteValueStreamsForMpp(
     const std::unordered_map<int, velox::RowTypePtr>& producerWireTypes,
     const std::unordered_set<int32_t>& broadcastSlotSet,
     int32_t numExchangeInputs,
-    int32_t numBroadcastInputs) {
+    int32_t numBroadcastInputs,
+    int32_t keyedFinalLocalDrivers) {
   std::vector<const MppExchangeSpec*> inboundExchanges;
   for (const auto& exchange : exchangeSpecs) {
     if (exchange.consumerFragmentId == fragmentId) {
@@ -1049,11 +1237,23 @@ velox::core::PlanNodePtr rewriteValueStreamsForMpp(
     if (it != producerWireTypes.end()) {
       producerWire = it->second;
     }
+    const bool localRepartition =
+        keyedFinalLocalDrivers > 1 &&
+        inboundExchanges[k]->partitionType == "HASH" &&
+        hasValidHashKeys(
+            inboundExchanges[k]->partitionKeyIndices, producerWire) &&
+        feedsKeyedFinalAggregation(
+            veloxPlanNode, valueStreamNodes[j]->id());
     veloxPlanNode = replaceValueStreamWithExchange(
         veloxPlanNode,
         valueStreamNodes[j]->id(),
         inboundExchanges[k]->exchangeNodeId,
-        producerWire);
+        producerWire,
+        /*producerPlanForMerge=*/nullptr,
+        inboundExchanges[k]->partitionType,
+        inboundExchanges[k]->partitionKeyIndices,
+        inboundExchanges[k]->rangeBoundsJson,
+        localRepartition);
   }
 
   LOG(INFO) << "MppJniWrapper: fragment " << fragmentId
@@ -1401,6 +1601,10 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
 #else
   const bool keepDeviceRootOutput = false;
 #endif
+  const int32_t keyedFinalLocalDrivers = std::max(
+      1,
+      preLoopSessionCfg->get<int32_t>(
+          kMppKeyedFinalLocalDrivers, kMppKeyedFinalLocalDriversDefault));
   bool singleTaskMode = singleTaskModeRequested;
   if (singleTaskMode) {
     // All known partition types are supported in single-task mode:
@@ -1643,6 +1847,7 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     }
 
     auto veloxPlanNode = converter.toVeloxPlan(substraitPlan, localFiles);
+    bool fragmentUsesKeyedFinalLocalRepartition = false;
     if (singleTaskMode) {
       // Bump the global id allocator above this fragment's high-water mark
       // so the next fragment's converter doesn't reuse ids.
@@ -1831,6 +2036,14 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
         if (it != producerWireTypes.end()) {
           producerWire = it->second;
         }
+        const bool localRepartition =
+            !singleTaskMode && keyedFinalLocalDrivers > 1 &&
+            inboundExchanges[k]->partitionType == "HASH" &&
+            hasValidHashKeys(
+                inboundExchanges[k]->partitionKeyIndices, producerWire) &&
+            feedsKeyedFinalAggregation(
+                veloxPlanNode, valueStreamNodes[j]->id());
+        fragmentUsesKeyedFinalLocalRepartition |= localRepartition;
         velox::core::PlanNodePtr producerPlanForMerge;
         if (singleTaskMode) {
           auto pit = unwrappedFragmentPlans.find(
@@ -1869,7 +2082,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
             producerPlanForMerge,
             inboundExchanges[k]->partitionType,
             inboundExchanges[k]->partitionKeyIndices,
-            inboundExchanges[k]->rangeBoundsJson);
+            inboundExchanges[k]->rangeBoundsJson,
+            localRepartition);
       }
 
       LOG(INFO) << "MppJniWrapper: fragment " << i
@@ -1905,7 +2119,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     // --- Problem 1: Wrap with PartitionedOutputNode ---
     //
     // Every fragment needs a PartitionedOutputNode at the root so that
-    // OutputBufferManager gets initialized when the Task starts. Without
+    // DefaultOutputBufferManager gets initialized when the Task starts.
+    // Without
     // this, the coordinator cannot read output from the root fragment and
     // consumer fragments cannot fetch data from producer fragments.
     //
@@ -2034,6 +2249,18 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
         1, // numSplitGroups
         emptyGroupedIds};
 
+    const bool rightSemiProjectMultiDriverSafe =
+        outboundExchange != nullptr && partitionType == "HASH" &&
+        hasValidHashKeys(
+            outboundExchange->partitionKeyIndices,
+            veloxPlanNode->outputType()) &&
+        isRightSemiProjectMultiDriverSafePlan(veloxPlanNode);
+    if (rightSemiProjectMultiDriverSafe) {
+      LOG(WARNING) << "MppJniWrapper: fragment " << i
+                   << " is a RIGHT_SEMI_PROJECT HASH-join shape that is "
+                      "safe for intra-task multi-driver execution";
+    }
+
     MppFragmentSpec fragSpec;
     // In single-task mode, merged producers are skipped (continue) above, so
     // fragment IDs in the surviving fragmentSpecs would be non-contiguous
@@ -2082,7 +2309,17 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
           singleTaskThreadPoolDriverBudget,
           std::max(1, mergedNumDrivers));
     }
+    if (fragmentUsesKeyedFinalLocalRepartition) {
+      mergedNumDrivers = std::max(mergedNumDrivers, keyedFinalLocalDrivers);
+      LOG(WARNING) << "MppJniWrapper: fragment " << i
+                   << " enabling keyed FINAL local HASH repartition with "
+                   << mergedNumDrivers << " drivers";
+    }
     fragSpec.numDrivers = mergedNumDrivers;
+    fragSpec.keyedFinalLocalRepartition =
+        fragmentUsesKeyedFinalLocalRepartition;
+    fragSpec.rightSemiProjectMultiDriverSafe =
+        rightSemiProjectMultiDriverSafe;
     fragSpec.scanInfos = std::move(fragScanInfos);
     fragSpec.scanNodeIds = std::move(fragScanNodeIds);
     // Determine connector IDs for scan nodes from the converted Velox plan.
@@ -2313,6 +2550,10 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeExplainMppQuery( // N
 
   auto veloxPool = defaultLeafVeloxMemoryPool();
   auto sessionCfg = createMppSessionConfig(runtime);
+  const int32_t keyedFinalLocalDrivers = std::max(
+      1,
+      sessionCfg->get<int32_t>(
+          kMppKeyedFinalLocalDrivers, kMppKeyedFinalLocalDriversDefault));
   std::unordered_map<int, velox::RowTypePtr> producerWireTypes;
   std::vector<std::string> finalPlans;
   finalPlans.reserve(numFragments);
@@ -2459,7 +2700,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeExplainMppQuery( // N
         producerWireTypes,
         broadcastSlotSet,
         numExchangeInputs,
-        numBroadcastInputs);
+        numBroadcastInputs,
+        keyedFinalLocalDrivers);
     auto wrappedPlan = wrapWithMppPartitionedOutput(
         static_cast<int32_t>(i), veloxPlanNode, exchangeSpecs);
     finalPlans.push_back(

@@ -37,9 +37,9 @@ import org.apache.spark.sql.catalyst.rules.Rule
  *
  * This rule must run as an optimizer rule, not as an analyzer rule. It uses whole-plan transforms,
  * which Spark 3.5 deliberately rejects while executing post-hoc resolution rules. The injected
- * operator-optimization and pre-CBO passes see predicate subqueries before RewriteSubquery. After
- * the rule observes an Exists, its self-registered user optimizer pass also provides
- * post-RewriteSubquery coverage on subsequent optimizer executions.
+ * operator-optimization and pre-CBO passes see predicate subqueries before RewriteSubquery. A
+ * registration-only post-hoc rule installs it in User Provided Optimizers before the first query,
+ * providing post-RewriteSubquery coverage without transforming an analyzer plan.
  */
 case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
   extends Rule[LogicalPlan]
@@ -58,52 +58,42 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
 
     val rewrittenSubqueries = plan.transformUp {
       case Filter(condition, child) =>
-        Filter(rewriteExistsExpression(condition), child)
+        // Preserve a paired EXISTS / NOT EXISTS until RewriteSubquery so the strictly guarded
+        // single-state rule can inspect both joins together. If its proof fails, this rule still
+        // sees and summarizes the resulting individual LeftSemi / LeftAnti joins in the later
+        // User Provided Optimizers pass.
+        if (MergeSelfCorrelatedExistenceState.hasPotentialPairedExistence(condition)) {
+          Filter(condition, child)
+        } else {
+          Filter(rewriteExistsExpression(condition), child)
+        }
     }
-    if (hasExistsExpression(rewrittenSubqueries)) {
-      registerPostSubqueryPass()
-    }
-
     if (!rewrittenSubqueries.resolved) {
       return rewrittenSubqueries
     }
 
     rewrittenSubqueries.transformUp {
       case join @ Join(_, right, joinType, Some(condition), _)
-          if isExistenceJoin(joinType) && condition.deterministic =>
+          if isExistenceJoin(joinType) && !isCandidateFirstExistenceJoin(joinType) &&
+            condition.deterministic =>
         rewriteJoin(join, right, condition)
           .getOrElse(join)
-    }
-  }
-
-  private def registerPostSubqueryPass(): Unit = {
-    val experimental = spark.experimental
-    experimental.synchronized {
-      if (!experimental.extraOptimizations.exists(_.isInstanceOf[RewriteExistenceJoinRhsDedup])) {
-        experimental.extraOptimizations = experimental.extraOptimizations :+ this
-        logDebug(
-          "RewriteExistenceJoinRhsDedup: self-registered into " +
-            "spark.experimental.extraOptimizations for post-RewriteSubquery pass")
-      }
-    }
-  }
-
-  private def hasExistsExpression(plan: LogicalPlan): Boolean = {
-    plan.exists {
-      node =>
-        node.expressions.exists {
-          expression =>
-            expression.exists {
-              case _: Exists => true
-              case _ => false
-            }
-        }
     }
   }
 
   private def isExistenceJoin(joinType: org.apache.spark.sql.catalyst.plans.JoinType): Boolean = {
     joinType match {
       case LeftSemi | LeftAnti | _: ExistenceJoin => true
+      case _ => false
+    }
+  }
+
+  private def isCandidateFirstExistenceJoin(
+      joinType: org.apache.spark.sql.catalyst.plans.JoinType): Boolean = {
+    joinType match {
+      case ExistenceJoin(exists) =>
+        exists.name.startsWith(
+          MergeSelfCorrelatedExistenceState.CandidateFirstExistenceAttributePrefix)
       case _ => false
     }
   }
@@ -558,9 +548,13 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
   private def isExistenceSummary(right: LogicalPlan): Boolean = {
     right match {
       case aggregate: Aggregate =>
-        aggregate.aggregateExpressions.exists(_.name.startsWith("_existence_min_")) &&
-        (aggregate.aggregateExpressions.exists(_.name.startsWith("_existence_max_")) ||
-          aggregate.aggregateExpressions.exists(_.name.startsWith("_existence_count_")))
+        val names = aggregate.aggregateExpressions.map(_.name)
+        val singleExistenceSummary =
+          names.exists(_.startsWith("_existence_min_")) &&
+            (names.exists(_.startsWith("_existence_max_")) ||
+              names.exists(_.startsWith("_existence_count_")))
+        val pairedExistenceSummary = names.count(_.startsWith("_paired_existence_")) == 4
+        singleExistenceSummary || pairedExistenceSummary
       case Project(_, child) => isExistenceSummary(child)
       case Filter(_, child) => isExistenceSummary(child)
       case _ => false

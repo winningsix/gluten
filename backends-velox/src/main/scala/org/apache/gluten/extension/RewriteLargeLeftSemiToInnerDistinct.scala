@@ -20,7 +20,8 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeSet, EqualTo, Expression}
 import org.apache.spark.sql.catalyst.plans.{Inner, LeftSemi}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Join, JoinHint, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, JoinHint, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{Project, SubqueryAlias}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.JOIN
 import org.apache.spark.sql.internal.SQLConf
@@ -116,6 +117,17 @@ case class RewriteLargeLeftSemiToInnerDistinct(spark: SparkSession)
       case j @ Join(left, right, LeftSemi, Some(condition), hint)
           if !hasUserHint(hint) && right.stats.sizeInBytes > BigInt(sizeThreshold) =>
         extractEquiKeys(condition, left.outputSet, right.outputSet) match {
+          case Some((_, rightKeys)) if isAlreadyUniqueOn(right, AttributeSet(rightKeys), 0) =>
+            // A grouped existence-state RHS can already be unique on a subset of the equi keys.
+            // Adding DISTINCT(rightKeys) in that case creates another full-cardinality hash
+            // aggregation after the real FINAL aggregation (canonical Q21 has tens of billions
+            // of order keys). Inner is bag-equivalent because at most one RHS row can match; keep
+            // the original LeftSemi output contract explicitly.
+            logDebug(
+              s"RewriteLargeLeftSemiToInnerDistinct: rewrote already-unique LeftSemi -> " +
+                s"Project(left.output, Inner) without DISTINCT on right keys " +
+                s"${rightKeys.map(_.name).mkString("[", ",", "]")}")
+            Project(left.output, Join(left, right, Inner, Some(condition), JoinHint.NONE))
           case Some((_, rightKeys)) =>
             val deduplicatedRight = Aggregate(
               groupingExpressions = rightKeys,
@@ -126,7 +138,12 @@ case class RewriteLargeLeftSemiToInnerDistinct(spark: SparkSession)
               s"RewriteLargeLeftSemiToInnerDistinct: rewrote LeftSemi -> Inner with DISTINCT on " +
                 s"right keys ${rightKeys.map(_.name).mkString("[", ",", "]")}; " +
                 s"right.sizeInBytes=${right.stats.sizeInBytes} > threshold=$sizeThreshold")
-            Join(left, deduplicatedRight, Inner, Some(condition), JoinHint.NONE)
+            // DISTINCT makes the inner join bag-equivalent to LeftSemi, but Inner would otherwise
+            // expose the RHS keys. Preserve the LeftSemi output contract explicitly, just as the
+            // already-unique fast path above does.
+            Project(
+              left.output,
+              Join(left, deduplicatedRight, Inner, Some(condition), JoinHint.NONE))
           case None =>
             // non-equi / mixed-side conjunct (e.g. Q21 l_suppkey <> l1.l_suppkey)
             // -- intentionally NOT rewritten by this minimal rule. Return the
@@ -135,6 +152,28 @@ case class RewriteLargeLeftSemiToInnerDistinct(spark: SparkSession)
             // rules survive.
             j
         }
+    }
+  }
+
+  private def isAlreadyUniqueOn(plan: LogicalPlan, equiKeys: AttributeSet, depth: Int): Boolean = {
+    val maxWrapperDepth = 4
+    plan match {
+      case Aggregate(groupingExpressions, _, _) if groupingExpressions.nonEmpty =>
+        // GROUP BY (orderkey) is unique for a join on (orderkey, delayedMin). The inverse is not
+        // true, hence grouping must be a subset of the equi keys rather than merely intersect it.
+        groupingExpressions.forall {
+          case groupingAttribute: Attribute =>
+            equiKeys.exists(_.semanticEquals(groupingAttribute))
+          case _ => false
+        }
+      case Filter(condition, child) if depth < maxWrapperDepth && condition.deterministic =>
+        isAlreadyUniqueOn(child, equiKeys, depth + 1)
+      case Project(projectList, child)
+          if depth < maxWrapperDepth && projectList.forall(_.isInstanceOf[Attribute]) =>
+        isAlreadyUniqueOn(child, equiKeys, depth + 1)
+      case SubqueryAlias(_, child) if depth < maxWrapperDepth =>
+        isAlreadyUniqueOn(child, equiKeys, depth + 1)
+      case _ => false
     }
   }
 

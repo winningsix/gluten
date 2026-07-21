@@ -20,7 +20,7 @@ import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.events.{GlutenMppPlanEvent, GlutenMppPlanFragmentEvent}
 import org.apache.gluten.expression.ConverterUtils
-import org.apache.gluten.extension.{ExchangeSpec, FlushableHashAggregateRule, MppFinalAggTopNPartialRule, MppParallelSortSplitRule, MppRemoveRedundantShuffleRule, MppReplicatedCartesianRule, MppSinglePartitionSortRule, NativeFragment, RewriteUncorrelatedScalarSubquery}
+import org.apache.gluten.extension.{ExchangeSpec, FlushableHashAggregateRule, MppBroadcastLifecycle, MppFinalAggTopNPartialRule, MppParallelSortSplitRule, MppRemoveRedundantShuffleRule, MppReplicatedCartesianRule, MppRootTopNPartialRule, MppSinglePartitionSortRule, NativeFragment, RewriteUncorrelatedScalarSubquery}
 import org.apache.gluten.extension.MppReplicatedCartesianRule.REPLICATED_CARTESIAN_MAX_BUILD_BYTES_TAG
 import org.apache.gluten.extension.columnar.UnionTransformerRule
 import org.apache.gluten.extension.columnar.heuristic.HeuristicTransform
@@ -45,7 +45,7 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expre
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Complete, Final, Partial}
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
-import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi, RightOuter}
+import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, FullOuter, Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, LeafNode, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
 import org.apache.spark.sql.connector.read.SupportsReportStatistics
@@ -68,7 +68,7 @@ import io.substrait.proto.ReadRel
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
 import java.security.MessageDigest
-import java.util.UUID
+import java.util.{Collections, IdentityHashMap, UUID}
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.JavaConverters._
@@ -284,7 +284,17 @@ private case class MppReplicatedJoinBuildInput(child: SparkPlan) extends UnaryTr
   override def nodeName: String = "MppReplicatedJoinBuildInput"
 
   override protected def doTransform(context: SubstraitContext): TransformContext = {
-    val childCtx = child.asInstanceOf[TransformSupport].transform(context)
+    // Plan-D write commands can reach this MPP-only marker before Gluten's normal columnar
+    // collapse has wrapped a vanilla ColumnarBroadcastExchangeExec in an
+    // InputIteratorTransformer. The marker denotes an exchange boundary, so represent that raw
+    // Spark exchange as an iterator ReadRel instead of casting it to TransformSupport. Plan-C
+    // queries normally arrive with the iterator wrapper already present and keep the fast path.
+    val transformChild = child match {
+      case ts: TransformSupport => ts
+      case rawExchange =>
+        ColumnarCollapseTransformStages.wrapInputIteratorTransformer(rawExchange)
+    }
+    val childCtx = transformChild.transform(context)
     TransformContext(output, childCtx.root)
   }
 
@@ -386,6 +396,7 @@ case class MppNativeQueryExec(
   private val SCALAR_SUBQUERY_REWRITE_ENABLED_DEFAULT = "true"
   private val MPP_SINGLE_TASK_MODE_KEY =
     "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode"
+  private val CANDIDATE_FIRST_EXISTENCE_ATTR_PREFIX = "_gluten_candidate_first_exists_"
 
   private type FragmentExtractionResult =
     (
@@ -461,6 +472,17 @@ case class MppNativeQueryExec(
 
   private def executeColumnarInternal(keepDeviceOutput: Boolean): RDD[ColumnarBatch] = {
     val executionChild = preparedChildPlan
+    // The final columnar rule normally marks these exchanges before Spark prepares the plan. Keep
+    // an execution-entry guard as well: MPP cross-cut rewrites can introduce or rebuild a broadcast
+    // after the final rule (Q15's fact-probe broadcast is one example). This marker only defers
+    // eager prepare; RANGE sampling or BSP fallback can still demand the relation lazily.
+    val deferredBroadcastCount =
+      MppBroadcastLifecycle.deferBroadcastPreparation(executionChild)
+    if (deferredBroadcastCount > 0) {
+      logDebug(
+        s"MppNativeQueryExec: execution-entry deferred $deferredBroadcastCount newly reachable " +
+          "ColumnarBroadcastExchangeExec node(s)")
+    }
     // Scope generated RANGE bounds to this MPP launch. A new action gets a new cache even if it
     // reuses the same SparkPlan object; equivalent exchanges inside this launch join one
     // generation.
@@ -956,6 +978,66 @@ case class MppNativeQueryExec(
     }
 
     /**
+     * Make an exchange producer emit exactly the columns consumed by this occurrence of the
+     * exchange. Gluten can push column pruning into InputIteratorTransformer without rebuilding the
+     * upstream Spark exchange. In that shape the native producer still exposes the exchange's wider
+     * child output while the consumer ValueStream exposes only the pruned attributes.
+     *
+     * The C++ exchange replacement cannot recover this mapping from generated Velox names. Its
+     * historical "drop N leading columns" fallback is valid only for the old synthetic hash prefix;
+     * on Q11 it changed [s_suppkey:BIGINT, s_nationkey:INT, n_nationkey:INT] into the last INT
+     * column even though the consumer needed the first BIGINT column. Project at the producer while
+     * Spark ExprIds are still available, which both preserves correctness and avoids sending unused
+     * columns.
+     */
+    def alignProducerOutputToConsumer(
+        producerFragmentId: Int,
+        consumerOutput: Seq[Attribute]): Unit = {
+      if (producerFragmentId < 0 || consumerOutput.isEmpty) {
+        return
+      }
+      val fragmentIndex = extractedFragments.indexWhere(_.id == producerFragmentId)
+      if (fragmentIndex < 0) {
+        logWarning(
+          s"MppNativeQueryExec: cannot align missing producer fragment $producerFragmentId")
+        return
+      }
+      val fragment = extractedFragments(fragmentIndex)
+      val producerOutput = fragment.outputAttributes
+      val projectedOutput = consumerOutput.map {
+        expected => producerOutput.find(_.exprId == expected.exprId)
+      }
+      if (projectedOutput.exists(_.isEmpty)) {
+        logWarning(
+          s"MppNativeQueryExec: cannot align producer fragment $producerFragmentId output " +
+            s"${describeAttributes(producerOutput)} to consumer output " +
+            s"${describeAttributes(consumerOutput)} because one or more ExprIds are absent; " +
+            "leaving the producer schema unchanged")
+        return
+      }
+      val selected = projectedOutput.flatten
+      if (sameOutputExprIds(producerOutput, selected)) {
+        return
+      }
+      fragment.rootOperator match {
+        case wst: WholeStageTransformer =>
+          val project = ProjectExecTransformer.createUnsafe(selected, wst.child)
+          val projectedWst = WholeStageTransformer(project, wst.materializeInput)(wst.stageId)
+          extractedFragments(fragmentIndex) =
+            fragment.copy(rootOperator = projectedWst, outputAttributes = selected)
+          logInfo(
+            s"MppNativeQueryExec: projected exchange producer F$producerFragmentId from " +
+              s"${describeAttributes(producerOutput)} to consumed columns " +
+              s"${describeAttributes(selected)}")
+        case other =>
+          logWarning(
+            s"MppNativeQueryExec: cannot project producer fragment $producerFragmentId root " +
+              s"${other.getClass.getSimpleName}; leaving wider output " +
+              describeAttributes(producerOutput))
+      }
+    }
+
+    /**
      * Walk the plan tree depth-first. Returns the fragment ID of the subtree rooted at `plan`. At
      * WholeStageTransformer: creates a new fragment. At ShuffleExchangeLike: creates an exchange
      * spec connecting producer to consumer. At wrapper nodes (ColumnarToRow, ColumnarToColumnar,
@@ -1066,6 +1148,10 @@ case class MppNativeQueryExec(
                         classifiedKeys,
                         exchangeNode.outputPartitioning.numPartitions)
                     }
+                  // child.output is the schema that InputIteratorTransformer serialized for this
+                  // ValueStream slot. It can be narrower (and differently ordered) than the
+                  // physical exchange child after column pruning.
+                  alignProducerOutputToConsumer(producerFragId, child.output)
                   extractedExchanges += ExchangeSpec(
                     id = exchangeCounter.getAndIncrement(),
                     producerFragmentId = producerFragId,
@@ -1140,9 +1226,19 @@ case class MppNativeQueryExec(
             // (MppJniWrapper.cc), and Velox's PartitionedOutputNode partitions BEFORE
             // the strip -- misrouting Q1's partial-agg states to all 4 F1 drivers and
             // producing 4 keys * 4 drivers = 16 rows instead of 4.
-            walk(
-              ensureWholeStageFragmentRoot(
-                stripSyntheticHashProject(unwrapTransparent(exchange.child))))
+            // ShuffleExchange's child is normally already wrapped in a
+            // WholeStageTransformer. Peel that shell before looking for the
+            // synthetic hash project; otherwise stripSyntheticHashProject sees
+            // only the WST and the hash_partition_key remains in the native
+            // wire schema. Large joins then transmit an unnecessary INT column
+            // and run an equally unnecessary receive-side `*_strip` projection
+            // (Q7's orders edge carries 45B rows).
+            val producer = stripSyntheticHashProject(unwrapTransparent(exchange.child))
+            val producerWithoutSyntheticHash = producer match {
+              case wst: WholeStageTransformer => stripSyntheticHashProject(wst.child)
+              case other => other
+            }
+            walk(ensureWholeStageFragmentRoot(producerWithoutSyntheticHash))
           }
 
         case bex: BroadcastExchangeLike =>
@@ -1264,23 +1360,30 @@ case class MppNativeQueryExec(
       case (consumerId, buf) => consumerId -> buf.toSeq
     }.toMap
     val localInputFragmentIds = localStreamInputs.iterator.map(_.fragmentId).toSet
-    val streamSafeFragments = adjustedFragments.map {
-      fragment =>
-        if (localInputFragmentIds.nonEmpty && fragment.parallelism != 1) {
-          logInfo(
-            s"MppNativeQueryExec: forcing fragment ${fragment.id} to one driver because the " +
-              "query consumes a JVM-backed local stream")
-          fragment.copy(parallelism = 1)
-        } else {
-          fragment
-        }
-    }
+    val streamSafeFragments =
+      restrictParallelismForLocalStreamConsumers(adjustedFragments, localInputFragmentIds)
     (
       streamSafeFragments,
       sortedExchanges,
       frozenBroadcasts,
       localStreamInputs.toSeq,
       rewrittenChild)
+  }
+
+  private[execution] def restrictParallelismForLocalStreamConsumers(
+      fragments: Seq[NativeFragment],
+      localInputFragmentIds: Set[Int]): Seq[NativeFragment] = {
+    fragments.map {
+      fragment =>
+        if (localInputFragmentIds.contains(fragment.id) && fragment.parallelism != 1) {
+          logInfo(
+            s"MppNativeQueryExec: forcing fragment ${fragment.id} to one driver because the " +
+              "fragment consumes a JVM-backed local stream")
+          fragment.copy(parallelism = 1)
+        } else {
+          fragment
+        }
+    }
   }
 
   /**
@@ -1293,6 +1396,7 @@ case class MppNativeQueryExec(
     val skipShuffleRule = MppRemoveRedundantShuffleRule()
     val parallelSortSplitRule = MppParallelSortSplitRule()
     val finalAggTopNPartialRule = MppFinalAggTopNPartialRule()
+    val rootTopNPartialRule = MppRootTopNPartialRule()
     val afterHeuristicTransform = HeuristicTransform.static()(plan)
     val afterPostProject =
       afterHeuristicTransform.transformUp { case node => PullOutPostProject.rewrite(node) }
@@ -1313,7 +1417,10 @@ case class MppNativeQueryExec(
     // finalAggTopNPartial inserts local TopN after final agg before the TakeOrdered
     // SINGLE gather; run after post-join agg splitting so it limits the split final output.
     val afterFinalAggTopNPartial = finalAggTopNPartialRule(afterRootFinalAggSplit)
-    val afterFinalAggSplit = splitFinalAggBeforeJoinHub(afterFinalAggTopNPartial)
+    // Generic root TopN partial handles non-aggregate producers such as TPC-H Q2. Keep it after
+    // the aggregate-specific rule so that rule retains its preferred insertion point.
+    val afterRootTopNPartial = rootTopNPartialRule(afterFinalAggTopNPartial)
+    val afterFinalAggSplit = splitFinalAggBeforeJoinHub(afterRootTopNPartial)
     val afterExistenceSplit = splitExistenceFinalBeforeJoinHub(afterFinalAggSplit)
     val afterNativeLocalSorts = offloadLocalSorts(afterExistenceSplit)
     // Remove Spark's WindowGroupLimit pruning operators by default only for cuDF MPP. Generic
@@ -1334,7 +1441,14 @@ case class MppNativeQueryExec(
           s"inserted HASH distribution (inserted " +
           rankFilterWindowStats.insertedHashExchanges + " exchange(s))")
     }
-    val afterNativeHashJoins = offloadLocalHashJoins(afterRankFilterWindow)
+    val (afterWindowInputOrdering, windowInputOrderingStats) =
+      MppWindowInputOrdering(afterRankFilterWindow)
+    if (windowInputOrderingStats.markedWindows > 0) {
+      logInfo(
+        s"MppNativeQueryExec: preserved verified local ordering for " +
+          windowInputOrderingStats.markedWindows + " native Window subtree(s)")
+    }
+    val afterNativeHashJoins = offloadLocalHashJoins(afterWindowInputOrdering)
     val afterSmjHashJoinRewrite = rewriteMppSortMergeJoinToHashJoin(afterNativeHashJoins)
     val afterBuildSideNormalization = normalizeMppJoinBuildSide(afterSmjHashJoinRewrite)
     val afterBroadcastPushdown =
@@ -1357,8 +1471,14 @@ case class MppNativeQueryExec(
     // more, then collapse again so the rewritten tail operators become part of the root native
     // fragment.
     val afterLateNativePostProject = rewriteNativePostProjects(collapsed)
-    normalizeInputIteratorTransformers(
+    val finalPlan = normalizeInputIteratorTransformers(
       ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(afterLateNativePostProject))
+    // Cross-cut rules may have changed a shuffle join into a broadcast join after the final
+    // columnar rule had already run. Defer the newly created exchange before any subsequent plan
+    // inspection can trigger eager preparation. The runtime commit still owns irreversible
+    // suppression after RANGE/BSP fallback is no longer possible.
+    MppBroadcastLifecycle.deferBroadcastPreparation(finalPlan)
+    finalPlan
   }
 
   /**
@@ -1838,6 +1958,15 @@ case class MppNativeQueryExec(
 
   private def offloadLocalHashJoins(plan: SparkPlan): SparkPlan = {
     var strippedSorts = 0
+    def ensureNativeHashJoinInput(child: SparkPlan): SparkPlan = child match {
+      case _: TransformSupport => child
+      case rawExchange if unwrapToExchange(rawExchange).isDefined =>
+        // Plan-D write planning can leave a vanilla shuffle/broadcast exchange directly below a
+        // vanilla hash join. The join is converted here before the normal Gluten collapse pass,
+        // so make the exchange an explicit ValueStream input for the native fragment.
+        ColumnarCollapseTransformStages.wrapInputIteratorTransformer(rawExchange)
+      case other => other
+    }
     def stripHashJoinInputSort(child: SparkPlan): SparkPlan = child match {
       case sort: SortExec if !sort.global =>
         strippedSorts += 1
@@ -1850,8 +1979,8 @@ case class MppNativeQueryExec(
     }
     val rewritten = plan.transformUp {
       case join: ShuffledHashJoinExec =>
-        val left = stripHashJoinInputSort(join.left)
-        val right = stripHashJoinInputSort(join.right)
+        val left = ensureNativeHashJoinInput(stripHashJoinInputSort(join.left))
+        val right = ensureNativeHashJoinInput(stripHashJoinInputSort(join.right))
         ShuffledHashJoinExecTransformer(
           join.leftKeys,
           join.rightKeys,
@@ -1862,23 +1991,33 @@ case class MppNativeQueryExec(
           right,
           join.isSkewJoin)
       case join: ShuffledHashJoinExecTransformer =>
-        val left = stripHashJoinInputSort(join.left)
-        val right = stripHashJoinInputSort(join.right)
+        val left = ensureNativeHashJoinInput(stripHashJoinInputSort(join.left))
+        val right = ensureNativeHashJoinInput(stripHashJoinInputSort(join.right))
         if ((left eq join.left) && (right eq join.right)) {
           join
         } else {
           join.copy(left = left, right = right)
         }
       case join: BroadcastHashJoinExec =>
+        val left = ensureNativeHashJoinInput(join.left)
+        val right = ensureNativeHashJoinInput(join.right)
         BroadcastHashJoinExecTransformer(
           join.leftKeys,
           join.rightKeys,
           join.joinType,
           join.buildSide,
           join.condition,
-          join.left,
-          join.right,
+          left,
+          right,
           join.isNullAwareAntiJoin)
+      case join: BroadcastHashJoinExecTransformer =>
+        val left = ensureNativeHashJoinInput(join.left)
+        val right = ensureNativeHashJoinInput(join.right)
+        if ((left eq join.left) && (right eq join.right)) {
+          join
+        } else {
+          join.copy(left = left, right = right)
+        }
     }
     if (strippedSorts > 0) {
       logInfo(
@@ -2273,32 +2412,66 @@ case class MppNativeQueryExec(
       return plan
     }
 
-    var pushCount = 0
-    val rewritten = plan.transformDown {
-      case project @ ProjectExecTransformer(projectList, join: BroadcastHashJoinExecTransformer) =>
-        val requiredByProject =
-          orderedAvailableAttributes(projectList.flatMap(_.references), join.output)
-        pushBroadcastJoinIntoProbeExchange(join, requiredByProject) match {
-          case Some(pushed) =>
-            pushCount += 1
-            ProjectExecTransformer(project.projectList, pushed)
-          case None =>
-            project
-        }
-
+    val broadcastCandidates = plan.collect {
       case join: BroadcastHashJoinExecTransformer =>
-        pushBroadcastJoinIntoProbeExchange(join, join.output) match {
-          case Some(pushed) =>
-            pushCount += 1
-            pushed
-          case None =>
-            join
-        }
+        s"${join.nodeName}#${join.id}(joinType=${join.joinType},buildSide=${join.buildSide})"
+    }
+    logInfo(
+      s"MppNativeQueryExec: broadcast-into-probe-exchange candidates=" +
+        broadcastCandidates.mkString("[", ", ", "]"))
+    if (broadcastCandidates.isEmpty) {
+      val hashJoinShapes = plan.collect {
+        case join: ShuffledHashJoinExecTransformer =>
+          s"${join.nodeName}#${join.id}(joinType=${join.joinType},buildSide=${join.buildSide})"
+        case join: BroadcastHashJoinExec =>
+          s"${join.nodeName}#${join.id}(joinType=${join.joinType},buildSide=${join.buildSide})"
+      }
+      logInfo(
+        s"MppNativeQueryExec: no transformed broadcast hash join candidate; " +
+          s"hashJoinClasses=${hashJoinShapes.mkString("[", ", ", "]")}")
+    }
+
+    // A selective dimension chain can contain multiple broadcast joins. transformDown sees the
+    // outer join before an inner join has moved into the exchange producer, so one pass cannot
+    // push the whole chain. Iterate to a small fixed point: after the inner push, the next pass
+    // can carry the outer dimension through the same HASH boundary. A successfully pushed join
+    // has no further exchange below its streamed side, so subsequent passes naturally stop.
+    var rewritten = plan
+    var pushCount = 0
+    var pass = 0
+    var pushedInPass = true
+    while (pushedInPass && pass < 4) {
+      val beforePass = pushCount
+      rewritten = rewritten.transformDown {
+        case project @ ProjectExecTransformer(
+              projectList,
+              join: BroadcastHashJoinExecTransformer) =>
+          val requiredByProject =
+            orderedAvailableAttributes(projectList.flatMap(_.references), join.output)
+          pushBroadcastJoinIntoProbeExchange(join, requiredByProject) match {
+            case Some(pushed) =>
+              pushCount += 1
+              ProjectExecTransformer(project.projectList, pushed)
+            case None =>
+              project
+          }
+
+        case join: BroadcastHashJoinExecTransformer =>
+          pushBroadcastJoinIntoProbeExchange(join, join.output) match {
+            case Some(pushed) =>
+              pushCount += 1
+              pushed
+            case None =>
+              join
+          }
+      }
+      pushedInPass = pushCount > beforePass
+      pass += 1
     }
     if (pushCount > 0) {
       logInfo(
         s"MppNativeQueryExec: pushed $pushCount replicated broadcast join(s) into " +
-          "probe exchange producer fragments")
+          s"probe exchange producer fragments in $pass pass(es)")
     }
     rewritten
   }
@@ -2310,8 +2483,16 @@ case class MppNativeQueryExec(
       return None
     }
 
-    val streamed = join.left
-    val build = join.right
+    // The replicated dimension can legally be either Spark child.  In particular, selective
+    // dimension-chain reordering often leaves the supplier/nation branch on the LEFT while the
+    // large fact/semi/anti chain is on the RIGHT.  The old implementation only handled
+    // BuildRight and therefore silently missed that equivalent plan shape at larger scale
+    // factors.  Normalize the arguments of the pushed join here; projectTo(requiredOutput, ...)
+    // below restores the original Spark output order.
+    val (streamed, build, streamedKeys, buildKeys) = join.buildSide match {
+      case BuildRight => (join.left, join.right, join.leftKeys, join.rightKeys)
+      case BuildLeft => (join.right, join.left, join.rightKeys, join.leftKeys)
+    }
     val allJoinRefs =
       (join.leftKeys ++ join.rightKeys ++ join.condition.toSeq).flatMap(_.references).distinct
     val allowedRefs = streamed.outputSet ++ build.outputSet
@@ -2326,8 +2507,8 @@ case class MppNativeQueryExec(
     pushBroadcastJoinBelowProbeExchange(
       streamed,
       build,
-      join.leftKeys,
-      join.rightKeys,
+      streamedKeys,
+      buildKeys,
       join.condition,
       streamedRefs,
       AttributeSet(requiredOutput)).flatMap {
@@ -2350,13 +2531,23 @@ case class MppNativeQueryExec(
     join.joinType match {
       case _: InnerLike =>
       case _ =>
+        logInfo(
+          s"MppNativeQueryExec: not pushing broadcast join into probe exchange; " +
+            s"join=${join.nodeName}#${join.id} joinType=${join.joinType} is not inner-like")
         return false
     }
-    if (join.isNullAwareAntiJoin || join.buildSide != BuildRight) {
+    if (join.isNullAwareAntiJoin) {
+      logInfo(
+        s"MppNativeQueryExec: not pushing broadcast join into probe exchange; " +
+          s"join=${join.nodeName}#${join.id} is null-aware anti join")
       return false
     }
     val buildExchange = boundaryExchange(join.buildPlan)
     if (!buildExchange.exists(_.isInstanceOf[BroadcastExchangeLike])) {
+      logInfo(
+        s"MppNativeQueryExec: not pushing broadcast join into probe exchange; " +
+          s"join=${join.nodeName}#${join.id} buildSide=${join.buildSide} " +
+          s"buildBoundary=${buildExchange.map(_.getClass.getSimpleName).getOrElse("none")}")
       return false
     }
 
@@ -2364,12 +2555,19 @@ case class MppNativeQueryExec(
       case Some(maxBuildBytes) =>
         val buildBytes = estimatedPlanBytes(join.buildPlan)
         if (buildBytes > maxBuildBytes) {
-          logDebug(
+          logInfo(
             s"MppNativeQueryExec: not pushing broadcast join into probe exchange; " +
               s"buildBytes=$buildBytes exceeds maxBuildBytes=$maxBuildBytes")
           return false
         }
+        logInfo(
+          s"MppNativeQueryExec: broadcast join is eligible for probe-exchange push; " +
+            s"join=${join.nodeName}#${join.id} buildSide=${join.buildSide} " +
+            s"buildBytes=$buildBytes maxBuildBytes=$maxBuildBytes")
       case None =>
+        logInfo(
+          s"MppNativeQueryExec: not pushing broadcast join into probe exchange; " +
+            s"join=${join.nodeName}#${join.id} maxBuildBytes is disabled")
         return false
     }
     true
@@ -2384,6 +2582,74 @@ case class MppNativeQueryExec(
       streamedRefs: Seq[Attribute],
       requiredOutput: AttributeSet): Option[SparkPlan] = {
     plan match {
+      // offloadLocalHashJoins runs before this rule and wraps a raw exchange in these two
+      // iterator adapters so the surrounding native hash join can consume it as a value stream.
+      // They do not change rows or attribute identities; descend through them and rebuild the
+      // wrappers around the rewritten exchange.  Without this case the broadcast pushdown became
+      // order-dependent and stopped at InputIteratorTransformer before reaching the HASH edge.
+      case iit: InputIteratorTransformer =>
+        pushBroadcastJoinBelowProbeExchange(
+          iit.child,
+          build,
+          streamedKeys,
+          buildKeys,
+          condition,
+          streamedRefs,
+          requiredOutput).map(newChild => iit.withNewChildren(Seq(newChild)))
+
+      case adapter: ColumnarInputAdapter =>
+        pushBroadcastJoinBelowProbeExchange(
+          adapter.child,
+          build,
+          streamedKeys,
+          buildKeys,
+          condition,
+          streamedRefs,
+          requiredOutput).map(newChild => adapter.withNewChildren(Seq(newChild)))
+
+      // genColumnarShuffleExchange may prepend a private Murmur3
+      // `hash_partition_key` expression. MPP recomputes that hash in the native partition
+      // function (see stripSyntheticHashProject), so remove the prefix before applying the
+      // ordinary attribute-only projection case below. Never strip an arbitrary computed
+      // project.
+      case project: ProjectExecTransformer
+          if project.projectList.nonEmpty &&
+            project.projectList.head.name == "hash_partition_key" &&
+            project.projectList.tail.forall(_.isInstanceOf[Attribute]) &&
+            referencesWithin(streamedRefs, AttributeSet(project.output.tail)) =>
+        pushBroadcastJoinBelowProbeExchange(
+          project.copy(projectList = project.projectList.tail),
+          build,
+          streamedKeys,
+          buildKeys,
+          condition,
+          streamedRefs,
+          requiredOutput)
+
+      // Spark can insert an attribute-only projection immediately above a HASH exchange after
+      // join reordering (for example, Q21's merged supplier-state shape keeps only
+      // l_orderkey/l_suppkey).  Such a projection neither evaluates expressions nor changes
+      // ExprIds, so it is safe to carry the replicated join through it.  Preserve the original
+      // projection columns and append only build-side attributes required by ancestors; a
+      // computed/aliased projection remains a hard boundary.
+      case project: ProjectExecTransformer
+          if project.projectList.forall(_.isInstanceOf[Attribute]) &&
+            referencesWithin(streamedRefs, project.outputSet) =>
+        val childRequired = requiredOutput ++ project.outputSet
+        pushBroadcastJoinBelowProbeExchange(
+          project.child,
+          build,
+          streamedKeys,
+          buildKeys,
+          condition,
+          streamedRefs,
+          childRequired).map {
+          newChild =>
+            val extras = newChild.output.filter(
+              attr => requiredOutput.contains(attr) && !project.outputSet.contains(attr))
+            projectTo(project.output ++ extras, newChild)
+        }
+
       case exchange: ShuffleExchangeLike
           if isHashPartitioned(exchange.asInstanceOf[SparkPlan]) &&
             referencesWithin(streamedRefs, exchange.asInstanceOf[SparkPlan].outputSet) =>
@@ -2455,10 +2721,19 @@ case class MppNativeQueryExec(
             streamedRefs,
             childRequired).map(newRight => join.copy(right = newRight))
         } else {
+          logInfo(
+            s"MppNativeQueryExec: probe-exchange push path cannot select one side of " +
+              s"${join.nodeName}#${join.id}; streamedRefs=" +
+              streamedRefs.map(_.name).mkString("[", ", ", "]"))
           None
         }
 
-      case _ =>
+      case other =>
+        logInfo(
+          s"MppNativeQueryExec: probe-exchange push path stopped at " +
+            s"${other.nodeName}#${other.id} (${other.getClass.getSimpleName}); streamedRefs=" +
+            streamedRefs.map(_.name).mkString("[", ", ", "]") +
+            s" output=${other.output.map(_.name).mkString("[", ", ", "]")}")
         None
     }
   }
@@ -2489,8 +2764,22 @@ case class MppNativeQueryExec(
   }
 
   private def broadcastJoinPushdownMaxBuildBytes: Option[BigInt] = {
-    val threshold = SQLConf.get.autoBroadcastJoinThreshold
-    if (threshold < 0) None else Some(BigInt(threshold))
+    val key = "spark.gluten.mpp.pushBroadcastJoinIntoProbeExchange.maxBuildBytes"
+    val configured = SQLConf.get.getConfString(key, "auto").trim
+    if (configured.isEmpty || configured.equalsIgnoreCase("auto")) {
+      val threshold = SQLConf.get.autoBroadcastJoinThreshold
+      if (threshold < 0) None else Some(BigInt(threshold))
+    } else if (configured.equalsIgnoreCase("none") || configured == "-1") {
+      None
+    } else {
+      parseBytes(configured).orElse {
+        logWarning(
+          s"MppNativeQueryExec: invalid byte size for $key=$configured; " +
+            "falling back to spark.sql.autoBroadcastJoinThreshold")
+        val threshold = SQLConf.get.autoBroadcastJoinThreshold
+        if (threshold < 0) None else Some(BigInt(threshold))
+      }
+    }
   }
 
   private def estimatedPlanBytes(plan: SparkPlan): BigInt = {
@@ -2835,9 +3124,24 @@ case class MppNativeQueryExec(
     join.joinType match {
       case _: InnerLike => true
       case LeftSemi => true
+      case _: ExistenceJoin if isCandidateFirstExistenceJoin(join) => true
       case LeftOuter | RightOuter
           if normalizeMppOuterJoinBuildSideEnabled || forceMppOuterJoinPreservedBuildSideEnabled =>
         true
+      case _ => false
+    }
+  }
+
+  /**
+   * Candidate-first planning uses a private existence attribute to request the native
+   * RIGHT_SEMI_PROJECT shape. Keep this marker deliberately narrower than ExistenceJoin itself:
+   * Spark also creates ordinary ExistenceJoin nodes for unrelated queries, and changing their build
+   * side here would silently broaden this MPP-only optimization.
+   */
+  private def isCandidateFirstExistenceJoin(join: ShuffledHashJoinExecTransformer): Boolean = {
+    join.joinType match {
+      case ExistenceJoin(exists) =>
+        exists.name.startsWith(CANDIDATE_FIRST_EXISTENCE_ATTR_PREFIX)
       case _ => false
     }
   }
@@ -2969,6 +3273,17 @@ case class MppNativeQueryExec(
 
   private def preferredMppBuildSide(
       join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
+    if (isCandidateFirstExistenceJoin(join)) {
+      // HashJoinExecTransformer swaps the physical inputs for BuildLeft. Its Velox mapping then
+      // emits Substrait RIGHT_SEMI with isExistenceJoin=1, which native converts to
+      // RIGHT_SEMI_PROJECT while JoinUtils projects Spark's original left output plus the private
+      // existence attribute back into the expected order.
+      return Some(
+        BuildSideChoice(
+          BuildLeft,
+          "private candidate-first existence attribute requires " +
+            "BuildLeft/RIGHT_SEMI_PROJECT"))
+    }
     if (join.joinType == LeftSemi) {
       return preferredLeftSemiBuildSide(join)
     }
@@ -2979,6 +3294,9 @@ case class MppNativeQueryExec(
       }
     }
     broadcastBuildSide(join)
+      .orElse {
+        dominantRealScanBuildSide(join)
+      }
       .orElse {
         smallRawDimensionBuildSide(join)
       }
@@ -2994,6 +3312,42 @@ case class MppNativeQueryExec(
       .orElse {
         sparkJoinSelectionBuildSide(join)
       }
+  }
+
+  /**
+   * CBO statistics below a write command can describe the pre-filter logical join rather than the
+   * physical producer and select the multi-terabyte fact input as BuildLeft (Q11). Use real leaf
+   * scan bytes only for an unambiguous dimension-vs-fact shape: the chosen side must expose at most
+   * four columns and scan at least eight times fewer bytes. Unlike broadcast selection, this is a
+   * partitioned hash build, so the dimension does not need to fit the broadcast threshold.
+   */
+  private def dominantRealScanBuildSide(
+      join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
+    join.joinType match {
+      case _: InnerLike =>
+      case _ => return None
+    }
+    val leftBytes = realScanBytes(join.left)
+    val rightBytes = realScanBytes(join.right)
+    if (leftBytes > 0 && rightBytes > 0) {
+      if (join.left.output.size <= 4 && leftBytes * 8 <= rightBytes) {
+        Some(
+          BuildSideChoice(
+            BuildLeft,
+            s"real leaf-scan bytes selected dominant smaller side " +
+              s"(leftScanBytes=$leftBytes, rightScanBytes=$rightBytes)"))
+      } else if (join.right.output.size <= 4 && rightBytes * 8 <= leftBytes) {
+        Some(
+          BuildSideChoice(
+            BuildRight,
+            s"real leaf-scan bytes selected dominant smaller side " +
+              s"(leftScanBytes=$leftBytes, rightScanBytes=$rightBytes)"))
+      } else {
+        None
+      }
+    } else {
+      None
+    }
   }
 
   private def preferredLeftSemiBuildSide(
@@ -3489,7 +3843,11 @@ case class MppNativeQueryExec(
   }
 
   private def pushBroadcastJoinIntoProbeExchangeEnabled: Boolean = {
-    booleanConf("spark.gluten.mpp.pushBroadcastJoinIntoProbeExchange", defaultValue = true)
+    // Recursively moving every broadcast join below a HASH producer can duplicate build work
+    // across producer fragments and turn selective star joins (TPC-H Q9 is a concrete example)
+    // into a substantially more expensive plan. Keep this experimental physical rewrite opt-in
+    // until it has a cost/shape guard; the logical selective-dimension rule is independent.
+    booleanConf("spark.gluten.mpp.pushBroadcastJoinIntoProbeExchange", defaultValue = false)
   }
 
   private def rewriteMppSortMergeJoinToHashJoinEnabled: Boolean = {
@@ -3995,8 +4353,12 @@ case class MppNativeQueryExec(
     }
 
     var markedCount = 0
+    val visited = Collections.newSetFromMap(new IdentityHashMap[SparkPlan, java.lang.Boolean]())
 
     def mark(plan: SparkPlan): Unit = {
+      if (!visited.add(plan)) {
+        return
+      }
       plan match {
         case prepared: MppPreparedChildExec =>
           mark(prepared.hiddenPlan)
@@ -4014,6 +4376,11 @@ case class MppNativeQueryExec(
         case other =>
           other.children.foreach(mark)
       }
+      // Executable subqueries referenced from expressions are prepared by Spark but are not
+      // regular children. Q11's duplicated scalar aggregate is one such plan: if it is omitted
+      // here, its 240-task driver-side broadcast can outlive the native query and interfere with
+      // the next iteration even though MPP has already inlined the same work.
+      plan.subqueries.foreach(mark)
     }
 
     mark(plan)

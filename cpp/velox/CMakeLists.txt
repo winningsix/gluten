@@ -195,11 +195,17 @@ set(VELOX_SRCS
     utils/ArrowAbiCompat.cc
     utils/Common.cc
     utils/ConfigExtractor.cc
-    utils/GccFloat128ToCharsShim.cc
     utils/VeloxArrowUtils.cc
     utils/VeloxBatchResizer.cc
     utils/VeloxWholeStageDumper.cc
     utils/VeloxWriterUtils.cc)
+
+# AArch64 libstdc++ provides std::to_chars(_Float128) directly and GCC does
+# not ship libquadmath on this architecture. The shim is only needed on
+# platforms where that overload is absent.
+if(NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+  list(APPEND VELOX_SRCS utils/GccFloat128ToCharsShim.cc)
+endif()
 
 if(ENABLE_S3)
   find_package(ZLIB)
@@ -267,8 +273,7 @@ add_dependencies(velox_jni_proto protobuf::libprotobuf)
 add_dependencies(velox velox_jni_proto)
 
 set(GLUTEN_UCX_INCLUDE_DIR "")
-set(GLUTEN_UCX_LIBRARIES /usr/lib64/libucp.so /usr/lib64/libuct.so
-                         /usr/lib64/libucs.so)
+set(GLUTEN_UCX_LIBRARIES "")
 if(DEFINED GLUTEN_UCX_HOME AND NOT "${GLUTEN_UCX_HOME}" STREQUAL "")
   set(GLUTEN_UCX_INCLUDE_DIR ${GLUTEN_UCX_HOME})
   set(GLUTEN_UCX_LIBRARIES ${GLUTEN_UCX_HOME}/libucp.so
@@ -277,8 +282,17 @@ if(DEFINED GLUTEN_UCX_HOME AND NOT "${GLUTEN_UCX_HOME}" STREQUAL "")
   if(EXISTS "${GLUTEN_UCX_HOME}/libucm.so")
     list(APPEND GLUTEN_UCX_LIBRARIES ${GLUTEN_UCX_HOME}/libucm.so)
   endif()
-elseif(EXISTS /usr/lib64/libucm.so)
-  list(APPEND GLUTEN_UCX_LIBRARIES /usr/lib64/libucm.so)
+else()
+  find_path(GLUTEN_UCX_INCLUDE_DIR NAMES ucp/api/ucp.h REQUIRED)
+  find_library(GLUTEN_UCP_LIBRARY NAMES ucp REQUIRED)
+  find_library(GLUTEN_UCT_LIBRARY NAMES uct REQUIRED)
+  find_library(GLUTEN_UCS_LIBRARY NAMES ucs REQUIRED)
+  list(APPEND GLUTEN_UCX_LIBRARIES ${GLUTEN_UCP_LIBRARY}
+       ${GLUTEN_UCT_LIBRARY} ${GLUTEN_UCS_LIBRARY})
+  find_library(GLUTEN_UCM_LIBRARY NAMES ucm)
+  if(GLUTEN_UCM_LIBRARY)
+    list(APPEND GLUTEN_UCX_LIBRARIES ${GLUTEN_UCM_LIBRARY})
+  endif()
 endif()
 
 target_include_directories(
@@ -366,9 +380,24 @@ import_library(
   facebook::velox::dwio_parquet_thrift_raw
   ${VELOX_BUILD_PATH}/velox/dwio/parquet/thrift/libvelox_dwio_parquet_thrift_raw.a
 )
-import_library(external::s2 ${VELOX_BUILD_PATH}/_deps/s2geometry-build/libs2.a)
-file(GLOB GLUTEN_ABSL_LIBRARIES "/usr/local/lib64/libabsl*.a")
+set(GLUTEN_S2_LIBRARY
+    "${VELOX_BUILD_PATH}/_deps/s2geometry-build/libs2.a")
+if(NOT EXISTS "${GLUTEN_S2_LIBRARY}")
+  # Velox's setup script may install s2geometry as a system dependency. In
+  # that case the Velox build consumes /usr/local/lib/libs2.a and no bundled
+  # s2geometry-build directory is created.
+  unset(GLUTEN_S2_LIBRARY)
+  find_library(GLUTEN_S2_LIBRARY NAMES s2 REQUIRED)
+endif()
+import_library(external::s2 ${GLUTEN_S2_LIBRARY})
+file(GLOB GLUTEN_ABSL_LIBRARIES
+     "/usr/local/lib/libabsl*.a"
+     "/usr/local/lib64/libabsl*.a")
 list(SORT GLUTEN_ABSL_LIBRARIES)
+set(GLUTEN_QUADMATH_LIBRARY "")
+if(NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+  set(GLUTEN_QUADMATH_LIBRARY quadmath)
+endif()
 
 if(BUILD_TESTS)
   target_link_libraries(facebook::velox INTERFACE facebook::velox::dbgen)
@@ -636,7 +665,6 @@ if(ENABLE_GPU)
   target_link_libraries(
     velox
     PRIVATE -Wl,--whole-archive
-            ${VELOX_BUILD_PATH}/velox/experimental/cudf/libvelox_cudf_common.a
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/exec/libvelox_cudf_exec.a
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/vector/libvelox_cudf_vector.a
             ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/libvelox_cudf_hive_connector.a
@@ -649,132 +677,50 @@ if(ENABLE_GPU)
   # uses thrift for handshake / buffered transport). System Arrow doesn't
   # link them in, so add /usr/local/lib/libthrift.a here.
   target_link_libraries(velox PUBLIC /usr/local/lib/libthrift.a)
-  # Older RAPIDS builds exposed RMM, rapids_logger, and KvikIO as shared
-  # libraries.  RAPIDS 26.06 instead exports PIC static targets, and cuDF's
-  # interface already whole-archives RMM and rapids_logger.  Detect the two
-  # layouts strictly: preserve the legacy shared links, but never add a second
-  # copy of an archive that cuDF already whole-archives.
-  function(gluten_validate_static_rapids_target target expected_path require_pic)
-    if(NOT TARGET "${target}")
-      message(FATAL_ERROR
-              "Found ${expected_path}, but RAPIDS target ${target} is missing")
-    endif()
-    get_target_property(_rapids_imported "${target}" IMPORTED)
-    get_target_property(_rapids_type "${target}" TYPE)
-    get_target_property(_rapids_location "${target}" IMPORTED_LOCATION_RELEASE)
-    if(NOT _rapids_imported OR NOT _rapids_type STREQUAL "STATIC_LIBRARY")
-      message(FATAL_ERROR
-              "RAPIDS target ${target} must be an imported static library; "
-              "observed imported=${_rapids_imported}, type=${_rapids_type}")
-    endif()
-    if(NOT _rapids_location OR NOT EXISTS "${_rapids_location}")
-      message(FATAL_ERROR
-              "RAPIDS target ${target} has no existing Release location: "
-              "${_rapids_location}")
-    endif()
-    get_filename_component(_rapids_expected_real "${expected_path}" REALPATH)
-    get_filename_component(_rapids_location_real "${_rapids_location}" REALPATH)
-    if(NOT _rapids_location_real STREQUAL _rapids_expected_real)
-      message(FATAL_ERROR
-              "RAPIDS target ${target} resolves to ${_rapids_location_real}; "
-              "expected ${_rapids_expected_real}")
-    endif()
-    if(require_pic)
-      get_target_property(_rapids_pic "${target}"
-                          INTERFACE_POSITION_INDEPENDENT_CODE)
-      if(NOT _rapids_pic)
-        message(FATAL_ERROR
-                "RAPIDS static target ${target} must advertise PIC; "
-                "observed ${_rapids_pic}")
-      endif()
-    endif()
-  endfunction()
-
-  function(gluten_require_cudf_whole_archive dependency_target)
-    if(NOT TARGET cudf::cudf)
-      message(FATAL_ERROR "cuDF target is missing while validating ${dependency_target}")
-    endif()
-    get_target_property(_cudf_type cudf::cudf TYPE)
-    get_target_property(_cudf_links cudf::cudf INTERFACE_LINK_LIBRARIES)
-    set(_whole_archive_edge "$<LINK_LIBRARY:WHOLE_ARCHIVE,${dependency_target}>")
-    list(FIND _cudf_links "${_whole_archive_edge}" _whole_archive_index)
-    if(NOT _cudf_type STREQUAL "SHARED_LIBRARY" OR
-       _whole_archive_index EQUAL -1)
-      message(FATAL_ERROR
-              "Static ${dependency_target} requires a shared cudf::cudf with "
-              "the exact ${_whole_archive_edge} interface edge; observed "
-              "type=${_cudf_type}, links=${_cudf_links}")
-    endif()
-  endfunction()
+  # Legacy RAPIDS layouts expose these dependencies as shared libraries and
+  # require explicit links. Current cuDF builds absorb their static archives
+  # into libcudf.so; their build-tree locations may also disappear when CMake
+  # reuses installed packages. Validate the shared cuDF artifact once, retain
+  # legacy shared links when present, and never link a second static copy.
+  get_target_property(_gluten_cudf_type cudf::cudf TYPE)
+  get_target_property(_gluten_cudf_location cudf::cudf
+                      IMPORTED_LOCATION_RELEASE)
+  if(NOT _gluten_cudf_type STREQUAL "SHARED_LIBRARY" OR
+     NOT EXISTS "${_gluten_cudf_location}")
+    message(FATAL_ERROR
+            "RAPIDS dependencies require an existing shared cudf::cudf; "
+            "observed type=${_gluten_cudf_type}, "
+            "location=${_gluten_cudf_location}")
+  endif()
 
   set(GLUTEN_EXPLICIT_RAPIDS_LIBRARIES)
 
   set(_gluten_rmm_shared "${VELOX_BUILD_PATH}/_deps/rmm-build/librmm.so")
-  set(_gluten_rmm_static "${VELOX_BUILD_PATH}/_deps/rmm-build/librmm.a")
   if(EXISTS "${_gluten_rmm_shared}")
     list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_rmm_shared}")
     message(STATUS "Using legacy shared RMM library: ${_gluten_rmm_shared}")
-  elseif(EXISTS "${_gluten_rmm_static}")
-    gluten_validate_static_rapids_target(rmm::rmm "${_gluten_rmm_static}" TRUE)
-    gluten_require_cudf_whole_archive(rmm::rmm)
-    message(STATUS
-            "Using cuDF's verified whole-archive edge for static RMM: "
-            "${_gluten_rmm_static}")
   else()
-    message(FATAL_ERROR
-            "No supported RMM library found at ${_gluten_rmm_shared} or "
-            "${_gluten_rmm_static}")
+    message(STATUS "Using RMM absorbed by shared cuDF: ${_gluten_cudf_location}")
   endif()
 
   set(_gluten_logger_shared
       "${VELOX_BUILD_PATH}/_deps/rapids_logger-build/librapids_logger.so")
-  set(_gluten_logger_static
-      "${VELOX_BUILD_PATH}/_deps/rapids_logger-build/librapids_logger.a")
   if(EXISTS "${_gluten_logger_shared}")
     list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_logger_shared}")
     message(STATUS
             "Using legacy shared RAPIDS logger library: ${_gluten_logger_shared}")
-  elseif(EXISTS "${_gluten_logger_static}")
-    gluten_validate_static_rapids_target(
-      rapids_logger::rapids_logger "${_gluten_logger_static}" FALSE)
-    gluten_require_cudf_whole_archive(rapids_logger::rapids_logger)
-    message(STATUS
-            "Using cuDF's verified whole-archive edge for static RAPIDS logger: "
-            "${_gluten_logger_static}")
   else()
-    message(FATAL_ERROR
-            "No supported RAPIDS logger library found at ${_gluten_logger_shared} "
-            "or ${_gluten_logger_static}")
+    message(STATUS
+            "Using RAPIDS logger absorbed by shared cuDF: ${_gluten_cudf_location}")
   endif()
 
   set(_gluten_kvikio_shared
       "${VELOX_BUILD_PATH}/_deps/kvikio-build/libkvikio.so")
-  set(_gluten_kvikio_static
-      "${VELOX_BUILD_PATH}/_deps/kvikio-build/libkvikio.a")
   if(EXISTS "${_gluten_kvikio_shared}")
     list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_kvikio_shared}")
     message(STATUS "Using legacy shared KvikIO library: ${_gluten_kvikio_shared}")
-  elseif(EXISTS "${_gluten_kvikio_static}")
-    # KvikIO is a PRIVATE cuDF dependency, so the installed cuDF package does
-    # not export kvikio::kvikio even though its PIC archive is absorbed into
-    # libcudf.so.  Validate the shared cuDF artifact instead of requiring a
-    # target that must not be in cuDF's public interface.
-    get_target_property(_gluten_cudf_type cudf::cudf TYPE)
-    get_target_property(_gluten_cudf_location cudf::cudf
-                        IMPORTED_LOCATION_RELEASE)
-    if(NOT _gluten_cudf_type STREQUAL "SHARED_LIBRARY" OR
-       NOT EXISTS "${_gluten_cudf_location}")
-      message(FATAL_ERROR
-              "Static KvikIO is expected to be absorbed by shared cudf::cudf; "
-              "observed cuDF type=${_gluten_cudf_type}, "
-              "location=${_gluten_cudf_location}")
-    endif()
-    message(STATUS
-            "Using static KvikIO absorbed by shared cuDF: ${_gluten_kvikio_static}")
   else()
-    message(FATAL_ERROR
-            "No supported KvikIO library found at ${_gluten_kvikio_shared} or "
-            "${_gluten_kvikio_static}")
+    message(STATUS "Using KvikIO absorbed by shared cuDF: ${_gluten_cudf_location}")
   endif()
 
   set(GLUTEN_CUDART_LIBRARY /usr/local/cuda/lib64/libcudart.so)
@@ -809,7 +755,7 @@ target_link_libraries(velox PRIVATE
   /usr/local/lib/libthriftmetadata.a
   /usr/local/lib/libthriftfrozen2.a
   ${GLUTEN_ABSL_LIBRARIES}
-  /usr/lib64/libquadmath.so.0
+  ${GLUTEN_QUADMATH_LIBRARY}
   -Wl,--end-group)
 
 add_custom_command(

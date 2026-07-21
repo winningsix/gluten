@@ -19,18 +19,21 @@ package org.apache.gluten.extension.columnar
 import org.apache.gluten.config.GlutenConfig
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeSet}
 import org.apache.spark.sql.catalyst.expressions.{EqualNullSafe, EqualTo, Expression}
-import org.apache.spark.sql.catalyst.expressions.{In, InSet, PredicateHelper}
-import org.apache.spark.sql.catalyst.plans.Inner
-import org.apache.spark.sql.catalyst.plans.logical.{BROADCAST, Filter, HintInfo, Join}
+import org.apache.spark.sql.catalyst.expressions.{In, InSet, PredicateHelper, SubqueryExpression}
+import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, Inner, LeftAnti, LeftSemi}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, BROADCAST, Filter, HintInfo, Join}
 import org.apache.spark.sql.catalyst.plans.logical.{JoinHint, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.plans.logical.SubqueryAlias
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 
 import java.util.concurrent.atomic.AtomicBoolean
+
+import scala.util.Try
 
 /**
  * Prune a large dimension by a filtered dimension chain before it reaches fact-ward joins, for
@@ -50,9 +53,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * rebuild defers any relation reachable only through the low-NDV pruning key until a high-NDV edge
  * is available, otherwise the low-NDV join can become a many-to-many fan-out.
  *
- * Intentionally narrow (`spark.gluten.sql.columnar.pushDimensionChainBeforeFact.enabled`): inner
- * joins only, a single selective literal-filtered seed, a prunable chain dimension, a large victim
- * with a non-pruning (high-NDV) fact-ward edge, and an idempotent canonical output.
+ * Intentionally narrow (`spark.gluten.sql.columnar.pushDimensionChainBeforeFact.enabled`): a single
+ * selective literal-filtered seed, a prunable chain dimension, a large victim with a non-pruning
+ * (high-NDV) fact-ward edge, and an idempotent canonical output. The optional mixed probe-spine
+ * path accepts only existence-filter joins and provably deduplicated inner joins whose conditions
+ * are deterministic pure equi predicates.
  */
 case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
   extends Rule[LogicalPlan]
@@ -61,16 +66,27 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
 
   private val maxSmallDimensionSizeInBytes = BigInt(64L * 1024L * 1024L)
   private val maxSmallDimensionRows = BigInt(100000)
-  private val maxPrunableChainDimensionSizeInBytes = BigInt(1024L * 1024L * 1024L)
-  private val maxPrunableChainDimensionRows = BigInt(10000000L)
+  private val maxPrunableChainDimensionSizeInBytesKey =
+    "spark.gluten.sql.columnar.pushDimensionChainBeforeFact.maxChainBytes"
+  private val maxPrunableChainDimensionRowsKey =
+    "spark.gluten.sql.columnar.pushDimensionChainBeforeFact.maxChainRows"
+  private val maxBasePrunableChainDimensionSizeInBytes = BigInt(1L << 30)
+  private val maxBasePrunableChainDimensionRows = BigInt(10000000L)
+  private val maxPrunableChainDimensionSizeInBytes =
+    nonNegativeBytesConf(maxPrunableChainDimensionSizeInBytesKey, "1g")
+  private val maxPrunableChainDimensionRows = BigInt(
+    nonNegativeLongConf(maxPrunableChainDimensionRowsKey, 10000000L))
   private val minVictimRows = BigInt(10000000L) // 10M: only prune a genuinely large dimension
   private val minVictimSizeInBytes = minVictimRows * 16
   private val minBenefitRatio = 2.0 // victim must be >= this multiple of the chain dim to bother
+  private val minExtendedBenefitCostRatio = 4.0
   private val minFactProbeRatio = 4.0
   private val maxClusterItems = 12
   private val maxWrapperDepth = 4
+  private val maxProbeSpineDepth = 8
   private val maxSelectiveInListValues = 16
   private val singleTaskModeKey = "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode"
+  private val mppPartitionsKey = "spark.gluten.mpp.multiExecutor.numPartitions"
   private val firstApplyLog = new AtomicBoolean(false)
 
   registerPostCboPass()
@@ -124,7 +140,9 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
               case Some(rewritten) if !rewritten.fastEquals(child) =>
                 logWarning(
                   "PushSelectiveDimensionChainBeforeFact: rewrote project-wrapped cluster " +
-                    s"projectRefs=${requiredOutput.map(_.name).toSeq.sorted.mkString(",")}")
+                    s"projectRefs=${requiredOutput.map(_.name).toSeq.sorted.mkString(",")} " +
+                    s"maxChainRows=$maxPrunableChainDimensionRows " +
+                    s"maxChainBytes=$maxPrunableChainDimensionSizeInBytes")
                 Project(projectList, rewritten)
               case _ =>
                 if (input.length >= 6) {
@@ -305,7 +323,7 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
       items: Seq[LogicalPlan],
       conditions: Seq[Expression],
       requiredOutput: AttributeSet): Option[LogicalPlan] = {
-    if (conditions.exists(!_.deterministic)) {
+    if (root.isStreaming || items.exists(_.isStreaming) || conditions.exists(!_.deterministic)) {
       return None
     }
     val atomic = deduplicatePredicates(conditions.flatMap(splitConjunctivePredicates))
@@ -313,8 +331,17 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
     // Equi-key union-find over base attributes appearing in attr=attr join predicates.
     val uf = equivClasses(atomic)
     val context = buildReorderContext(items, atomic, uf).getOrElse(return None)
-    val ReorderContext(seed, others, chainDim, rest, victim, chainAttr, victimAttr, lowNdv, _) =
-      context
+    val ReorderContext(
+      seed,
+      others,
+      chainDim,
+      rest,
+      victim,
+      chainAttr,
+      victimAttr,
+      lowNdv,
+      _,
+      probeSpine) = context
 
     if (hasCompetingSelectiveEntrances(context)) {
       logDebug(
@@ -377,7 +404,22 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
         // victim.key = chainDim.key (transitive within the same equi-class).
         Some(EqualTo(victimAttr, chainAttr))
       }
-    val victimPrunedRaw = buildJoin(victim, dimChain, pruneCondition)
+    val victimPrunedRaw = probeSpine match {
+      case Some(spine) =>
+        if (
+          pruneCondition.exists {
+            condition => !condition.references.subsetOf(spine.base.outputSet ++ dimChain.outputSet)
+          }
+        ) {
+          return None
+        }
+        val originalHint =
+          originalPruneJoinHint(root, victimAttr, chainAttr, directChainVictimEdges).getOrElse(
+            return None)
+        injectDimensionIntoProbeSpine(spine, dimChain, pruneCondition, originalHint)
+      case None =>
+        buildJoin(victim, dimChain, pruneCondition)
+    }
     val victimPrunedRequired =
       requiredOutput ++ AttributeSet(rewrittenRemainingConditions.flatMap(_.references))
     val victimPruned = projectForFuture(victimPrunedRaw, victimPrunedRequired)
@@ -390,6 +432,260 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
         rewrittenRemainingConditions,
         lowNdv,
         requiredOutput))
+  }
+
+  /**
+   * Expose the left probe below existence filters that commute with an inner dimension join.
+   *
+   * Accepted wrappers are deliberately narrow:
+   *   - deterministic pure-equi LeftSemi, LeftAnti, and ExistenceJoin;
+   *   - deterministic pure-equi Inner only when its RHS is structurally deduplicated on a non-empty
+   *     subset of the RHS equi-join keys.
+   *
+   * Any right/full/outer join, non-deduplicated inner build, subquery/volatile expression, or
+   * reference to a protected dimension/seed attribute rejects the entire spine. This is what lets
+   * canonical Q21 move supplier/nation below its summarized existence filters without making the
+   * rule specific to Q21 or to table names.
+   */
+  private def extractProbeSpine(
+      root: LogicalPlan,
+      protectedAttrs: AttributeSet,
+      victimAttr: Attribute): Option[ProbeSpine] = {
+    if (root.isStreaming) {
+      return None
+    }
+    val outermostFirst = scala.collection.mutable.ArrayBuffer.empty[LogicalPlan]
+    var current = root
+    var keepGoing = true
+    var depth = 0
+    while (keepGoing && depth < maxProbeSpineDepth) {
+      current match {
+        case join @ Join(left, right, joinType, Some(condition), _)
+            if isSafeProbeWrapper(left, right, joinType, condition, protectedAttrs) =>
+          outermostFirst += join
+          current = left
+          depth += 1
+        case project @ Project(projectList, child)
+            if isAttributeOnlyProject(projectList) &&
+              projectList.forall(_.deterministic) &&
+              projectList.forall(!hasSubqueryExpression(_)) &&
+              AttributeSet(projectList.flatMap(_.references)).intersect(protectedAttrs).isEmpty &&
+              containsJoinThroughSafeUnary(child, 0) =>
+          outermostFirst += project
+          current = child
+          depth += 1
+        case filter @ Filter(condition, child)
+            if condition.deterministic &&
+              !hasSubqueryExpression(condition) &&
+              condition.references.intersect(protectedAttrs).isEmpty &&
+              containsJoinThroughSafeUnary(child, 0) =>
+          outermostFirst += filter
+          current = child
+          depth += 1
+        case alias @ SubqueryAlias(_, child) if containsJoinThroughSafeUnary(child, 0) =>
+          outermostFirst += alias
+          current = child
+          depth += 1
+        case _ =>
+          keepGoing = false
+      }
+    }
+
+    // If the total bound was exhausted while another join is still buried below unary nodes,
+    // reject rather than treating that partially unwrapped subtree as the base.
+    val remainingContainsJoin = current.exists(_.isInstanceOf[Join])
+    val hasJoinFrame = outermostFirst.exists(_.isInstanceOf[Join])
+    if (
+      hasJoinFrame && !remainingContainsJoin && depth < maxProbeSpineDepth &&
+      current.outputSet.contains(victimAttr)
+    ) {
+      Some(ProbeSpine(current, outermostFirst.reverse.toSeq, root.output))
+    } else {
+      None
+    }
+  }
+
+  private def highNdvProbeBranches(spine: ProbeSpine, lowNdv: AttributeSet): Seq[LogicalPlan] =
+    spine.wrappers.collect {
+      case join: Join if wrapperUsesHighNdvProbeKey(join, lowNdv) => join.right
+    }
+
+  private def wrapperUsesHighNdvProbeKey(join: Join, lowNdv: AttributeSet): Boolean =
+    join.condition.toSeq.flatMap(splitConjunctivePredicates).exists {
+      case EqualTo(left: Attribute, right: Attribute)
+          if join.left.outputSet.contains(left) && join.right.outputSet.contains(right) =>
+        !lowNdv.contains(left)
+      case EqualTo(left: Attribute, right: Attribute)
+          if join.left.outputSet.contains(right) && join.right.outputSet.contains(left) =>
+        !lowNdv.contains(right)
+      case _ => false
+    }
+
+  private def containsJoinThroughSafeUnary(plan: LogicalPlan, depth: Int): Boolean = plan match {
+    case _: Join => true
+    case Project(projectList, child)
+        if depth < maxWrapperDepth && isAttributeOnlyProject(projectList) =>
+      containsJoinThroughSafeUnary(child, depth + 1)
+    case Filter(condition, child) if depth < maxWrapperDepth && condition.deterministic =>
+      containsJoinThroughSafeUnary(child, depth + 1)
+    case SubqueryAlias(_, child) if depth < maxWrapperDepth =>
+      containsJoinThroughSafeUnary(child, depth + 1)
+    case _ => false
+  }
+
+  private def isSafeProbeWrapper(
+      left: LogicalPlan,
+      right: LogicalPlan,
+      joinType: org.apache.spark.sql.catalyst.plans.JoinType,
+      condition: Expression,
+      protectedAttrs: AttributeSet): Boolean = {
+    if (
+      left.isStreaming || right.isStreaming ||
+      !condition.deterministic ||
+      hasSubqueryExpression(condition) ||
+      right.exists(_.expressions.exists(hasSubqueryExpression)) ||
+      right.exists(_.expressions.exists(!_.deterministic)) ||
+      !condition.references.subsetOf(left.outputSet ++ right.outputSet) ||
+      condition.references.intersect(protectedAttrs).nonEmpty ||
+      planReferences(right).intersect(protectedAttrs).nonEmpty ||
+      !isPureEquiJoinCondition(condition, left.outputSet, right.outputSet)
+    ) {
+      return false
+    }
+
+    joinType match {
+      case LeftSemi | LeftAnti | _: ExistenceJoin => true
+      case Inner =>
+        val rightKeys = rightEquiKeys(condition, left.outputSet, right.outputSet)
+        rightKeys.nonEmpty && isDeduplicatedOn(right, rightKeys, 0)
+      case _ => false
+    }
+  }
+
+  private def isPureEquiJoinCondition(
+      condition: Expression,
+      left: AttributeSet,
+      right: AttributeSet): Boolean = {
+    val predicates = splitConjunctivePredicates(condition)
+    predicates.nonEmpty && predicates.forall {
+      case EqualTo(l: Attribute, r: Attribute) =>
+        (left.contains(l) && right.contains(r)) ||
+        (left.contains(r) && right.contains(l))
+      case _ => false
+    }
+  }
+
+  private def rightEquiKeys(
+      condition: Expression,
+      left: AttributeSet,
+      right: AttributeSet): AttributeSet =
+    AttributeSet(splitConjunctivePredicates(condition).flatMap {
+      case EqualTo(l: Attribute, r: Attribute) if left.contains(l) && right.contains(r) => Seq(r)
+      case EqualTo(l: Attribute, r: Attribute) if left.contains(r) && right.contains(l) => Seq(l)
+      case _ => Seq.empty
+    })
+
+  private def isDeduplicatedOn(plan: LogicalPlan, keys: AttributeSet, depth: Int): Boolean =
+    plan match {
+      case Aggregate(groupingExpressions, _, _) =>
+        // GROUP BY (a, b) is not unique on a. The grouping set must be a non-empty subset of the
+        // RHS equi keys; joining on additional keys remains unique, but omitting a grouping key
+        // does not. Restrict the proof to plain Attributes so expression/alias equivalence cannot
+        // be inferred accidentally.
+        groupingExpressions.nonEmpty && groupingExpressions.forall {
+          case groupingAttr: Attribute => keys.exists(_.semanticEquals(groupingAttr))
+          case _ => false
+        }
+      case Filter(condition, child) if depth < maxWrapperDepth && condition.deterministic =>
+        isDeduplicatedOn(child, keys, depth + 1)
+      case Project(projectList, child)
+          if depth < maxWrapperDepth && isAttributeOnlyProject(projectList) =>
+        isDeduplicatedOn(child, keys, depth + 1)
+      case SubqueryAlias(_, child) if depth < maxWrapperDepth =>
+        isDeduplicatedOn(child, keys, depth + 1)
+      case _ => false
+    }
+
+  private def planReferences(plan: LogicalPlan): AttributeSet = {
+    var references = AttributeSet(plan.output)
+    plan.foreach {
+      node =>
+        references = references ++ node.outputSet ++
+          AttributeSet(node.expressions.flatMap(_.references))
+    }
+    references
+  }
+
+  private def hasSubqueryExpression(expression: Expression): Boolean =
+    expression.exists {
+      case _: SubqueryExpression => true
+      case _ => false
+    }
+
+  private[columnar] def probeSpineCanCommuteForTesting(
+      root: LogicalPlan,
+      protectedAttrs: AttributeSet,
+      victimAttr: Attribute): Boolean =
+    extractProbeSpine(root, protectedAttrs, victimAttr).nonEmpty
+
+  /**
+   * Find the inner join that carried the chain-victim edge before cluster flattening, and normalize
+   * its hint to the rewritten `(victim, dimension)` orientation.
+   */
+  private def originalPruneJoinHint(
+      root: LogicalPlan,
+      victimAttr: Attribute,
+      chainAttr: Attribute,
+      directEdges: Seq[Expression]): Option[JoinHint] = {
+    if (directEdges.isEmpty) {
+      return None
+    }
+
+    val candidates = root.collect {
+      case Join(left, right, Inner, Some(condition), hint)
+          if !hasHintsOnBothSides(hint) &&
+            directEdges.forall(
+              edge => splitConjunctivePredicates(condition).exists(samePredicate(_, edge))) &&
+            left.outputSet.contains(victimAttr) && right.outputSet.contains(chainAttr) =>
+        hint
+      case Join(left, right, Inner, Some(condition), hint)
+          if !hasHintsOnBothSides(hint) &&
+            directEdges.forall(
+              edge => splitConjunctivePredicates(condition).exists(samePredicate(_, edge))) &&
+            right.outputSet.contains(victimAttr) && left.outputSet.contains(chainAttr) =>
+        JoinHint(hint.rightHint, hint.leftHint)
+    }
+    candidates.distinct match {
+      case Seq(hint) => Some(hint)
+      case _ => None
+    }
+  }
+
+  private def hasHintsOnBothSides(hint: JoinHint): Boolean =
+    hint.leftHint.nonEmpty && hint.rightHint.nonEmpty
+
+  private def injectDimensionIntoProbeSpine(
+      spine: ProbeSpine,
+      dimension: LogicalPlan,
+      pruneCondition: Option[Expression],
+      originalHint: JoinHint): LogicalPlan = {
+    val injectedBase = Join(spine.base, dimension, Inner, pruneCondition, originalHint)
+    val rebuilt = spine.wrappers.foldLeft(injectedBase: LogicalPlan) {
+      case (left, wrapper: Join) => wrapper.copy(left = left)
+      case (child, Project(projectList, _)) =>
+        val dimensionAttrs = child.output.filter(dimension.outputSet.contains)
+        Project(projectList ++ dimensionAttrs.filterNot(projectList.contains), child)
+      case (child, filter: Filter) => filter.copy(child = child)
+      case (child, alias: SubqueryAlias) => alias.withNewChildren(Seq(child))
+      case (_, other) =>
+        throw new IllegalStateException(s"Unsupported probe-spine wrapper ${other.nodeName}")
+    }
+    val rebuiltOutputSet = rebuilt.outputSet
+    val appendedDimensionAttrs =
+      dimension.output.filter {
+        attr => !spine.originalOutput.contains(attr) && rebuiltOutputSet.contains(attr)
+      }
+    Project(spine.originalOutput ++ appendedDimensionAttrs, rebuilt)
   }
 
   /**
@@ -566,7 +862,18 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
       chainAttr: Attribute,
       victimAttr: Attribute,
       lowNdv: AttributeSet,
-      factWardBranch: LogicalPlan)
+      competingExemptBranches: Seq[LogicalPlan],
+      probeSpine: Option[ProbeSpine])
+
+  /**
+   * A cardinality-filtering probe spine whose joins may safely commute with a selective inner
+   * dimension join. `wrappers` are stored innermost first so they can be rebuilt without changing
+   * join type, condition, hint, or the original output attribute identities.
+   */
+  private case class ProbeSpine(
+      base: LogicalPlan,
+      wrappers: Seq[LogicalPlan],
+      originalOutput: Seq[Attribute])
 
   private def buildReorderContext(
       items: Seq[LogicalPlan],
@@ -580,7 +887,9 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
 
     // Chain dimension: a prunable item directly equi-joined to the seed.
     val chainCandidates = others.filter(
-      it => hasEquiEdge(seed.outputSet, it.outputSet, atomic) && hasPrunableChainDimensionStats(it))
+      it =>
+        hasEquiEdge(seed.outputSet, it.outputSet, atomic) &&
+          isPotentialPrunableChainDimension(it))
     if (chainCandidates.length != 1) return None
     val chainDim = chainCandidates.head
     val rest = others.filterNot(_ eq chainDim)
@@ -594,25 +903,70 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
             val lowNdv = uf.classOf(victimAttr)
             val factWardCandidates = rest.filter(
               f => !(f eq v) && hasHighNdvEdge(v.outputSet, f.outputSet, atomic, lowNdv))
-            if (factWardCandidates.nonEmpty && isLargeVictim(v)) {
+            val probeSpine = extractProbeSpine(v, chainDim.outputSet ++ seed.outputSet, victimAttr)
+            val costVictim = probeSpine.map(_.base).getOrElse(v)
+            val workBranches = deduplicateBranches(
+              factWardCandidates ++ probeSpine.toSeq.flatMap(highNdvProbeBranches(_, lowNdv))
+            )
+            val baseEligible = hasBasePrunableChainDimensionStats(chainDim)
+            // Keep the conservative 10M/1GiB path unchanged. A larger chain is admitted only
+            // when it has multiple high-NDV exits and either an explicit configured allowance or
+            // a favorable cost estimate. The cost estimate charges the projected chain once per
+            // MPP peer (worst-case broadcast) and credits only the victim bytes avoided at those
+            // downstream exits. This lets a selective SF30000 supplier/nation chain prune l1,
+            // while preventing a generic single-exit star join from crossing the old size gate.
+            val chainIsEligible =
+              baseEligible ||
+                (workBranches.size >= 2 &&
+                  (hasPrunableChainDimensionStats(chainDim) ||
+                    extendedChainCostJustifiesRewrite(chainDim, costVictim, workBranches)))
+            if (
+              factWardCandidates.nonEmpty &&
+              chainIsEligible &&
+              isLargeVictim(costVictim)
+            ) {
+              val directPruningEdge = edgePredicates(chainDim.outputSet, v.outputSet, atomic)
+                .exists(_.references.subsetOf(lowNdv))
+              val rows = victimScore(costVictim)
+              val downstreamBenefit = rows * workBranches.size
+              // Preserve the original <=10M/1GiB behavior exactly: it selected one fact-ward
+              // branch and treated any other literal-filtered entrance as competing. Only the
+              // extended path may exempt all high-NDV external exits, which Q21 needs because its
+              // orders branch is selective while its summarized existence branches are internal
+              // to the mixed probe spine.
+              val competingExemptBranches =
+                if (baseEligible || probeSpine.isEmpty) {
+                  Seq(chooseFactWardBranch(factWardCandidates))
+                } else factWardCandidates
               Some(
                 (
                   v,
                   chainAttr,
                   victimAttr,
                   lowNdv,
-                  chooseFactWardBranch(factWardCandidates),
-                  victimScore(v)))
+                  competingExemptBranches,
+                  probeSpine,
+                  directPruningEdge,
+                  downstreamBenefit,
+                  rows))
             } else {
               None
             }
         }
     }
     if (victimChoice.isEmpty) return None
-    val (victim, chainAttr, victimAttr, lowNdv, factWardBranch, _) =
-      victimChoice.maxBy { case (v, _, _, _, _, rows) => (rows, v.outputSet.toString) }
+    // Prefer pruning the relation directly joined to the selective chain. A transitive
+    // equivalence-class match is useful as a fallback, but can otherwise mistake a downstream
+    // aggregate state relation for the fact probe. Within the same topology, estimate saved
+    // work as victim cardinality times the number of high-NDV exits that consume it.
+    val (victim, chainAttr, victimAttr, lowNdv, competingExemptBranches, probeSpine, _, _, _) =
+      victimChoice.maxBy {
+        case (v, _, _, _, _, _, direct, downstreamBenefit, rows) =>
+          (direct, downstreamBenefit, rows, v.outputSet.toString)
+      }
 
-    if (!benefitsFromPrune(victim, chainDim)) {
+    val costVictim = probeSpine.map(_.base).getOrElse(victim)
+    if (!benefitsFromPrune(costVictim, chainDim)) {
       None
     } else {
       Some(
@@ -625,7 +979,8 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
           chainAttr,
           victimAttr,
           lowNdv,
-          factWardBranch))
+          competingExemptBranches,
+          probeSpine))
     }
   }
 
@@ -635,8 +990,15 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
   private def competingSelectiveEntrances(context: ReorderContext): Seq[LogicalPlan] =
     context.others
       .filterNot(_ eq context.victim)
-      .filterNot(sameBranch(_, context.factWardBranch))
+      .filterNot(
+        candidate =>
+          context.competingExemptBranches.exists(branch => sameBranch(candidate, branch)))
       .filter(hasSelectiveLiteralFilter)
+
+  private def deduplicateBranches(branches: Seq[LogicalPlan]): Seq[LogicalPlan] =
+    branches.foldLeft(Vector.empty[LogicalPlan]) {
+      (acc, branch) => if (acc.exists(sameBranch(_, branch))) acc else acc :+ branch
+    }
 
   private def deduplicatePredicates(predicates: Seq[Expression]): Seq[Expression] =
     predicates.foldLeft(Vector.empty[Expression]) {
@@ -713,6 +1075,101 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
       positiveRowCount(plan).exists(_ <= maxPrunableChainDimensionRows) ||
       realScanBytes(plan) <= maxPrunableChainDimensionSizeInBytes
 
+  /**
+   * A large chain may enter the expensive cost check only if its current filtered/projected
+   * cardinality estimate fits Spark's broadcast budget. Unlike `realScanBytes`, `stats` reflects
+   * filters already attached to the chain (including a selective runtime key filter).
+   */
+  private def isPotentialPrunableChainDimension(plan: LogicalPlan): Boolean = {
+    if (hasPrunableChainDimensionStats(plan)) {
+      true
+    } else {
+      val maxBroadcastBytes = BigInt(spark.sessionState.conf.autoBroadcastJoinThreshold)
+      val estimatedBytes = plan.stats.sizeInBytes
+      maxBroadcastBytes >= 0 && estimatedBytes > 0 && estimatedBytes <= maxBroadcastBytes
+    }
+  }
+
+  private def hasBasePrunableChainDimensionStats(plan: LogicalPlan): Boolean =
+    hasSmallDimensionStats(plan) ||
+      positiveRowCount(plan).exists(_ <= maxBasePrunableChainDimensionRows) ||
+      realScanBytes(plan) <= maxBasePrunableChainDimensionSizeInBytes
+
+  /**
+   * Compare a conservative MPP broadcast cost with the downstream victim work the prune avoids.
+   * This is deliberately not a query-name or table-name check. It uses only plan statistics and
+   * topology, and it is applied in addition to the strict semantic/shape checks in this rule.
+   */
+  private def extendedChainCostJustifiesRewrite(
+      chainDim: LogicalPlan,
+      victim: LogicalPlan,
+      factWardBranches: Seq[LogicalPlan]): Boolean = {
+    val maxBroadcastBytes = BigInt(spark.sessionState.conf.autoBroadcastJoinThreshold)
+    val chainBytes = conservativePlanBytes(chainDim)
+    if (
+      maxBroadcastBytes < 0 || chainBytes <= 0 || chainBytes > maxBroadcastBytes ||
+      factWardBranches.size < 2
+    ) {
+      return false
+    }
+
+    val configuredPeers = positiveLongConf(
+      mppPartitionsKey,
+      math.max(1L, spark.sessionState.conf.numShufflePartitions.toLong))
+    val peerCount = BigInt(math.max(1L, configuredPeers))
+    val broadcastCostBytes = chainBytes * peerCount
+    val victimBytes = conservativePlanBytes(victim)
+    val avoidedWorkBytes = victimBytes * factWardBranches.size
+    val worthwhile =
+      victimBytes > 0 &&
+        BigDecimal(avoidedWorkBytes) >=
+        BigDecimal(broadcastCostBytes) * BigDecimal(minExtendedBenefitCostRatio)
+
+    if (worthwhile) {
+      logInfo(
+        "PushSelectiveDimensionChainBeforeFact: admitted extended chain by cost " +
+          s"chainBytes=$chainBytes peerCount=$peerCount broadcastCostBytes=$broadcastCostBytes " +
+          s"victimBytes=$victimBytes factWardExits=${factWardBranches.size} " +
+          s"avoidedWorkBytes=$avoidedWorkBytes " +
+          s"minBenefitCostRatio=$minExtendedBenefitCostRatio")
+    }
+    worthwhile
+  }
+
+  /**
+   * Missing column statistics can make a projected plan estimate much larger than the bytes its
+   * scans can physically read. Charge/credit no more than the smaller positive estimate. This is
+   * intentionally conservative for the benefit side and prevents bogus huge estimates from
+   * admitting a rewrite.
+   */
+  private def conservativePlanBytes(plan: LogicalPlan): BigInt = {
+    val positive = Seq(plan.stats.sizeInBytes, realScanBytes(plan)).filter(_ > 0)
+    if (positive.nonEmpty) positive.min else BigInt(0)
+  }
+
+  private def nonNegativeBytesConf(key: String, default: String): BigInt = {
+    val defaultBytes = BigInt(JavaUtils.byteStringAsBytes(default))
+    Try(BigInt(JavaUtils.byteStringAsBytes(spark.sessionState.conf.getConfString(key, default))))
+      .filter(_ >= 0)
+      .getOrElse(defaultBytes)
+  }
+
+  private def nonNegativeLongConf(key: String, default: Long): Long =
+    Try(spark.sessionState.conf.getConfString(key, default.toString).toLong)
+      .filter(_ >= 0L)
+      .getOrElse(default)
+
+  private def positiveLongConf(key: String, default: Long): Long =
+    Try(spark.sessionState.conf.getConfString(key, default.toString).toLong)
+      .filter(_ > 0L)
+      .getOrElse(default)
+
+  private def chooseFactWardBranch(candidates: Seq[LogicalPlan]): LogicalPlan = {
+    val nonSelective = candidates.filterNot(hasSelectiveLiteralFilter)
+    val pool = if (nonSelective.nonEmpty) nonSelective else candidates
+    pool.minBy(_.outputSet.toString)
+  }
+
   private def canBroadcastPrunedBranchIntoMuchLargerFact(
       victim: LogicalPlan,
       prunedBranch: LogicalPlan,
@@ -723,12 +1180,6 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
     prunedBytes > 0 &&
     factBytes > prunedBytes &&
     factBytes.toDouble / victimBytes >= minFactProbeRatio
-  }
-
-  private def chooseFactWardBranch(candidates: Seq[LogicalPlan]): LogicalPlan = {
-    val nonSelective = candidates.filterNot(hasSelectiveLiteralFilter)
-    val pool = if (nonSelective.nonEmpty) nonSelective else candidates
-    pool.minBy(_.outputSet.toString)
   }
 
   private def benefitsFromPrune(victim: LogicalPlan, chainDim: LogicalPlan): Boolean = {

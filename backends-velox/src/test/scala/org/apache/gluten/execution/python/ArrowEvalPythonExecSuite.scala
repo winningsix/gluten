@@ -190,11 +190,13 @@ class ArrowEvalPythonExecSuite extends WholeStageTransformerSuite {
       // Keep the tested Python input as a nullable AttributeReference. The engine deliberately
       // does not broaden its conservative pre-projection contract to arbitrary CASE expressions.
       .repartition(1)
-    val rowReference = withSQLConf(
+    var rowReference = Seq.empty[org.apache.spark.sql.Row]
+    withSQLConf(
       "spark.sql.execution.pythonUDF.arrow.enabled" -> "false",
       "spark.gluten.mpp.enabled" -> "false") {
       val base = nullableInputs
-      base.select(ordinaryPythonUDFString(base("payload")).as("decoded")).collect().toSeq
+      rowReference =
+        base.select(ordinaryPythonUDFString(base("payload")).as("decoded")).collect().toSeq
     }
     assert(rowReference.head.isNullAt(0))
 
@@ -554,13 +556,14 @@ class ArrowEvalPythonExecSuite extends WholeStageTransformerSuite {
       val udfConstructor = classOf[UserDefinedPythonFunction].getConstructors
         .find(_.getParameterCount == 5)
         .get
-      udfConstructor
-        .newInstance(
+      val udfArgs: Array[AnyRef] = Array(
           name,
-          function,
+          function.asInstanceOf[AnyRef],
           declaredReturnType,
           Int.box(baseUdf.pythonEvalType),
           Boolean.box(true))
+      udfConstructor
+        .newInstance(udfArgs: _*)
         .asInstanceOf[UserDefinedPythonFunction]
     } finally {
       Files.deleteIfExists(commandFile)

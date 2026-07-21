@@ -66,6 +66,23 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
   def isMppSuppressed: Boolean =
     getTagValue(ColumnarBroadcastExchangeExec.MppSuppressedTag).contains(true)
 
+  /**
+   * Skip Spark's eager `prepare()` launch while an enclosing MPP query is still validating.
+   *
+   * Unlike [[isMppSuppressed]], this marker is reversible in behavior: `doExecuteBroadcast` and
+   * direct access to [[relationFuture]] still start the broadcast on demand. This lets RANGE
+   * sampling and BSP fallback consume a live exchange without also running dead broadcast jobs for
+   * queries that commit to native MPP.
+   */
+  def isMppPrepareDeferred: Boolean =
+    getTagValue(ColumnarBroadcastExchangeExec.MppPrepareDeferredTag).contains(true)
+
+  def deferPrepareForMppNativeExecution(): Boolean = synchronized {
+    val newlyMarked = !isMppPrepareDeferred
+    setTagValue(ColumnarBroadcastExchangeExec.MppPrepareDeferredTag, true)
+    newlyMarked
+  }
+
   @transient
   private lazy val promise = Promise[broadcast.Broadcast[Any]]()
 
@@ -202,7 +219,7 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
     // MppNativeQueryExec has inlined this build subtree into its consumer
     // fragment via single-task merge. See [[isMppSuppressed]] for the full
     // rationale and MppNativeQueryExec for the commit point.
-    if (isMppSuppressed) return
+    if (isMppSuppressed || isMppPrepareDeferred) return
     relationFuture
   }
 
@@ -256,6 +273,13 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
 }
 
 object ColumnarBroadcastExchangeExec {
+
+  /**
+   * Prevent eager `doPrepare` for a broadcast below MPP while keeping lazy broadcast execution
+   * available to RANGE sampling and BSP fallback.
+   */
+  val MppPrepareDeferredTag: TreeNodeTag[Boolean] =
+    TreeNodeTag[Boolean]("mpp.prepareDeferred")
 
   /**
    * Plan-tree-attached marker committed by `MppNativeQueryExec` after fallback-capable validation

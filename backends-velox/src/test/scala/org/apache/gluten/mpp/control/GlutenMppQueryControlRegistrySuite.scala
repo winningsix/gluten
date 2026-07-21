@@ -170,18 +170,38 @@ class GlutenMppQueryControlRegistrySuite extends AnyFunSuite {
     assert(retry.peerCompletions.map(_.peerIndex) == Seq(0))
   }
 
-  test("peer terminal before output EOS aborts the remaining peers") {
+  test("non-success peer terminal before output EOS aborts the remaining peers") {
     val registry = new GlutenMppQueryControlRegistry(5000L)
     val p0 = peer(0)
     val p1 = peer(1)
     registry.processHeartbeat(heartbeat(p0))
     registry.processHeartbeat(heartbeat(p1))
 
-    registry.processHeartbeat(heartbeat(p0.copy(state = MppPeerState.Succeeded)))
+    registry.processHeartbeat(heartbeat(p0.copy(state = MppPeerState.Aborted)))
     val snapshot = registry.snapshot(run).get
     assert(snapshot.state == MppQueryRunState.Aborting)
     assert(snapshot.firstFailure.exists(_.contains("before output EOS")))
     assert(registry.processHeartbeat(heartbeat(p1)).abortCommands.map(_.peerIndex) == Seq(1))
+  }
+
+  test("successful Spark task end is an implicit output EOS") {
+    val registry = new GlutenMppQueryControlRegistry(5000L)
+    val p0 = peer(0)
+    val p1 = peer(1)
+    registry.processHeartbeat(heartbeat(p0))
+    registry.processHeartbeat(heartbeat(p1))
+
+    registry.onTaskEnd(p0.taskAttemptId, p0.executorId, failed = false, "success")
+    val oneFinished = registry.snapshot(run).get
+    assert(oneFinished.state == MppQueryRunState.Running)
+    assert(oneFinished.firstFailure.isEmpty)
+    assert(oneFinished.peers.find(_.peerIndex == 0).exists(_.outputComplete))
+
+    registry.onTaskEnd(p1.taskAttemptId, p1.executorId, failed = false, "success")
+    val finished = registry.snapshot(run).get
+    assert(finished.state == MppQueryRunState.Terminal)
+    assert(finished.firstFailure.isEmpty)
+    assert(finished.peers.forall(peer => peer.outputComplete && peer.terminal))
   }
 
   test("terminal tombstone rejects late traffic and expires after retention") {
