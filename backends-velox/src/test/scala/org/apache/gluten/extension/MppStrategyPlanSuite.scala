@@ -356,11 +356,12 @@ class MppStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   }
 
   test("MPP metrics are reported") {
-    // Run a Plan C query and check that dynamic extraction updates the public MPP metrics.
+    // Use a HASH exchange so this test reaches Plan C's irreversible native-execution commit.
+    // An ORDER BY introduces a hybrid RANGE pre-action that may legitimately delegate to BSP
+    // before the MPP metrics are updated, which tests RANGE fallback rather than metrics.
     val df = spark.sql("""SELECT l_returnflag, count(*) as cnt
                          |FROM lineitem
-                         |GROUP BY l_returnflag
-                         |ORDER BY l_returnflag""".stripMargin)
+                         |GROUP BY l_returnflag""".stripMargin)
     // Force execution so metrics are populated
     df.collect()
 
