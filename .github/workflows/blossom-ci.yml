@@ -13,9 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Trigger CI on NVIDIA's hybrid GitHub and Blossom infrastructure.
+# A workflow to trigger ci on hybrid infra (github + self hosted runner)
 name: Blossom-CI
-
 on:
   issue_comment:
     types: [created]
@@ -27,29 +26,32 @@ on:
       args:
         description: 'argument'
         required: false
-
 jobs:
   Authorization:
     name: Authorization
     runs-on: blossom
     outputs:
       args: ${{ env.args }}
+
+    # This job only runs for pull request comments
     if: |
+      github.event.issue.pull_request &&
       github.event.comment.body == 'build' &&
       (
+        github.actor == 'binmahone' ||
+        github.actor == 'firestarman' ||
+        github.actor == 'GaryShen2008' ||
+        github.actor == 'liurenjie1024' ||
+        github.actor == 'NvTimLiu' ||
         github.actor == 'pxLi' ||
+        github.actor == 'res-life' ||
+        github.actor == 'sperlingxx' ||
+        github.actor == 'thirtiseven' ||
+        github.actor == 'winningsix' ||
+        github.actor == 'wjxiz1992' ||
         github.actor == 'YanxuanLiu' ||
         github.actor == 'yinqingh' ||
-        github.actor == 'NvTimLiu' ||
-        github.actor == 'winningsix' ||
-        github.actor == 'binmahone' ||
-        github.actor == 'thirtiseven' ||
-        github.actor == 'GaryShen2008' ||
-        github.actor == 'firestarman' ||
-        github.actor == 'sperlingxx' ||
-        github.actor == 'res-life' ||
-        github.actor == 'liurenjie1024' ||
-        github.actor == 'wjxiz1992'
+        false
       )
     steps:
       - name: Check if comment is issued by authorized person
@@ -71,16 +73,21 @@ jobs:
           ref: ${{ fromJson(needs.Authorization.outputs.args).ref }}
           lfs: 'true'
 
-      - name: Setup Java
+      # repo specific steps
+      - name: Setup java
         uses: actions/setup-java@v5
         with:
           distribution: adopt
           java-version: 8
 
-      - name: Setup Black Duck properties
-        run: echo detect.maven.included.scopes=compile >> application.properties
+      # add blackduck properties https://synopsys.atlassian.net/wiki/spaces/INTDOCS/pages/631308372/Methods+for+Configuring+Analysis#Using-a-configuration-file
+      # currently hardcode projects here to avoid intermittent mvn scan failures
+      - name: Setup blackduck properties
+        run: |
+          echo detect.maven.build.command="-pl=com.nvidia:rapids-4-spark-parent,com.nvidia:rapids-4-spark-sql_2.12 -am" >> application.properties
+          echo detect.maven.included.scopes=compile >> application.properties
 
-      - name: Run Blossom action
+      - name: Run blossom action
         uses: NVIDIA/blossom-action@main
         env:
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -91,11 +98,11 @@ jobs:
           args3: ${{ fromJson(needs.Authorization.outputs.args).args3 }}
 
   Job-trigger:
-    name: Start CI job
+    name: Start ci job
     needs: [Vulnerability-scan]
     runs-on: blossom
     steps:
-      - name: Start CI job
+      - name: Start ci job
         run: blossom-ci
         env:
           OPERATION: 'START-CI-JOB'
@@ -105,7 +112,7 @@ jobs:
   Upload-Log:
     name: Upload log
     runs-on: blossom
-    if: github.event_name == 'workflow_dispatch'
+    if : github.event_name == 'workflow_dispatch'
     steps:
       - name: Jenkins log for pull request ${{ fromJson(github.event.inputs.args).pr }} (click here)
         run: blossom-ci
