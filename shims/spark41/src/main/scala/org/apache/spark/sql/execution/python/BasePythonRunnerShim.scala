@@ -50,8 +50,7 @@ abstract class BasePythonRunnerShim(
     PythonUDFRunner.writeUDFs(
       dataOut,
       funcs,
-      argOffsets.map(_.map(pair => ArgumentMetadata(pair._1, pair._2))),
-      None)
+      argOffsets.map(_.map(pair => ArgumentMetadata(pair._1, pair._2, false))))
   }
 
   override protected def newWriter(

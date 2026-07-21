@@ -20,25 +20,49 @@ import org.apache.gluten.exception.GlutenNotSupportException
 import org.apache.gluten.expression.{ExpressionConverter, ExpressionTransformer, GenericExpressionTransformer, UDFMappings}
 
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.util.Utils
 
 import java.util.Locale
 
 object HiveUDFTransformer {
-  def isHiveUDF(expr: Expression): Boolean = {
-    expr match {
-      case _: HiveSimpleUDF | _: HiveGenericUDF => true
-      case _ => false
+  private val HIVE_SIMPLE_UDF_CLASS: Option[Class[_]] =
+    optionalClass("org.apache.spark.sql.hive.HiveSimpleUDF")
+  private val HIVE_GENERIC_UDF_CLASS: Option[Class[_]] =
+    optionalClass("org.apache.spark.sql.hive.HiveGenericUDF")
+
+  private def optionalClass(className: String): Option[Class[_]] = {
+    try {
+      Some(Utils.classForName(className))
+    } catch {
+      case _: ClassNotFoundException | _: NoClassDefFoundError => None
     }
   }
 
-  def getHiveUDFNameAndClassName(expr: Expression): (String, String) = expr match {
-    case s: HiveSimpleUDF =>
-      (s.name.stripPrefix("default."), s.funcWrapper.functionClassName)
-    case g: HiveGenericUDF =>
-      (g.name.stripPrefix("default."), g.funcWrapper.functionClassName)
-    case _ =>
+  def isHiveUDF(expr: Expression): Boolean = {
+    HIVE_SIMPLE_UDF_CLASS.exists(_.isAssignableFrom(expr.getClass)) ||
+    HIVE_GENERIC_UDF_CLASS.exists(_.isAssignableFrom(expr.getClass))
+  }
+
+  def getHiveUDFNameAndClassName(expr: Expression): (String, String) = {
+    if (!isHiveUDF(expr)) {
       throw new GlutenNotSupportException(
         s"Expression $expr is not a HiveSimpleUDF or HiveGenericUDF")
+    }
+    val funcWrapper = invokeNoArg[AnyRef](expr, "funcWrapper")
+    (
+      invokeNoArg[String](expr, "name").stripPrefix("default."),
+      invokeNoArg[String](funcWrapper, "functionClassName"))
+  }
+
+  private def invokeNoArg[T](target: AnyRef, methodName: String): T = {
+    val method = target.getClass.getMethods
+      .find(method => method.getName == methodName && method.getParameterCount == 0)
+      .getOrElse {
+        val declaredMethod = target.getClass.getDeclaredMethod(methodName)
+        declaredMethod.setAccessible(true)
+        declaredMethod
+      }
+    method.invoke(target).asInstanceOf[T]
   }
 
   def replaceWithExpressionTransformer(

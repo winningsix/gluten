@@ -19,10 +19,11 @@ package org.apache.spark.shuffle
 import org.apache.gluten.config.{HashShuffleWriterType, ShuffleWriterType}
 import org.apache.gluten.vectorized.NativePartitioning
 
-import org.apache.spark.{Aggregator, Partitioner, ShuffleDependency, SparkEnv}
+import org.apache.spark.{Aggregator, Partitioner, PipelinedShuffleDependency, ShuffleDependency, SparkEnv}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.serializer.Serializer
 import org.apache.spark.sql.execution.metric.SQLMetric
+import org.apache.spark.sql.types.StructType
 
 import scala.reflect.ClassTag
 
@@ -50,6 +51,13 @@ import scala.reflect.ClassTag
  * @param metrics
  *   the metrics for the columnar shuffle
  */
+trait ColumnarShuffleDependencyLike {
+  def nativePartitioning: NativePartitioning
+  def metrics: Map[String, SQLMetric]
+  def shuffleWriterType: ShuffleWriterType
+  def outputSchema: StructType
+}
+
 class ColumnarShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
     @transient private val _rdd: RDD[_ <: Product2[K, V]],
     override val partitioner: Partitioner,
@@ -60,7 +68,8 @@ class ColumnarShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
     override val shuffleWriterProcessor: ShuffleWriteProcessor = new ShuffleWriteProcessor,
     val nativePartitioning: NativePartitioning,
     val metrics: Map[String, SQLMetric],
-    val shuffleWriterType: ShuffleWriterType = HashShuffleWriterType)
+    val shuffleWriterType: ShuffleWriterType = HashShuffleWriterType,
+    val outputSchema: StructType = StructType(Nil))
   extends ShuffleDependency[K, V, C](
     _rdd,
     partitioner,
@@ -68,4 +77,27 @@ class ColumnarShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
     keyOrdering,
     aggregator,
     mapSideCombine,
-    shuffleWriterProcessor) {}
+    shuffleWriterProcessor)
+  with ColumnarShuffleDependencyLike {}
+
+class PipelinedColumnarShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
+    @transient private val _rdd: RDD[_ <: Product2[K, V]],
+    override val partitioner: Partitioner,
+    override val serializer: Serializer = SparkEnv.get.serializer,
+    override val keyOrdering: Option[Ordering[K]] = None,
+    override val aggregator: Option[Aggregator[K, V, C]] = None,
+    override val mapSideCombine: Boolean = false,
+    override val shuffleWriterProcessor: ShuffleWriteProcessor = new ShuffleWriteProcessor,
+    val nativePartitioning: NativePartitioning,
+    val metrics: Map[String, SQLMetric],
+    val shuffleWriterType: ShuffleWriterType = HashShuffleWriterType,
+    val outputSchema: StructType = StructType(Nil))
+  extends PipelinedShuffleDependency[K, V, C](
+    _rdd,
+    partitioner,
+    serializer,
+    keyOrdering,
+    aggregator,
+    mapSideCombine,
+    shuffleWriterProcessor)
+  with ColumnarShuffleDependencyLike {}

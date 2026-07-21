@@ -56,6 +56,7 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
 
   private val MPP_ENABLED_KEY = "spark.gluten.mpp.enabled"
   private val MPP_STRATEGY_KEY = "spark.gluten.mpp.strategy.enabled"
+  private val PIPELINED_SHUFFLE_ENABLED_KEY = "spark.sql.shuffle.pipelined.enabled"
   private val MPP_ENABLED_DEFAULT = "true"
   // Disable Plan C for now - shadow plan generation returns CommandResultExec.
   // Use Plan D (MppCollapseRule) which has a working child plan.
@@ -75,6 +76,12 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
         s"MppStrategy: disabled (" +
           s"mpp.enabled=${session.conf.get(MPP_ENABLED_KEY, MPP_ENABLED_DEFAULT)}, " +
           s"strategy.enabled=${session.conf.get(MPP_STRATEGY_KEY, MPP_STRATEGY_DEFAULT)})")
+      return Nil
+    }
+    if (isPipelinedShuffleEnabled) {
+      logWarning(
+        s"MppStrategy: disabled because $PIPELINED_SHUFFLE_ENABLED_KEY=true; " +
+          "Gluten incremental shuffle must go through Spark shuffle-manager routing, not MPP")
       return Nil
     }
     if (generatingShadowPlan) return Nil
@@ -122,6 +129,9 @@ case class MppStrategy(session: SparkSession) extends SparkStrategy with Logging
     val strategyEnabled = session.conf.get(MPP_STRATEGY_KEY, MPP_STRATEGY_DEFAULT).toBoolean
     mppEnabled && strategyEnabled
   }
+
+  private def isPipelinedShuffleEnabled: Boolean =
+    session.conf.get(PIPELINED_SHUFFLE_ENABLED_KEY, "false").toBoolean
 
   /**
    * Check whether the logical plan looks like a top-level query root. We avoid intercepting DDL

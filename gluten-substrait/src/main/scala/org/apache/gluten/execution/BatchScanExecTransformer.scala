@@ -106,7 +106,7 @@ abstract class BatchScanExecTransformerBase(
       sparkContext) ++ customMetrics
 
   def doPostDriverMetrics(): Unit = {
-    postDriverMetrics()
+    postDriverMetrics(Array.empty)
   }
 
   override def scanFilters: Seq[Expression] = scan match {

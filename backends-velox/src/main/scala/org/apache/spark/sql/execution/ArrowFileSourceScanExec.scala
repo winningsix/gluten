@@ -33,6 +33,8 @@ case class ArrowFileSourceScanExec(original: FileSourceScanExec)
 
   override def output: Seq[Attribute] = original.output
 
+  override def markedForSingleTaskExecution: Boolean = original.markedForSingleTaskExecution
+
   override def doCanonicalize(): FileSourceScanExec = original.doCanonicalize()
 
   override protected def doExecuteColumnar(): RDD[ColumnarBatch] = {

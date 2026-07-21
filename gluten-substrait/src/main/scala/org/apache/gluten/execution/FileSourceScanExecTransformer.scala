@@ -48,6 +48,7 @@ case class FileSourceScanExecTransformer(
     override val dataFilters: Seq[Expression],
     override val tableIdentifier: Option[TableIdentifier],
     override val disableBucketedScan: Boolean = false,
+    override val markedForSingleTaskExecution: Boolean = false,
     override val pushDownFilters: Option[Seq[Expression]] = None)
   extends FileSourceScanExecTransformerBase(
     relation,
@@ -59,7 +60,9 @@ case class FileSourceScanExecTransformer(
     optionalNumCoalescedBuckets,
     dataFilters,
     tableIdentifier,
-    disableBucketedScan) {
+    disableBucketedScan,
+    markedForSingleTaskExecution
+  ) {
 
   override def doCanonicalize(): FileSourceScanExecTransformer = {
     FileSourceScanExecTransformer(
@@ -77,6 +80,7 @@ case class FileSourceScanExecTransformer(
       QueryPlan.normalizePredicates(dataFilters, output),
       None,
       disableBucketedScan,
+      markedForSingleTaskExecution,
       pushDownFilters.map(QueryPlan.normalizePredicates(_, output))
     )
   }
@@ -95,7 +99,8 @@ abstract class FileSourceScanExecTransformerBase(
     optionalNumCoalescedBuckets: Option[Int],
     dataFilters: Seq[Expression],
     tableIdentifier: Option[TableIdentifier],
-    disableBucketedScan: Boolean = false)
+    disableBucketedScan: Boolean = false,
+    override val markedForSingleTaskExecution: Boolean = false)
   extends FileSourceScanExecShim(
     relation,
     output,

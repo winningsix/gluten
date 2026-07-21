@@ -18,7 +18,7 @@ package org.apache.spark.shuffle.sort
 
 import org.apache.gluten.shuffle.SupportsColumnarShuffle
 
-import org.apache.spark.{ShuffleDependency, SparkConf, SparkContext, SparkEnv, TaskContext}
+import org.apache.spark.{ShuffleDependency, SparkConf, SparkContext, SparkEnv, SparkException, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config
 import org.apache.spark.serializer.SerializerManager
@@ -97,28 +97,33 @@ class ColumnarShuffleManager(conf: SparkConf)
       dependency: ShuffleDependency[K, V, C]
   ): ShuffleHandle = {
     ensureCleanupListener()
-    if (dependency.isInstanceOf[ColumnarShuffleDependency[_, _, _]]) {
-      logInfo(s"Registering ColumnarShuffle shuffleId: $shuffleId")
-      new ColumnarShuffleHandle[K, V](
-        shuffleId,
-        dependency.asInstanceOf[ColumnarShuffleDependency[K, V, V]])
-    } else if (SortShuffleWriter.shouldBypassMergeSort(conf, dependency)) {
-      // If there are fewer than spark.shuffle.sort.bypassMergeThreshold partitions and we don't
-      // need map-side aggregation, then write numPartitions files directly and just concatenate
-      // them at the end. This avoids doing serialization and deserialization twice to merge
-      // together the spilled files, which would happen with the normal code path. The downside is
-      // having multiple files open at a time and thus more memory allocated to buffers.
-      new BypassMergeSortShuffleHandle[K, V](
-        shuffleId,
-        dependency.asInstanceOf[ShuffleDependency[K, V, V]])
-    } else if (SortShuffleManager.canUseSerializedShuffle(dependency)) {
-      // Otherwise, try to buffer map outputs in a serialized form, since this is more efficient:
-      new SerializedShuffleHandle[K, V](
-        shuffleId,
-        dependency.asInstanceOf[ShuffleDependency[K, V, V]])
-    } else {
-      // Otherwise, buffer map outputs in a deserialized form:
-      new BaseShuffleHandle(shuffleId, dependency)
+    dependency match {
+      case pipelined: PipelinedColumnarShuffleDependency[_, _, _] =>
+        throw new SparkException(
+          s"Pipelined columnar shuffle $shuffleId reached ColumnarShuffleManager " +
+            s"(${getClass.getName}). Configure spark.shuffle.manager.incremental=" +
+            s"${UcxColumnarShuffleManager.ClassName}; otherwise Spark will try to run a " +
+            s"pipelined dependency with a materialized shuffle manager.")
+      case columnar: ColumnarShuffleDependency[K @unchecked, V @unchecked, V @unchecked] =>
+        logInfo(s"Registering ColumnarShuffle shuffleId: $shuffleId")
+        new ColumnarShuffleHandle[K, V](shuffleId, columnar)
+      case _ if SortShuffleWriter.shouldBypassMergeSort(conf, dependency) =>
+        // If there are fewer than spark.shuffle.sort.bypassMergeThreshold partitions and we don't
+        // need map-side aggregation, then write numPartitions files directly and just concatenate
+        // them at the end. This avoids doing serialization and deserialization twice to merge
+        // together the spilled files, which would happen with the normal code path. The downside is
+        // having multiple files open at a time and thus more memory allocated to buffers.
+        new BypassMergeSortShuffleHandle[K, V](
+          shuffleId,
+          dependency.asInstanceOf[ShuffleDependency[K, V, V]])
+      case _ if SortShuffleManager.canUseSerializedShuffle(dependency) =>
+        // Otherwise, try to buffer map outputs in a serialized form, since this is more efficient:
+        new SerializedShuffleHandle[K, V](
+          shuffleId,
+          dependency.asInstanceOf[ShuffleDependency[K, V, V]])
+      case _ =>
+        // Otherwise, buffer map outputs in a deserialized form:
+        new BaseShuffleHandle(shuffleId, dependency)
     }
   }
 

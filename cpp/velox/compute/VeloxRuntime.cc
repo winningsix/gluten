@@ -33,6 +33,8 @@
 #include "utils/ConfigExtractor.h"
 #include "utils/VeloxArrowUtils.h"
 #include "utils/VeloxWholeStageDumper.h"
+#include "velox/exec/HashPartitionFunction.h"
+#include "velox/exec/RoundRobinPartitionFunction.h"
 
 DECLARE_bool(velox_exception_user_stacktrace_enabled);
 DECLARE_bool(velox_memory_use_hugepages);
@@ -61,6 +63,121 @@ DECLARE_bool(velox_memory_pool_capacity_transfer_across_tasks);
 using namespace facebook;
 
 namespace gluten {
+namespace {
+
+const std::string kNativeUcxWriteEnabled =
+    "spark.gluten.ucx.shuffle.native.write.enabled";
+const std::string kNativeUcxTaskId =
+    "spark.gluten.ucx.shuffle.native.taskId";
+const std::string kNativeUcxWriteNumPartitions =
+    "spark.gluten.ucx.shuffle.native.write.numPartitions";
+const std::string kNativeUcxWritePartitioning =
+    "spark.gluten.ucx.shuffle.native.write.partitioning";
+const std::string kNativeUcxWriteDropFirstColumn =
+    "spark.gluten.ucx.shuffle.native.write.dropFirstColumn";
+
+bool boolConf(
+    const std::unordered_map<std::string, std::string>& conf,
+    const std::string& key,
+    bool defaultValue = false) {
+  const auto it = conf.find(key);
+  if (it == conf.end()) {
+    return defaultValue;
+  }
+  return it->second == "true" || it->second == "1";
+}
+
+int intConf(
+    const std::unordered_map<std::string, std::string>& conf,
+    const std::string& key,
+    int defaultValue) {
+  const auto it = conf.find(key);
+  if (it == conf.end() || it->second.empty()) {
+    return defaultValue;
+  }
+  return std::stoi(it->second);
+}
+
+std::string stringConf(
+    const std::unordered_map<std::string, std::string>& conf,
+    const std::string& key,
+    const std::string& defaultValue = "") {
+  const auto it = conf.find(key);
+  return it == conf.end() ? defaultValue : it->second;
+}
+
+RowTypePtr dropFirstField(const RowTypePtr& inputType) {
+  VELOX_CHECK_GT(
+      inputType->size(),
+      0,
+      "Native UCX shuffle cannot drop the first field from an empty row type");
+  std::vector<std::string> names;
+  std::vector<TypePtr> types;
+  names.reserve(inputType->size() - 1);
+  types.reserve(inputType->size() - 1);
+  for (auto i = 1; i < inputType->size(); ++i) {
+    names.push_back(inputType->nameOf(i));
+    types.push_back(inputType->childAt(i));
+  }
+  return ROW(std::move(names), std::move(types));
+}
+
+core::PlanNodePtr wrapNativeUcxPartitionedOutput(
+    const core::PlanNodePtr& source,
+    const std::unordered_map<std::string, std::string>& conf) {
+  const auto numPartitions =
+      intConf(conf, kNativeUcxWriteNumPartitions, 1);
+  VELOX_CHECK_GT(numPartitions, 0, "Native UCX shuffle needs partitions > 0");
+  const auto partitioning = stringConf(conf, kNativeUcxWritePartitioning, "");
+  const auto dropFirstColumn = boolConf(conf, kNativeUcxWriteDropFirstColumn);
+  const auto inputType = source->outputType();
+  const auto outputType = dropFirstColumn ? dropFirstField(inputType) : inputType;
+  const auto outputNodeId = std::string{"ucx_partitioned_output"};
+  LOG(INFO) << "Creating native UCX PartitionedOutput partitioning="
+            << partitioning << " partitions=" << numPartitions
+            << " dropFirstColumn=" << dropFirstColumn
+            << " inputType=" << inputType->toString()
+            << " outputType=" << outputType->toString();
+  if (numPartitions == 1 || partitioning == "single") {
+    return core::PartitionedOutputNode::single(
+        outputNodeId,
+        outputType,
+        std::string{"Presto"},
+        source,
+        core::PartitionedOutputNode::TransportType::kUcx);
+  }
+
+  std::vector<core::TypedExprPtr> keys;
+  core::PartitionFunctionSpecPtr funcSpec;
+  if (partitioning == "rr") {
+    funcSpec = std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>();
+  } else {
+    VELOX_CHECK_GT(
+        inputType->size(),
+        0,
+        "Native UCX hash/range shuffle requires a partition id/hash column");
+    keys.push_back(std::make_shared<core::FieldAccessTypedExpr>(
+        inputType->childAt(0),
+        inputType->nameOf(0)));
+    funcSpec = std::make_shared<velox::exec::HashPartitionFunctionSpec>(
+        inputType,
+        std::vector<column_index_t>{0});
+  }
+
+  return std::make_shared<core::PartitionedOutputNode>(
+      outputNodeId,
+      core::PartitionedOutputNode::Kind::kPartitioned,
+      std::move(keys),
+      numPartitions,
+      /*replicateNullsAndAny=*/false,
+      std::move(funcSpec),
+      outputType,
+      std::string{"Presto"},
+      source,
+      core::PartitionedOutputNode::TransportType::kUcx);
+}
+
+} // namespace
 
 VeloxRuntime::VeloxRuntime(
     const std::string& kind,
@@ -176,8 +293,21 @@ std::shared_ptr<ResultIterator> VeloxRuntime::createResultIterator(
       *localWriteFilesTempPath(),
       *localWriteFileName());
   veloxPlan_ = veloxPlanConverter.toVeloxPlan(substraitPlan_, std::move(localFiles_));
+  if (boolConf(confMap_, kNativeUcxWriteEnabled)) {
+    veloxPlan_ = wrapNativeUcxPartitionedOutput(veloxPlan_, confMap_);
+    LOG(INFO) << "Wrapped Velox plan with native UCX PartitionedOutput taskId="
+              << stringConf(confMap_, kNativeUcxTaskId)
+              << " plan:" << std::endl
+              << veloxPlan_->toString(true, true);
+  }
   LOG_IF(INFO, debugModeEnabled_ && taskInfo_.has_value())
       << "############### Velox plan for task " << taskInfo_.value() << " ###############" << std::endl
+      << veloxPlan_->toString(true, true);
+  LOG_IF(
+      INFO,
+      !boolConf(confMap_, kNativeUcxWriteEnabled) &&
+          !stringConf(confMap_, "spark.gluten.ucx.shuffle.native.read.streams").empty())
+      << "Velox plan with native UCX ExchangeNode(s):" << std::endl
       << veloxPlan_->toString(true, true);
 
   // Scan node can be required.
@@ -196,7 +326,8 @@ std::shared_ptr<ResultIterator> VeloxRuntime::createResultIterator(
       streamIds,
       spillDir,
       veloxCfg_,
-      taskInfo_.has_value() ? taskInfo_.value() : SparkTaskInfo{});
+      taskInfo_.has_value() ? taskInfo_.value() : SparkTaskInfo{},
+      stringConf(confMap_, kNativeUcxTaskId));
 
   auto remainingInputIterators = veloxPlanConverter.remainingInputIterators();
   if (!remainingInputIterators.empty()) {

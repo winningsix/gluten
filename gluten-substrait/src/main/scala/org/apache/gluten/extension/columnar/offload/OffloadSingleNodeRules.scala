@@ -363,7 +363,7 @@ object OffloadOthers {
             plan.lowerBound,
             plan.upperBound,
             plan.withReplacement,
-            plan.seed,
+            plan.resolvedSeed,
             child)
         case plan: RDDScanExec if RDDScanTransformer.isSupportRDDScanExec(plan) =>
           RDDScanTransformer.getRDDScanTransform(plan)

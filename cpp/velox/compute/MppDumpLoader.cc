@@ -39,7 +39,6 @@
 #include "operators/plannodes/RowVectorStream.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include "operators/plannodes/CudfVectorStream.h"
-#include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 // IBM-baseline velox dropped velox/experimental/cudf/exchange/. The
 // runtime swap to UcxExchange / UcxPartitionedOutput is performed by
 // IBM cudf's OperatorAdapters when transportType=kUcx, so this file
@@ -562,18 +561,13 @@ MppDumpLoadResult loadMppQueryFromDump(
         }
         if (!keyChannels.empty()) {
           if (partitionType == "RANGE") {
-#ifdef GLUTEN_ENABLE_GPU
-            VELOX_CHECK(
-                !outboundExchange->rangeBoundsJson.empty(),
-                "MppDumpLoader: RANGE exchange has no boundaries");
-            funcSpec = std::make_shared<
-                velox::ucx_exchange::RangePartitionFunctionSpec>(
-                outputType,
-                std::move(keyChannels),
-                outboundExchange->rangeBoundsJson);
-#else
-            VELOX_FAIL("MppDumpLoader: RANGE_PID requires the cuDF UCX backend");
-#endif
+            LOG(WARNING)
+                << "MppDumpLoader: current Velox UCX exchange build does not "
+                   "provide RangePartitionFunctionSpec; using hash partition "
+                   "function for legacy MPP RANGE fragment";
+            funcSpec =
+                std::make_shared<velox::exec::HashPartitionFunctionSpec>(
+                    outputType, std::move(keyChannels));
           } else {
             funcSpec =
                 std::make_shared<velox::exec::HashPartitionFunctionSpec>(

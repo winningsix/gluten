@@ -56,12 +56,28 @@ public class TaskWallTimeTracker {
   public long shuffleWriteStopNanos;
   // writeMetadataFileAndCommit
   public long shuffleWriteMetaNanos;
+  // UCX incremental shuffle writer setup.
+  public long ucxWriterOpenNanos;
+  // Driver-side control-plane wait before a UCX writer starts pushing data.
+  public long ucxWriterReadersReadyWaitNanos;
+  // UCX incremental shuffle writer native write calls.
+  public long ucxWriterWriteBatchNanos;
+  // UCX incremental shuffle writer close.
+  public long ucxWriterCloseNanos;
+  // UCX incremental shuffle reader setup.
+  public long ucxReaderOpenNanos;
+  // UCX incremental shuffle reader native nextBatch calls, including data wait.
+  public long ucxReaderNextBatchNanos;
+  // UCX incremental shuffle reader close.
+  public long ucxReaderCloseNanos;
   // task completion listener cleanup
   public long taskCleanupNanos;
 
   public int nativeHasNextCalls;
   public int nativeNextCalls;
   public int arrowImportCalls;
+  public int ucxWriterWriteBatchCalls;
+  public int ucxReaderNextBatchCalls;
 
   // Nesting depth for native JNI calls. Only depth-0 calls
   // accumulate wall time to avoid double-counting.
@@ -90,10 +106,19 @@ public class TaskWallTimeTracker {
             + " shuffleWriteJniNanos={}"
             + " shuffleWriteStopNanos={}"
             + " shuffleWriteMetaNanos={}"
+            + " ucxWriterOpenNanos={}"
+            + " ucxWriterReadersReadyWaitNanos={}"
+            + " ucxWriterWriteBatchNanos={}"
+            + " ucxWriterCloseNanos={}"
+            + " ucxReaderOpenNanos={}"
+            + " ucxReaderNextBatchNanos={}"
+            + " ucxReaderCloseNanos={}"
             + " taskCleanupNanos={}"
             + " nativeHasNextCalls={}"
             + " nativeNextCalls={}"
-            + " arrowImportCalls={}",
+            + " arrowImportCalls={}"
+            + " ucxWriterWriteBatchCalls={}"
+            + " ucxReaderNextBatchCalls={}",
         stageId,
         taskAttemptId,
         taskWallNanos,
@@ -107,10 +132,19 @@ public class TaskWallTimeTracker {
         shuffleWriteJniNanos,
         shuffleWriteStopNanos,
         shuffleWriteMetaNanos,
+        ucxWriterOpenNanos,
+        ucxWriterReadersReadyWaitNanos,
+        ucxWriterWriteBatchNanos,
+        ucxWriterCloseNanos,
+        ucxReaderOpenNanos,
+        ucxReaderNextBatchNanos,
+        ucxReaderCloseNanos,
         taskCleanupNanos,
         nativeHasNextCalls,
         nativeNextCalls,
-        arrowImportCalls);
+        arrowImportCalls,
+        ucxWriterWriteBatchCalls,
+        ucxReaderNextBatchCalls);
     reset();
   }
 }

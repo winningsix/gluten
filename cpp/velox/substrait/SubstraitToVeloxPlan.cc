@@ -33,6 +33,9 @@
 
 #include <google/protobuf/wrappers.pb.h>
 
+#include <sstream>
+#include <unordered_set>
+
 #ifdef GLUTEN_ENABLE_GPU
 #include "operators/plannodes/CudfVectorStream.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSink.h"
@@ -45,6 +48,9 @@ using namespace cudf_velox::connector::hive;
 namespace gluten {
 namespace {
 
+const std::string kNativeUcxReadStreams =
+    "spark.gluten.ucx.shuffle.native.read.streams";
+
 bool useCudfTableHandle(const std::shared_ptr<SplitInfo>& splitInfo) {
 #ifdef GLUTEN_ENABLE_GPU
   if (splitInfo == nullptr) {
@@ -54,6 +60,28 @@ bool useCudfTableHandle(const std::shared_ptr<SplitInfo>& splitInfo) {
 #else
   return false;
 #endif
+}
+
+std::unordered_set<int32_t> parseNativeUcxReadStreams(
+    const facebook::velox::config::ConfigBase* veloxCfg) {
+  std::unordered_set<int32_t> streams;
+  const auto value = veloxCfg->get<std::string>(kNativeUcxReadStreams, "");
+  std::stringstream ss(value);
+  std::string token;
+  while (std::getline(ss, token, ',')) {
+    if (token.empty()) {
+      continue;
+    }
+    streams.insert(std::stoi(token));
+  }
+  return streams;
+}
+
+bool useNativeUcxExchangeForStream(
+    const facebook::velox::config::ConfigBase* veloxCfg,
+    int32_t streamIdx) {
+  const auto streams = parseNativeUcxReadStreams(veloxCfg);
+  return streams.find(streamIdx) != streams.end();
 }
 
 core::SortOrder toSortOrder(const ::substrait::SortField& sortField) {
@@ -1603,6 +1631,23 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::constructCudfValueStreamNode(
   }
 
   auto outputType = ROW(std::move(outNames), std::move(veloxTypeList));
+  if (useNativeUcxExchangeForStream(veloxCfg_, streamIdx)) {
+    const auto allocatedPlanNodeId = nextPlanNodeId();
+    const auto exchangeNodeId = fmt::format("ucx_exchange_{}", streamIdx);
+    auto node = std::make_shared<core::ExchangeNode>(
+        exchangeNodeId,
+        outputType,
+        std::string{"Presto"},
+        core::ExchangeNode::TransportType::kUcx);
+    auto splitInfo = std::make_shared<SplitInfo>();
+    splitInfo->leafType = SplitInfo::LeafType::TRIVIAL_LEAF;
+    splitInfoMap_[node->id()] = splitInfo;
+    LOG(INFO) << "Created Velox UCX ExchangeNode '" << node->id()
+              << "' for CudfValueStream streamIdx=" << streamIdx
+              << " allocatedPlanNodeId=" << allocatedPlanNodeId
+              << " outputType=" << outputType->toString();
+    return node;
+  }
   std::shared_ptr<ResultIterator> iterator;
   if (!validationMode_) {
     VELOX_CHECK_LT(streamIdx, inputIters_.size(), "Could not find stream index {} in input iterator list.", streamIdx);

@@ -62,7 +62,6 @@
 #include "operators/plannodes/CudfVectorStream.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
-#include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 #endif
 
 using namespace gluten;
@@ -213,6 +212,7 @@ std::shared_ptr<velox::config::ConfigBase> createMppSessionConfig(
 std::unordered_map<std::string, std::string> buildMppQueryConfig(
     const std::shared_ptr<velox::config::ConfigBase>& veloxCfg,
     uint64_t replicatedCartesianMaxBuildBytes) {
+  (void)replicatedCartesianMaxBuildBytes;
   std::unordered_map<std::string, std::string> configs;
 
   configs[velox::core::QueryConfig::kPreferredOutputBatchRows] =
@@ -330,10 +330,6 @@ std::unordered_map<std::string, std::string> buildMppQueryConfig(
         std::to_string(veloxCfg->get<bool>(
             kCudfSkipOutputToVelox,
             kCudfSkipOutputToVeloxDefault));
-    if (replicatedCartesianMaxBuildBytes > 0) {
-      configs[velox::cudf_velox::CudfConfig::kCudfNestedLoopJoinMaxBuildBytes] =
-          std::to_string(replicatedCartesianMaxBuildBytes);
-    }
 #endif
 
     const auto setIfExists = [&](const std::string& glutenKey, const std::string& veloxKey) {
@@ -494,11 +490,14 @@ PartitionSpecAndExprs buildPartitionFunctionSpec(
     }
     if (!keyChannels.empty()) {
       if (partitionType == "RANGE") {
-#ifdef GLUTEN_ENABLE_GPU
+        LOG(WARNING)
+            << "MppJniWrapper: current Velox UCX exchange build does not "
+               "provide RangePartitionFunctionSpec; using hash partition "
+               "function for legacy MPP RANGE fragment "
+            << fragmentIdForLogging;
         result.funcSpec =
-            std::make_shared<velox::ucx_exchange::RangePartitionFunctionSpec>(
-                outputType, std::move(keyChannels), rangeBoundsJson);
-#endif
+            std::make_shared<velox::exec::HashPartitionFunctionSpec>(
+                outputType, std::move(keyChannels));
       } else {
         result.funcSpec =
             std::make_shared<velox::exec::HashPartitionFunctionSpec>(

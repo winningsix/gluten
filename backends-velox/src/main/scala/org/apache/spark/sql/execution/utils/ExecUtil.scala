@@ -27,7 +27,7 @@ import org.apache.gluten.vectorized.{ArrowWritableColumnVector, NativeColumnarTo
 import org.apache.spark.{Partitioner, RangePartitioner, ShuffleDependency}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.serializer.Serializer
-import org.apache.spark.shuffle.{ColumnarShuffleDependency, GlutenShuffleUtils}
+import org.apache.spark.shuffle.{ColumnarShuffleDependency, GlutenShuffleUtils, PipelinedColumnarShuffleDependency, UcxColumnarShuffleManager}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, BoundReference, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.expressions.codegen.LazilyGeneratedOrdering
@@ -36,7 +36,7 @@ import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{IntegerType, StructType}
+import org.apache.spark.sql.types.{IntegerType, StructField, StructType}
 import org.apache.spark.sql.vectorized.{ColumnarBatch, ColumnVector}
 import org.apache.spark.util.MutablePair
 
@@ -84,7 +84,8 @@ object ExecUtil {
   // scalastyle:off argcount
   def genShuffleDependency(
       rdd: RDD[ColumnarBatch],
-      outputAttributes: Seq[Attribute],
+      childOutputAttributes: Seq[Attribute],
+      projectOutputAttributes: Seq[Attribute],
       newPartitioning: Partitioning,
       serializer: Serializer,
       writeMetrics: Map[String, SQLMetric],
@@ -111,7 +112,7 @@ object ExecUtil {
               batch => {
                 val rows = convertColumnarToRow(batch)
                 val projection =
-                  UnsafeProjection.create(sortingExpressions.map(_.child), outputAttributes)
+                  UnsafeProjection.create(sortingExpressions.map(_.child), childOutputAttributes)
                 val mutablePair = new MutablePair[InternalRow, Null]()
                 rows.map(row => mutablePair.update(projection(row).copy(), null))
               })
@@ -182,6 +183,11 @@ object ExecUtil {
     // other than read the "key" part.
     // Thus in Columnar Shuffle we never use the "key" part.
     val isOrderSensitive = isRoundRobin && !SQLConf.get.sortBeforeRepartition
+    val shuffleOutputAttributes =
+      Option(projectOutputAttributes).getOrElse(childOutputAttributes)
+    val outputSchema = StructType(shuffleOutputAttributes.map {
+      a => StructField(a.name, a.dataType, a.nullable, a.metadata)
+    })
 
     val rddWithDummyKey: RDD[Product2[Int, ColumnarBatch]] = newPartitioning match {
       case RangePartitioning(sortingExpressions, _) =>
@@ -189,7 +195,7 @@ object ExecUtil {
           (_, cbIter) => {
             val partitionKeyExtractor: InternalRow => Any = {
               val projection =
-                UnsafeProjection.create(sortingExpressions.map(_.child), outputAttributes)
+                UnsafeProjection.create(sortingExpressions.map(_.child), childOutputAttributes)
               row => projection(row)
             }
             val newIter = computeAndAddPartitionId(cbIter, partitionKeyExtractor)
@@ -203,16 +209,46 @@ object ExecUtil {
           isOrderSensitive = isOrderSensitive)
     }
 
+    val pipelinedShuffleEnabled =
+      SQLConf.get.getConfString("spark.sql.shuffle.pipelined.enabled", "false").toBoolean
     val dependency =
-      new ColumnarShuffleDependency[Int, ColumnarBatch, ColumnarBatch](
-        rddWithDummyKey,
-        new PartitionIdPassThrough(newPartitioning.numPartitions),
-        serializer,
-        shuffleWriterProcessor = ShuffleExchangeExec.createShuffleWriteProcessor(writeMetrics),
-        nativePartitioning = nativePartitioning,
-        metrics = metrics,
-        shuffleWriterType = shuffleWriterType
-      )
+      if (pipelinedShuffleEnabled) {
+        val incrementalManager = rdd.sparkContext.getConf
+          .getOption("spark.shuffle.manager.incremental")
+          .getOrElse {
+            throw new IllegalStateException(
+              "spark.sql.shuffle.pipelined.enabled=true requires " +
+                s"spark.shuffle.manager.incremental=${UcxColumnarShuffleManager.ClassName} " +
+                "for Gluten columnar shuffle")
+          }
+        if (incrementalManager != UcxColumnarShuffleManager.ClassName) {
+          throw new IllegalStateException(
+            "Gluten pipelined columnar shuffle requires " +
+              s"spark.shuffle.manager.incremental=${UcxColumnarShuffleManager.ClassName}, " +
+              s"but got $incrementalManager")
+        }
+        new PipelinedColumnarShuffleDependency[Int, ColumnarBatch, ColumnarBatch](
+          rddWithDummyKey,
+          new PartitionIdPassThrough(newPartitioning.numPartitions),
+          serializer,
+          shuffleWriterProcessor = ShuffleExchangeExec.createShuffleWriteProcessor(writeMetrics),
+          nativePartitioning = nativePartitioning,
+          metrics = metrics,
+          shuffleWriterType = shuffleWriterType,
+          outputSchema = outputSchema
+        )
+      } else {
+        new ColumnarShuffleDependency[Int, ColumnarBatch, ColumnarBatch](
+          rddWithDummyKey,
+          new PartitionIdPassThrough(newPartitioning.numPartitions),
+          serializer,
+          shuffleWriterProcessor = ShuffleExchangeExec.createShuffleWriteProcessor(writeMetrics),
+          nativePartitioning = nativePartitioning,
+          metrics = metrics,
+          shuffleWriterType = shuffleWriterType,
+          outputSchema = outputSchema
+        )
+      }
 
     dependency
   }

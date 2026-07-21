@@ -112,6 +112,7 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
   private val MPP_ENABLED_KEY = "spark.gluten.mpp.enabled"
   private val MPP_ENABLED_DEFAULT = "true"
+  private val PIPELINED_SHUFFLE_ENABLED_KEY = "spark.sql.shuffle.pipelined.enabled"
 
   // --- Broadcast fusion guard ---
   //
@@ -164,6 +165,12 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
   override def apply(plan: SparkPlan): SparkPlan = {
     if (!isMppEnabled) {
+      return plan
+    }
+    if (isPipelinedShuffleEnabled) {
+      logWarning(
+        s"MppCollapseRule: disabled because $PIPELINED_SHUFFLE_ENABLED_KEY=true; " +
+          "Gluten incremental shuffle must go through Spark shuffle-manager routing, not MPP")
       return plan
     }
     // When Plan C (MppStrategy) is enabled, disable Plan D entirely.
@@ -296,6 +303,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
   private def isMppEnabled: Boolean = {
     SQLConf.get.getConfString(MPP_ENABLED_KEY, MPP_ENABLED_DEFAULT).toBoolean
+  }
+
+  private def isPipelinedShuffleEnabled: Boolean = {
+    SQLConf.get.getConfString(PIPELINED_SHUFFLE_ENABLED_KEY, "false").toBoolean
   }
 
   private def failOnFallback: Boolean = {

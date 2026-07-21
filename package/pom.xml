@@ -275,6 +275,8 @@
                     <ignoreClass>org.apache.spark.util.collection.unsafe.sort.UnsafeExternalSorter$ChainedIterator</ignoreClass>
                     <ignoreClass>org.apache.spark.memory.MemoryConsumer</ignoreClass>
                     <ignoreClass>org.apache.spark.memory.TaskMemoryManager</ignoreClass>
+                    <!-- Spark 5 catalyst includes this datasketches memory class. -->
+                    <ignoreClass>org.apache.datasketches.memory.internal.ResourceImpl</ignoreClass>
                     <!-- guava -->
                     <ignoreClass>com.google.thirdparty.publicsuffix*</ignoreClass>
                   </ignoreClasses>

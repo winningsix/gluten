@@ -23,10 +23,8 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.catalog.HiveTableRelation
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.execution.{FilterExec, LeafExecNode, SparkPlan}
-import org.apache.spark.sql.hive.HiveTableScanExecTransformer.{ORC_INPUT_FORMAT_CLASS, PARQUET_INPUT_FORMAT_CLASS, TEXT_INPUT_FORMAT_CLASS}
 import org.apache.spark.sql.types.{ArrayType, DataType, MapType, StructType}
 import org.apache.spark.sql.util.SchemaUtils._
-import org.apache.spark.util.Utils
 
 object HiveTableScanNestedColumnPruning extends Logging {
   import org.apache.spark.sql.catalyst.expressions.SchemaPruning._
@@ -36,19 +34,17 @@ object HiveTableScanNestedColumnPruning extends Logging {
       project.child match {
         case HiveTableScanExecTransformer(_, relation, _, _) =>
           relation.tableMeta.storage.inputFormat match {
-            case Some(inputFormat)
-                if TEXT_INPUT_FORMAT_CLASS.isAssignableFrom(Utils.classForName(inputFormat)) =>
+            case Some(inputFormat) if HiveTableScanExecTransformer.isTextInputFormat(inputFormat) =>
               relation.tableMeta.storage.serde match {
                 case Some("org.openx.data.jsonserde.JsonSerDe") | Some(
                       "org.apache.hive.hcatalog.data.JsonSerDe") =>
                   return true
                 case _ =>
               }
-            case Some(inputFormat)
-                if ORC_INPUT_FORMAT_CLASS.isAssignableFrom(Utils.classForName(inputFormat)) =>
+            case Some(inputFormat) if HiveTableScanExecTransformer.isOrcInputFormat(inputFormat) =>
               return true
             case Some(inputFormat)
-                if PARQUET_INPUT_FORMAT_CLASS.isAssignableFrom(Utils.classForName(inputFormat)) =>
+                if HiveTableScanExecTransformer.isParquetInputFormat(inputFormat) =>
               return true
             case _ =>
           }

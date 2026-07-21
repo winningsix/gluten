@@ -18,6 +18,7 @@ package org.apache.spark.sql.execution
 
 import org.apache.spark._
 import org.apache.spark.rdd.RDD
+import org.apache.spark.shuffle.{NativeUcxShuffleExecution, NativeUcxShuffleReadBatchIterator}
 import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.internal.SQLConf
@@ -132,10 +133,16 @@ class ShuffledColumnarBatchRDD(
           context,
           sqlMetricsReporter)
     }
-    reader.read().asInstanceOf[Iterator[Product2[Int, ColumnarBatch]]].map {
-      case (_, batch: ColumnarBatch) =>
-        sqlMetricsReporter.incBatchesRecordsRead(batch.numRows())
-        batch
+    val readIter = reader.read().asInstanceOf[Iterator[Product2[Int, ColumnarBatch]]]
+    NativeUcxShuffleExecution.readSpec(readIter) match {
+      case Some(spec) =>
+        new NativeUcxShuffleReadBatchIterator(spec)
+      case None =>
+        readIter.map {
+          case (_, batch: ColumnarBatch) =>
+            sqlMetricsReporter.incBatchesRecordsRead(batch.numRows())
+            batch
+        }
     }
   }
 

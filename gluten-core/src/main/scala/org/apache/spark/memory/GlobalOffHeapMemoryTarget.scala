@@ -110,13 +110,20 @@ class GlobalOffHeapMemoryTarget private[memory]
   override def accept[T](visitor: MemoryTargetVisitor[T]): T = visitor.visit(this)
 
   private[memory] def memoryManagerOption(): Option[MemoryManager] = {
+    val tc = TaskContext.get()
+    if (tc != null && tc.taskAttemptId() == -1) {
+      // TaskResources.runUnsafe installs a synthetic driver-side TaskContext for
+      // native validation. Prefer its memory manager; Spark 5's driver SparkEnv
+      // can expose a zero-sized off-heap pool even when the synthetic context was
+      // initialized from the configured off-heap size.
+      return Some(FIELD_MEMORY_MANAGER.get(tc.taskMemoryManager()).asInstanceOf[MemoryManager])
+    }
     val env = SparkEnv.get
     if (env != null) {
       // SPARK-46947: https://github.com/apache/spark/pull/45052.
       ensureMemoryStoreInitialized(env)
       return Some(env.memoryManager)
     }
-    val tc = TaskContext.get()
     if (tc != null) {
       // This may happen in test code that mocks the task context without booting up SparkEnv.
       return Some(FIELD_MEMORY_MANAGER.get(tc.taskMemoryManager()).asInstanceOf[MemoryManager])

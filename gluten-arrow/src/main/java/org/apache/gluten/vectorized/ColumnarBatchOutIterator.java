@@ -59,6 +59,11 @@ public class ColumnarBatchOutIterator extends ClosableIterator<ColumnarBatch>
 
   private native void nativeNoMoreSplits(long iterHandle);
 
+  private native void nativeAddUcxExchangeSplits(
+      long iterHandle, String exchangeNodeId, String[] remoteTaskIds);
+
+  private native void nativeNoMoreUcxExchangeSplits(long iterHandle, String exchangeNodeId);
+
   @Override
   public boolean hasNext0() throws IOException {
     TaskWallTimeTracker t = TaskWallTimeTracker.get();
@@ -132,6 +137,39 @@ public class ColumnarBatchOutIterator extends ClosableIterator<ColumnarBatch>
       throw new IllegalStateException("Cannot call noMoreSplits on a closed iterator");
     }
     nativeNoMoreSplits(iterHandle);
+  }
+
+  /**
+   * Add remote producer task URLs to a Velox UCX ExchangeNode in this iterator's native task.
+   *
+   * @param exchangeNodeId Velox ExchangeNode id
+   * @param remoteTaskIds remote task URLs, e.g. http://host:port/v1/task/task-id/results/partition
+   */
+  public void addUcxExchangeSplits(String exchangeNodeId, String[] remoteTaskIds) {
+    if (closed.get()) {
+      throw new IllegalStateException("Cannot add UCX exchange splits to a closed iterator");
+    }
+    if (exchangeNodeId == null) {
+      throw new IllegalArgumentException("exchangeNodeId must not be null");
+    }
+    if (remoteTaskIds == null || remoteTaskIds.length == 0) {
+      return;
+    }
+    nativeAddUcxExchangeSplits(iterHandle, exchangeNodeId, remoteTaskIds);
+  }
+
+  /**
+   * Signal no more remote producer task URLs for a Velox UCX ExchangeNode in this iterator's native
+   * task.
+   */
+  public void noMoreUcxExchangeSplits(String exchangeNodeId) {
+    if (closed.get()) {
+      throw new IllegalStateException("Cannot finish UCX exchange splits on a closed iterator");
+    }
+    if (exchangeNodeId == null) {
+      throw new IllegalArgumentException("exchangeNodeId must not be null");
+    }
+    nativeNoMoreUcxExchangeSplits(iterHandle, exchangeNodeId);
   }
 
   @Override

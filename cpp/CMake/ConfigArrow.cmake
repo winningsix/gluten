@@ -20,9 +20,14 @@ set(ARROW_STATIC_LIBRARY_SUFFIX ".a")
 set(ARROW_LIB_NAME "arrow")
 set(ARROW_BUNDLED_DEPS "arrow_bundled_dependencies")
 
-set(ARROW_INSTALL_DIR "${ARROW_HOME}/install")
+if(EXISTS "${ARROW_HOME}/install")
+  set(ARROW_INSTALL_DIR "${ARROW_HOME}/install")
+else()
+  set(ARROW_INSTALL_DIR "${ARROW_HOME}")
+endif()
 set(ARROW_LIB_DIR "${ARROW_INSTALL_DIR}/lib")
 set(ARROW_LIB64_DIR "${ARROW_INSTALL_DIR}/lib64")
+set(ARROW_LIB_X86_64_DIR "${ARROW_INSTALL_DIR}/lib/x86_64")
 
 function(FIND_ARROW_LIB LIB_NAME)
   if(NOT TARGET Arrow::${LIB_NAME})
@@ -37,7 +42,7 @@ function(FIND_ARROW_LIB LIB_NAME)
     find_library(
       ARROW_LIB_${LIB_NAME}
       NAMES ${ARROW_LIB_FULL_NAME}
-      PATHS ${ARROW_LIB_DIR} ${ARROW_LIB64_DIR}
+      PATHS ${ARROW_LIB_DIR} ${ARROW_LIB64_DIR} ${ARROW_LIB_X86_64_DIR}
       NO_DEFAULT_PATH)
     if(NOT ARROW_LIB_${LIB_NAME})
       find_library(ARROW_LIB_${LIB_NAME} NAMES ${ARROW_LIB_FULL_NAME})

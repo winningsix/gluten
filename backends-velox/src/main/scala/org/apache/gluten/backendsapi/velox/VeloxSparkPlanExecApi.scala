@@ -67,6 +67,15 @@ import scala.collection.JavaConverters._
 
 class VeloxSparkPlanExecApi extends SparkPlanExecApi {
 
+  override def isSupportedScanFilter(filter: Expression, sparkExecNode: LeafExecNode): Boolean = {
+    // CudfHive scan-side recursive evaluation cannot run Velox bloom filters.
+    if (filter.exists(_.isInstanceOf[VeloxBloomFilterMightContain])) {
+      false
+    } else {
+      super.isSupportedScanFilter(filter, sparkExecNode)
+    }
+  }
+
   /** Transform GetArrayItem to Substrait. */
   override def genGetArrayItemTransformer(
       substraitExprName: String,
@@ -553,6 +562,7 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
     ExecUtil.genShuffleDependency(
       rdd,
       childOutputAttributes,
+      projectOutputAttributes,
       newPartitioning,
       serializer,
       writeMetrics,

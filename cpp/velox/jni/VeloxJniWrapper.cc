@@ -24,9 +24,11 @@
 
 #include <exception>
 #include "JniUdf.h"
+#include "compute/ResultIterator.h"
 #include "compute/Runtime.h"
 #include "compute/VeloxBackend.h"
 #include "compute/VeloxRuntime.h"
+#include "compute/WholeStageResultIterator.h"
 #include "config/GlutenConfig.h"
 #include "jni/JniError.h"
 #include "jni/JniFileSystem.h"
@@ -62,6 +64,35 @@ jmethodID blockStripesConstructor;
 
 jclass batchWriteMetricsClass;
 jmethodID batchWriteMetricsConstructor;
+
+std::vector<std::string> jStringArrayToVector(JNIEnv* env, jobjectArray values) {
+  std::vector<std::string> out;
+  if (values == nullptr) {
+    return out;
+  }
+  const auto size = env->GetArrayLength(values);
+  out.reserve(size);
+  for (jsize i = 0; i < size; ++i) {
+    auto value = static_cast<jstring>(env->GetObjectArrayElement(values, i));
+    if (value != nullptr) {
+      out.push_back(jStringToCString(env, value));
+      env->DeleteLocalRef(value);
+    }
+  }
+  return out;
+}
+
+WholeStageResultIterator* wholeStageIteratorFromHandle(int64_t iterHandle) {
+  auto iter = ObjectStore::retrieve<ResultIterator>(iterHandle);
+  VELOX_CHECK_NOT_NULL(iter, "Invalid native iterator handle {}", iterHandle);
+  auto* wholeStageIter =
+      dynamic_cast<WholeStageResultIterator*>(iter->getInputIter());
+  VELOX_CHECK_NOT_NULL(
+      wholeStageIter,
+      "Native iterator handle {} is not a Velox WholeStageResultIterator",
+      iterHandle);
+  return wholeStageIter;
+}
 } // namespace
 
 #ifdef __cplusplus
@@ -141,6 +172,34 @@ JNIEXPORT void JNICALL Java_org_apache_gluten_init_NativeBackendInitializer_shut
     jclass) {
   JNI_METHOD_START
   VeloxBackend::get()->tearDown();
+  JNI_METHOD_END()
+}
+
+JNIEXPORT void JNICALL
+Java_org_apache_gluten_vectorized_ColumnarBatchOutIterator_nativeAddUcxExchangeSplits( // NOLINT
+    JNIEnv* env,
+    jobject,
+    jlong iterHandle,
+    jstring exchangeNodeId,
+    jobjectArray remoteTaskIds) {
+  JNI_METHOD_START
+  auto* wholeStageIter = wholeStageIteratorFromHandle(iterHandle);
+  wholeStageIter->addRemoteExchangeSplits(
+      jStringToCString(env, exchangeNodeId),
+      jStringArrayToVector(env, remoteTaskIds));
+  JNI_METHOD_END()
+}
+
+JNIEXPORT void JNICALL
+Java_org_apache_gluten_vectorized_ColumnarBatchOutIterator_nativeNoMoreUcxExchangeSplits( // NOLINT
+    JNIEnv* env,
+    jobject,
+    jlong iterHandle,
+    jstring exchangeNodeId) {
+  JNI_METHOD_START
+  auto* wholeStageIter = wholeStageIteratorFromHandle(iterHandle);
+  wholeStageIter->noMoreRemoteExchangeSplits(
+      jStringToCString(env, exchangeNodeId));
   JNI_METHOD_END()
 }
 

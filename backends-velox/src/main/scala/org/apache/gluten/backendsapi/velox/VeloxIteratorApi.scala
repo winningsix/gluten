@@ -29,8 +29,9 @@ import org.apache.gluten.substrait.rel.{LocalFilesBuilder, LocalFilesNode, Split
 import org.apache.gluten.substrait.rel.LocalFilesNode.ReadFileFormat
 import org.apache.gluten.vectorized._
 
-import org.apache.spark.{Partition, SparkConf, TaskContext}
+import org.apache.spark.{Partition, SparkConf, SparkException, TaskContext}
 import org.apache.spark.internal.Logging
+import org.apache.spark.shuffle.{NativeUcxShuffleExecution, NativeUcxShuffleReadSpec}
 import org.apache.spark.softaffinity.SoftAffinity
 import org.apache.spark.sql.catalyst.catalog.ExternalCatalogUtils
 import org.apache.spark.sql.catalyst.util.{DateFormatter, TimestampFormatter}
@@ -45,6 +46,7 @@ import java.lang.{Long => JLong}
 import java.nio.charset.StandardCharsets
 import java.time.ZoneOffset
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -202,16 +204,20 @@ class VeloxIteratorApi extends IteratorApi with Logging {
       trySetCurrentTask(context)
     }
 
-    val columnarNativeIterators = inputIterators.map {
+    val taskContextBoundInputIterators = bindTaskContextToInputIterators(inputIterators, context)
+    val columnarNativeIterators = taskContextBoundInputIterators.map {
       iter => new ColumnarBatchInIterator(BackendsApiManager.getBackendName, iter.asJava)
     }
 
-    val extraConf = Map(
+    val extraConf = nativeUcxExtraConf(
+      inputIterators,
+      Map(
       GlutenConfig.COLUMNAR_CUDF_ENABLED.key ->
         enableCudf.toString,
       "spark.gluten.sql.columnar.cudf.skipOutputToVelox" ->
         skipOutputToVelox.toString
-    ).asJava
+      ))
+      .asJava
     val transKernel = NativePlanEvaluator
       .create(BackendsApiManager.getBackendName, extraConf)
 
@@ -239,6 +245,9 @@ class VeloxIteratorApi extends IteratorApi with Logging {
           .rewriteSpillPath(spillDirPath)
       )
     resIter.noMoreSplits()
+    val nativeUcxPollerFailure = new AtomicReference[Throwable](null)
+    val nativeUcxPollers =
+      startNativeUcxExchangePollers(inputIterators, resIter, nativeUcxPollerFailure)
 
     val tracker =
       org.apache.gluten.metrics.TaskWallTimeTracker.get()
@@ -247,9 +256,10 @@ class VeloxIteratorApi extends IteratorApi with Logging {
     val itrMetrics = IteratorMetricsJniWrapper.create()
 
     Iterators
-      .wrap(resIter.asScala)
+      .wrap(checkedNativeUcxIterator(resIter.asScala, nativeUcxPollerFailure))
       .protectInvocationFlow()
       .recycleIterator {
+        stopNativeUcxExchangePollers(nativeUcxPollers)
         updateNativeMetrics(itrMetrics.fetch(resIter))
         updateInputMetrics(context.taskMetrics().inputMetrics)
         resIter.close()
@@ -285,16 +295,20 @@ class VeloxIteratorApi extends IteratorApi with Logging {
       trySetCurrentTask(context)
     }
 
-    val extraConf = Map(
+    val extraConf = nativeUcxExtraConf(
+      inputIterators,
+      Map(
       GlutenConfig.COLUMNAR_CUDF_ENABLED.key ->
         enableCudf.toString,
       "spark.gluten.sql.columnar.cudf.skipOutputToVelox" ->
         skipOutputToVelox.toString
-    ).asJava
+      ))
+      .asJava
     val transKernel = NativePlanEvaluator
       .create(BackendsApiManager.getBackendName, extraConf)
+    val taskContextBoundInputIterators = bindTaskContextToInputIterators(inputIterators, context)
     val columnarNativeIterator =
-      inputIterators.map {
+      taskContextBoundInputIterators.map {
         iter => new ColumnarBatchInIterator(BackendsApiManager.getBackendName, iter.asJava)
       }
     val spillDirPath = SparkDirectoryUtil
@@ -314,6 +328,9 @@ class VeloxIteratorApi extends IteratorApi with Logging {
           .rewriteSpillPath(spillDirPath)
       )
     nativeResultIterator.noMoreSplits()
+    val nativeUcxPollerFailure = new AtomicReference[Throwable](null)
+    val nativeUcxPollers =
+      startNativeUcxExchangePollers(inputIterators, nativeResultIterator, nativeUcxPollerFailure)
 
     val tracker =
       org.apache.gluten.metrics.TaskWallTimeTracker.get()
@@ -322,9 +339,10 @@ class VeloxIteratorApi extends IteratorApi with Logging {
     val itrMetrics = IteratorMetricsJniWrapper.create()
 
     Iterators
-      .wrap(nativeResultIterator.asScala)
+      .wrap(checkedNativeUcxIterator(nativeResultIterator.asScala, nativeUcxPollerFailure))
       .protectInvocationFlow()
       .recycleIterator {
+        stopNativeUcxExchangePollers(nativeUcxPollers)
         updateNativeMetrics(itrMetrics.fetch(nativeResultIterator))
         nativeResultIterator.close()
         if (enableCudf) {
@@ -343,6 +361,138 @@ class VeloxIteratorApi extends IteratorApi with Logging {
       GpuMemoryTrackerJniWrapper.setCurrentTask(context.taskAttemptId())
     } catch {
       case _: UnsatisfiedLinkError => // JNI not loaded, skip
+    }
+  }
+
+  private def nativeUcxExtraConf(
+      inputIterators: Seq[Iterator[ColumnarBatch]],
+      base: Map[String, String]): Map[String, String] = {
+    val readerStreams = nativeUcxReaderStreams(inputIterators).map(_._1)
+    val writerConf =
+      NativeUcxShuffleExecution.currentWriterContext
+        .map(NativeUcxShuffleExecution.writerExtraConf)
+        .getOrElse(Map.empty)
+    val readerConf = NativeUcxShuffleExecution.readerExtraConf(readerStreams)
+    val merged = base ++ writerConf ++ readerConf
+    if (writerConf.nonEmpty || readerConf.nonEmpty) {
+      logInfo(
+        s"Velox native UCX shuffle conf writer=${writerConf.nonEmpty} " +
+          s"readerStreams=${readerStreams.sorted.mkString("[", ",", "]")} " +
+          s"inputIterators=${nativeUcxInputSummary(inputIterators)}")
+    }
+    merged
+  }
+
+  private def nativeUcxReaderStreams(
+      inputIterators: Seq[Iterator[ColumnarBatch]]): Seq[(Int, NativeUcxShuffleReadSpec)] = {
+    inputIterators.zipWithIndex.flatMap {
+      case (iterator, streamIdx) =>
+        NativeUcxShuffleExecution.readSpec(iterator).map(streamIdx -> _)
+    }
+  }
+
+  private def nativeUcxInputSummary(
+      inputIterators: Seq[Iterator[ColumnarBatch]]): String = {
+    inputIterators.zipWithIndex
+      .map {
+        case (iterator, streamIdx) =>
+          val nativeSpec = NativeUcxShuffleExecution
+            .readSpec(iterator)
+            .map {
+              spec =>
+                s"native(shuffleId=${spec.shuffleId},reduce=${spec.reducePartitionId}," +
+                  s"maps=${spec.expectedMaps},mapRange=[${spec.startMapIndex},${spec.endMapIndex}))"
+            }
+            .getOrElse("local")
+          s"$streamIdx=${iterator.getClass.getName}:$nativeSpec"
+      }
+      .mkString("[", ",", "]")
+  }
+
+  private def bindTaskContextToInputIterators(
+      inputIterators: Seq[Iterator[ColumnarBatch]],
+      context: TaskContext): Seq[Iterator[ColumnarBatch]] = {
+    inputIterators.map { input =>
+      new Iterator[ColumnarBatch] {
+        override def hasNext: Boolean =
+          withCapturedTaskContext(context) {
+            input.hasNext
+          }
+
+        override def next(): ColumnarBatch =
+          withCapturedTaskContext(context) {
+            input.next()
+          }
+      }
+    }
+  }
+
+  private def withCapturedTaskContext[T](context: TaskContext)(body: => T): T = {
+    if (TaskContext.get() == null) {
+      TaskContext.withTaskContext(context) {
+        body
+      }
+    } else {
+      body
+    }
+  }
+
+  private def startNativeUcxExchangePollers(
+      inputIterators: Seq[Iterator[ColumnarBatch]],
+      nativeResultIterator: ColumnarBatchOutIterator,
+      failure: AtomicReference[Throwable]): Seq[Thread] = {
+    nativeUcxReaderStreams(inputIterators).map {
+      case (streamIdx, spec) =>
+        val exchangeNodeId = NativeUcxShuffleExecution.exchangeNodeId(streamIdx)
+        NativeUcxShuffleExecution.startVeloxExchangeSplitPoller(
+          spec,
+          streamIdx,
+          urls => nativeResultIterator.addUcxExchangeSplits(exchangeNodeId, urls),
+          () => nativeResultIterator.noMoreUcxExchangeSplits(exchangeNodeId),
+          error => failure.compareAndSet(null, error))
+    }
+  }
+
+  private def stopNativeUcxExchangePollers(pollers: Seq[Thread]): Unit = {
+    pollers.foreach(_.interrupt())
+    pollers.foreach {
+      poller =>
+        if (Thread.currentThread() != poller) {
+          try {
+            poller.join(1000L)
+          } catch {
+            case e: InterruptedException =>
+              Thread.currentThread().interrupt()
+              throw new SparkException("Interrupted stopping Velox UCX exchange split poller", e)
+          }
+        }
+    }
+  }
+
+  private def checkedNativeUcxIterator(
+      delegate: Iterator[ColumnarBatch],
+      failure: AtomicReference[Throwable]): Iterator[ColumnarBatch] = {
+    new Iterator[ColumnarBatch] {
+      override def hasNext: Boolean = {
+        throwIfNativeUcxPollerFailed(failure)
+        val result = delegate.hasNext
+        throwIfNativeUcxPollerFailed(failure)
+        result
+      }
+
+      override def next(): ColumnarBatch = {
+        throwIfNativeUcxPollerFailed(failure)
+        val result = delegate.next()
+        throwIfNativeUcxPollerFailed(failure)
+        result
+      }
+    }
+  }
+
+  private def throwIfNativeUcxPollerFailed(failure: AtomicReference[Throwable]): Unit = {
+    val error = failure.get()
+    if (error != null) {
+      throw new SparkException("Velox UCX exchange split poller failed", error)
     }
   }
 

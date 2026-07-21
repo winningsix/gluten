@@ -16,14 +16,22 @@
  */
 #include "WholeStageResultIterator.h"
 #include <chrono>
+#include <deque>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <folly/executors/CPUThreadPoolExecutor.h>
 #include "VeloxBackend.h"
 #include "VeloxPlanConverter.h"
 #include "VeloxRuntime.h"
 #include "config/VeloxConfig.h"
 #include "utils/ConfigExtractor.h"
+#include "velox/common/future/VeloxPromise.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/connectors/hive/iceberg/IcebergSplit.h"
+#include "velox/exec/BlockingReason.h"
+#include "velox/exec/Exchange.h"
 #include "velox/exec/PlanNodeStats.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include <cudf/io/types.hpp>
@@ -72,8 +80,164 @@ const std::string kGpuComputeNanos = "gpuComputeNanos";
 
 // others
 const std::string kHiveDefaultPartition = "__HIVE_DEFAULT_PARTITION__";
+constexpr uint64_t kParallelResultQueueMaxBytes = 64UL << 20;
+constexpr uint32_t kParallelTaskMaxDrivers = 1;
+
+bool planRequiresParallelExecution(
+    const std::shared_ptr<const velox::core::PlanNode>& planNode) {
+  if (std::dynamic_pointer_cast<const velox::core::ExchangeNode>(planNode) !=
+          nullptr ||
+      std::dynamic_pointer_cast<const velox::core::PartitionedOutputNode>(
+          planNode) != nullptr) {
+    return true;
+  }
+  for (const auto& source : planNode->sources()) {
+    if (planRequiresParallelExecution(source)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool planRootIsPartitionedOutput(
+    const std::shared_ptr<const velox::core::PlanNode>& planNode) {
+  return std::dynamic_pointer_cast<const velox::core::PartitionedOutputNode>(
+             planNode) != nullptr;
+}
 
 } // namespace
+
+class WholeStageParallelResultQueue {
+ public:
+  explicit WholeStageParallelResultQueue(uint64_t maxBytes)
+      : maxBytes_(maxBytes) {}
+
+  velox::exec::BlockingReason enqueue(
+      velox::RowVectorPtr vector,
+      bool drained,
+      velox::ContinueFuture* future) {
+    if (vector == nullptr) {
+      std::lock_guard<std::mutex> l(mutex_);
+      if (drained) {
+        ++drainedProducers_;
+      } else {
+        ++finishedProducers_;
+      }
+      if (consumerBlocked_) {
+        consumerBlocked_ = false;
+        consumerPromise_.setValue();
+      }
+      return velox::exec::BlockingReason::kNotBlocked;
+    }
+
+    const auto bytes = vector->retainedSize();
+    std::lock_guard<std::mutex> l(mutex_);
+    if (closed_) {
+      throw std::runtime_error("WholeStage parallel result queue is closed");
+    }
+
+    queue_.push_back({std::move(vector), bytes});
+    totalBytes_ += bytes;
+    if (consumerBlocked_) {
+      consumerBlocked_ = false;
+      consumerPromise_.setValue();
+    }
+
+    if (totalBytes_ > maxBytes_) {
+      auto [promise, producerFuture] =
+          velox::makeVeloxContinuePromiseContract(
+              "WholeStageParallelResultQueue::enqueue");
+      producerUnblockPromises_.emplace_back(std::move(promise));
+      *future = std::move(producerFuture);
+      return velox::exec::BlockingReason::kWaitForConsumer;
+    }
+    return velox::exec::BlockingReason::kNotBlocked;
+  }
+
+  velox::RowVectorPtr dequeue() {
+    for (;;) {
+      velox::RowVectorPtr vector;
+      std::vector<velox::ContinuePromise> mayContinue;
+      {
+        std::lock_guard<std::mutex> l(mutex_);
+        if (closed_) {
+          return nullptr;
+        }
+
+        if (!queue_.empty()) {
+          auto result = std::move(queue_.front());
+          queue_.pop_front();
+          totalBytes_ -= result.bytes;
+          vector = std::move(result.vector);
+          if (totalBytes_ < maxBytes_ / 2) {
+            mayContinue = std::move(producerUnblockPromises_);
+          }
+        } else if (
+            numProducers_.has_value() &&
+            finishedProducers_ >= numProducers_.value()) {
+          return nullptr;
+        } else if (
+            numProducers_.has_value() &&
+            drainedProducers_ >= numProducers_.value()) {
+          return nullptr;
+        }
+
+        if (vector == nullptr) {
+          consumerBlocked_ = true;
+          consumerPromise_ =
+              velox::ContinuePromise("WholeStageParallelResultQueue::dequeue");
+          consumerFuture_ = consumerPromise_.getFuture();
+        }
+      }
+
+      for (auto& promise : mayContinue) {
+        promise.setValue();
+      }
+      if (vector != nullptr) {
+        return vector;
+      }
+      consumerFuture_.wait();
+    }
+  }
+
+  void setNumProducers(int32_t n) {
+    std::lock_guard<std::mutex> l(mutex_);
+    numProducers_ = n;
+  }
+
+  void close() {
+    std::lock_guard<std::mutex> l(mutex_);
+    closed_ = true;
+    for (auto& promise : producerUnblockPromises_) {
+      promise.setValue();
+    }
+    producerUnblockPromises_.clear();
+    if (consumerBlocked_) {
+      consumerBlocked_ = false;
+      consumerPromise_.setValue();
+    }
+  }
+
+ private:
+  struct Entry {
+    velox::RowVectorPtr vector;
+    uint64_t bytes;
+  };
+
+  std::deque<Entry> queue_;
+  uint64_t totalBytes_ = 0;
+  const uint64_t maxBytes_;
+  std::optional<int32_t> numProducers_;
+  int32_t finishedProducers_ = 0;
+  int32_t drainedProducers_ = 0;
+  std::mutex mutex_;
+  std::vector<velox::ContinuePromise> producerUnblockPromises_;
+  bool consumerBlocked_ = false;
+  velox::ContinuePromise consumerPromise_{
+      velox::ContinuePromise::makeEmpty()};
+  velox::ContinueFuture consumerFuture_;
+  bool closed_ = false;
+};
 
 WholeStageResultIterator::WholeStageResultIterator(
     VeloxMemoryManager* memoryManager,
@@ -83,7 +247,8 @@ WholeStageResultIterator::WholeStageResultIterator(
     const std::vector<facebook::velox::core::PlanNodeId>& streamIds,
     const std::string spillDir,
     const std::shared_ptr<facebook::velox::config::ConfigBase>& veloxCfg,
-    const SparkTaskInfo& taskInfo)
+    const SparkTaskInfo& taskInfo,
+    const std::string& taskIdOverride)
     : memoryManager_(memoryManager),
       veloxCfg_(veloxCfg),
 #ifdef GLUTEN_ENABLE_GPU
@@ -100,6 +265,18 @@ WholeStageResultIterator::WholeStageResultIterator(
     spillExecutor_ = std::make_shared<folly::CPUThreadPoolExecutor>(spillThreadNum);
   }
   getOrderedNodeIds(veloxPlan_, orderedNodeIds_);
+  requiresParallelExecution_ = planRequiresParallelExecution(veloxPlan_);
+  parallelTaskProducesOutput_ =
+      requiresParallelExecution_ && !planRootIsPartitionedOutput(veloxPlan_);
+  if (requiresParallelExecution_) {
+    taskExecutor_ = std::make_shared<folly::CPUThreadPoolExecutor>(
+        kParallelTaskMaxDrivers);
+    if (parallelTaskProducesOutput_) {
+      parallelResultQueue_ =
+          std::make_shared<WholeStageParallelResultQueue>(
+              kParallelResultQueueMaxBytes);
+    }
+  }
 
   auto fileSystem = velox::filesystems::getFileSystem(spillDir, nullptr);
   GLUTEN_CHECK(fileSystem != nullptr, "File System for spilling is null!");
@@ -111,21 +288,55 @@ WholeStageResultIterator::WholeStageResultIterator(
   std::unordered_set<velox::core::PlanNodeId> emptySet;
   velox::core::PlanFragment planFragment{planNode, velox::core::ExecutionStrategy::kUngrouped, 1, emptySet};
   std::shared_ptr<velox::core::QueryCtx> queryCtx = createNewVeloxQueryCtx();
+  const auto veloxTaskId = taskIdOverride.empty()
+      ? fmt::format(
+            "Gluten_Stage_{}_TID_{}_VTID_{}",
+            std::to_string(taskInfo_.stageId),
+            std::to_string(taskInfo_.taskId),
+            std::to_string(taskInfo.vId))
+      : taskIdOverride;
+  velox::exec::Consumer consumer{};
+  std::function<void(std::exception_ptr)> onError;
+  if (parallelResultQueue_ != nullptr) {
+    auto queueHolder = std::weak_ptr<WholeStageParallelResultQueue>(
+        parallelResultQueue_);
+    consumer =
+        [queueHolder, veloxTaskId](
+            velox::RowVectorPtr vector,
+            bool drained,
+            velox::ContinueFuture* future) {
+          auto queue = queueHolder.lock();
+          if (queue == nullptr) {
+            LOG(ERROR) << "WholeStage parallel result queue destroyed, taskId="
+                       << veloxTaskId;
+            return velox::exec::BlockingReason::kNotBlocked;
+          }
+          return queue->enqueue(std::move(vector), drained, future);
+        };
+    onError = [queueHolder, veloxTaskId](std::exception_ptr) {
+      auto queue = queueHolder.lock();
+      if (queue == nullptr) {
+        LOG(ERROR) << "WholeStage parallel result queue destroyed, taskId="
+                   << veloxTaskId;
+        return;
+      }
+      queue->close();
+    };
+  }
+
   task_ = velox::exec::Task::create(
-      fmt::format(
-          "Gluten_Stage_{}_TID_{}_VTID_{}",
-          std::to_string(taskInfo_.stageId),
-          std::to_string(taskInfo_.taskId),
-          std::to_string(taskInfo.vId)),
+      veloxTaskId,
       std::move(planFragment),
       0,
       std::move(queryCtx),
-      velox::exec::Task::ExecutionMode::kSerial,
-      /*consumer=*/velox::exec::Consumer{},
+      requiresParallelExecution_
+          ? velox::exec::Task::ExecutionMode::kParallel
+          : velox::exec::Task::ExecutionMode::kSerial,
+      /*consumer=*/std::move(consumer),
       /*memoryArbitrationPriority=*/0,
       /*spillDiskOpts=*/spillOpts,
-      /*onError=*/nullptr);
-  if (!task_->supportSerialExecutionMode()) {
+      /*onError=*/std::move(onError));
+  if (!requiresParallelExecution_ && !task_->supportSerialExecutionMode()) {
     throw std::runtime_error("Task doesn't support single threaded execution: " + planNode->toString());
   }
 
@@ -282,6 +493,66 @@ WholeStageResultIterator::WholeStageResultIterator(
   }
 }
 
+WholeStageResultIterator::~WholeStageResultIterator() {
+  closeVeloxTask();
+  // GPU thread-region tracking dropped in IBM-baseline switch (GpuGuard /
+  // endGpuRegion removed). The diagnostic semaphore-permit cleanup is no
+  // longer needed; cuDF stream-pool + RMM thread-safety handle concurrency.
+}
+
+void WholeStageResultIterator::closeVeloxTask() {
+  if (parallelResultQueue_ != nullptr) {
+    parallelResultQueue_->close();
+  }
+  if (task_ == nullptr) {
+    parallelResultQueue_.reset();
+    taskExecutor_.reset();
+    return;
+  }
+
+  const auto taskId = task_->taskId();
+  std::shared_ptr<velox::memory::MemoryPool> taskPool;
+  if (task_->pool() != nullptr) {
+    taskPool = task_->pool()->shared_from_this();
+  }
+  try {
+    LOG(INFO) << "Closing Velox task from WholeStageResultIterator, taskId="
+              << taskId << ", state=" << static_cast<int>(task_->state())
+              << ", running=" << task_->isRunning()
+              << ", taskPoolUseCount="
+              << (taskPool == nullptr ? 0 : taskPool.use_count());
+    if (task_->isRunning()) {
+      auto future = task_->requestCancel();
+      if (future.valid()) {
+        future.wait();
+      }
+    } else {
+      auto future = task_->taskCompletionFuture();
+      if (future.valid()) {
+        future.wait();
+      }
+    }
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Failed while closing Velox task from WholeStageResultIterator, taskId="
+               << taskId << ", error=" << e.what();
+  } catch (...) {
+    LOG(ERROR) << "Failed while closing Velox task from WholeStageResultIterator, taskId="
+               << taskId << ", unknown error";
+  }
+
+  auto deletionFuture = task_->taskDeletionFuture();
+  task_.reset();
+  if (deletionFuture.valid()) {
+    std::move(deletionFuture).wait(std::chrono::seconds(30));
+  }
+  LOG(INFO) << "Released Velox task from WholeStageResultIterator, taskId="
+            << taskId << ", taskPoolUseCountAfterTaskReset="
+            << (taskPool == nullptr ? 0 : taskPool.use_count());
+  taskPool.reset();
+  parallelResultQueue_.reset();
+  taskExecutor_.reset();
+}
+
 std::shared_ptr<velox::core::QueryCtx> WholeStageResultIterator::createNewVeloxQueryCtx() {
   std::unordered_map<std::string, std::shared_ptr<velox::config::ConfigBase>> connectorConfigs;
   auto hiveConnectorSessionConfig = createHiveConnectorSessionConfig(veloxCfg_);
@@ -291,7 +562,7 @@ std::shared_ptr<velox::core::QueryCtx> WholeStageResultIterator::createNewVeloxQ
   connectorConfigs[kCudfIcebergConnectorId] = hiveConnectorSessionConfig;
 #endif
   std::shared_ptr<velox::core::QueryCtx> ctx = velox::core::QueryCtx::create(
-      nullptr,
+      taskExecutor_.get(),
       facebook::velox::core::QueryConfig{getQueryContextConf()},
       connectorConfigs,
       gluten::VeloxBackend::get()->getAsyncDataCache(),
@@ -305,7 +576,67 @@ std::shared_ptr<velox::core::QueryCtx> WholeStageResultIterator::createNewVeloxQ
   return ctx;
 }
 
+void WholeStageResultIterator::startParallelTaskIfNeeded() {
+  if (parallelTaskStarted_) {
+    return;
+  }
+  parallelTaskStarted_ = true;
+  try {
+    task_->start(kParallelTaskMaxDrivers);
+    if (parallelResultQueue_ != nullptr) {
+      parallelResultQueue_->setNumProducers(task_->numOutputDrivers());
+    }
+  } catch (...) {
+    if (parallelResultQueue_ != nullptr) {
+      parallelResultQueue_->close();
+    }
+    throw;
+  }
+}
+
+void WholeStageResultIterator::checkTaskError() {
+  if (task_ == nullptr) {
+    return;
+  }
+  auto error = task_->error();
+  if (error == nullptr) {
+    return;
+  }
+  if (parallelResultQueue_ != nullptr) {
+    parallelResultQueue_->close();
+  }
+  std::rethrow_exception(error);
+}
+
+std::shared_ptr<ColumnarBatch> WholeStageResultIterator::toColumnarBatch(
+    const velox::RowVectorPtr& vector) {
+  if (vector == nullptr || vector->size() == 0) {
+    return nullptr;
+  }
+
+#ifdef GLUTEN_ENABLE_GPU
+  if (auto cudfVec = std::dynamic_pointer_cast<
+          velox::cudf_velox::CudfVector>(vector)) {
+    auto numCols = cudfVec->getTableView().num_columns();
+    return std::make_shared<VeloxColumnarBatch>(vector, numCols);
+  }
+#endif
+
+  {
+    ScopedTimer timer(&loadLazyVectorTime_);
+    for (auto& child : vector->children()) {
+      child->loadedVector();
+    }
+  }
+
+  return std::make_shared<VeloxColumnarBatch>(vector);
+}
+
 std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
+  return requiresParallelExecution_ ? nextParallel() : nextSerial();
+}
+
+std::shared_ptr<ColumnarBatch> WholeStageResultIterator::nextSerial() {
   auto nextStart = std::chrono::steady_clock::now();
   ++nextCallCount_;
 
@@ -365,29 +696,60 @@ std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
   if (vector == nullptr) {
     return recordAndReturn(nullptr);
   }
-  uint64_t numRows = vector->size();
-  if (numRows == 0) {
+  return recordAndReturn(toColumnarBatch(vector));
+}
+
+std::shared_ptr<ColumnarBatch> WholeStageResultIterator::nextParallel() {
+  auto nextStart = std::chrono::steady_clock::now();
+  ++nextCallCount_;
+
+  auto recordAndReturn =
+      [&](std::shared_ptr<ColumnarBatch> result)
+      -> std::shared_ptr<ColumnarBatch> {
+    auto nextEnd = std::chrono::steady_clock::now();
+    totalNextNanos_ += std::chrono::duration_cast<
+        std::chrono::nanoseconds>(nextEnd - nextStart).count();
+    return result;
+  };
+
+  if (parallelTaskFinished_) {
     return recordAndReturn(nullptr);
   }
 
-#ifdef GLUTEN_ENABLE_GPU
-  if (auto cudfVec = std::dynamic_pointer_cast<
-          velox::cudf_velox::CudfVector>(vector)) {
-    auto numCols = cudfVec->getTableView().num_columns();
-    return recordAndReturn(
-        std::make_shared<VeloxColumnarBatch>(vector, numCols));
-  }
-#endif
+  startParallelTaskIfNeeded();
+  checkTaskError();
 
-  {
-    ScopedTimer timer(&loadLazyVectorTime_);
-    for (auto& child : vector->children()) {
-      child->loadedVector();
+  if (!parallelTaskProducesOutput_) {
+    auto veloxStart = std::chrono::steady_clock::now();
+    auto future = task_->taskCompletionFuture();
+    if (future.valid()) {
+      future.wait();
     }
+    auto veloxEnd = std::chrono::steady_clock::now();
+    totalVeloxNextNanos_ += std::chrono::duration_cast<
+        std::chrono::nanoseconds>(veloxEnd - veloxStart).count();
+    parallelTaskFinished_ = true;
+    checkTaskError();
+    return recordAndReturn(nullptr);
   }
 
-  return recordAndReturn(
-      std::make_shared<VeloxColumnarBatch>(vector));
+  auto veloxStart = std::chrono::steady_clock::now();
+  auto vector = parallelResultQueue_->dequeue();
+  auto veloxEnd = std::chrono::steady_clock::now();
+  totalVeloxNextNanos_ += std::chrono::duration_cast<
+      std::chrono::nanoseconds>(veloxEnd - veloxStart).count();
+  checkTaskError();
+
+  if (vector == nullptr) {
+    auto future = task_->taskCompletionFuture();
+    if (future.valid()) {
+      future.wait();
+    }
+    parallelTaskFinished_ = true;
+    checkTaskError();
+    return recordAndReturn(nullptr);
+  }
+  return recordAndReturn(toColumnarBatch(vector));
 }
 
 int64_t WholeStageResultIterator::spillFixedSize(int64_t size) {
@@ -492,6 +854,24 @@ void WholeStageResultIterator::addIteratorSplits(const std::vector<std::shared_p
     exec::Split split(folly::copy(connectorSplit), -1);
     task_->addSplit(streamIds_[i], std::move(split));
   }
+}
+
+void WholeStageResultIterator::addRemoteExchangeSplits(
+    const velox::core::PlanNodeId& exchangeNodeId,
+    const std::vector<std::string>& remoteTaskIds) {
+  VELOX_CHECK_NOT_NULL(task_, "Cannot add UCX exchange splits before Velox task is created");
+  for (const auto& remoteTaskId : remoteTaskIds) {
+    exec::Split split(
+        std::make_shared<velox::exec::RemoteConnectorSplit>(remoteTaskId),
+        -1);
+    task_->addSplit(exchangeNodeId, std::move(split));
+  }
+}
+
+void WholeStageResultIterator::noMoreRemoteExchangeSplits(
+    const velox::core::PlanNodeId& exchangeNodeId) {
+  VELOX_CHECK_NOT_NULL(task_, "Cannot finish UCX exchange splits before Velox task is created");
+  task_->noMoreSplits(exchangeNodeId);
 }
 
 void WholeStageResultIterator::noMoreSplits() {

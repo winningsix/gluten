@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 include_guard(GLOBAL)
+include(FetchContent)
 
 set(GLUTEN_GFLAGS_BUILD_SHA256_CHECKSUM
     34af2f15cf7367513b352bdcd2493ab14ce43692d2dcd9dfc499492966c64dcf)
@@ -28,7 +29,7 @@ message(STATUS "Building gflags from source")
 FetchContent_Declare(
   gflags
   URL ${GLUTEN_GFLAGS_SOURCE_URL}
-  URL_HASH SHA256=${GLUTEN_GFLAGS_BUILD_SHA256_CHECKSUM})
+  URL_HASH "${GLUTEN_GFLAGS_BUILD_SHA256_CHECKSUM}")
 
 set(GFLAGS_BUILD_STATIC_LIBS ON)
 set(GFLAGS_BUILD_SHARED_LIBS ON)

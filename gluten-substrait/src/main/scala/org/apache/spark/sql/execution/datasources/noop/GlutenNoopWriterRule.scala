@@ -33,9 +33,9 @@ import org.apache.spark.sql.execution.datasources.v2.{AppendDataExec, OverwriteB
  */
 case class GlutenNoopWriterRule(session: SparkSession) extends Rule[SparkPlan] {
   override def apply(p: SparkPlan): SparkPlan = p match {
-    case rc @ AppendDataExec(_, _, NoopWrite) =>
+    case rc @ AppendDataExec(_, _, NoopWrite, _, _) =>
       injectFakeRowAdaptor(rc, rc.child)
-    case rc @ OverwriteByExpressionExec(_, _, NoopWrite) =>
+    case rc @ OverwriteByExpressionExec(_, _, NoopWrite, _, _) =>
       injectFakeRowAdaptor(rc, rc.child)
     case _ => p
   }

@@ -29,7 +29,12 @@ import org.apache.gluten.substrait.rel.LocalFilesNode.ReadFileFormat
 import org.apache.gluten.utils.SubstraitPlanPrinterUtil
 
 import org.apache.spark._
+import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
+import org.apache.spark.shuffle.{
+  NativeUcxShuffleExecution,
+  NativeUcxShuffleReadMetadataIterator
+}
 import org.apache.spark.softaffinity.SoftAffinity
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
@@ -442,7 +447,9 @@ case class WholeStageTransformer(child: SparkPlan, materializeInput: Boolean = f
  * partition of [[BroadcastBuildSideRDD]] is meaningless. [[BroadcastBuildSideRDD]] should only be
  * used to hold the broadcast value and generate iterator for join.
  */
-class ColumnarInputRDDsWrapper(columnarInputRDDs: Seq[RDD[ColumnarBatch]]) extends Serializable {
+class ColumnarInputRDDsWrapper(columnarInputRDDs: Seq[RDD[ColumnarBatch]])
+  extends Serializable
+  with Logging {
   def getDependencies: Seq[Dependency[ColumnarBatch]] = {
     assert(
       columnarInputRDDs
@@ -481,10 +488,45 @@ class ColumnarInputRDDsWrapper(columnarInputRDDs: Seq[RDD[ColumnarBatch]]) exten
         index += 1
         cartesian.getIterators(partition, context)
       case rdd =>
-        val it = rdd.iterator(inputColumnarRDDPartitions(index), context)
+        val streamIdx = index
+        val (rawIt, readSpecs) =
+          NativeUcxShuffleExecution.withReadSpecCapture {
+            rdd.iterator(inputColumnarRDDPartitions(streamIdx), context)
+          }
+        val it =
+          readSpecs.headOption
+            .map {
+              spec =>
+                if (readSpecs.size > 1) {
+                  logWarning(
+                    s"Captured ${readSpecs.size} native UCX read specs for input " +
+                      s"stream $streamIdx; using shuffleId=${spec.shuffleId}")
+                }
+                new NativeUcxShuffleReadMetadataIterator[ColumnarBatch](rawIt, spec)
+            }
+            .getOrElse(rawIt)
+        logInputIterator(streamIdx, rdd, it)
         index += 1
         it :: Nil
     }
+  }
+
+  private def logInputIterator(
+      streamIdx: Int,
+      rdd: RDD[ColumnarBatch],
+      iterator: Iterator[ColumnarBatch]): Unit = {
+    val nativeSpec = NativeUcxShuffleExecution
+      .readSpec(iterator)
+      .map {
+        spec =>
+          s"native(shuffleId=${spec.shuffleId},reduce=${spec.reducePartitionId}," +
+            s"maps=${spec.expectedMaps},mapRange=[${spec.startMapIndex},${spec.endMapIndex}))"
+      }
+      .getOrElse("local")
+    logInfo(
+      s"Columnar input iterator stream=$streamIdx rddId=${rdd.id} " +
+        s"rddClass=${rdd.getClass.getName} iteratorClass=${iterator.getClass.getName} " +
+        s"nativeUcx=$nativeSpec")
   }
 }
 

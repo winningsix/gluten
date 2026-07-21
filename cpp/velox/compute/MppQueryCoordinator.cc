@@ -55,7 +55,7 @@
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/OutputBuffer.h"
-#include "velox/exec/DefaultOutputBufferManager.h"
+#include "velox/exec/OutputBufferManager.h"
 #include "velox/exec/SerializedPage.h"
 #include "velox/exec/Task.h"
 #ifdef GLUTEN_ENABLE_GPU
@@ -114,7 +114,7 @@ int envIntOrDefault(const char* name, int defaultValue) {
 
 void removeTaskOutputState(
     const std::shared_ptr<Task>& task,
-    const std::shared_ptr<DefaultOutputBufferManager>& bufferManager,
+    const std::shared_ptr<OutputBufferManager>& bufferManager,
     std::string_view queryId,
     std::string_view reason) {
   if (task == nullptr) {
@@ -207,7 +207,7 @@ MppQueryCoordinator::MppQueryCoordinator(
       localPeerId_(std::move(localPeerId)),
       peerIndex_(peerIndex),
       peerCount_(peerCount),
-      bufferManager_(DefaultOutputBufferManager::getInstanceRef()) {
+      bufferManager_(OutputBufferManager::getInstanceRef()) {
   VELOX_CHECK(!fragmentSpecs_.empty(), "At least one fragment is required");
   VELOX_CHECK(queryCtx_ != nullptr, "QueryCtx must not be null");
   VELOX_CHECK(executor_ != nullptr, "Executor must not be null");

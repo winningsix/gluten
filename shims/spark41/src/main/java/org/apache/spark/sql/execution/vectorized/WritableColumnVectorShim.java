@@ -17,6 +17,7 @@
 package org.apache.spark.sql.execution.vectorized;
 
 import org.apache.spark.sql.types.DataType;
+import org.apache.spark.unsafe.types.BinaryView;
 import org.apache.spark.unsafe.types.UTF8String;
 
 import java.nio.ByteBuffer;
@@ -79,6 +80,9 @@ public class WritableColumnVectorShim extends WritableColumnVector {
   public void putBytes(int rowId, int count, byte[] src, int srcIndex) {}
 
   @Override
+  public void putBytes(int rowId, int count, ByteBuffer src, int srcIndex) {}
+
+  @Override
   public void putShort(int rowId, short value) {}
 
   @Override
@@ -86,6 +90,9 @@ public class WritableColumnVectorShim extends WritableColumnVector {
 
   @Override
   public void putShorts(int rowId, int count, short[] src, int srcIndex) {}
+
+  @Override
+  public void putShortsFromIntsLittleEndian(int rowId, int count, byte[] src, int srcIndex) {}
 
   @Override
   public void putShorts(int rowId, int count, byte[] src, int srcIndex) {}
@@ -161,6 +168,11 @@ public class WritableColumnVectorShim extends WritableColumnVector {
   @Override
   protected UTF8String getBytesAsUTF8String(int rowId, int count) {
     return null;
+  }
+
+  @Override
+  protected BinaryView getBytesAsBinaryView(int rowId, int count) {
+    return BinaryView.fromBytes(getBytes(rowId, count));
   }
 
   @Override

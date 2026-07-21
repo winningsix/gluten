@@ -35,7 +35,8 @@ object ScanTransformerFactory {
       scanExec.optionalNumCoalescedBuckets,
       scanExec.dataFilters,
       scanExec.tableIdentifier,
-      scanExec.disableBucketedScan
+      scanExec.disableBucketedScan,
+      scanExec.markedForSingleTaskExecution
     )
   }
 

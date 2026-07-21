@@ -269,6 +269,12 @@ GpuBufferBatchResizer::~GpuBufferBatchResizer() {
 }
 
 std::shared_ptr<ColumnarBatch> GpuBufferBatchResizer::next() {
+  if (stashedBatch_ != nullptr) {
+    auto batch = std::move(stashedBatch_);
+    stashedBatch_.reset();
+    return batch;
+  }
+
   std::vector<std::shared_ptr<GpuBufferColumnarBatch>> cachedBatches;
   int32_t cachedRows = 0;
   int64_t cachedBytes = 0;
@@ -278,10 +284,21 @@ std::shared_ptr<ColumnarBatch> GpuBufferBatchResizer::next() {
       break;
     }
 
+    if (nextCb->getType() == "velox") {
+      if (cachedRows == 0) {
+        return nextCb;
+      }
+      stashedBatch_ = std::move(nextCb);
+      break;
+    }
+
     auto nextBatch = std::dynamic_pointer_cast<GpuBufferColumnarBatch>(nextCb);
-    VELOX_CHECK_NOT_NULL(nextBatch);
+    VELOX_CHECK_NOT_NULL(
+        nextBatch,
+        "GpuBufferBatchResizer expected GpuBufferColumnarBatch or VeloxColumnarBatch, got {}",
+        nextCb->getType());
     if (nextBatch->numRows() == 0) {
-        continue;
+      continue;
     }
 
     cachedRows += nextBatch->numRows();

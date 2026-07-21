@@ -23,7 +23,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
 import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
 import org.apache.spark.sql.types._
-import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
+import org.apache.spark.unsafe.types.{BinaryView, CalendarInterval, TimestampNanosVal, UTF8String}
 
 import java.math.BigDecimal
 
@@ -104,6 +104,15 @@ final class ArrowColumnarRow(writableColumns: Array[ArrowWritableColumnVector], 
 
   override def getBinary(ordinal: Int): Array[Byte] =
     columns(ordinal).getBinary(rowId)
+
+  override def getBinaryView(ordinal: Int): BinaryView =
+    BinaryView.fromBytes(getBinary(ordinal))
+
+  override def getTimestampLTZNanos(ordinal: Int): TimestampNanosVal =
+    throw new UnsupportedOperationException("Timestamp LTZ nanos is not supported")
+
+  override def getTimestampNTZNanos(ordinal: Int): TimestampNanosVal =
+    throw new UnsupportedOperationException("Timestamp NTZ nanos is not supported")
 
   override def getInterval(ordinal: Int): CalendarInterval =
     columns(ordinal).getInterval(rowId)

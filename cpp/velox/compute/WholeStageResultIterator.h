@@ -35,6 +35,8 @@
 
 namespace gluten {
 
+class WholeStageParallelResultQueue;
+
 class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
  public:
   WholeStageResultIterator(
@@ -45,17 +47,10 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
       const std::vector<facebook::velox::core::PlanNodeId>& streamIds,
       const std::string spillDir,
       const std::shared_ptr<facebook::velox::config::ConfigBase>& veloxCfg,
-      const SparkTaskInfo& taskInfo);
+      const SparkTaskInfo& taskInfo,
+      const std::string& taskIdOverride = "");
 
-  virtual ~WholeStageResultIterator() {
-    if (task_ != nullptr && task_->isRunning()) {
-      // calling .wait() may take no effect in single thread execution mode
-      task_->requestCancel().wait();
-    }
-    // GPU thread-region tracking dropped in IBM-baseline switch (GpuGuard /
-    // endGpuRegion removed). The diagnostic semaphore-permit cleanup is no
-    // longer needed; cuDF stream-pool + RMM thread-safety handle concurrency.
-  }
+  virtual ~WholeStageResultIterator();
 
   std::shared_ptr<ColumnarBatch> next() override;
 
@@ -81,11 +76,36 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
   /// Add iterator-based splits from input iterators
   void addIteratorSplits(const std::vector<std::shared_ptr<ResultIterator>>& inputIterators) override;
 
+  /// Add Velox remote-task splits to a UCX ExchangeNode.
+  void addRemoteExchangeSplits(
+      const facebook::velox::core::PlanNodeId& exchangeNodeId,
+      const std::vector<std::string>& remoteTaskIds);
+
+  /// Signal that no more remote-task splits will be added to a UCX ExchangeNode.
+  void noMoreRemoteExchangeSplits(
+      const facebook::velox::core::PlanNodeId& exchangeNodeId);
+
   /// Signal that no more splits will be added.
   /// This is required for proper task completion and enables future barrier support.
   void noMoreSplits() override;
 
  private:
+  /// Start the Velox task when the plan requires parallel execution.
+  void startParallelTaskIfNeeded();
+
+  /// Propagate any asynchronous Velox task error to the JNI caller.
+  void checkTaskError();
+
+  /// Execute one step through the serial Task::next() path.
+  std::shared_ptr<ColumnarBatch> nextSerial();
+
+  /// Execute one step through the parallel Task::start() + consumer queue path.
+  std::shared_ptr<ColumnarBatch> nextParallel();
+
+  /// Convert a Velox output vector to Gluten's ColumnarBatch wrapper.
+  std::shared_ptr<ColumnarBatch> toColumnarBatch(
+      const facebook::velox::RowVectorPtr& vector);
+
   /// Get the Spark confs to Velox query context.
   std::unordered_map<std::string, std::string> getQueryContextConf();
 
@@ -105,6 +125,9 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
   /// Collect Velox metrics.
   void collectMetrics();
 
+  /// Stop and release the Velox task before the Spark task memory manager is released.
+  void closeVeloxTask();
+
   /// Return a certain type of runtime metric. Supported metric types are: sum, count, min, max.
   static int64_t runtimeMetric(
       const std::string& type,
@@ -120,8 +143,14 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
   const bool enableCudf_;
 #endif
   const SparkTaskInfo taskInfo_;
+  std::shared_ptr<folly::Executor> taskExecutor_ = nullptr;
   std::shared_ptr<facebook::velox::exec::Task> task_;
   std::shared_ptr<const facebook::velox::core::PlanNode> veloxPlan_;
+  std::shared_ptr<WholeStageParallelResultQueue> parallelResultQueue_ = nullptr;
+  bool requiresParallelExecution_ = false;
+  bool parallelTaskProducesOutput_ = false;
+  bool parallelTaskStarted_ = false;
+  bool parallelTaskFinished_ = false;
 
   /// Spill.
   std::string spillStrategy_;

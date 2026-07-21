@@ -30,14 +30,11 @@ import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.hive.HiveTableScanExecTransformer._
 import org.apache.spark.sql.hive.client.HiveClientImpl
-import org.apache.spark.sql.hive.execution.{AbstractHiveTableScanExec, HiveTableScanExec}
+import org.apache.spark.sql.hive.execution.AbstractHiveTableScanExec
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.Utils
 
-import org.apache.hadoop.hive.ql.io.orc.OrcInputFormat
-import org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
 import org.apache.hadoop.hive.ql.plan.TableDesc
-import org.apache.hadoop.mapred.TextInputFormat
 
 import java.net.URI
 
@@ -128,19 +125,16 @@ case class HiveTableScanExecTransformer(
 
   private def getReadFileFormat(storage: CatalogStorageFormat): ReadFileFormat = {
     storage.inputFormat match {
-      case Some(inputFormat)
-          if TEXT_INPUT_FORMAT_CLASS.isAssignableFrom(Utils.classForName(inputFormat)) =>
+      case Some(inputFormat) if HiveTableScanExecTransformer.isTextInputFormat(inputFormat) =>
         storage.serde match {
           case Some("org.openx.data.jsonserde.JsonSerDe") | Some(
                 "org.apache.hive.hcatalog.data.JsonSerDe") =>
             ReadFileFormat.JsonReadFormat
           case _ => ReadFileFormat.TextReadFormat
         }
-      case Some(inputFormat)
-          if ORC_INPUT_FORMAT_CLASS.isAssignableFrom(Utils.classForName(inputFormat)) =>
+      case Some(inputFormat) if HiveTableScanExecTransformer.isOrcInputFormat(inputFormat) =>
         ReadFileFormat.OrcReadFormat
-      case Some(inputFormat)
-          if PARQUET_INPUT_FORMAT_CLASS.isAssignableFrom(Utils.classForName(inputFormat)) =>
+      case Some(inputFormat) if HiveTableScanExecTransformer.isParquetInputFormat(inputFormat) =>
         ReadFileFormat.ParquetReadFormat
       case _ => ReadFileFormat.UnknownFormat
     }
@@ -210,26 +204,70 @@ object HiveTableScanExecTransformer {
 
   private val NULL_VALUE: Char = 0x00
   private val DEFAULT_FIELD_DELIMITER: Char = 0x01
-  val TEXT_INPUT_FORMAT_CLASS: Class[TextInputFormat] =
-    Utils.classForName("org.apache.hadoop.mapred.TextInputFormat")
-  val ORC_INPUT_FORMAT_CLASS: Class[OrcInputFormat] =
-    Utils.classForName("org.apache.hadoop.hive.ql.io.orc.OrcInputFormat")
-  val PARQUET_INPUT_FORMAT_CLASS: Class[MapredParquetInputFormat] =
-    Utils.classForName("org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat")
+  private val TEXT_INPUT_FORMAT_CLASS: Option[Class[_]] =
+    optionalClass("org.apache.hadoop.mapred.TextInputFormat")
+  private val ORC_INPUT_FORMAT_CLASS: Option[Class[_]] =
+    optionalClass("org.apache.hadoop.hive.ql.io.orc.OrcInputFormat")
+  private val PARQUET_INPUT_FORMAT_CLASS: Option[Class[_]] =
+    optionalClass("org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat")
+  private val HIVE_TABLE_SCAN_EXEC_CLASS: Option[Class[_]] =
+    optionalClass("org.apache.spark.sql.hive.execution.HiveTableScanExec")
+
+  private def optionalClass(className: String): Option[Class[_]] = {
+    try {
+      Some(Utils.classForName(className))
+    } catch {
+      case _: ClassNotFoundException | _: NoClassDefFoundError => None
+    }
+  }
+
+  private def isAssignableInputFormat(
+      inputFormat: String,
+      expectedClass: Option[Class[_]]): Boolean = {
+    expectedClass.exists {
+      expected =>
+        try {
+          expected.isAssignableFrom(Utils.classForName(inputFormat))
+        } catch {
+          case _: ClassNotFoundException | _: NoClassDefFoundError => false
+        }
+    }
+  }
+
+  private[hive] def isTextInputFormat(inputFormat: String): Boolean =
+    isAssignableInputFormat(inputFormat, TEXT_INPUT_FORMAT_CLASS)
+
+  private[hive] def isOrcInputFormat(inputFormat: String): Boolean =
+    isAssignableInputFormat(inputFormat, ORC_INPUT_FORMAT_CLASS)
+
+  private[hive] def isParquetInputFormat(inputFormat: String): Boolean =
+    isAssignableInputFormat(inputFormat, PARQUET_INPUT_FORMAT_CLASS)
+
   def isHiveTableScan(plan: SparkPlan): Boolean = {
-    plan.isInstanceOf[HiveTableScanExec]
+    HIVE_TABLE_SCAN_EXEC_CLASS.exists(_.isAssignableFrom(plan.getClass))
   }
 
   def apply(plan: SparkPlan): HiveTableScanExecTransformer = {
-    plan match {
-      case hiveTableScan: HiveTableScanExec =>
-        new HiveTableScanExecTransformer(
-          hiveTableScan.requestedAttributes,
-          hiveTableScan.relation,
-          hiveTableScan.partitionPruningPred)(hiveTableScan.session)
-      case _ =>
-        throw new UnsupportedOperationException(
-          s"Can't transform HiveTableScanExecTransformer from ${plan.getClass.getSimpleName}")
+    if (!isHiveTableScan(plan)) {
+      throw new UnsupportedOperationException(
+        s"Can't transform HiveTableScanExecTransformer from ${plan.getClass.getSimpleName}")
     }
+
+    new HiveTableScanExecTransformer(
+      invokeNoArg[Seq[Attribute]](plan, "requestedAttributes"),
+      invokeNoArg[HiveTableRelation](plan, "relation"),
+      invokeNoArg[Seq[Expression]](plan, "partitionPruningPred")
+    )(invokeNoArg[SparkSession](plan, "session"))
+  }
+
+  private def invokeNoArg[T](target: AnyRef, methodName: String): T = {
+    val method = target.getClass.getMethods
+      .find(method => method.getName == methodName && method.getParameterCount == 0)
+      .getOrElse {
+        val declaredMethod = target.getClass.getDeclaredMethod(methodName)
+        declaredMethod.setAccessible(true)
+        declaredMethod
+      }
+    method.invoke(target).asInstanceOf[T]
   }
 }

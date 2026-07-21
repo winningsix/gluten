@@ -20,7 +20,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.util.{ArrayData, MapData}
 import org.apache.spark.sql.types.{DataType, Decimal}
 import org.apache.spark.sql.vectorized.ColumnarBatch
-import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
+import org.apache.spark.unsafe.types.{BinaryView, CalendarInterval, TimestampNanosVal, UTF8String}
 
 /**
  * An internal-row abstraction that is designed for columnar-based computations to bypass Spark's
@@ -65,6 +65,12 @@ sealed abstract class BatchCarrierRow extends InternalRowSparkCompatible {
   override def getUTF8String(ordinal: Int): UTF8String = throw unsupported()
 
   override def getBinary(ordinal: Int): Array[Byte] = throw unsupported()
+
+  override def getBinaryView(ordinal: Int): BinaryView = throw unsupported()
+
+  override def getTimestampLTZNanos(ordinal: Int): TimestampNanosVal = throw unsupported()
+
+  override def getTimestampNTZNanos(ordinal: Int): TimestampNanosVal = throw unsupported()
 
   override def getInterval(ordinal: Int): CalendarInterval = throw unsupported()
 

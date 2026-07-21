@@ -41,6 +41,10 @@
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #endif
 
+#ifdef GLUTEN_ENABLE_GPU
+DEFINE_bool(velox_ucx_exchange, false, "Enable Velox UCX exchange");
+#endif
+
 #include "compute/VeloxRuntime.h"
 #include "config/VeloxConfig.h"
 #include "jni/JniFileSystem.h"
@@ -268,18 +272,6 @@ void VeloxBackend::init(
         // concat-with-bufferedResult_ cost in high-cardinality groupbys.
         {velox::cudf_velox::CudfConfig::kCudfConcatOptimizationEnabled,
          backendConf_->get(kCudfConcatOptimizationEnabled, kCudfConcatOptimizationEnabledDefault)},
-        {velox::cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys,
-         backendConf_->get(
-             kCudfGroupbyStreamingMaxDistinctKeys,
-             kCudfGroupbyStreamingMaxDistinctKeysDefault)},
-        {velox::cudf_velox::CudfConfig::kCudfOrderBySortedRunBytes,
-         backendConf_->get(
-             kCudfOrderBySortedRunBytes,
-             kCudfOrderBySortedRunBytesDefault)},
-        {velox::cudf_velox::CudfConfig::kCudfOrderByMergeFanIn,
-         backendConf_->get(
-             kCudfOrderByMergeFanIn,
-             kCudfOrderByMergeFanInDefault)},
         {velox::cudf_velox::CudfConfig::kCudfBatchSizeMinThreshold,
          backendConf_->get(kCudfBatchSizeMinThreshold, kCudfBatchSizeMinThresholdDefault)},
         // Forward the ucx-exchange VLOG level so CudfConfig.exchangeLogLevel is
@@ -515,10 +507,6 @@ void VeloxBackend::tearDown() {
     if (ucxCommunicatorThread_.joinable()) {
       ucxCommunicatorThread_.join();
     }
-    // The progress thread is now gone. Drain all communicator-owned children
-    // and UCXX resources while the backend and singleton still provide stable
-    // keepalive references, then release both owners in that order.
-    facebook::velox::ucx_exchange::Communicator::shutdown();
     ucxCommunicator_.reset();
 #endif
 

@@ -159,6 +159,7 @@ set(VELOX_SRCS
     jni/JniFileSystem.cc
     jni/JniUdf.cc
     jni/MppJniWrapper.cc
+    jni/UcxShuffleJniWrapper.cc
     jni/VeloxJniWrapper.cc
     memory/BufferOutputStream.cc
     memory/VeloxColumnarBatch.cc
