@@ -31,7 +31,13 @@ namespace gluten {
 
 class Payload {
  public:
-  enum Type : uint8_t { kCompressed = 1, kUncompressed = 2, kToBeCompressed = 3, kRaw = 4, kMergedCompressed = 5 };
+  enum Type : uint8_t {
+    kCompressed = 1,
+    kUncompressed = 2,
+    kToBeCompressed = 3,
+    kRaw = 4,
+    kMergedCompressed = 5
+  };
 
   Payload(Type type, uint32_t numRows, const std::vector<bool>* isValidityBuffer);
 
@@ -95,7 +101,9 @@ class BlockPayload final : public Payload {
   // thread, then submits decompression to the global
   // ShuffleCompressionPool. Decompression of buffer N
   // overlaps with I/O read of buffer N+1.
-  static arrow::Result<std::vector<std::shared_ptr<arrow::Buffer>>> deserializeAsync(
+  static arrow::Result<
+      std::vector<std::shared_ptr<arrow::Buffer>>>
+  deserializeAsync(
       arrow::io::InputStream* inputStream,
       const std::shared_ptr<arrow::util::Codec>& codec,
       arrow::MemoryPool* pool,
@@ -116,29 +124,41 @@ class BlockPayload final : public Payload {
 
     std::vector<int64_t> bufMeta;
     int64_t totalUncomp = 0;
-    std::future<arrow::Result<std::shared_ptr<arrow::Buffer>>> mergedFuture;
+    std::future<arrow::Result<
+        std::shared_ptr<arrow::Buffer>>>
+        mergedFuture;
 
     struct PendingBuffer {
-      std::future<arrow::Result<std::shared_ptr<arrow::Buffer>>> future;
+      std::future<arrow::Result<
+          std::shared_ptr<arrow::Buffer>>> future;
     };
     std::vector<PendingBuffer> perBufferFutures;
 
-    std::vector<std::shared_ptr<arrow::Buffer>> readyBuffers;
+    std::vector<std::shared_ptr<arrow::Buffer>>
+        readyBuffers;
 
     PendingDecompression() = default;
-    PendingDecompression(PendingDecompression&&) = default;
-    PendingDecompression& operator=(PendingDecompression&&) = default;
-    PendingDecompression(const PendingDecompression&) = delete;
-    PendingDecompression& operator=(const PendingDecompression&) = delete;
+    PendingDecompression(
+        PendingDecompression&&) = default;
+    PendingDecompression& operator=(
+        PendingDecompression&&) = default;
+    PendingDecompression(
+        const PendingDecompression&) = delete;
+    PendingDecompression& operator=(
+        const PendingDecompression&) = delete;
   };
 
-  static arrow::Result<PendingDecompression> startDeserialize(
+  static arrow::Result<PendingDecompression>
+  startDeserialize(
       arrow::io::InputStream* inputStream,
-      const std::shared_ptr<arrow::util::Codec>& codec,
+      const std::shared_ptr<
+          arrow::util::Codec>& codec,
       arrow::MemoryPool* pool,
       int64_t& deserializeTime);
 
-  static arrow::Result<std::vector<std::shared_ptr<arrow::Buffer>>> finishDeserialize(
+  static arrow::Result<
+      std::vector<std::shared_ptr<arrow::Buffer>>>
+  finishDeserialize(
       PendingDecompression&& pending,
       int64_t& decompressTime);
 
@@ -151,7 +171,9 @@ class BlockPayload final : public Payload {
     uint32_t numBuffers;
   };
 
-  static arrow::Result<BlockHeader> readHeader(arrow::io::InputStream* inputStream, int64_t& deserializeTime);
+  static arrow::Result<BlockHeader> readHeader(
+      arrow::io::InputStream* inputStream,
+      int64_t& deserializeTime);
 
   static arrow::Result<std::vector<std::shared_ptr<arrow::Buffer>>> readSelectedBuffers(
       arrow::io::InputStream* inputStream,
@@ -168,7 +190,8 @@ class BlockPayload final : public Payload {
 
   // Compress all buffers sequentially using the default memory pool.
   // Designed to run on a background pool thread for async compression.
-  static arrow::Result<std::unique_ptr<BlockPayload>> compressBuffersForPool(
+  static arrow::Result<std::unique_ptr<BlockPayload>>
+  compressBuffersForPool(
       uint32_t numRows,
       std::vector<std::shared_ptr<arrow::Buffer>> buffers,
       const std::vector<bool>* isValidityBuffer,
@@ -185,14 +208,16 @@ class BlockPayload final : public Payload {
     std::shared_ptr<arrow::ResizableBuffer> output;
   };
 
-  static arrow::Result<PreparedCompression> prepareCompression(
+  static arrow::Result<PreparedCompression>
+  prepareCompression(
       uint32_t numRows,
       std::vector<std::shared_ptr<arrow::Buffer>> buffers,
       const std::vector<bool>* isValidityBuffer,
       arrow::MemoryPool* pool,
       arrow::util::Codec* codec);
 
-  static arrow::Result<std::unique_ptr<BlockPayload>> finishCompression(
+  static arrow::Result<std::unique_ptr<BlockPayload>>
+  finishCompression(
       PreparedCompression&& pc,
       arrow::util::Codec* codec);
 
@@ -200,7 +225,8 @@ class BlockPayload final : public Payload {
   // [BlockType][PayloadType][numRows][numBuffers][data]
   // Allocated on the given pool (typically default pool).
   // Phase 1: pre-allocate with header space.
-  static arrow::Result<PreparedCompression> prepareWireFormat(
+  static arrow::Result<PreparedCompression>
+  prepareWireFormat(
       uint32_t numRows,
       std::vector<std::shared_ptr<arrow::Buffer>> buffers,
       const std::vector<bool>* isValidityBuffer,
@@ -209,7 +235,8 @@ class BlockPayload final : public Payload {
 
   // Phase 2: compress and fill header. Returns the
   // complete wire-format buffer (not a BlockPayload).
-  static arrow::Result<std::shared_ptr<arrow::Buffer>> finishWireFormat(
+  static arrow::Result<std::shared_ptr<arrow::Buffer>>
+  finishWireFormat(
       PreparedCompression&& pc,
       arrow::util::Codec* codec);
 
@@ -223,7 +250,8 @@ class BlockPayload final : public Payload {
     return numBuffers_;
   }
 
-  const std::vector<std::shared_ptr<arrow::Buffer>>& buffers() const {
+  const std::vector<std::shared_ptr<arrow::Buffer>>&
+  buffers() const {
     return buffers_;
   }
 
@@ -263,7 +291,10 @@ class InMemoryPayload final : public Payload {
   arrow::Result<std::shared_ptr<arrow::Buffer>> readBufferAt(uint32_t index);
 
   arrow::Result<std::unique_ptr<BlockPayload>>
-  toBlockPayload(Payload::Type payloadType, arrow::MemoryPool* pool, arrow::util::Codec* codec);
+  toBlockPayload(
+      Payload::Type payloadType,
+      arrow::MemoryPool* pool,
+      arrow::util::Codec* codec);
 
   arrow::Status copyBuffers(arrow::MemoryPool* pool);
 

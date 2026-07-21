@@ -9,11 +9,11 @@
 #include <execinfo.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -22,7 +22,7 @@
 namespace {
 
 using CudaError = int;
-using CudaStream = void *;
+using CudaStream = void*;
 
 std::mutex allocationMutex;
 struct Allocation {
@@ -37,7 +37,7 @@ struct ContextStats {
   uint64_t currentAllocations{0};
 };
 
-std::unordered_map<void *, Allocation> allocations;
+std::unordered_map<void*, Allocation> allocations;
 std::unordered_map<std::string, uint32_t> contextIds;
 std::vector<ContextStats> contexts{{"unattributed"}};
 std::atomic<uint64_t> currentBytes{0};
@@ -56,10 +56,10 @@ void printTopContexts() {
     std::lock_guard<std::mutex> lock(allocationMutex);
     snapshot = contexts;
   }
-  std::sort(snapshot.begin(), snapshot.end(),
-            [](const auto &left, const auto &right) {
-              return left.currentBytes > right.currentBytes;
-            });
+  std::sort(
+      snapshot.begin(), snapshot.end(), [](const auto& left, const auto& right) {
+        return left.currentBytes > right.currentBytes;
+      });
   const auto count = std::min<std::size_t>(snapshot.size(), 12);
   for (std::size_t i = 0; i < count; ++i) {
     if (snapshot[i].currentBytes == 0) {
@@ -69,21 +69,23 @@ void printTopContexts() {
         STDERR_FILENO,
         "CUDA_ALLOC_TRACE_CONTEXT rank=%zu currentBytes=%llu peakBytes=%llu "
         "currentAllocations=%llu name=%s\n",
-        i + 1, static_cast<unsigned long long>(snapshot[i].currentBytes),
+        i + 1,
+        static_cast<unsigned long long>(snapshot[i].currentBytes),
         static_cast<unsigned long long>(snapshot[i].peakBytes),
         static_cast<unsigned long long>(snapshot[i].currentAllocations),
         snapshot[i].name.c_str());
   }
 }
 
-template <typename Function> Function loadNext(const char *name) {
-  auto *symbol = dlsym(RTLD_NEXT, name);
+template <typename Function>
+Function loadNext(const char* name) {
+  auto* symbol = dlsym(RTLD_NEXT, name);
   if (symbol == nullptr) {
     // Spark loads libgluten with a classloader-local dlopen scope. Its
     // libcudart dependency is therefore not necessarily visible through
     // RTLD_NEXT from a process-wide preload. Reopen the already-loaded SONAME
     // globally so the real runtime entry points can be resolved.
-    auto *cudart = dlopen("libcudart.so.13", RTLD_NOW | RTLD_GLOBAL);
+    auto* cudart = dlopen("libcudart.so.13", RTLD_NOW | RTLD_GLOBAL);
     if (cudart != nullptr) {
       symbol = dlsym(cudart, name);
     }
@@ -95,13 +97,16 @@ template <typename Function> Function loadNext(const char *name) {
 }
 
 void printStack() {
-  void *frames[48];
+  void* frames[48];
   const int count = backtrace(frames, 48);
   backtrace_symbols_fd(frames, count, STDERR_FILENO);
 }
 
-void recordAllocation(const char *api, void *pointer, std::size_t bytes,
-                      CudaError status) {
+void recordAllocation(
+    const char* api,
+    void* pointer,
+    std::size_t bytes,
+    CudaError status) {
   if (status != 0 || pointer == nullptr || bytes == 0) {
     return;
   }
@@ -112,7 +117,7 @@ void recordAllocation(const char *api, void *pointer, std::size_t bytes,
     std::lock_guard<std::mutex> lock(allocationMutex);
     inserted = allocations.emplace(pointer, Allocation{bytes, context}).second;
     if (inserted) {
-      auto &stats = contexts[context];
+      auto& stats = contexts[context];
       stats.currentBytes += bytes;
       stats.peakBytes = std::max(stats.peakBytes, stats.currentBytes);
       ++stats.currentAllocations;
@@ -144,34 +149,42 @@ void recordAllocation(const char *api, void *pointer, std::size_t bytes,
   }
 
   if (crossedGiB || bytes >= (64ULL << 20)) {
-    dprintf(STDERR_FILENO,
-            "CUDA_ALLOC_TRACE event=allocate api=%s pid=%d ptr=%p bytes=%zu "
-            "currentBytes=%llu peakBytes=%llu totalBytes=%llu allocations=%llu "
-            "frees=%llu freeFailures=%llu\n",
-            api, static_cast<int>(getpid()), pointer, bytes,
-            static_cast<unsigned long long>(current),
-            static_cast<unsigned long long>(peak),
-            static_cast<unsigned long long>(total),
-            static_cast<unsigned long long>(count),
-            static_cast<unsigned long long>(freeCount.load()),
-            static_cast<unsigned long long>(freeFailureCount.load()));
+    dprintf(
+        STDERR_FILENO,
+        "CUDA_ALLOC_TRACE event=allocate api=%s pid=%d ptr=%p bytes=%zu "
+        "currentBytes=%llu peakBytes=%llu totalBytes=%llu allocations=%llu "
+        "frees=%llu freeFailures=%llu\n",
+        api,
+        static_cast<int>(getpid()),
+        pointer,
+        bytes,
+        static_cast<unsigned long long>(current),
+        static_cast<unsigned long long>(peak),
+        static_cast<unsigned long long>(total),
+        static_cast<unsigned long long>(count),
+        static_cast<unsigned long long>(freeCount.load()),
+        static_cast<unsigned long long>(freeFailureCount.load()));
     printStack();
     printTopContexts();
   }
 }
 
-void recordFree(const char *api, void *pointer, CudaError status) {
+void recordFree(const char* api, void* pointer, CudaError status) {
   if (pointer == nullptr) {
     return;
   }
   if (status != 0) {
     const auto failures = freeFailureCount.fetch_add(1) + 1;
     if (failures <= 32) {
-      dprintf(STDERR_FILENO,
-              "CUDA_ALLOC_TRACE event=freeFailure api=%s pid=%d ptr=%p "
-              "status=%d failures=%llu\n",
-              api, static_cast<int>(getpid()), pointer, status,
-              static_cast<unsigned long long>(failures));
+      dprintf(
+          STDERR_FILENO,
+          "CUDA_ALLOC_TRACE event=freeFailure api=%s pid=%d ptr=%p "
+          "status=%d failures=%llu\n",
+          api,
+          static_cast<int>(getpid()),
+          pointer,
+          status,
+          static_cast<unsigned long long>(failures));
       printStack();
     }
     return;
@@ -183,7 +196,7 @@ void recordFree(const char *api, void *pointer, CudaError status) {
     const auto it = allocations.find(pointer);
     if (it != allocations.end()) {
       bytes = it->second.bytes;
-      auto &stats = contexts[it->second.context];
+      auto& stats = contexts[it->second.context];
       stats.currentBytes -= bytes;
       --stats.currentAllocations;
       allocations.erase(it);
@@ -197,7 +210,7 @@ void recordFree(const char *api, void *pointer, CudaError status) {
 
 } // namespace
 
-extern "C" void cuda_alloc_trace_push_context(const char *name) {
+extern "C" void cuda_alloc_trace_push_context(const char* name) {
   if (name == nullptr || name[0] == '\0') {
     contextStack.push_back(0);
     return;
@@ -216,8 +229,8 @@ extern "C" void cuda_alloc_trace_pop_context() {
   }
 }
 
-extern "C" CudaError cudaMalloc(void **pointer, std::size_t bytes) {
-  using Function = CudaError (*)(void **, std::size_t);
+extern "C" CudaError cudaMalloc(void** pointer, std::size_t bytes) {
+  using Function = CudaError (*)(void**, std::size_t);
   static auto real = loadNext<Function>("cudaMalloc");
   if (real == nullptr) {
     return 999;
@@ -227,15 +240,16 @@ extern "C" CudaError cudaMalloc(void **pointer, std::size_t bytes) {
   }
   insideHook = true;
   const auto status = real(pointer, bytes);
-  recordAllocation("cudaMalloc", status == 0 ? *pointer : nullptr, bytes,
-                   status);
+  recordAllocation("cudaMalloc", status == 0 ? *pointer : nullptr, bytes, status);
   insideHook = false;
   return status;
 }
 
-extern "C" CudaError cudaMallocManaged(void **pointer, std::size_t bytes,
-                                       unsigned int flags) {
-  using Function = CudaError (*)(void **, std::size_t, unsigned int);
+extern "C" CudaError cudaMallocManaged(
+    void** pointer,
+    std::size_t bytes,
+    unsigned int flags) {
+  using Function = CudaError (*)(void**, std::size_t, unsigned int);
   static auto real = loadNext<Function>("cudaMallocManaged");
   if (real == nullptr) {
     return 999;
@@ -245,15 +259,17 @@ extern "C" CudaError cudaMallocManaged(void **pointer, std::size_t bytes,
   }
   insideHook = true;
   const auto status = real(pointer, bytes, flags);
-  recordAllocation("cudaMallocManaged", status == 0 ? *pointer : nullptr, bytes,
-                   status);
+  recordAllocation(
+      "cudaMallocManaged", status == 0 ? *pointer : nullptr, bytes, status);
   insideHook = false;
   return status;
 }
 
-extern "C" CudaError cudaMallocAsync(void **pointer, std::size_t bytes,
-                                     CudaStream stream) {
-  using Function = CudaError (*)(void **, std::size_t, CudaStream);
+extern "C" CudaError cudaMallocAsync(
+    void** pointer,
+    std::size_t bytes,
+    CudaStream stream) {
+  using Function = CudaError (*)(void**, std::size_t, CudaStream);
   static auto real = loadNext<Function>("cudaMallocAsync");
   if (real == nullptr) {
     return 999;
@@ -263,14 +279,14 @@ extern "C" CudaError cudaMallocAsync(void **pointer, std::size_t bytes,
   }
   insideHook = true;
   const auto status = real(pointer, bytes, stream);
-  recordAllocation("cudaMallocAsync", status == 0 ? *pointer : nullptr, bytes,
-                   status);
+  recordAllocation(
+      "cudaMallocAsync", status == 0 ? *pointer : nullptr, bytes, status);
   insideHook = false;
   return status;
 }
 
-extern "C" CudaError cudaFree(void *pointer) {
-  using Function = CudaError (*)(void *);
+extern "C" CudaError cudaFree(void* pointer) {
+  using Function = CudaError (*)(void*);
   static auto real = loadNext<Function>("cudaFree");
   if (real == nullptr) {
     return 999;
@@ -285,8 +301,8 @@ extern "C" CudaError cudaFree(void *pointer) {
   return status;
 }
 
-extern "C" CudaError cudaFreeAsync(void *pointer, CudaStream stream) {
-  using Function = CudaError (*)(void *, CudaStream);
+extern "C" CudaError cudaFreeAsync(void* pointer, CudaStream stream) {
+  using Function = CudaError (*)(void*, CudaStream);
   static auto real = loadNext<Function>("cudaFreeAsync");
   if (real == nullptr) {
     return 999;

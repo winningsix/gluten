@@ -32,9 +32,9 @@
 #include "velox/common/future/VeloxPromise.h"
 #include "velox/core/PlanFragment.h"
 #include "velox/core/QueryCtx.h"
-#include "velox/exec/DefaultOutputBufferManager.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/SerializedPage.h"
+#include "velox/exec/DefaultOutputBufferManager.h"
 #include "velox/exec/Task.h"
 
 namespace gluten {
@@ -191,7 +191,9 @@ class MppQueryCoordinator {
   ///
   /// Idempotent: safe to call multiple times. Safe to call before start()
   /// (no-op).
-  void abort(std::chrono::milliseconds perTaskTimeout = std::chrono::milliseconds(10000));
+  void abort(
+      std::chrono::milliseconds perTaskTimeout =
+          std::chrono::milliseconds(10000));
 
   /// Emit one JSON line per Velox operator in every fragment task.
   ///
@@ -247,7 +249,9 @@ class MppQueryCoordinator {
   /// constructing PrestoSerializedPage around each IOBuf so the consumer
   /// path (prepareStreamForDeserialize -> VectorStreamGroup::read) is
   /// unchanged.
-  bool fetchNextOutputPage(std::vector<std::unique_ptr<facebook::velox::exec::SerializedPageBase>>& pages);
+  bool fetchNextOutputPage(
+      std::vector<std::unique_ptr<facebook::velox::exec::SerializedPageBase>>&
+          pages);
 
 #ifdef GLUTEN_ENABLE_GPU
   /// Fetch one packed root output directly from the UCX device queue and
@@ -275,7 +279,8 @@ class MppQueryCoordinator {
   /// Inner size = fragmentReplicaCount_[fragId]. For fragments consuming an
   /// N-partition exchange inner size is N; for leaf/non-consumer fragments
   /// inner size is 1. Each replica i carries destination=i at Task::create.
-  std::vector<std::vector<std::shared_ptr<facebook::velox::exec::Task>>> fragmentTasks_;
+  std::vector<std::vector<std::shared_ptr<facebook::velox::exec::Task>>>
+      fragmentTasks_;
 
   /// Per-fragment replica count. Derived at start() from inbound exchanges'
   /// numPartitions. Fragments with no inbound exchange have count = 1.
@@ -296,10 +301,12 @@ class MppQueryCoordinator {
   /// Output buffer reading state for the root fragment. When root is
   /// replicated we track per-replica sequence + atEnd. Drain strategy is
   /// selected at start() time based on root's inbound exchange type.
-  std::shared_ptr<facebook::velox::exec::DefaultOutputBufferManager> bufferManager_;
+  std::shared_ptr<facebook::velox::exec::DefaultOutputBufferManager>
+      bufferManager_;
   std::vector<int64_t> rootOutputSequence_;
   std::vector<bool> rootReplicaAtEnd_;
-  std::deque<std::unique_ptr<facebook::velox::exec::SerializedPageBase>> pendingRootPages_;
+  std::deque<std::unique_ptr<facebook::velox::exec::SerializedPageBase>>
+      pendingRootPages_;
   int32_t rootFetchCursor_{0};
   bool rootProducesOutput_{true};
   bool deviceRootOutput_{false};

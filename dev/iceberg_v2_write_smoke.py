@@ -21,9 +21,7 @@ def assert_native_write_plan(name, plan, writer):
     if missing:
         raise RuntimeError(f"{name} plan is missing {missing}:\n{plan}")
     if plan.index("MppNativeQuery") < plan.index(writer):
-        raise RuntimeError(
-            f"{name} MPP query is outside the Iceberg writer boundary:\n{plan}"
-        )
+        raise RuntimeError(f"{name} MPP query is outside the Iceberg writer boundary:\n{plan}")
     if "ColumnarToRow" in plan:
         raise RuntimeError(f"{name} plan contains a row boundary:\n{plan}")
 
@@ -41,8 +39,7 @@ def inspect_local_data_files(spark, table, expected_field_ids):
         parquet_file = pq.ParquetFile(local_path)
         parquet_writers.add(parquet_file.metadata.created_by)
         actual_field_ids = {
-            int(value)
-            for value in re.findall(r"field_id=(\d+)", str(parquet_file.schema))
+            int(value) for value in re.findall(r"field_id=(\d+)", str(parquet_file.schema))
         }
         if not expected_field_ids.issubset(actual_field_ids):
             raise RuntimeError(
@@ -70,9 +67,7 @@ def main():
     parser.add_argument("--warehouse", required=True)
     args = parser.parse_args()
 
-    spark = SparkSession.builder.appName(
-        "Iceberg V2 write boundary smoke"
-    ).getOrCreate()
+    spark = SparkSession.builder.appName("Iceberg V2 write boundary smoke").getOrCreate()
     spark.sparkContext.setLogLevel("INFO")
     spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
@@ -126,7 +121,8 @@ def main():
     spark.sql(f"DROP TABLE IF EXISTS {table}")
     spark.sql(f"DROP TABLE IF EXISTS {static_table}")
     spark.sql(f"DROP TABLE IF EXISTS {nested_table}")
-    spark.sql(f"""
+    spark.sql(
+        f"""
         CREATE TABLE {table} (
           id BIGINT,
           p INT,
@@ -134,8 +130,10 @@ def main():
         ) USING iceberg
         PARTITIONED BY (p)
         TBLPROPERTIES ('format-version' = '2')
-        """)
-    spark.sql(f"""
+        """
+    )
+    spark.sql(
+        f"""
         CREATE TABLE {static_table} (
           id BIGINT,
           p INT,
@@ -143,8 +141,10 @@ def main():
         ) USING iceberg
         PARTITIONED BY (p)
         TBLPROPERTIES ('format-version' = '2')
-        """)
-    spark.sql(f"""
+        """
+    )
+    spark.sql(
+        f"""
         CREATE TABLE {nested_table} (
           id BIGINT,
           tags ARRAY<STRING>,
@@ -152,7 +152,8 @@ def main():
           detail STRUCT<label: STRING, score: BIGINT>
         ) USING iceberg
         TBLPROPERTIES ('format-version' = '2')
-        """)
+        """
+    )
 
     append_plan = command_plan(
         spark,
@@ -235,14 +236,16 @@ def main():
             f"SELECT p, count(*) AS count FROM {static_table} GROUP BY p ORDER BY p"
         ).collect()
     }
-    nested_stats = spark.sql(f"""
+    nested_stats = spark.sql(
+        f"""
         SELECT
           count(*) AS count,
           sum(detail.score) AS score_sum,
           count_if(size(tags) = 1) AS single_tag_rows,
           count_if(attrs['source'] = concat('row-', CAST(id AS STRING))) AS matching_attrs
         FROM {nested_table}
-        """).first().asDict()
+        """
+    ).first().asDict()
     snapshots = [
         {
             "operation": row["operation"],
@@ -282,9 +285,7 @@ def main():
             f"expected={expected_nested_stats}, actual={nested_stats}, files={nested_files}"
         )
     if format_version != "2":
-        raise RuntimeError(
-            f"format version mismatch: expected=2, actual={format_version}"
-        )
+        raise RuntimeError(f"format version mismatch: expected=2, actual={format_version}")
     snapshot_operations = [snapshot["operation"] for snapshot in snapshots]
     if snapshot_operations != ["append", "append", "overwrite"]:
         raise RuntimeError(

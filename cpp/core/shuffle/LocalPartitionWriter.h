@@ -138,7 +138,8 @@ class LocalPartitionWriter : public PartitionWriter {
   int64_t mapId_{-1};
 
  public:
-  void setShuffleIdAndMapId(int32_t shuffleId, int64_t mapId) {
+  void setShuffleIdAndMapId(
+      int32_t shuffleId, int64_t mapId) {
     shuffleId_ = shuffleId;
     mapId_ = mapId;
   }

@@ -200,9 +200,9 @@ set(VELOX_SRCS
     utils/VeloxWholeStageDumper.cc
     utils/VeloxWriterUtils.cc)
 
-# AArch64 libstdc++ provides std::to_chars(_Float128) directly and GCC does not
-# ship libquadmath on this architecture. The shim is only needed on platforms
-# where that overload is absent.
+# AArch64 libstdc++ provides std::to_chars(_Float128) directly and GCC does
+# not ship libquadmath on this architecture. The shim is only needed on
+# platforms where that overload is absent.
 if(NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
   list(APPEND VELOX_SRCS utils/GccFloat128ToCharsShim.cc)
 endif()
@@ -284,9 +284,9 @@ if(DEFINED GLUTEN_UCX_HOME AND NOT "${GLUTEN_UCX_HOME}" STREQUAL "")
     set(GLUTEN_UCX_INCLUDE_DIR ${GLUTEN_UCX_HOME})
     set(GLUTEN_UCX_LIBRARY_DIR ${GLUTEN_UCX_HOME})
   endif()
-  set(GLUTEN_UCX_LIBRARIES
-      ${GLUTEN_UCX_LIBRARY_DIR}/libucp.so ${GLUTEN_UCX_LIBRARY_DIR}/libuct.so
-      ${GLUTEN_UCX_LIBRARY_DIR}/libucs.so)
+  set(GLUTEN_UCX_LIBRARIES ${GLUTEN_UCX_LIBRARY_DIR}/libucp.so
+                           ${GLUTEN_UCX_LIBRARY_DIR}/libuct.so
+                           ${GLUTEN_UCX_LIBRARY_DIR}/libucs.so)
   if(EXISTS "${GLUTEN_UCX_LIBRARY_DIR}/libucm.so")
     list(APPEND GLUTEN_UCX_LIBRARIES ${GLUTEN_UCX_LIBRARY_DIR}/libucm.so)
   endif()
@@ -295,8 +295,8 @@ else()
   find_library(GLUTEN_UCP_LIBRARY NAMES ucp REQUIRED)
   find_library(GLUTEN_UCT_LIBRARY NAMES uct REQUIRED)
   find_library(GLUTEN_UCS_LIBRARY NAMES ucs REQUIRED)
-  list(APPEND GLUTEN_UCX_LIBRARIES ${GLUTEN_UCP_LIBRARY} ${GLUTEN_UCT_LIBRARY}
-       ${GLUTEN_UCS_LIBRARY})
+  list(APPEND GLUTEN_UCX_LIBRARIES ${GLUTEN_UCP_LIBRARY}
+       ${GLUTEN_UCT_LIBRARY} ${GLUTEN_UCS_LIBRARY})
   find_library(GLUTEN_UCM_LIBRARY NAMES ucm)
   if(GLUTEN_UCM_LIBRARY)
     list(APPEND GLUTEN_UCX_LIBRARIES ${GLUTEN_UCM_LIBRARY})
@@ -308,18 +308,18 @@ target_include_directories(
   PUBLIC ${CMAKE_SYSTEM_INCLUDE_PATH}
          ${JNI_INCLUDE_DIRS}
          ${VELOX_BUILD_PATH}
-         # ucxx headers fetched by velox FetchContent. The release build tree
-         # (VELOX_BUILD_PATH) does not stage them under _deps, so point at the
-         # ucx-probe build dir explicitly. Required by
-         # velox/experimental/ucx-exchange/Communicator.h's `#include
-         # "ucxx/api.h"`.
+         # ucxx headers fetched by velox FetchContent. The release build
+         # tree (VELOX_BUILD_PATH) does not stage them under _deps, so
+         # point at the ucx-probe build dir explicitly. Required by
+         # velox/experimental/ucx-exchange/Communicator.h's
+         # `#include "ucxx/api.h"`.
          /opt/velox/_build/ucx-probe/_deps/ucxx-src/cpp/include
          ${VELOX_BUILD_PATH}/_deps/ucxx-src/cpp/include
-         # cudf + transitive dep headers fetched by velox FetchContent. cudf
-         # interop types (e.g. cudf/io/types.hpp) aren't propagated through
-         # velox cudf static-library targets; cudf headers transitively include
-         # rmm + cccl + others, so we list each FetchContent _src/include
-         # subtree explicitly.
+         # cudf + transitive dep headers fetched by velox FetchContent.
+         # cudf interop types (e.g. cudf/io/types.hpp) aren't propagated
+         # through velox cudf static-library targets; cudf headers
+         # transitively include rmm + cccl + others, so we list each
+         # FetchContent _src/include subtree explicitly.
          ${VELOX_BUILD_PATH}/_deps/cudf-src/cpp/include
          ${VELOX_BUILD_PATH}/_deps/rmm-src/cpp/include
          ${VELOX_BUILD_PATH}/_deps/rmm-build/include
@@ -329,8 +329,8 @@ target_include_directories(
          ${VELOX_BUILD_PATH}/_deps/cuco-src/include
          ${VELOX_BUILD_PATH}/_deps/kvikio-src/cpp/include
          ${VELOX_BUILD_PATH}/_deps/rapids_logger-src/include
-         # CUDA runtime headers (cuda_runtime_api.h etc.) used transitively by
-         # rmm/cuda_stream_view.hpp.
+         # CUDA runtime headers (cuda_runtime_api.h etc.) used transitively
+         # by rmm/cuda_stream_view.hpp.
          /usr/local/cuda/include
          ${GLUTEN_UCX_INCLUDE_DIR}
          ${CMAKE_CURRENT_SOURCE_DIR}
@@ -339,9 +339,9 @@ target_include_directories(
          ${PROTOBUF_INCLUDE}
          # Forward gluten's public include dirs (substrait/*.pb.h etc.) to
          # downstream consumers. Previously propagated transitively via
-         # `target_link_libraries(velox PUBLIC ... gluten ...)`, which now only
-         # lives in velox's PRIVATE scope to avoid baking libgluten.a into
-         # consumers a second time.
+         # `target_link_libraries(velox PUBLIC ... gluten ...)`, which now
+         # only lives in velox's PRIVATE scope to avoid baking libgluten.a
+         # into consumers a second time.
          $<TARGET_PROPERTY:gluten,INTERFACE_INCLUDE_DIRECTORIES>)
 
 set_target_properties(velox PROPERTIES LIBRARY_OUTPUT_DIRECTORY
@@ -364,22 +364,22 @@ if(ENABLE_JEMALLOC_STATS)
 endif()
 
 # Link the static gluten core library with --whole-archive so that JNI entry
-# points (referenced only from Java, not from C++) are not dropped by the
-# linker. Keep this PRIVATE: the whole-archive/allow-multiple-definition dance
-# is only needed for libgluten.so's own build. Propagating it via PUBLIC causes
-# every downstream consumer (executables, plugin .so's) to bake libgluten.a +
+# points (referenced only from Java, not from C++) are not dropped by the linker.
+# Keep this PRIVATE: the whole-archive/allow-multiple-definition dance is only
+# needed for libgluten.so's own build. Propagating it via PUBLIC causes every
+# downstream consumer (executables, plugin .so's) to bake libgluten.a +
 # libprotobuf.a into themselves a second time, which FATALs at runtime when
 # protobuf's global descriptor pool detects the same .proto registered twice.
-target_link_libraries(
-  velox PRIVATE -Wl,--whole-archive gluten -Wl,--no-whole-archive
-                -Wl,--allow-multiple-definition)
+target_link_libraries(velox PRIVATE
+  -Wl,--whole-archive gluten -Wl,--no-whole-archive
+  -Wl,--allow-multiple-definition)
 
 # Requires VELOX_MONO_LIBRARY=ON when building Velox.
 import_library(facebook::velox ${VELOX_BUILD_PATH}/lib/libvelox.a)
 
 # velox/tpch/gen generator functions (mk_region, sd_cust, etc.) live in
-# libdbgen.a. When libvelox.a is whole-archive'd into libgluten.so, velox's tpch
-# code is pulled in and needs these symbols regardless of BUILD_TESTS.
+# libdbgen.a. When libvelox.a is whole-archive'd into libgluten.so, velox's
+# tpch code is pulled in and needs these symbols regardless of BUILD_TESTS.
 import_library(facebook::velox::dbgen
                ${VELOX_BUILD_PATH}/velox/tpch/gen/dbgen/libdbgen.a)
 add_duckdb()
@@ -388,16 +388,18 @@ import_library(
   facebook::velox::dwio_parquet_thrift_raw
   ${VELOX_BUILD_PATH}/velox/dwio/parquet/thrift/libvelox_dwio_parquet_thrift_raw.a
 )
-set(GLUTEN_S2_LIBRARY "${VELOX_BUILD_PATH}/_deps/s2geometry-build/libs2.a")
+set(GLUTEN_S2_LIBRARY
+    "${VELOX_BUILD_PATH}/_deps/s2geometry-build/libs2.a")
 if(NOT EXISTS "${GLUTEN_S2_LIBRARY}")
-  # Velox's setup script may install s2geometry as a system dependency. In that
-  # case the Velox build consumes /usr/local/lib/libs2.a and no bundled
+  # Velox's setup script may install s2geometry as a system dependency. In
+  # that case the Velox build consumes /usr/local/lib/libs2.a and no bundled
   # s2geometry-build directory is created.
   unset(GLUTEN_S2_LIBRARY)
   find_library(GLUTEN_S2_LIBRARY NAMES s2 REQUIRED)
 endif()
 import_library(external::s2 ${GLUTEN_S2_LIBRARY})
-file(GLOB GLUTEN_ABSL_LIBRARIES "/usr/local/lib/libabsl*.a"
+file(GLOB GLUTEN_ABSL_LIBRARIES
+     "/usr/local/lib/libabsl*.a"
      "/usr/local/lib64/libabsl*.a")
 list(SORT GLUTEN_ABSL_LIBRARIES)
 set(GLUTEN_QUADMATH_LIBRARY "")
@@ -424,9 +426,10 @@ if(BUILD_TESTS)
       ${VELOX_HOME}/velox/exec/tests/utils/CMakeLists.txt)
   set(VELOX_TEMP_PATH_INTERFACE_DEFINITION "")
   if(EXISTS "${VELOX_EXEC_TEST_UTILS_CMAKE}")
-    file(STRINGS "${VELOX_EXEC_TEST_UTILS_CMAKE}"
-         VELOX_TEMP_PATH_INTERFACE_DEFINITION
-         REGEX "velox_add_library\\(velox_temp_path[ \\t]+INTERFACE")
+    file(
+      STRINGS "${VELOX_EXEC_TEST_UTILS_CMAKE}"
+      VELOX_TEMP_PATH_INTERFACE_DEFINITION
+      REGEX "velox_add_library\\(velox_temp_path[ \\t]+INTERFACE")
   endif()
   if(VELOX_TEMP_PATH_INTERFACE_DEFINITION)
     foreach(VELOX_TEMP_PATH_HEADER TempDirectoryPath.h TempFilePath.h)
@@ -440,7 +443,7 @@ if(BUILD_TESTS)
     add_library(facebook::velox::temp_path INTERFACE IMPORTED)
     set_target_properties(
       facebook::velox::temp_path PROPERTIES INTERFACE_INCLUDE_DIRECTORIES
-                                            "${VELOX_HOME}")
+                                              "${VELOX_HOME}")
     message(STATUS "Importing Velox temp_path as a header-only target")
   elseif(EXISTS "${VELOX_TEMP_PATH_LIBRARY}")
     import_library(facebook::velox::temp_path ${VELOX_TEMP_PATH_LIBRARY})
@@ -457,8 +460,7 @@ if(BUILD_TESTS)
     facebook::velox::exec_test_lib
     INTERFACE facebook::velox::vector_test_lib
               facebook::velox::dwio_common_test
-              facebook::velox::file_test_utils
-              facebook::velox::temp_path
+              facebook::velox::file_test_utils facebook::velox::temp_path
               # QueryAssertions and OperatorTestBase in exec_test_lib call
               # DuckDB directly. Keep DuckDB after the importing archive on
               # one-pass GNU linker command lines.
@@ -472,16 +474,16 @@ endif()
 # pulls in every .o so that APIs consumers call but libgluten.so's own code
 # doesn't reference (e.g. folly::Init, various init helpers) are still present
 # in libgluten.so for dynamic symbol lookup.
-target_link_libraries(
-  velox PRIVATE -Wl,--whole-archive facebook::velox -Wl,--no-whole-archive
-                facebook::velox::dbgen)
+target_link_libraries(velox PRIVATE
+  -Wl,--whole-archive facebook::velox -Wl,--no-whole-archive
+  facebook::velox::dbgen)
 
-# PRIVATE + whole-archive: Folly::folly is libfolly.a (STATIC IMPORTED). Same
-# reasoning as facebook::velox above — PRIVATE prevents double-registration of
-# folly's own gflags in consumers; whole-archive ensures consumer-only APIs
+# PRIVATE + whole-archive: Folly::folly is libfolly.a (STATIC IMPORTED).
+# Same reasoning as facebook::velox above — PRIVATE prevents double-registration
+# of folly's own gflags in consumers; whole-archive ensures consumer-only APIs
 # (folly::Init, etc.) are present in libgluten.so for symbol lookup.
-target_link_libraries(velox PRIVATE -Wl,--whole-archive Folly::folly
-                                    -Wl,--no-whole-archive)
+target_link_libraries(velox PRIVATE
+  -Wl,--whole-archive Folly::folly -Wl,--no-whole-archive)
 
 # The velox target embeds the static gluten core archive manually with
 # --whole-archive, so close gluten's public static dependencies on the final
@@ -596,15 +598,15 @@ if(BUILD_EXAMPLES)
   add_subdirectory(udf/examples)
 endif()
 
-# Standalone developer tool binaries (mpp-substrait-runner, etc). Always added
-# so `cmake --build --target mpp-substrait-runner` works without needing to
-# re-run cmake with an extra flag. The binaries link against the existing
-# `velox` target so they incur no extra heavy deps.
+# Standalone developer tool binaries (mpp-substrait-runner, etc).
+# Always added so `cmake --build --target mpp-substrait-runner` works
+# without needing to re-run cmake with an extra flag. The binaries link
+# against the existing `velox` target so they incur no extra heavy deps.
 add_subdirectory(tools)
 
 if(ENABLE_GPU)
-  # Propagate GPU flag to velox target so MppJniWrapper.cc and other sources can
-  # use #ifdef GLUTEN_ENABLE_GPU for GPU-specific code paths.
+  # Propagate GPU flag to velox target so MppJniWrapper.cc and other sources
+  # can use #ifdef GLUTEN_ENABLE_GPU for GPU-specific code paths.
   target_compile_definitions(velox PRIVATE GLUTEN_ENABLE_GPU)
 
   # A cuDF build-tree package config resolves transitive RAPIDS dependencies
@@ -613,9 +615,9 @@ if(ENABLE_GPU)
   # before importing cuDF.
   if(NOT COMMAND CPMFindPackage)
     # CPM records initialization in a GLOBAL property, but CMake command
-    # definitions are directory-scoped. Another subproject can therefore set the
-    # property without making CPMFindPackage visible in this directory. Clear
-    # the stale marker before including CPM in the Velox backend scope.
+    # definitions are directory-scoped. Another subproject can therefore set
+    # the property without making CPMFindPackage visible in this directory.
+    # Clear the stale marker before including CPM in the Velox backend scope.
     set_property(GLOBAL PROPERTY CPM_INITIALIZED)
     if(DEFINED CPM_FILE AND EXISTS "${CPM_FILE}")
       get_filename_component(CPM_FILE "${CPM_FILE}" REALPATH)
@@ -627,8 +629,7 @@ if(ENABLE_GPU)
       get_filename_component(CPM_DIRECTORY "${CPM_FILE}" DIRECTORY)
       include("${CPM_FILE}")
     else()
-      message(
-        FATAL_ERROR "CPMFindPackage is required to import the cuDF build tree")
+      message(FATAL_ERROR "CPMFindPackage is required to import the cuDF build tree")
     endif()
   endif()
 
@@ -666,24 +667,23 @@ if(ENABLE_GPU)
                           ${VELOX_BUILD_PATH}/_deps/curl-build/lib/libcurl.so)
 
   # Static cuDF integration archives: PRIVATE + whole-archive. Like
-  # facebook::velox, these need every .o pulled in so consumer-used APIs end up
-  # exported from libgluten.so. Use full paths instead of imported targets so
-  # cmake doesn't drop the --whole-archive flags.
+  # facebook::velox, these need every .o pulled in so consumer-used APIs
+  # end up exported from libgluten.so. Use full paths instead of imported
+  # targets so cmake doesn't drop the --whole-archive flags.
   target_link_libraries(
     velox
-    PRIVATE
-      -Wl,--whole-archive
-      ${VELOX_BUILD_PATH}/velox/experimental/cudf/exec/libvelox_cudf_exec.a
-      ${VELOX_BUILD_PATH}/velox/experimental/cudf/vector/libvelox_cudf_vector.a
-      ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/libvelox_cudf_hive_connector.a
-      ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/iceberg/libvelox_cudf_iceberg_connector.a
-      ${VELOX_BUILD_PATH}/velox/experimental/cudf/expression/libvelox_cudf_expression.a
-      -Wl,--no-whole-archive)
+    PRIVATE -Wl,--whole-archive
+            ${VELOX_BUILD_PATH}/velox/experimental/cudf/exec/libvelox_cudf_exec.a
+            ${VELOX_BUILD_PATH}/velox/experimental/cudf/vector/libvelox_cudf_vector.a
+            ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/libvelox_cudf_hive_connector.a
+            ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/iceberg/libvelox_cudf_iceberg_connector.a
+            ${VELOX_BUILD_PATH}/velox/experimental/cudf/expression/libvelox_cudf_expression.a
+            -Wl,--no-whole-archive)
   # Shared libs consumers need at link time (cudf::cudf, libcurl): PUBLIC.
   target_link_libraries(velox PUBLIC cudf::cudf velox_curl)
-  # IBM baseline brings in apache thrift symbols transitively (Presto serde uses
-  # thrift for handshake / buffered transport). System Arrow doesn't link them
-  # in, so add /usr/local/lib/libthrift.a here.
+  # IBM baseline brings in apache thrift symbols transitively (Presto serde
+  # uses thrift for handshake / buffered transport). System Arrow doesn't
+  # link them in, so add /usr/local/lib/libthrift.a here.
   target_link_libraries(velox PUBLIC /usr/local/lib/libthrift.a)
   # Legacy RAPIDS layouts expose these dependencies as shared libraries and
   # require explicit links. Current cuDF builds absorb their static archives
@@ -693,13 +693,12 @@ if(ENABLE_GPU)
   get_target_property(_gluten_cudf_type cudf::cudf TYPE)
   get_target_property(_gluten_cudf_location cudf::cudf
                       IMPORTED_LOCATION_RELEASE)
-  if(NOT _gluten_cudf_type STREQUAL "SHARED_LIBRARY"
-     OR NOT EXISTS "${_gluten_cudf_location}")
-    message(
-      FATAL_ERROR
-        "RAPIDS dependencies require an existing shared cudf::cudf; "
-        "observed type=${_gluten_cudf_type}, "
-        "location=${_gluten_cudf_location}")
+  if(NOT _gluten_cudf_type STREQUAL "SHARED_LIBRARY" OR
+     NOT EXISTS "${_gluten_cudf_location}")
+    message(FATAL_ERROR
+            "RAPIDS dependencies require an existing shared cudf::cudf; "
+            "observed type=${_gluten_cudf_type}, "
+            "location=${_gluten_cudf_location}")
   endif()
 
   set(GLUTEN_EXPLICIT_RAPIDS_LIBRARIES)
@@ -709,69 +708,63 @@ if(ENABLE_GPU)
     list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_rmm_shared}")
     message(STATUS "Using legacy shared RMM library: ${_gluten_rmm_shared}")
   else()
-    message(
-      STATUS "Using RMM absorbed by shared cuDF: ${_gluten_cudf_location}")
+    message(STATUS "Using RMM absorbed by shared cuDF: ${_gluten_cudf_location}")
   endif()
 
   set(_gluten_logger_shared
       "${VELOX_BUILD_PATH}/_deps/rapids_logger-build/librapids_logger.so")
   if(EXISTS "${_gluten_logger_shared}")
     list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_logger_shared}")
-    message(
-      STATUS
-        "Using legacy shared RAPIDS logger library: ${_gluten_logger_shared}")
+    message(STATUS
+            "Using legacy shared RAPIDS logger library: ${_gluten_logger_shared}")
   else()
-    message(
-      STATUS
-        "Using RAPIDS logger absorbed by shared cuDF: ${_gluten_cudf_location}")
+    message(STATUS
+            "Using RAPIDS logger absorbed by shared cuDF: ${_gluten_cudf_location}")
   endif()
 
   set(_gluten_kvikio_shared
       "${VELOX_BUILD_PATH}/_deps/kvikio-build/libkvikio.so")
   if(EXISTS "${_gluten_kvikio_shared}")
     list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_kvikio_shared}")
-    message(
-      STATUS "Using legacy shared KvikIO library: ${_gluten_kvikio_shared}")
+    message(STATUS "Using legacy shared KvikIO library: ${_gluten_kvikio_shared}")
   else()
-    message(
-      STATUS "Using KvikIO absorbed by shared cuDF: ${_gluten_cudf_location}")
+    message(STATUS "Using KvikIO absorbed by shared cuDF: ${_gluten_cudf_location}")
   endif()
 
   set(GLUTEN_CUDART_LIBRARY /usr/local/cuda/lib64/libcudart.so)
   if(EXISTS /usr/local/cuda/lib64/libcudart.so.13)
     set(GLUTEN_CUDART_LIBRARY /usr/local/cuda/lib64/libcudart.so.13)
   endif()
-  target_link_libraries(
-    velox
-    PUBLIC ${GLUTEN_EXPLICIT_RAPIDS_LIBRARIES}
-           ${VELOX_BUILD_PATH}/_deps/ucxx-build/libucxx.so
-           ${GLUTEN_CUDART_LIBRARY} ${GLUTEN_UCX_LIBRARIES})
+  target_link_libraries(velox PUBLIC
+    ${GLUTEN_EXPLICIT_RAPIDS_LIBRARIES}
+    ${VELOX_BUILD_PATH}/_deps/ucxx-build/libucxx.so
+    ${GLUTEN_CUDART_LIBRARY}
+    ${GLUTEN_UCX_LIBRARIES})
 endif()
 
 # Keep these at the end of libgluten.so's link line. `facebook::velox` and the
 # cuDF integration archives are pulled in with whole-archive above, and static
 # dependencies must appear after the archives that reference them.
-target_link_libraries(
-  velox
-  PRIVATE duckdb_static
-          -Wl,--start-group
-          Arrow::arrow
-          Arrow::arrow_bundled_dependencies
-          facebook::velox::dwio_parquet_thrift_raw
-          external::s2
-          /usr/local/lib/libthrift.a
-          /usr/local/lib/libthriftcpp2.a
-          /usr/local/lib/libthriftprotocol.a
-          /usr/local/lib/libthrift-core.a
-          /usr/local/lib/libthrifttyperep.a
-          /usr/local/lib/libthriftannotation.a
-          /usr/local/lib/libthrifttype.a
-          /usr/local/lib/libthriftanyrep.a
-          /usr/local/lib/libthriftmetadata.a
-          /usr/local/lib/libthriftfrozen2.a
-          ${GLUTEN_ABSL_LIBRARIES}
-          ${GLUTEN_QUADMATH_LIBRARY}
-          -Wl,--end-group)
+target_link_libraries(velox PRIVATE
+  duckdb_static
+  -Wl,--start-group
+  Arrow::arrow
+  Arrow::arrow_bundled_dependencies
+  facebook::velox::dwio_parquet_thrift_raw
+  external::s2
+  /usr/local/lib/libthrift.a
+  /usr/local/lib/libthriftcpp2.a
+  /usr/local/lib/libthriftprotocol.a
+  /usr/local/lib/libthrift-core.a
+  /usr/local/lib/libthrifttyperep.a
+  /usr/local/lib/libthriftannotation.a
+  /usr/local/lib/libthrifttype.a
+  /usr/local/lib/libthriftanyrep.a
+  /usr/local/lib/libthriftmetadata.a
+  /usr/local/lib/libthriftfrozen2.a
+  ${GLUTEN_ABSL_LIBRARIES}
+  ${GLUTEN_QUADMATH_LIBRARY}
+  -Wl,--end-group)
 
 add_custom_command(
   TARGET velox

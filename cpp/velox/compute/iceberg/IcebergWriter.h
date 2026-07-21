@@ -78,7 +78,8 @@ class IcebergWriter {
   std::shared_ptr<facebook::velox::memory::MemoryPool> pool_;
   std::shared_ptr<facebook::velox::memory::MemoryPool> connectorPool_;
   std::shared_ptr<facebook::velox::connector::hive::HiveConfig> connectorConfig_;
-  std::shared_ptr<const facebook::velox::connector::hive::iceberg::IcebergConfig> icebergConfig_;
+  std::shared_ptr<const facebook::velox::connector::hive::iceberg::IcebergConfig>
+      icebergConfig_;
   std::shared_ptr<facebook::velox::config::ConfigBase> connectorSessionProperties_;
 
   std::shared_ptr<facebook::velox::core::QueryCtx> queryCtx_;

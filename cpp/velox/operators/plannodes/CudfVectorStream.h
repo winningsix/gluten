@@ -17,8 +17,6 @@
 
 #pragma once
 
-#include <cudf/concatenate.hpp>
-#include <nvtx3/nvtx3.hpp>
 #include "compute/ResultIterator.h"
 #include "cudf/GpuLock.h"
 #include "memory/GpuBufferColumnarBatch.h"
@@ -35,6 +33,8 @@
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include <cudf/concatenate.hpp>
+#include <nvtx3/nvtx3.hpp>
 
 namespace gluten {
 
@@ -114,7 +114,7 @@ class CudfVectorStream : public CudfVectorStreamBase {
     // in the IBM-baseline switch. Hard-coded to reasonable defaults pending
     // a long-term port to QueryConfig.
     targetBatchBytes_ = int64_t{2L * 1024 * 1024 * 1024}; // 2GB
-    targetBatchRows_ = int32_t{1'000'000}; // 1M rows
+    targetBatchRows_ = int32_t{1'000'000};                 // 1M rows
   }
 
   bool hasPending() const {
@@ -137,11 +137,15 @@ class CudfVectorStream : public CudfVectorStreamBase {
       if (targetBatchRows_ > 0) {
         return pendingRowCount_ < targetBatchRows_;
       }
-      return pendingRows_.empty() && pendingGpuBatches_.empty();
+      return pendingRows_.empty()
+          && pendingGpuBatches_.empty();
     };
 
     {
-      nvtx3::scoped_range_in<VD> accRange(nvtx3::event_attributes{"ShuffleRead::accumulate", nvtx3::rgb{70, 130, 180}});
+      nvtx3::scoped_range_in<VD> accRange(
+          nvtx3::event_attributes{
+              "ShuffleRead::accumulate",
+              nvtx3::rgb{70, 130, 180}});
       while (belowThreshold()) {
         auto cb = nextInternal();
         if (cb == nullptr) {
@@ -149,19 +153,25 @@ class CudfVectorStream : public CudfVectorStreamBase {
         }
 
         if (cb->getType() == "velox") {
-          auto vb = std::dynamic_pointer_cast<VeloxColumnarBatch>(cb);
+          auto vb =
+              std::dynamic_pointer_cast<VeloxColumnarBatch>(
+                  cb);
           VELOX_CHECK_NOT_NULL(vb);
           auto vp = vb->getRowVector();
           VELOX_CHECK_NOT_NULL(vp);
-          auto cudfVector = std::dynamic_pointer_cast<facebook::velox::cudf_velox::CudfVector>(vp);
+          auto cudfVector = std::dynamic_pointer_cast<
+              facebook::velox::cudf_velox::CudfVector>(vp);
           if (cudfVector != nullptr) {
             if (!pendingRows_.empty()) {
               stashedCudf_ = cudfVector;
               break;
             }
             GpuLockGuard gpuLock;
-            return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
-                vp->pool(), outputType_, vp->size(), cudfVector->release(), cudfVector->stream());
+            return std::make_shared<
+                facebook::velox::cudf_velox::CudfVector>(
+                vp->pool(), outputType_, vp->size(),
+                cudfVector->release(),
+                cudfVector->stream());
           }
           pendingRows_.push_back(vp);
           pendingBytes_ += vp->estimateFlatSize();
@@ -171,11 +181,14 @@ class CudfVectorStream : public CudfVectorStreamBase {
 
 #ifdef GLUTEN_ENABLE_GPU
         if (cb->getType() == "gpu") {
-          auto gpuBatch = std::dynamic_pointer_cast<GpuBufferColumnarBatch>(cb);
+          auto gpuBatch =
+              std::dynamic_pointer_cast<
+                  GpuBufferColumnarBatch>(cb);
           VELOX_CHECK_NOT_NULL(gpuBatch);
           pendingBytes_ += gpuBatch->numBytes();
           pendingRowCount_ += gpuBatch->numRows();
-          pendingGpuBatches_.push_back(std::move(gpuBatch));
+          pendingGpuBatches_.push_back(
+              std::move(gpuBatch));
           continue;
         }
 #endif
@@ -188,45 +201,66 @@ class CudfVectorStream : public CudfVectorStreamBase {
       }
     }
 
-    if (pendingRows_.empty() && pendingGpuBatches_.empty() && stashedCudf_ != nullptr) {
+    if (pendingRows_.empty()
+        && pendingGpuBatches_.empty()
+        && stashedCudf_ != nullptr) {
       auto cudf = std::move(stashedCudf_);
       stashedCudf_ = nullptr;
       GpuLockGuard gpuLock;
-      return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
-          cudf->pool(), outputType_, cudf->size(), cudf->release(), cudf->stream());
+      return std::make_shared<
+          facebook::velox::cudf_velox::CudfVector>(
+          cudf->pool(), outputType_, cudf->size(),
+          cudf->release(), cudf->stream());
     }
 
 #ifdef GLUTEN_ENABLE_GPU
     if (!pendingGpuBatches_.empty()) {
       std::shared_ptr<GpuBufferColumnarBatch> composed;
       {
-        nvtx3::scoped_range_in<VD> compRange(nvtx3::event_attributes{"ShuffleRead::compose", nvtx3::rgb{50, 205, 50}});
+        nvtx3::scoped_range_in<VD> compRange(
+            nvtx3::event_attributes{
+                "ShuffleRead::compose",
+                nvtx3::rgb{50, 205, 50}});
         ScopedTimer composeTimer(&composeNs_);
-        composed = GpuBufferColumnarBatch::compose(getPinnedArrowMemoryPool(), pendingGpuBatches_, pendingRowCount_);
+        composed = GpuBufferColumnarBatch::compose(
+            getPinnedArrowMemoryPool(),
+            pendingGpuBatches_, pendingRowCount_);
       }
 
       GpuLockGuard gpuLock;
       std::shared_ptr<VeloxColumnarBatch> vcb;
       {
-        nvtx3::scoped_range_in<VD> h2dRange(nvtx3::event_attributes{"ShuffleRead::H2D", nvtx3::rgb{220, 20, 60}});
+        nvtx3::scoped_range_in<VD> h2dRange(
+            nvtx3::event_attributes{
+                "ShuffleRead::H2D",
+                nvtx3::rgb{220, 20, 60}});
         ScopedTimer h2dTimer(&h2dUploadNs_);
-        vcb = gpuBuffersToCudfVector(composed->getRowType(), composed->numRows(), composed->buffers(), pool_);
+        vcb = gpuBuffersToCudfVector(
+            composed->getRowType(),
+            composed->numRows(),
+            composed->buffers(), pool_);
       }
       VELOX_CHECK_NOT_NULL(vcb);
 
-      numCoalescedBatches_ += (pendingGpuBatches_.size() > 1) ? 1 : 0;
+      numCoalescedBatches_ +=
+          (pendingGpuBatches_.size() > 1) ? 1 : 0;
       ++gpuBatchUploads_;
       pendingGpuBatches_.clear();
       pendingBytes_ = 0;
       pendingRowCount_ = 0;
 
-      auto vb = std::dynamic_pointer_cast<VeloxColumnarBatch>(vcb);
+      auto vb =
+          std::dynamic_pointer_cast<VeloxColumnarBatch>(
+              vcb);
       VELOX_CHECK_NOT_NULL(vb);
       auto rv = vb->getRowVector();
-      auto cudfVec = std::dynamic_pointer_cast<facebook::velox::cudf_velox::CudfVector>(rv);
+      auto cudfVec = std::dynamic_pointer_cast<
+          facebook::velox::cudf_velox::CudfVector>(rv);
       VELOX_CHECK_NOT_NULL(cudfVec);
-      return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
-          pool_, outputType_, cudfVec->size(), cudfVec->release(), cudfVec->stream());
+      return std::make_shared<
+          facebook::velox::cudf_velox::CudfVector>(
+          pool_, outputType_, cudfVec->size(),
+          cudfVec->release(), cudfVec->stream());
     }
 #endif
 
@@ -235,9 +269,13 @@ class CudfVectorStream : public CudfVectorStreamBase {
     }
 
     {
-      nvtx3::scoped_range_in<VD> batchH2d(nvtx3::event_attributes{"ShuffleRead::batchedH2D", nvtx3::rgb{220, 20, 60}});
+      nvtx3::scoped_range_in<VD> batchH2d(
+          nvtx3::event_attributes{
+              "ShuffleRead::batchedH2D",
+              nvtx3::rgb{220, 20, 60}});
       GpuLockGuard gpuLock;
-      auto stream = facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
+      auto stream =
+          facebook::velox::cudf_velox::cudfGlobalStreamPool().get_stream();
       // toCudfTableBatched (vector input) was removed in the IBM-baseline
       // switch in favour of single-RowVector toCudfTable. Convert each
       // pending row vector individually, then concatenate the resulting
@@ -245,12 +283,15 @@ class CudfVectorStream : public CudfVectorStreamBase {
       auto mr = facebook::velox::cudf_velox::get_output_mr();
       std::unique_ptr<cudf::table> tbl;
       if (pendingRows_.size() == 1) {
-        tbl = facebook::velox::cudf_velox::with_arrow::toCudfTable(pendingRows_.front(), pool_, stream, mr);
+        tbl = facebook::velox::cudf_velox::with_arrow::toCudfTable(
+            pendingRows_.front(), pool_, stream, mr);
       } else {
         std::vector<std::unique_ptr<cudf::table>> parts;
         parts.reserve(pendingRows_.size());
         for (auto& rv : pendingRows_) {
-          parts.emplace_back(facebook::velox::cudf_velox::with_arrow::toCudfTable(rv, pool_, stream, mr));
+          parts.emplace_back(
+              facebook::velox::cudf_velox::with_arrow::toCudfTable(
+                  rv, pool_, stream, mr));
         }
         std::vector<cudf::table_view> views;
         views.reserve(parts.size());
@@ -262,14 +303,17 @@ class CudfVectorStream : public CudfVectorStreamBase {
       VELOX_CHECK_NOT_NULL(tbl);
       const auto size = tbl->num_rows();
 
-      numCoalescedBatches_ += (pendingRows_.size() > 1) ? 1 : 0;
+      numCoalescedBatches_ +=
+          (pendingRows_.size() > 1) ? 1 : 0;
 
       pendingRows_.clear();
       pendingBytes_ = 0;
       pendingRowCount_ = 0;
 
-      return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
-          pool_, outputType_, size, std::move(tbl), stream);
+      return std::make_shared<
+          facebook::velox::cudf_velox::CudfVector>(
+          pool_, outputType_, size,
+          std::move(tbl), stream);
     }
   }
 
@@ -280,7 +324,8 @@ class CudfVectorStream : public CudfVectorStreamBase {
   void logTimingSummary() const {
     if (gpuBatchUploads_ > 0) {
       LOG(INFO) << "CudfVectorStream summary: gpuBatchUploads=" << gpuBatchUploads_
-                << " composeMs=" << (composeNs_ / 1'000'000) << " h2dUploadMs=" << (h2dUploadNs_ / 1'000'000)
+                << " composeMs=" << (composeNs_ / 1'000'000)
+                << " h2dUploadMs=" << (h2dUploadNs_ / 1'000'000)
                 << " coalesced=" << numCoalescedBatches_;
     }
   }
@@ -400,7 +445,9 @@ class CudfValueStream : public facebook::velox::exec::SourceOperator, public fac
     auto count = rvStream_->numCoalescedBatches();
     if (count > 0) {
       auto lockedStats = stats_.wlock();
-      lockedStats->addRuntimeStat("numCoalescedBatches", facebook::velox::RuntimeCounter(count));
+      lockedStats->addRuntimeStat(
+          "numCoalescedBatches",
+          facebook::velox::RuntimeCounter(count));
     }
   }
 

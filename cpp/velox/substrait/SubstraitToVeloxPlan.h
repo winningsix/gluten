@@ -34,7 +34,9 @@ struct WindowInputOrdering {
   bool inputsSorted;
 };
 
-WindowInputOrdering selectWindowInputOrdering(const core::PlanNodePtr& input, bool preserveSortedInput);
+WindowInputOrdering selectWindowInputOrdering(
+    const core::PlanNodePtr& input,
+    bool preserveSortedInput);
 
 } // namespace detail
 

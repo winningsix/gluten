@@ -46,8 +46,10 @@ class VeloxGpuHashShuffleWriter : public VeloxHashShuffleWriter {
   arrow::Status stop() override {
     if (gpuWriteBatches_ > 0) {
       LOG(INFO) << "GpuShuffleWriter summary: batches=" << gpuWriteBatches_
-                << " gpuPartitionMs=" << (gpuPartitionNs_ / 1'000'000) << " d2hMs=" << (d2hNs_ / 1'000'000)
-                << " extractMs=" << (extractBufferNs_ / 1'000'000) << " evictMs=" << (evictNs_ / 1'000'000)
+                << " gpuPartitionMs=" << (gpuPartitionNs_ / 1'000'000)
+                << " d2hMs=" << (d2hNs_ / 1'000'000)
+                << " extractMs=" << (extractBufferNs_ / 1'000'000)
+                << " evictMs=" << (evictNs_ / 1'000'000)
                 << " cpuFallbackBatches=" << cpuFallbackBatches_;
     }
     return VeloxHashShuffleWriter::stop();
@@ -70,7 +72,8 @@ class VeloxGpuHashShuffleWriter : public VeloxHashShuffleWriter {
     return sizeof(int64_t) * newSize;
   }
 
-  arrow::Status gpuPartitionAndEvict(std::shared_ptr<facebook::velox::cudf_velox::CudfVector> cudfVec);
+  arrow::Status gpuPartitionAndEvict(
+      std::shared_ptr<facebook::velox::cudf_velox::CudfVector> cudfVec);
 
   // Fast path for data pre-partitioned by CudfShufflePartition in the pipeline.
   // The RowVector's first column contains sorted PIDs; scan for boundaries and

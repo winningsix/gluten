@@ -49,9 +49,12 @@ class ShuffleCompressionPool {
   }
 
   template <typename F>
-  auto submit(F&& func) -> std::future<decltype(func())> {
+  auto submit(F&& func)
+      -> std::future<decltype(func())> {
     using R = decltype(func());
-    auto task = std::make_shared<std::packaged_task<R()>>(std::forward<F>(func));
+    auto task =
+        std::make_shared<std::packaged_task<R()>>(
+            std::forward<F>(func));
     auto future = task->get_future();
     {
       std::unique_lock<std::mutex> lock(mutex_);
@@ -99,7 +102,9 @@ class ShuffleCompressionPool {
           Task task;
           {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] { return stopped_ || !queue_.empty(); });
+            cv_.wait(lock, [this] {
+              return stopped_ || !queue_.empty();
+            });
             if (stopped_ && queue_.empty()) {
               return;
             }
@@ -113,8 +118,10 @@ class ShuffleCompressionPool {
     }
   }
 
-  ShuffleCompressionPool(const ShuffleCompressionPool&) = delete;
-  ShuffleCompressionPool& operator=(const ShuffleCompressionPool&) = delete;
+  ShuffleCompressionPool(
+      const ShuffleCompressionPool&) = delete;
+  ShuffleCompressionPool& operator=(
+      const ShuffleCompressionPool&) = delete;
 
   std::vector<std::thread> workers_;
   std::queue<Task> queue_;

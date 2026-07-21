@@ -18,6 +18,5 @@ add_test_case(object_store_test SOURCES ObjectStoreTest.cc)
 add_test_case(parallel_compression_test SOURCES ParallelCompressionTest.cc)
 
 add_executable(parallel_compression_bench ParallelCompressionBench.cc)
-target_include_directories(parallel_compression_bench
-                           PRIVATE ${CMAKE_SOURCE_DIR}/core)
+target_include_directories(parallel_compression_bench PRIVATE ${CMAKE_SOURCE_DIR}/core)
 target_link_libraries(parallel_compression_bench gluten Arrow::arrow)

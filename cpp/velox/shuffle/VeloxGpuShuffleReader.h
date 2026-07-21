@@ -66,7 +66,8 @@ class VeloxGpuHashShuffleReaderDeserializer final : public ColumnarBatchIterator
   bool reachedEos_{false};
   bool blockTypeResolved_{false};
 
-  std::deque<BlockPayload::PendingDecompression> prefetchQueue_;
+  std::deque<BlockPayload::PendingDecompression>
+      prefetchQueue_;
   static constexpr size_t kMaxPrefetch = 16;
 
   void fillPrefetchQueue();
