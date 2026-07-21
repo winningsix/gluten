@@ -23,7 +23,7 @@ import org.apache.spark.sql.{QueryTest, SparkSession}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, AttributeReference, ExprId, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical.{IdentityBroadcastMode, RangePartitioning}
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarShuffleExchangeExec, LocalTableScanExec, ProjectExec, ScalarSubquery, SparkPlan, SubqueryExec, UnionExec}
+import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarShuffleExchangeExec, ProjectExec, ScalarSubquery, SparkPlan, SubqueryExec, UnionExec}
 import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
 import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.IntegerType
@@ -130,7 +130,7 @@ class MppSuppressDeadBroadcastsRuleSuite extends QueryTest with SharedSparkSessi
     val subquery = SubqueryExec("expression-subquery", exchange)
     val project = ProjectExec(
       Seq(Alias(ScalarSubquery(subquery, ExprId(1L)), "scalar_value")()),
-      LocalTableScanExec(Seq.empty, Seq(InternalRow.empty)))
+      LocalTableScanExecCompat(Seq.empty, Seq(InternalRow.empty)))
 
     MppSuppressDeadBroadcastsRule()(mpp(project))
 
@@ -143,7 +143,7 @@ class MppSuppressDeadBroadcastsRuleSuite extends QueryTest with SharedSparkSessi
     val subquery = SubqueryExec("committed-expression-subquery", exchange)
     val project = ProjectExec(
       Seq(Alias(ScalarSubquery(subquery, ExprId(2L)), "scalar_value")()),
-      LocalTableScanExec(Seq.empty, Seq(InternalRow.empty)))
+      LocalTableScanExecCompat(Seq.empty, Seq(InternalRow.empty)))
 
     mpp(project).suppressDeadBroadcastsForNativeMpp(project)
 

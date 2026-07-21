@@ -3958,7 +3958,7 @@ case class MppNativeQueryExec(
         exchanges.map {
           spec =>
             if (
-              spec.exchangeType == "HASH" &&
+              (spec.exchangeType == "HASH" || spec.exchangeType == "RANGE") &&
               spec.numPartitions > cap
             ) {
               logDebug(

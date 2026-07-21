@@ -16,12 +16,16 @@
  */
 package org.apache.gluten.execution
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, CurrentRow, Expression, Rank, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, CurrentRow, Expression, Literal, RangeFrame, Rank, RowFrame, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedFollowing, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Count, Sum}
 import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.types.{ByteType, DoubleType, IntegerType, LongType, ShortType}
 
 private[execution] object MppWindowInputOrdering {
   sealed private trait WindowKind
   private case object RankLike extends WindowKind
+  private case object FullPartitionCount extends WindowKind
+  private case object RunningRangeSum extends WindowKind
 
   private[execution] case class OrderingStats(markedWindows: Int)
 
@@ -64,6 +68,24 @@ private[execution] object MppWindowInputOrdering {
               if window.orderSpec.nonEmpty &&
                 hasFrame(spec, UnboundedPreceding, CurrentRow) =>
             Some(RankLike)
+          case aggregate: AggregateExpression
+              if !aggregate.isDistinct && aggregate.filter.isEmpty =>
+            aggregate.aggregateFunction match {
+              case count: Count
+                  if window.orderSpec.isEmpty &&
+                    count.children.size == 1 &&
+                    count.children.head.isInstanceOf[Literal] &&
+                    count.children.head.asInstanceOf[Literal].value != null &&
+                    hasFrame(spec, UnboundedPreceding, UnboundedFollowing, Some(RowFrame)) =>
+                Some(FullPartitionCount)
+              case sum: Sum
+                  if window.orderSpec.nonEmpty &&
+                    sum.child.isInstanceOf[Attribute] &&
+                    supportedRangeSumType(sum.child.dataType) &&
+                    hasFrame(spec, UnboundedPreceding, CurrentRow, Some(RangeFrame)) =>
+                Some(RunningRangeSum)
+              case _ => None
+            }
           case _ => None
         }
       case _ => None
@@ -89,6 +111,13 @@ private[execution] object MppWindowInputOrdering {
       case _ => false
     }
   }
+
+  private def supportedRangeSumType(dataType: org.apache.spark.sql.types.DataType): Boolean =
+    dataType == ByteType ||
+      dataType == ShortType ||
+      dataType == IntegerType ||
+      dataType == LongType ||
+      dataType == DoubleType
 
   private def sameExpressions(left: Seq[Expression], right: Seq[Expression]): Boolean = {
     left.length == right.length && left.zip(right).forall {

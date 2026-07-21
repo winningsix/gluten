@@ -161,7 +161,11 @@ class PushSelectiveDimensionFilterIntoAggregateSuite extends QueryTest with Shar
 
   private def semiBelowGroupedAggregate(plan: LogicalPlan): Boolean = {
     plan.exists {
-      case Aggregate(Seq(_), _, Join(_, _, LeftSemi, Some(_), _)) => true
+      case aggregate: Aggregate if aggregate.groupingExpressions.size == 1 =>
+        aggregate.child match {
+          case Join(_, _, LeftSemi, Some(_), _) => true
+          case _ => false
+        }
       case _ => false
     }
   }
@@ -184,7 +188,7 @@ class PushSelectiveDimensionFilterIntoAggregateSuite extends QueryTest with Shar
 
   private def containsGroupedAggregate(plan: LogicalPlan): Boolean = {
     plan.exists {
-      case Aggregate(grouping, _, _) if grouping.nonEmpty => true
+      case aggregate: Aggregate if aggregate.groupingExpressions.nonEmpty => true
       case _ => false
     }
   }
@@ -375,15 +379,18 @@ class PushSelectiveDimensionFilterIntoAggregateSuite extends QueryTest with Shar
   test("does not rewrite a multi-key aggregate") {
     var changed = false
     val multiKey = originalPlan().transformUp {
-      case aggregate @ Aggregate(Seq(grouping: Attribute), aggregateExpressions, child)
-          if !changed =>
-        child.output.find(!_.semanticEquals(grouping)) match {
-          case Some(secondGrouping) =>
-            changed = true
-            aggregate.copy(
-              groupingExpressions = Seq(grouping, secondGrouping),
-              aggregateExpressions = aggregateExpressions :+ secondGrouping)
-          case None => aggregate
+      case aggregate: Aggregate if !changed =>
+        aggregate.groupingExpressions match {
+          case Seq(grouping: Attribute) =>
+            aggregate.child.output.find(!_.semanticEquals(grouping)) match {
+              case Some(secondGrouping) =>
+                changed = true
+                aggregate.copy(
+                  groupingExpressions = Seq(grouping, secondGrouping),
+                  aggregateExpressions = aggregate.aggregateExpressions :+ secondGrouping)
+              case None => aggregate
+            }
+          case _ => aggregate
         }
     }
     assert(changed, multiKey.treeString)

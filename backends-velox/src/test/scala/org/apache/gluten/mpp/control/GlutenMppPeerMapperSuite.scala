@@ -16,7 +16,7 @@
  */
 package org.apache.gluten.mpp.control
 
-import org.apache.gluten.execution.UcxEndpointInfo
+import org.apache.gluten.execution.{MppPeerInfo, UcxEndpointInfo}
 
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -91,6 +91,18 @@ class GlutenMppPeerMapperSuite extends AnyFunSuite {
     assert(out.head.preferredLocation == "executor_bmHost_e1")
   }
 
+  test("UCX connection prefers a non-loopback BlockManager IP over another listener NIC") {
+    val infos = Seq(
+      info(
+        "e1",
+        host = "10.87.131.11",
+        blockManagerHost = "10.87.131.11",
+        ucxHost = "10.87.131.15"))
+    val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 1)
+    assert(out.head.host == "10.87.131.11")
+    assert(out.head.preferredLocation == "executor_10.87.131.11_e1")
+  }
+
   test("UCX connection does not replace listener host with localhost placement host") {
     val infos =
       Seq(info("e1", host = "infoHost", blockManagerHost = "localhost", ucxHost = "ucxHost"))
@@ -111,7 +123,7 @@ class GlutenMppPeerMapperSuite extends AnyFunSuite {
     val infos = Seq(info("e1", host = "infoHost", blockManagerHost = "", ucxHost = "ucxHost"))
     val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 1)
     assert(out.head.host == "ucxHost")
-    assert(out.head.preferredLocation == "executor_ucxHost_e1")
+    assert(out.head.preferredLocation == "executor_infoHost_e1")
   }
 
   test("requestedCount truncation matches take()") {
@@ -164,15 +176,7 @@ class GlutenMppPeerMapperSuite extends AnyFunSuite {
   }
 
   test("toPeerEndpointsJson escapes quote / backslash / control chars in peerId and host") {
-    val peers = GlutenMppPeerMapper.toMppPeerInfos(
-      Seq(
-        info(
-          executorId = """e"1\x""",
-          host = "h\ta\nb",
-          blockManagerHost = "h\ta\nb",
-          ucxListenerPort = 60000,
-          ucxHost = "ucxHost")),
-      1)
+    val peers = Seq(MppPeerInfo("""e"1\x""", "h\ta\nb", 59997, "unused"))
     val json = GlutenMppPeerMapper.toPeerEndpointsJson(peers)
     // Must escape: " -> \", \ -> \\, \t -> \t, \n -> \n
     val expected =

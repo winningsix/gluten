@@ -298,6 +298,13 @@ void VeloxBackend::init(
          backendConf_->get(
              kCudfExchangeBatchSizeMinThreshold,
              kCudfExchangeBatchSizeMinThresholdDefault)},
+        // Bound post-exchange concat independently from aggregation concat.
+        // Wide exchange inputs can exhaust the device before reaching the row
+        // target. Keep the default large enough to avoid excessive UCX batches.
+        {velox::cudf_velox::CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
+         backendConf_->get(
+             kCudfExchangeBatchSizeMinThresholdBytes,
+             kCudfExchangeBatchSizeMinThresholdBytesDefault)},
         // Keep the new bounded external-sort implementation. MPP uses the
         // previously validated 3 GiB run/output bounds so 30 TB Q2/Q11 do not
         // spill or split already materialized local sorts into thousands of

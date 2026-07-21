@@ -492,12 +492,10 @@ void MppQueryCoordinator::start() {
                << " localPeerId=" << localPeerId_;
 
   // Write-in-MPP: detect whether the root fragment is a distributed TableWrite.
-  // When it is, the root must NOT use the SELECT ORDER-BY drain model (one
-  // ordered stream on peer0). Instead every peer runs one TableWrite over the
-  // slice it owns and drains its own commit batch. This single flag flips the
-  // three places that otherwise special-case a root RANGE exchange for ordered
-  // SELECT: per-peer replica count (1 writer/peer), destination ownership (fan
-  // across peers, not peer0-only), and rootProducesOutput_ (all peers emit).
+  // A write root runs exactly one TableWrite per peer over all HASH/RANGE
+  // destinations that peer owns and drains its local commit batch. Non-write
+  // RANGE roots use the same peer ownership, but retain sequential local drain
+  // so RANGE destinations stay ordered within each Spark output partition.
   const bool rootIsWrite = [&]() {
     std::function<bool(const core::PlanNodePtr&)> hasTableWrite = [&](const core::PlanNodePtr& node) -> bool {
       if (node == nullptr) {
@@ -742,13 +740,6 @@ void MppQueryCoordinator::start() {
     if (peerCount_ <= 1 || exchange.partitionType == "BROADCAST") {
       return true;
     }
-    if (exchange.consumerFragmentId == rootFragmentId_ && exchange.partitionType == "RANGE" && !rootIsWrite) {
-      // Preserve final ORDER BY by draining the root RANGE exchange on
-      // peer0 until we implement a k-way merge across Spark partitions.
-      // A distributed write root instead fans destinations across peers
-      // (below), so each peer writes the slice it owns.
-      return peerIndex == 0;
-    }
     if (exchange.partitionType == "HASH" || exchange.partitionType == "RANGE") {
       for (int dest = 0; dest < std::max(1, exchange.numPartitions); ++dest) {
         if (destinationOwner(dest, std::max(1, exchange.numPartitions)) == peerIndex) {
@@ -838,12 +829,7 @@ void MppQueryCoordinator::start() {
       int32_t ownedDestinations = 0;
       const auto destinations = std::max(1, exchange.numPartitions);
       for (int32_t dest = 0; dest < destinations; ++dest) {
-        const bool owned =
-            exchange.consumerFragmentId == rootFragmentId_ &&
-                exchange.partitionType == "RANGE" && !rootIsWrite
-            ? peerIndex == 0
-            : destinationOwner(dest, destinations) == peerIndex;
-        ownedDestinations += owned ? 1 : 0;
+        ownedDestinations += destinationOwner(dest, destinations) == peerIndex ? 1 : 0;
       }
       return std::min(base, ownedDestinations);
     }
@@ -875,19 +861,12 @@ void MppQueryCoordinator::start() {
         rootDrainSequential_ = true;
       }
       if (peerCount_ > 1) {
-        if (exchange.partitionType == "RANGE") {
-          // Final ORDER BY uses RANGE partitions. Keep the final ordered drain
-          // on one Spark output partition until a k-way merge output iterator
-          // exists across peer coordinators.
-          rootProducesOutput_ = peerIndex_ == 0;
-        } else if (exchange.partitionType == "HASH") {
-          rootProducesOutput_ = false;
-          for (int dest = 0; dest < std::max(1, exchange.numPartitions); ++dest) {
-            if (destinationOwner(dest, std::max(1, exchange.numPartitions)) == peerIndex_) {
-              rootProducesOutput_ = true;
-              break;
-            }
-          }
+        if (exchange.partitionType == "HASH" || exchange.partitionType == "RANGE") {
+          // MppNativeQueryRDD partition index is the native peer index. The
+          // weighted owner function assigns contiguous destination ranges in
+          // peer order, so RANGE remains globally ordered across Spark output
+          // partitions while each peer drains its local replicas sequentially.
+          rootProducesOutput_ = fragmentReplicaCount_[rootFragmentId_] > 0;
         } else if (exchange.partitionType != "BROADCAST") {
           rootProducesOutput_ = peerIndex_ == 0;
         }
@@ -901,7 +880,7 @@ void MppQueryCoordinator::start() {
     // inbound exchange. peerHasFragment() above already zeroed replicaCount for
     // peers that own none: a SINGLE/ROUND_ROBIN gather (global top-N / global
     // aggregation / scalar subquery) is peer0-only, while HASH/RANGE is fanned
-    // dest % peerCount. Mirror that here. Forcing every peer to produce breaks
+    // across peers. Mirror that here. Forcing every peer to produce breaks
     // SINGLE-gather writes -- peer!=0 has no slice, so its TableWrite's inbound
     // exchange source blocks forever in WaitingForMetadata (no producer ever
     // targets that destination), hanging the query. HASH/RANGE writes still
@@ -1355,7 +1334,6 @@ void MppQueryCoordinator::start() {
     //   http://127.0.0.1:<port-3>/v1/task/<taskId>/results/<dest>
     const bool isHash = exchange.partitionType == "HASH";
     const bool isRange = exchange.partitionType == "RANGE";
-    const bool isRootConsumer = exchange.consumerFragmentId == rootFragmentId_;
     const auto totalDestinations = std::max(1, exchange.numPartitions);
     const auto peerOwnsDestination = [&](int dest) {
       if (peerCount_ <= 1) {
@@ -1363,9 +1341,6 @@ void MppQueryCoordinator::start() {
       }
       if (isBroadcast) {
         return true;
-      }
-      if (isRootConsumer && isRange && !rootIsWrite) {
-        return peerIndex_ == 0;
       }
       if (isHash || isRange) {
         return destinationOwner(dest, totalDestinations) == peerIndex_;

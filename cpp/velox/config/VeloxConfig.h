@@ -311,6 +311,10 @@ const std::string kCudfExchangeBatchSizeMinThreshold =
     "spark.gluten.sql.columnar.backend.velox.cudf.exchange_batch_size_min_threshold";
 const std::string kCudfExchangeBatchSizeMinThresholdDefault = "32000000";
 
+const std::string kCudfExchangeBatchSizeMinThresholdBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.exchange_batch_size_min_threshold_bytes";
+const std::string kCudfExchangeBatchSizeMinThresholdBytesDefault = "33554432";
+
 // Optional byte threshold for CudfBatchConcat. Keep this independent from the
 // generic GPU target: a 2 GiB inherited default fragments aggregation input
 // and regresses Q16/Q17 at SF30000. Zero preserves the existing row threshold;

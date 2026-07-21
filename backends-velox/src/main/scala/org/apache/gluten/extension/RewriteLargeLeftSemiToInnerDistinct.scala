@@ -158,10 +158,10 @@ case class RewriteLargeLeftSemiToInnerDistinct(spark: SparkSession)
   private def isAlreadyUniqueOn(plan: LogicalPlan, equiKeys: AttributeSet, depth: Int): Boolean = {
     val maxWrapperDepth = 4
     plan match {
-      case Aggregate(groupingExpressions, _, _) if groupingExpressions.nonEmpty =>
+      case aggregate: Aggregate if aggregate.groupingExpressions.nonEmpty =>
         // GROUP BY (orderkey) is unique for a join on (orderkey, delayedMin). The inverse is not
         // true, hence grouping must be a subset of the equi keys rather than merely intersect it.
-        groupingExpressions.forall {
+        aggregate.groupingExpressions.forall {
           case groupingAttribute: Attribute =>
             equiKeys.exists(_.semanticEquals(groupingAttribute))
           case _ => false
