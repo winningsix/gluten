@@ -149,12 +149,9 @@ class VeloxListenerApi extends ListenerApi with Logging {
 
   override def onDriverShutdown(): Unit = {
     GlutenMppDriverService.shutdown()
-    try {
-      GpuMemoryTrackerJniWrapper.shutdown()
-    } catch {
-      case _: UnsatisfiedLinkError =>
-    }
-    shutdown()
+    // NativeBackendInitializer and GpuMemoryTracker are initialized once per JVM. Their terminal
+    // cleanup is owned by NativeBackendInitializer's JVM shutdown hook so a later SparkContext in
+    // this JVM can keep using the process-wide Velox backend.
   }
 
   override def onExecutorStart(pc: PluginContext): Unit = {
@@ -186,12 +183,6 @@ class VeloxListenerApi extends ListenerApi with Logging {
 
   override def onExecutorShutdown(): Unit = {
     GlutenMppExecutorService.onExecutorShutdown()
-    try {
-      GpuMemoryTrackerJniWrapper.shutdown()
-    } catch {
-      case _: UnsatisfiedLinkError =>
-    }
-    shutdown()
   }
 
   private def initialize(conf: SparkConf, isDriver: Boolean): Unit = {
@@ -338,14 +329,11 @@ class VeloxListenerApi extends ListenerApi with Logging {
     }
   }
 
-  private def shutdown(): Unit = {
-    NativeBackendInitializer.forBackend(VeloxBackend.BACKEND_NAME).shutdown()
-  }
 }
 
 object VeloxListenerApi {
-  // TODO: Implement graceful shutdown and remove these flags.
-  //  As spark conf may change when active Spark session is recreated.
+  // The native backend and the other static initializers are process-scoped. A recreated
+  // SparkContext reuses the first context's native configuration until the JVM exits.
   private val driverInitialized: AtomicBoolean = new AtomicBoolean(false)
   private val executorInitialized: AtomicBoolean = new AtomicBoolean(false)
   private val platformLibDir: String = {

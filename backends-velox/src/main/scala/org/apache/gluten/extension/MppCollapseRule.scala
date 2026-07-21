@@ -36,8 +36,8 @@ import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.command.{DataWritingCommandExec, ExecutedCommandExec}
 import org.apache.spark.sql.execution.datasources.v2.{V2CommandExec, V2TableWriteExec}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, ShuffleExchangeLike}
-import org.apache.spark.sql.execution.python.EvalPythonExecTransformer
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, ShuffledHashJoinExec}
+import org.apache.spark.sql.execution.python.EvalPythonExecTransformer
 import org.apache.spark.sql.internal.SQLConf
 
 import java.util.concurrent.atomic.AtomicInteger

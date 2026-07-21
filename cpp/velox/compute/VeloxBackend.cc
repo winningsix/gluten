@@ -31,6 +31,7 @@
 #endif
 #ifdef GLUTEN_ENABLE_GPU
 #include "cudf/CheckOverflowInTableInsertCudf.h"
+#include "cudf/GpuMemoryTracker.h"
 #include "operators/plannodes/CudfVectorStream.h"
 #include "ucs/config/global_opts.h"
 #include "ucs/debug/debug.h"
@@ -537,6 +538,13 @@ VeloxBackend* VeloxBackend::get() {
   return instance_.get();
 }
 
+VeloxMemoryManager* VeloxBackend::getGlobalMemoryManager() const {
+  if (!globalMemoryManager_) {
+    throw GlutenException("VeloxBackend global memory manager is unavailable after terminal teardown.");
+  }
+  return globalMemoryManager_.get();
+}
+
 void VeloxBackend::tearDown() {
   if (tornDown_.exchange(true, std::memory_order_acq_rel)) {
     return;
@@ -554,6 +562,7 @@ void VeloxBackend::tearDown() {
     // keepalive references, then release both owners in that order.
     facebook::velox::ucx_exchange::Communicator::shutdown();
     ucxCommunicator_.reset();
+    GpuMemoryTracker::shutdown();
 #endif
 
 #ifdef ENABLE_HDFS

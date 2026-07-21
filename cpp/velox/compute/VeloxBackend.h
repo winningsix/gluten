@@ -58,9 +58,7 @@ class VeloxBackend {
     return backendConf_;
   }
 
-  VeloxMemoryManager* getGlobalMemoryManager() const {
-    return globalMemoryManager_.get();
-  }
+  VeloxMemoryManager* getGlobalMemoryManager() const;
 
   void tearDown();
 

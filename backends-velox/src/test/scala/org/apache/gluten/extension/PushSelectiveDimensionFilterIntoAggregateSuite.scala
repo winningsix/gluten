@@ -334,7 +334,8 @@ class PushSelectiveDimensionFilterIntoAggregateSuite extends QueryTest with Shar
           join.copy(hint = JoinHint(Some(broadcast), None))
         } else {
           join.copy(hint = JoinHint(None, Some(broadcast)))
-        })
+        }
+    )
     val rewritten = applyRule(withHint)
     assert(semiBelowGroupedAggregate(rewritten), rewritten.treeString)
     assertBroadcastSemi(rewritten)

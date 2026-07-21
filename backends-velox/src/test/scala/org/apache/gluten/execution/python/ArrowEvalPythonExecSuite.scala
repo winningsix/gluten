@@ -557,11 +557,11 @@ class ArrowEvalPythonExecSuite extends WholeStageTransformerSuite {
         .find(_.getParameterCount == 5)
         .get
       val udfArgs: Array[AnyRef] = Array(
-          name,
-          function.asInstanceOf[AnyRef],
-          declaredReturnType,
-          Int.box(baseUdf.pythonEvalType),
-          Boolean.box(true))
+        name,
+        function.asInstanceOf[AnyRef],
+        declaredReturnType,
+        Int.box(baseUdf.pythonEvalType),
+        Boolean.box(true))
       udfConstructor
         .newInstance(udfArgs: _*)
         .asInstanceOf[UserDefinedPythonFunction]
