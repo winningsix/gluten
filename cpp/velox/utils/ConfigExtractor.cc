@@ -236,6 +236,15 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorSessionC
   configs[facebook::velox::connector::hive::HiveConfig::kReadTimestampUnitSession] = std::string("6");
   if (conf->get<bool>(kCudfEnabled, kCudfEnabledDefault)) {
     configs["parquet.reader.timestamp_type"] = kCudfTimestampMicrosecondsTypeId;
+    // Spark exposes this backend option with hyphens, while the Velox cuDF
+    // connector reads the session property with underscores. Dynamic prefix
+    // stripping alone therefore leaves the connector on its default (true).
+    configs["cudf.hive.use_buffered_input"] =
+        conf->get<bool>(
+            "spark.gluten.sql.columnar.backend.velox.cudf.hive.use-buffered-input",
+            true)
+        ? "true"
+        : "false";
   }
   configs[facebook::velox::connector::hive::HiveConfig::kMaxPartitionsPerWritersSession] =
       conf->get<std::string>(kMaxPartitions, "10000");

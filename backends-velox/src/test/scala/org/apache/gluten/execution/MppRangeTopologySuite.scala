@@ -16,11 +16,44 @@
  */
 package org.apache.gluten.execution
 
-import org.apache.gluten.extension.ExchangeSpec
+import org.apache.gluten.extension.{ExchangeSpec, NativeFragment}
 
 import org.scalatest.funsuite.AnyFunSuite
 
 class MppRangeTopologySuite extends AnyFunSuite {
+  test("collapses RANGE only when its consumer has one native driver") {
+    val range = ExchangeSpec(
+      id = 5,
+      producerFragmentId = 2,
+      consumerFragmentId = 1,
+      exchangeType = "RANGE",
+      numPartitions = 128,
+      partitionKeys = Seq.empty,
+      rangeBoundsJson = Some("{\"boundaries\":[]}"),
+      rangeEffectivePartitions = Some(4)
+    )
+    val hash = range.copy(id = 6, exchangeType = "HASH")
+    val otherRange = range.copy(id = 7, consumerFragmentId = 3)
+    val fragments = Seq(
+      NativeFragment(1, null, Seq.empty, parallelism = 1),
+      NativeFragment(3, null, Seq.empty, parallelism = 2))
+
+    val Seq(single, unchangedHash, unchangedRange) =
+      MppRangeTopology.collapseRangesForSingleDriverConsumers(
+        Seq(range, hash, otherRange),
+        fragments)
+
+    assert(single.exchangeType === "SINGLE")
+    assert(single.numPartitions === 1)
+    assert(single.partitionKeys.isEmpty)
+    assert(single.rangeOrdering.isEmpty)
+    assert(single.rangeSamplePlan === null)
+    assert(single.rangeBoundsJson.isEmpty)
+    assert(single.rangeEffectivePartitions.isEmpty)
+    assert(unchangedHash === hash)
+    assert(unchangedRange === otherRange)
+  }
+
   test("uses the effective RANGE partition count for native destinations") {
     val range = ExchangeSpec(
       id = 7,

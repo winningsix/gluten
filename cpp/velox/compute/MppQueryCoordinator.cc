@@ -135,18 +135,6 @@ void removeTaskOutputState(
                  << ") threw unknown exception";
     }
   }
-#ifdef GLUTEN_ENABLE_GPU
-  try {
-    auto queueMgr = facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
-    queueMgr->removeTask(tid);
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "MppQueryCoordinator[" << queryId << "]: UcxOutputQueueManager::removeTask(" << tid
-               << ") threw: " << e.what();
-  } catch (...) {
-    LOG(ERROR) << "MppQueryCoordinator[" << queryId << "]: UcxOutputQueueManager::removeTask(" << tid
-               << ") threw unknown exception";
-  }
-#endif
 }
 
 bool isSafeTaskIdComponent(const std::string& value) {
@@ -1060,7 +1048,9 @@ void MppQueryCoordinator::start() {
       // enqueueBroadcastOutputLocked replicates every page to all N
       // consumer replicas and isFinishedLocked() can eventually return.
       // Bootstrap producers are started before their splits are added, so this
-      // still happens before any enqueue.
+      // still happens before any enqueue. Velox's registered partitioned-output
+      // manager forwards this update to the UCX queue as part of Task's generic
+      // output lifecycle.
       task->updateOutputBuffers(bcastN, /*noMoreBuffers=*/true);
     }
   };
@@ -1107,6 +1097,7 @@ void MppQueryCoordinator::start() {
     for (size_t i = 0; i < spec.scanNodeIds.size(); i++) {
       const auto& scanInfo = spec.scanInfos[i];
       const auto& scanNodeId = spec.scanNodeIds[i];
+      std::vector<bool> scanSplitConsumed(scanInfo->paths.size(), false);
       // Use the connector ID from the plan's TableScanNode.
       // This is critical: "test-hive" -> Velox Hive connector,
       // "cudf-hive" -> cuDF GPU connector (handles type casting).
@@ -1116,6 +1107,9 @@ void MppQueryCoordinator::start() {
 
       size_t addedSplits = 0;
       for (size_t j = 0; j < scanInfo->paths.size(); j++) {
+        if (scanSplitConsumed[j]) {
+          continue;
+        }
         // K-way distributed broadcast production: every scan-bearing fragment --
         // INCLUDING BROADCAST producers -- strides its files 1/peerCount so each
         // peer scans a distinct slice. For a BROADCAST producer this means each
@@ -1148,6 +1142,94 @@ void MppQueryCoordinator::start() {
             }
           }
           std::unordered_map<std::string, std::string> customSplitInfo{{"table_format", "hive-iceberg"}};
+          std::vector<connector::hive::iceberg::IcebergCoalescedFile>
+              coalescedFiles;
+#ifdef GLUTEN_ENABLE_GPU
+          const auto configuredMultiFileTarget =
+              queryCtx_->queryConfig().get<uint64_t>(
+                  kCudfIcebergMultiFileTargetBytes,
+                  kCudfIcebergMultiFileTargetBytesDefault);
+          const auto targetBytes = configuredMultiFileTarget > 0
+              ? configuredMultiFileTarget
+              : queryCtx_->queryConfig().get<uint64_t>(
+                    kCudfGpuTargetBatchBytes,
+                    std::stoull(kCudfGpuTargetBatchBytesDefault));
+          const auto maxFiles = queryCtx_->queryConfig().get<int32_t>(
+              kCudfIcebergMultiFileMaxFiles,
+              kCudfIcebergMultiFileMaxFilesDefault);
+          const auto maxFileBytes = queryCtx_->queryConfig().get<uint64_t>(
+              kCudfIcebergMultiFileMaxFileBytes,
+              kCudfIcebergMultiFileMaxFileBytesDefault);
+          const bool useExperimentalReader =
+              queryCtx_->queryConfig().get<bool>(
+                  kCudfHiveUseExperimentalReader, false);
+          // A whole-file Iceberg Parquet task covers [4, fileSize), excluding
+          // its PAR1 header. Require the range to reach EOF so genuine
+          // row-group splits are never coalesced.
+          const auto isWholeFile = [&](size_t index) {
+            return index < scanInfo->starts.size() &&
+                index < scanInfo->lengths.size() &&
+                index < scanInfo->properties.size() &&
+                scanInfo->starts[index] <= 4 &&
+                scanInfo->properties[index].has_value() &&
+                scanInfo->properties[index]->fileSize.has_value() &&
+                scanInfo->starts[index] <= static_cast<uint64_t>(
+                    *scanInfo->properties[index]->fileSize) &&
+                scanInfo->lengths[index] >= static_cast<uint64_t>(
+                    *scanInfo->properties[index]->fileSize) -
+                    scanInfo->starts[index];
+          };
+          const bool useCudfIceberg = connectorId == kCudfIcebergConnectorId;
+          const bool primaryCanCoalesce = useCudfIceberg &&
+              !useExperimentalReader &&
+              targetBytes > 0 && maxFiles > 1 && deleteFiles.empty() &&
+              isWholeFile(j) &&
+              static_cast<uint64_t>(*scanInfo->properties[j]->fileSize) <=
+                  targetBytes &&
+              static_cast<uint64_t>(*scanInfo->properties[j]->fileSize) <=
+                  maxFileBytes;
+          uint64_t accumulatedBytes = primaryCanCoalesce
+              ? static_cast<uint64_t>(*scanInfo->properties[j]->fileSize)
+              : 0;
+          if (primaryCanCoalesce) {
+            for (size_t next = j + 1;
+                 next < scanInfo->paths.size() &&
+                 coalescedFiles.size() + 1 < static_cast<size_t>(maxFiles) &&
+                 accumulatedBytes < targetBytes;
+                 ++next) {
+              if (scanSplitConsumed[next] ||
+                  scanSplitOwners.at(scanInfo.get())[next] != peerIndex_) {
+                continue;
+              }
+              const bool hasDeletes =
+                  next < icebergSplitInfo->deleteFilesVec.size() &&
+                  !icebergSplitInfo->deleteFilesVec[next].empty();
+              const bool samePartition =
+                  scanInfo->partitionColumns.empty() ||
+                  scanInfo->partitionColumns[next] ==
+                      scanInfo->partitionColumns[j];
+              const bool sameMetadata =
+                  scanInfo->metadataColumns[next] ==
+                  scanInfo->metadataColumns[j];
+              if (hasDeletes || !isWholeFile(next) || !samePartition ||
+                  !sameMetadata ||
+                  static_cast<uint64_t>(
+                      *scanInfo->properties[next]->fileSize) > maxFileBytes) {
+                continue;
+              }
+              const auto fileSize = static_cast<uint64_t>(
+                  *scanInfo->properties[next]->fileSize);
+              if (accumulatedBytes >= targetBytes ||
+                  fileSize > targetBytes - accumulatedBytes) {
+                continue;
+              }
+              coalescedFiles.push_back(
+                  {scanInfo->paths[next], fileSize});
+              accumulatedBytes += fileSize;
+              scanSplitConsumed[next] = true;
+            }
+          }
+#endif
           connectorSplit = std::make_shared<connector::hive::iceberg::HiveIcebergSplit>(
               connectorId,
               scanInfo->paths[j],
@@ -1161,7 +1243,9 @@ void MppQueryCoordinator::start() {
               true,
               std::move(deleteFiles),
               metadataColumn,
-              j < scanInfo->properties.size() ? scanInfo->properties[j] : std::nullopt);
+              j < scanInfo->properties.size() ? scanInfo->properties[j] : std::nullopt,
+              /*dataSequenceNumber=*/0,
+              std::move(coalescedFiles));
         } else
 #ifdef GLUTEN_ENABLE_GPU
             if (connectorId == kCudfHiveConnectorId && scanInfo->canUseCudfConnector()) {

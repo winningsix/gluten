@@ -223,6 +223,40 @@ std::unordered_map<std::string, std::string> buildMppQueryConfig(
   configs[velox::core::QueryConfig::kPreferredOutputBatchBytes] =
       std::to_string(veloxCfg->get<uint64_t>(kVeloxPreferredBatchBytes, 10L << 20));
 
+#ifdef GLUTEN_ENABLE_GPU
+  // The MPP coordinator constructs scan splits after planning. Preserve the
+  // scan batching knobs in QueryConfig so it can build multi-file Iceberg
+  // splits using the same byte target as the regular execution path.
+  configs[kCudfGpuTargetBatchBytes] = std::to_string(veloxCfg->get<uint64_t>(
+      kCudfGpuTargetBatchBytes,
+      std::stoull(kCudfGpuTargetBatchBytesDefault)));
+  configs[kCudfIcebergMultiFileTargetBytes] = std::to_string(
+      veloxCfg->get<uint64_t>(
+          kCudfIcebergMultiFileTargetBytes,
+          kCudfIcebergMultiFileTargetBytesDefault));
+  configs[kCudfIcebergMultiFileMaxFiles] = std::to_string(
+      veloxCfg->get<int32_t>(
+          kCudfIcebergMultiFileMaxFiles,
+          kCudfIcebergMultiFileMaxFilesDefault));
+  configs[kCudfIcebergMultiFileMaxFileBytes] = std::to_string(
+      veloxCfg->get<uint64_t>(
+          kCudfIcebergMultiFileMaxFileBytes,
+          kCudfIcebergMultiFileMaxFileBytesDefault));
+  configs[kCudfHiveUseExperimentalReader] = std::to_string(
+      veloxCfg->get<bool>(kCudfHiveUseExperimentalReader, false));
+
+  // Keep the UCX exchange byte bound independently configurable, but make the
+  // byte-aware path active by default by inheriting the GPU compute batch
+  // target. GLUTEN_UCX_PARTITIONED_OUTPUT_BATCH_BYTES remains a runtime
+  // override inside UcxPartitionedOutput.
+  configs[velox::core::QueryConfig::kUcxPartitionedOutputBatchBytes] =
+      std::to_string(veloxCfg->get<uint64_t>(
+          kCudfPartitionedOutputBatchBytes,
+          veloxCfg->get<uint64_t>(
+              kCudfGpuTargetBatchBytes,
+              std::stoull(kCudfGpuTargetBatchBytesDefault))));
+#endif
+
   try {
     configs[velox::core::QueryConfig::kSparkAnsiEnabled] =
         veloxCfg->get<std::string>(kAnsiEnabled, "false");

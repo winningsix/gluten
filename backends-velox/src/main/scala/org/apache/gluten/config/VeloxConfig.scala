@@ -776,6 +776,15 @@ object VeloxConfig extends ConfigRegistry {
       .longConf
       .createWithDefault(2147483648L)
 
+  val CUDF_ICEBERG_MULTI_FILE_TARGET_BYTES =
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.iceberg.multi_file.target_bytes")
+      .doc(
+        "Target total compressed bytes for one coalesced Iceberg multi-file split. " +
+          "Zero inherits cudf.gpuTargetBatchBytes for compatibility; set this independently " +
+          "to tune scan grouping without changing compute and exchange batch sizes.")
+      .bytesConf(ByteUnit.BYTE)
+      .createWithDefault(0L)
+
   val CUDF_CONCURRENT_GPU_TASKS =
     buildConf("spark.gluten.sql.columnar.backend.velox.cudf.concurrentGpuTasks")
       .doc(

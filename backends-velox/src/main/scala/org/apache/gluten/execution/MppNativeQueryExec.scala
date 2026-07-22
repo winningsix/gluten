@@ -135,6 +135,27 @@ private[execution] case class MppLocalStreamSlot(fragmentId: Int, slotIdx: Int)
  * output buffers that can never receive a RANGE PID.
  */
 private[execution] object MppRangeTopology {
+  def collapseRangesForSingleDriverConsumers(
+      exchanges: Seq[ExchangeSpec],
+      fragments: Seq[NativeFragment]): Seq[ExchangeSpec] = {
+    val consumerParallelism = fragments.iterator.map(f => f.id -> f.parallelism).toMap
+    exchanges.map {
+      case spec
+          if spec.exchangeType == "RANGE" &&
+            consumerParallelism.get(spec.consumerFragmentId).contains(1) =>
+        spec.copy(
+          exchangeType = "SINGLE",
+          numPartitions = 1,
+          partitionKeys = Seq.empty,
+          rangeOrdering = Seq.empty,
+          rangeSamplePlan = null,
+          rangeBoundsJson = None,
+          rangeEffectivePartitions = None
+        )
+      case spec => spec
+    }
+  }
+
   def applyEffectivePartitionCounts(exchanges: Seq[ExchangeSpec]): Seq[ExchangeSpec] = {
     exchanges.map {
       case spec if spec.exchangeType == "RANGE" =>
@@ -1438,7 +1459,21 @@ case class MppNativeQueryExec(
 
     // Sort fragments by ID (ensures topological order: producers before consumers)
     val sortedFragments = extractedFragments.sortBy(_.id).toSeq
-    val sortedExchanges = capLocalHashExchangeTasks(extractedExchanges.toSeq).sortBy(_.id).toSeq
+    val cappedExchanges = capLocalHashExchangeTasks(extractedExchanges.toSeq)
+    val singleDriverExchanges =
+      MppRangeTopology.collapseRangesForSingleDriverConsumers(cappedExchanges, sortedFragments)
+    cappedExchanges.zip(singleDriverExchanges).foreach {
+      case (before, after) if before.exchangeType == "RANGE" && after.exchangeType == "SINGLE" =>
+        logInfo(
+          s"MppNativeQueryExec: planning RANGE exchange ${before.id} " +
+            s"F${before.producerFragmentId}->F${before.consumerFragmentId} as SINGLE because " +
+            "the consumer fragment has exactly one native driver")
+      case _ =>
+    }
+    val sortedExchanges =
+      planMppExchangePartitions(singleDriverExchanges)
+        .sortBy(_.id)
+        .toSeq
     val adjustedFragments =
       tunePostJoinFinalAggSplitParallelism(sortedFragments, sortedExchanges)
     val frozenBroadcasts = broadcastsByConsumer.iterator.map {
@@ -3971,6 +4006,78 @@ case class MppNativeQueryExec(
             }
         }
       case None => exchanges
+    }
+  }
+
+  private val smallMppRangeMaxBytes = BigInt(64L) << 20
+  private val smallMppRangeMaxRows = BigInt(1000000L)
+
+  /**
+   * Translate Catalyst shuffle partitioning into MPP exchange partitioning.
+   *
+   * `spark.sql.shuffle.partitions` describes Spark shuffle tasks; it is not the native MPP
+   * topology. Native HASH and RANGE exchanges fan out to the MPP peers instead. A small globally
+   * ordered producer is gathered by a true SINGLE exchange, which preserves global-sort semantics
+   * and avoids executing the producer once in Spark merely to sample RANGE bounds.
+   *
+   * Missing statistics are handled conservatively: retain RANGE semantics but cap the requested
+   * boundaries at the peer count. We never infer SINGLE from an unknown estimate.
+   */
+  private def planMppExchangePartitions(exchanges: Seq[ExchangeSpec]): Seq[ExchangeSpec] = {
+    val peerCount = math.max(1, mppSparkPartitionCount)
+    exchanges.map {
+      case spec if spec.exchangeType == "RANGE" =>
+        smallMppRangeReason(spec) match {
+          case Some(reason) =>
+            logInfo(
+              s"MppNativeQueryExec: planning small RANGE exchange ${spec.id} " +
+                s"F${spec.producerFragmentId}->F${spec.consumerFragmentId} as SINGLE ($reason)")
+            spec.copy(
+              exchangeType = "SINGLE",
+              numPartitions = 1,
+              partitionKeys = Seq.empty,
+              rangeOrdering = Seq.empty,
+              rangeSamplePlan = null,
+              rangeBoundsJson = None,
+              rangeEffectivePartitions = None
+            )
+          case None =>
+            val rangePartitions = math.min(spec.numPartitions, peerCount)
+            if (spec.numPartitions == rangePartitions) {
+              spec
+            } else {
+              val estimate = planLogicalStats(spec.rangeSamplePlan)
+                .map {
+                  stats =>
+                    s"estimatedBytes=${stats.sizeInBytes}, " +
+                      s"estimatedRows=${stats.rowCount.getOrElse("unknown")}"
+                }
+                .getOrElse("statistics=unknown")
+              logInfo(
+                s"MppNativeQueryExec: aligning RANGE exchange ${spec.id} " +
+                  s"F${spec.producerFragmentId}->F${spec.consumerFragmentId} partitions " +
+                  s"from ${spec.numPartitions} to MPP peer cap $rangePartitions ($estimate)")
+              spec.copy(numPartitions = rangePartitions)
+            }
+        }
+
+      case spec => spec
+    }
+  }
+
+  private def smallMppRangeReason(spec: ExchangeSpec): Option[String] = {
+    if (spec.rangeSamplePlan == null) {
+      return None
+    }
+    planLogicalStats(spec.rangeSamplePlan).flatMap {
+      stats =>
+        val bytesSmall = isConfidentSize(stats.sizeInBytes) &&
+          stats.sizeInBytes <= smallMppRangeMaxBytes
+        val rowsSmall = stats.rowCount.exists(rows => rows >= 0 && rows <= smallMppRangeMaxRows)
+        Option.when(bytesSmall || rowsSmall)(
+          s"estimatedBytes=${stats.sizeInBytes}, " +
+            s"estimatedRows=${stats.rowCount.getOrElse("unknown")}, " +
+            s"maxBytes=$smallMppRangeMaxBytes, maxRows=$smallMppRangeMaxRows")
     }
   }
 

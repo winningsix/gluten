@@ -73,7 +73,8 @@ class MppWindowInputOrderingSuite extends AnyFunSuite {
           Seq(sum),
           Seq(partition),
           Seq(SortOrder(order, Ascending), SortOrder(secondOrder, Descending)),
-          SpecifiedWindowFrame(RangeFrame, UnboundedPreceding, CurrentRow))
+          SpecifiedWindowFrame(RangeFrame, UnboundedPreceding, CurrentRow)
+        )
 
         assertMarked(window)
     }

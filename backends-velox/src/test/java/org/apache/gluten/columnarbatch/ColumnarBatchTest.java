@@ -240,6 +240,42 @@ public class ColumnarBatchTest extends VeloxBackendTestBase {
         });
   }
 
+  @Test
+  public void testSelectColumnsAndRows() {
+    TaskResources$.MODULE$.runUnsafe(
+        () -> {
+          final int numRows = 20;
+          final ColumnarBatch batch = newArrowBatch("a boolean, b int", numRows);
+          final ArrowWritableColumnVector col0 = (ArrowWritableColumnVector) batch.column(0);
+          final ArrowWritableColumnVector col1 = (ArrowWritableColumnVector) batch.column(1);
+          for (int j = 0; j < numRows; j++) {
+            col0.putBoolean(j, j % 2 == 0);
+            col1.putInt(j, 15 - j);
+          }
+          StructType structType = new StructType();
+          structType = structType.add("a", DataTypes.BooleanType, true);
+          structType = structType.add("b", DataTypes.IntegerType, true);
+          ColumnarBatch veloxBatch =
+              RowToVeloxColumnarExec.toColumnarBatchIterator(
+                      JavaConverters.<InternalRow>asScalaIterator(batch.rowIterator()),
+                      structType,
+                      numRows,
+                      Integer.MAX_VALUE)
+                  .next();
+          ColumnarBatch selected =
+              VeloxColumnarBatches.select(veloxBatch, new int[] {1, 0}, new int[] {3, 1});
+          try {
+            Assert.assertEquals(2, selected.numCols());
+            Assert.assertEquals(2, selected.numRows());
+            Assert.assertEquals("[12,false]\n[14,false]", ColumnarBatches.toString(selected, 0, 2));
+          } finally {
+            selected.close();
+            veloxBatch.close();
+          }
+          return null;
+        });
+  }
+
   private static ColumnarBatch newArrowBatch(String schema, int numRows) {
     final ArrowWritableColumnVector[] columns =
         ArrowWritableColumnVector.allocateColumns(numRows, StructType.fromDDL(schema));

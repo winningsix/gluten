@@ -171,7 +171,9 @@ WholeStageResultIterator::WholeStageResultIterator(
 
       std::shared_ptr<velox::connector::ConnectorSplit> split;
       if (auto icebergSplitInfo = std::dynamic_pointer_cast<IcebergSplitInfo>(scanInfo)) {
-        // Set Iceberg split (never coalesced).
+        // Coalesce compatible whole-file Iceberg splits for the cuDF reader.
+        // Splits with deletes, byte ranges, differing constants, or unknown
+        // file sizes stay on the single-file path.
         std::unordered_map<std::string, std::string> customSplitInfo{{"table_format", "hive-iceberg"}};
         std::vector<velox::connector::hive::iceberg::IcebergDeleteFile> deleteFiles;
         if (idx < icebergSplitInfo->deleteFilesVec.size()) {
@@ -188,6 +190,70 @@ WholeStageResultIterator::WholeStageResultIterator(
           connectorId = kCudfIcebergConnectorId;
         }
 #endif
+        std::vector<velox::connector::hive::iceberg::IcebergCoalescedFile>
+            coalescedFiles;
+#ifdef GLUTEN_ENABLE_GPU
+        const bool useCudfIceberg = connectorId == kCudfIcebergConnectorId;
+        const bool useExperimentalReader = veloxCfg_->get<bool>(
+            kCudfHiveUseExperimentalReader, false);
+        const auto configuredMultiFileTarget = veloxCfg_->get<uint64_t>(
+            kCudfIcebergMultiFileTargetBytes,
+            kCudfIcebergMultiFileTargetBytesDefault);
+        const uint64_t targetBytes = configuredMultiFileTarget > 0
+            ? configuredMultiFileTarget
+            : veloxCfg_->get<uint64_t>(kCudfGpuTargetBatchBytes, 0);
+        const int32_t maxFiles = veloxCfg_->get<int32_t>(
+            kCudfIcebergMultiFileMaxFiles,
+            kCudfIcebergMultiFileMaxFilesDefault);
+        const uint64_t maxFileBytes = veloxCfg_->get<uint64_t>(
+            kCudfIcebergMultiFileMaxFileBytes,
+            kCudfIcebergMultiFileMaxFileBytesDefault);
+        // Iceberg represents a complete Parquet file as [4, fileSize): the
+        // leading four bytes are the PAR1 magic. A real range split does not
+        // reach fileSize and remains ineligible.
+        const auto isWholeFile = [&](size_t fileIndex) {
+          return starts[fileIndex] <= 4 &&
+              properties[fileIndex].has_value() &&
+              properties[fileIndex]->fileSize.has_value() &&
+              starts[fileIndex] <= static_cast<uint64_t>(
+                  *properties[fileIndex]->fileSize) &&
+              lengths[fileIndex] >= static_cast<uint64_t>(
+                  *properties[fileIndex]->fileSize) - starts[fileIndex];
+        };
+        const bool primaryCanCoalesce = useCudfIceberg &&
+            !useExperimentalReader && targetBytes > 0 && maxFiles > 1 &&
+            deleteFiles.empty() && isWholeFile(idx) &&
+            static_cast<uint64_t>(*properties[idx]->fileSize) <= targetBytes &&
+            static_cast<uint64_t>(*properties[idx]->fileSize) <= maxFileBytes;
+        uint64_t accumulatedBytes = primaryCanCoalesce
+            ? static_cast<uint64_t>(*properties[idx]->fileSize)
+            : 0;
+        size_t next = idx + 1;
+        while (primaryCanCoalesce && next < paths.size() &&
+               coalescedFiles.size() + 1 < static_cast<size_t>(maxFiles) &&
+               accumulatedBytes < targetBytes) {
+          const bool hasDeletes =
+              next < icebergSplitInfo->deleteFilesVec.size() &&
+              !icebergSplitInfo->deleteFilesVec[next].empty();
+          if (hasDeletes || !isWholeFile(next) ||
+              static_cast<uint64_t>(*properties[next]->fileSize) >
+                  maxFileBytes ||
+              (!partitionColumns.empty() &&
+               partitionColumns[next] != partitionColumns[idx]) ||
+              metadataColumns[next] != metadataColumns[idx]) {
+            break;
+          }
+          const auto fileSize =
+              static_cast<uint64_t>(*properties[next]->fileSize);
+          if (accumulatedBytes >= targetBytes ||
+              fileSize > targetBytes - accumulatedBytes) {
+            break;
+          }
+          coalescedFiles.push_back({paths[next], fileSize});
+          accumulatedBytes += fileSize;
+          ++next;
+        }
+#endif
         split = std::make_shared<velox::connector::hive::iceberg::HiveIcebergSplit>(
             connectorId,
             paths[idx],
@@ -201,8 +267,18 @@ WholeStageResultIterator::WholeStageResultIterator(
             true,
             std::move(deleteFiles),
             std::unordered_map<std::string, std::string>(),
-            properties[idx]);
+            properties[idx],
+            /*dataSequenceNumber=*/0,
+            std::move(coalescedFiles));
         connectorSplits.emplace_back(split);
+#ifdef GLUTEN_ENABLE_GPU
+        if (next > static_cast<size_t>(idx + 1)) {
+          VLOG(1) << "Coalesced " << (next - idx)
+                  << " Iceberg files into one cuDF split ("
+                  << accumulatedBytes << " bytes)";
+          idx = static_cast<int>(next - 1);
+        }
+#endif
       } else {
 #ifdef GLUTEN_ENABLE_GPU
         const bool useCudf = canUseCudfConnector && enableCudf_ &&

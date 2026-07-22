@@ -43,6 +43,7 @@ object GlutenIcebergSourceUtil {
       path: String,
       start: Long,
       length: Long,
+      fileSize: Long,
       partitionColumns: JMap[String, String],
       deleteFiles: JList[DeleteFile],
       fileFormat: FileFormat)
@@ -133,6 +134,7 @@ object GlutenIcebergSourceUtil {
     val paths = new JArrayList[String]()
     val starts = new JArrayList[JLong]()
     val lengths = new JArrayList[JLong]()
+    val fileSizes = new JArrayList[JLong]()
     val partitionColumns = new JArrayList[JMap[String, String]]()
     val deleteFilesList = new JArrayList[JList[DeleteFile]]()
     var fileFormat = ReadFileFormat.UnknownFormat
@@ -143,6 +145,7 @@ object GlutenIcebergSourceUtil {
         paths.add(BackendsApiManager.getTransformerApiInstance.encodeFilePathIfNeed(split.path))
         starts.add(split.start)
         lengths.add(split.length)
+        fileSizes.add(split.fileSize)
         partitionColumns.add(split.partitionColumns)
         deleteFilesList.add(split.deleteFiles)
         val currentFileFormat = convertFileFormat(split.fileFormat)
@@ -162,6 +165,7 @@ object GlutenIcebergSourceUtil {
       paths,
       starts,
       lengths,
+      fileSizes,
       partitionColumns,
       fileFormat,
       SoftAffinity
@@ -184,9 +188,11 @@ object GlutenIcebergSourceUtil {
               ContentFileUtil.getFilePath(task.file()),
               task.start(),
               task.length(),
+              task.file().fileSizeInBytes(),
               getPartitionColumns(task, readPartitionSchema),
               task.deletes(),
-              task.file().format())
+              task.file().format()
+            )
         }
       case other =>
         throw new GlutenNotSupportException(s"Unsupported input partition type: $other")
@@ -198,6 +204,7 @@ object GlutenIcebergSourceUtil {
     IcebergLocalFilesBuilder.makeIcebergLocalFiles(
       0,
       new JArrayList[String](),
+      new JArrayList[JLong](),
       new JArrayList[JLong](),
       new JArrayList[JLong](),
       new JArrayList[JMap[String, String]](),

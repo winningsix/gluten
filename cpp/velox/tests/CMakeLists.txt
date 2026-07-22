@@ -100,17 +100,17 @@ if(ENABLE_GPU)
   add_executable(check_overflow_in_table_insert_gpu_test
                  CheckOverflowInTableInsertGpuTest.cc)
   target_include_directories(
-    check_overflow_in_table_insert_gpu_test
-    PRIVATE ${CMAKE_SOURCE_DIR}/velox ${CMAKE_SOURCE_DIR}/src)
+    check_overflow_in_table_insert_gpu_test PRIVATE ${CMAKE_SOURCE_DIR}/velox
+                                                    ${CMAKE_SOURCE_DIR}/src)
   target_compile_definitions(
     check_overflow_in_table_insert_gpu_test
     PUBLIC LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
-  target_link_libraries(check_overflow_in_table_insert_gpu_test
-                        PRIVATE velox cudf::cudf velox_curl GTest::gtest
-                                GTest::gtest_main Folly::folly)
-  gtest_discover_tests(
+  target_link_libraries(
     check_overflow_in_table_insert_gpu_test
-    DISCOVERY_MODE PRE_TEST
+    PRIVATE velox cudf::cudf velox_curl GTest::gtest GTest::gtest_main
+            Folly::folly)
+  gtest_discover_tests(
+    check_overflow_in_table_insert_gpu_test DISCOVERY_MODE PRE_TEST
     PROPERTIES LABELS "cuda_driver"
     TIMEOUT 3000)
 endif()
@@ -148,8 +148,8 @@ add_velox_test(
   VeloxSubstraitSignatureTest.cc
   VeloxToSubstraitTypeTest.cc)
 # VeloxSubstraitRoundTripTest directly calls folly::init and Folly APIs.  A
-# shared Folly build must therefore be on this executable's link line instead
-# of relying on libgluten.so's private dependency.
+# shared Folly build must therefore be on this executable's link line instead of
+# relying on libgluten.so's private dependency.
 target_link_libraries(velox_plan_conversion_test Folly::folly)
 add_velox_test(spark_functions_test SOURCES SparkFunctionTest.cc
                FunctionTest.cc)

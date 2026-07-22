@@ -16,8 +16,9 @@
  */
 package org.apache.gluten.mpp.control
 
-import com.google.common.net.InetAddresses
 import org.apache.gluten.execution.{MppPeerInfo, UcxEndpointInfo}
+
+import com.google.common.net.InetAddresses
 
 import java.net.URI
 
