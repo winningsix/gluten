@@ -4074,10 +4074,14 @@ case class MppNativeQueryExec(
         val bytesSmall = isConfidentSize(stats.sizeInBytes) &&
           stats.sizeInBytes <= smallMppRangeMaxBytes
         val rowsSmall = stats.rowCount.exists(rows => rows >= 0 && rows <= smallMppRangeMaxRows)
-        Option.when(bytesSmall || rowsSmall)(
-          s"estimatedBytes=${stats.sizeInBytes}, " +
-            s"estimatedRows=${stats.rowCount.getOrElse("unknown")}, " +
-            s"maxBytes=$smallMppRangeMaxBytes, maxRows=$smallMppRangeMaxRows")
+        if (bytesSmall || rowsSmall) {
+          Some(
+            s"estimatedBytes=${stats.sizeInBytes}, " +
+              s"estimatedRows=${stats.rowCount.getOrElse("unknown")}, " +
+              s"maxBytes=$smallMppRangeMaxBytes, maxRows=$smallMppRangeMaxRows")
+        } else {
+          None
+        }
     }
   }
 
