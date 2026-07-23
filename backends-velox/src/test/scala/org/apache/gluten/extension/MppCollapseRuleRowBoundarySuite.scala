@@ -18,7 +18,7 @@ package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.exception.GlutenException
-import org.apache.gluten.execution.{ColumnarUnionExec, FlushableHashAggregateExecTransformer, GenerateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, MppJvmStreamInputMatcher, MppNativeQueryExec, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, UnionExecTransformer, VeloxColumnarToRowExec}
+import org.apache.gluten.execution.{ColumnarCoalesceExec, ColumnarUnionExec, FlushableHashAggregateExecTransformer, GenerateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, MppJvmStreamInputMatcher, MppNativeQueryExec, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, UnionExecTransformer, VeloxColumnarToRowExec}
 import org.apache.gluten.expression.aggregate.VeloxCollectList
 import org.apache.gluten.extension.columnar.FallbackTags
 
@@ -111,6 +111,37 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(normalizedRange.outputPartitioning.isInstanceOf[RangePartitioning])
     assert(normalizedRange.child eq child)
     assert(!normalizedRange.child.isInstanceOf[ColumnarShuffleExchangeExec])
+  }
+
+  test("distributed V2 write preserves its root shuffle during dynamic extraction preparation") {
+    val child = nativeLeaf()
+    val ordering = Seq(SortOrder(child.output.head, Ascending, NullsFirst, Seq.empty))
+    val range = ColumnarShuffleExchangeExec(
+      outputPartitioning = RangePartitioning(ordering, 8),
+      child = child,
+      projectOutputAttributes = child.output)
+    val sorted = SortExecTransformer(ordering, global = true, range, testSpillFrequency = 0)
+    val coalesced = ColumnarCoalesceExec(200, sorted)
+    val writerDistribution = ColumnarShuffleExchangeExec(
+      outputPartitioning = HashPartitioning(Seq(coalesced.output.head), 128),
+      child = coalesced,
+      projectOutputAttributes = coalesced.output)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val normalized = rule.normalizeMppNativeOperators(writerDistribution)
+    val (rootExchange, producer) =
+      MppNativeQueryExec.detachDistributedWriteRoot(normalized, distributedWriteOutput = true)
+    val prepared = MppNativeQueryExec.reattachDistributedWriteRoot(rootExchange, producer)
+
+    assert(rootExchange.isDefined)
+    assert(producer eq normalized.asInstanceOf[ColumnarShuffleExchangeExec].child)
+    assert(prepared.isInstanceOf[ProjectExecTransformer])
+    val preparedRoot = prepared
+      .asInstanceOf[ProjectExecTransformer]
+      .child
+      .asInstanceOf[ColumnarShuffleExchangeExec]
+    assert(preparedRoot.outputPartitioning.isInstanceOf[HashPartitioning])
+    assert(preparedRoot.child.find(_.isInstanceOf[ColumnarShuffleExchangeExec]).isDefined)
   }
 
   private def collectStructAggregate(flushable: Boolean): HashAggregateExecBaseTransformer = {

@@ -23,7 +23,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, BoundReference, Descending, NullsFirst, NullsLast, SortOrder, UnsafeRow}
+import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, BoundReference, Descending, GenericInternalRow, NullsFirst, NullsLast, SortOrder, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.expressions.codegen.LazilyGeneratedOrdering
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.internal.SQLConf
@@ -32,10 +32,13 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import com.fasterxml.jackson.databind.ObjectMapper
 
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
 import java.util.concurrent.{CompletableFuture, ExecutionException}
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
+import scala.util.Try
 import scala.util.control.NonFatal
 
 /**
@@ -176,6 +179,12 @@ object MppRangeBoundsGenerator extends Logging {
     case _ => false
   }
 
+  def supportsIntegralInterval(dataType: DataType): Boolean = dataType match {
+    case ByteType | ShortType | IntegerType | LongType | DateType | TimestampType => true
+    case timestampNtz if timestampNtz.typeName == "timestamp_ntz" => true
+    case _ => false
+  }
+
   def generate(
       samplePlan: SparkPlan,
       outputAttributes: Seq[Attribute],
@@ -252,6 +261,91 @@ object MppRangeBoundsGenerator extends Logging {
         .collect()
     )
     Result(encode(ordering, bounds), bounds.length)
+  }
+
+  /**
+   * Build valid RANGE boundaries from an integral predicate interval without executing the
+   * producer. Exact quantiles are a load-balancing optimization, not an ordering requirement: any
+   * strictly ordered boundaries preserve Spark's global RANGE semantics. This fast path is useful
+   * for date/timestamp/integral keys whose physical plan already proves a bounded interval.
+   */
+  def fromIntegralInterval(
+      ordering: Seq[SortOrder],
+      lowerInclusive: Long,
+      upperExclusive: Long,
+      requestedPartitions: Int,
+      basicIsoDateEncoding: Boolean = false): Option[Result] = {
+    if (ordering.isEmpty || requestedPartitions <= 1 || lowerInclusive >= upperExclusive) {
+      return None
+    }
+    val dataType = ordering.head.dataType
+    if (!supportsIntegralInterval(dataType)) {
+      return None
+    }
+
+    // Some applications explicitly encode dates as IntegerType using BASIC_ISO_DATE. Only apply
+    // calendar interpolation when the caller declares that encoding; inferring semantics from an
+    // integer's digits could silently skew an unrelated numeric RANGE key.
+    val dateEncodedInterval = if (dataType == IntegerType && basicIsoDateEncoding) {
+      for {
+        lower <- parseBasicIsoDate(lowerInclusive)
+        upper <- parseBasicIsoDate(upperExclusive)
+        if lower.isBefore(upper)
+      } yield (lower.toEpochDay, upper.toEpochDay)
+    } else {
+      None
+    }
+    val interpolationLower = dateEncodedInterval.map(_._1).getOrElse(lowerInclusive)
+    val interpolationUpper = dateEncodedInterval.map(_._2).getOrElse(upperExclusive)
+    val span = BigInt(interpolationUpper) - BigInt(interpolationLower)
+    val ascendingValues = (1 until requestedPartitions).iterator
+      .map(index => BigInt(interpolationLower) + span * index / requestedPartitions)
+      .filter(value => value > interpolationLower && value < interpolationUpper)
+      .map(_.toLong)
+      .map {
+        value =>
+          dateEncodedInterval
+            .map(_ => DateTimeFormatter.BASIC_ISO_DATE.format(LocalDate.ofEpochDay(value)).toLong)
+            .getOrElse(value)
+      }
+      .toArray
+      .distinct
+    val boundaryValues = ordering.head.direction match {
+      case Ascending => ascendingValues
+      case Descending => ascendingValues.reverse
+    }
+    if (boundaryValues.isEmpty) {
+      return None
+    }
+
+    // Varying the leading key is sufficient to produce strictly ordered lexicographic boundaries.
+    // Trailing NULL sentinels only decide where rows equal to a leading boundary land; they do not
+    // change global ordering correctness. This lets a proven interval on the leading date/integral
+    // key avoid a Spark sampling pre-action even when the write has secondary sort columns.
+    val projection = UnsafeProjection.create(ordering.map(_.dataType).toArray)
+    val rows: Array[InternalRow] = boundaryValues.map {
+      value =>
+        val encoded: Any = dataType match {
+          case ByteType => value.toByte
+          case ShortType => value.toShort
+          case IntegerType | DateType => value.toInt
+          case LongType | TimestampType => value
+          case timestampNtz if timestampNtz.typeName == "timestamp_ntz" => value
+        }
+        projection(
+          new GenericInternalRow(Array[Any](encoded) ++ Array.fill[Any](ordering.size - 1)(null)))
+          .copy(): InternalRow
+    }
+    Some(Result(encode(ordering, rows), rows.length))
+  }
+
+  private def parseBasicIsoDate(encoded: Long): Option[LocalDate] = {
+    val text = encoded.toString
+    if (text.length != 8) {
+      None
+    } else {
+      Try(LocalDate.parse(text, DateTimeFormatter.BASIC_ISO_DATE)).toOption
+    }
   }
 
   private[utils] def materializeShuffleDependencies(rdd: RDD[_]): Unit = {

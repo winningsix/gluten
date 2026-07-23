@@ -33,6 +33,7 @@ import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExecBase, ColumnarToRowExec, CommandResultExec, DeserializeToObjectExec, FilterExec, GenerateExec, ProjectExec, RowToColumnarExec, ScalarSubquery, SortExec, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
+import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
 import org.apache.spark.sql.execution.command.{DataWritingCommandExec, ExecutedCommandExec}
 import org.apache.spark.sql.execution.datasources.v2.{V2CommandExec, V2TableWriteExec}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, ShuffleExchangeLike}
@@ -222,7 +223,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
             logWarning(
               s"MppCollapseRule: *** MPP MODE ACTIVE UNDER V2 WRITE *** " +
                 s"writer=${v2.getClass.getSimpleName}")
-            v2.withNewChildren(Seq(mppQuery))
+            val distributedWriteQuery = mppQuery.transformDown {
+              case mpp: MppNativeQueryExec => mpp.copy(distributedWriteOutput = true)
+            }
+            v2.withNewChildren(Seq(distributedWriteQuery))
           case None =>
             val reason =
               s"MppCollapseRule: FALLBACK TO BSP under V2 write " +
@@ -730,7 +734,12 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
     // Plan D: Wrap, don't replace. Keep original plan as child so Spark's
     // shuffle/broadcast validation passes. At execution time, MppNativeQueryExec
     // bypasses child.executeColumnar() and runs via MppQueryCoordinator instead.
-    Some(MppNativeQueryExec(child = rewritten, fragments = fragments, exchanges = exchanges))
+    Some(
+      MppNativeQueryExec(
+        child = rewritten,
+        fragments = fragments,
+        exchanges = exchanges,
+        originalLogicalPlan = rewritten.logicalLink.orNull))
   }
 
   private[extension] def normalizeMppNativeOperators(plan: SparkPlan): SparkPlan =
@@ -945,6 +954,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   private def isExactJvmStreamIngress(plan: SparkPlan): Boolean = plan match {
     case r2c: RowToColumnarExecBase => MppJvmStreamInputMatcher.rowInput(r2c).isDefined
     case r2c: RowToColumnarExec => MppJvmStreamInputMatcher.rowInput(r2c).isDefined
+    case cache: InMemoryTableScanExec =>
+      MppJvmStreamInputMatcher.rowInput(cache).isDefined
     case _ => false
   }
 
@@ -997,6 +1008,9 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         true
       case r2c: RowToColumnarExec
           if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(r2c).isDefined =>
+        true
+      case cache: InMemoryTableScanExec
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(cache).isDefined =>
         true
 
       // A remaining row transition is a real execution boundary. The only C2R shape that MPP may
@@ -1123,6 +1137,9 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         None
       case r2c: RowToColumnarExec
           if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(r2c).isDefined =>
+        None
+      case cache: InMemoryTableScanExec
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(cache).isDefined =>
         None
       case c2r: ColumnarToRowExecBase =>
         Some(describeExecutionBoundary(c2r, "native-to-row"))

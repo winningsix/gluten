@@ -1951,12 +1951,12 @@ RowVectorPtr MppQueryCoordinator::fetchNextDeviceOutput() {
     auto state = std::make_shared<DeviceFetchState>();
     state->sequence = requestedSequence;
 
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                 << "]: fetchNextDeviceOutput rootTask=" << rootTaskId
-                 << " seq=" << requestedSequence
-                 << " rootState="
-                 << static_cast<int>(
-                        fragmentTasks_[rootFragmentId_][idx]->state());
+    VLOG(2) << "MppQueryCoordinator[" << queryId_
+            << "]: fetchNextDeviceOutput rootTask=" << rootTaskId
+            << " seq=" << requestedSequence
+            << " rootState="
+            << static_cast<int>(
+                   fragmentTasks_[rootFragmentId_][idx]->state());
 
     queueManager->getData(
         rootTaskId,
@@ -1967,10 +1967,10 @@ RowVectorPtr MppQueryCoordinator::fetchNextDeviceOutput() {
             std::shared_ptr<cudf::packed_columns> data,
             int64_t sequence,
             std::vector<int64_t> /*remainingBytes*/) {
-          LOG(WARNING) << "MppQueryCoordinator[" << qid
-                       << "]: device getData callback fired replica=" << idx
-                       << " sequence=" << sequence
-                       << " hasData=" << (data != nullptr);
+          VLOG(2) << "MppQueryCoordinator[" << qid
+                  << "]: device getData callback fired replica=" << idx
+                  << " sequence=" << sequence
+                  << " hasData=" << (data != nullptr);
           state->data = std::move(data);
           state->sequence = sequence;
           bool expected = false;
@@ -2030,7 +2030,7 @@ RowVectorPtr MppQueryCoordinator::fetchNextDeviceOutput() {
         outputType,
         tableView.num_rows(),
         std::move(packedTable),
-        rmm::cuda_stream_default);
+        deviceRootOutputStream_.view());
   }
 
   rethrowFirstTaskError();

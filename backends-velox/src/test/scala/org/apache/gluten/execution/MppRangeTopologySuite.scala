@@ -54,6 +54,24 @@ class MppRangeTopologySuite extends AnyFunSuite {
     assert(unchangedRange === otherRange)
   }
 
+  test("preserves RANGE for a distributed one-writer-per-peer consumer") {
+    val range = ExchangeSpec(
+      id = 8,
+      producerFragmentId = 2,
+      consumerFragmentId = 1,
+      exchangeType = "RANGE",
+      numPartitions = 4,
+      partitionKeys = Seq.empty)
+    val fragments = Seq(NativeFragment(1, null, Seq.empty, parallelism = 1))
+
+    val Seq(unchanged) = MppRangeTopology.collapseRangesForSingleDriverConsumers(
+      Seq(range),
+      fragments,
+      distributedSingleDriverConsumerIds = Set(1))
+
+    assert(unchanged === range)
+  }
+
   test("uses the effective RANGE partition count for native destinations") {
     val range = ExchangeSpec(
       id = 7,

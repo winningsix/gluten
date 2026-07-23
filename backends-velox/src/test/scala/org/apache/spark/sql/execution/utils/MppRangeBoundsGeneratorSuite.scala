@@ -21,7 +21,7 @@ import org.apache.gluten.utils.LocalTableScanExecCompat
 import org.apache.spark.{HashPartitioner, SparkConf, SparkContext, SparkFunSuite}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Ascending, AttributeReference, Descending, GenericInternalRow, NullsFirst, NullsLast, SortOrder, UnsafeProjection, UnsafeRow}
-import org.apache.spark.sql.types.{DecimalType, DoubleType, FloatType, IntegerType, StringType}
+import org.apache.spark.sql.types.{DateType, DecimalType, DoubleType, FloatType, IntegerType, StringType}
 import org.apache.spark.unsafe.types.UTF8String
 
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -100,6 +100,65 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
     assert(!MppRangeBoundsGenerator.supports(DecimalType(18, 2)))
     assert(!MppRangeBoundsGenerator.supports(FloatType))
     assert(!MppRangeBoundsGenerator.supports(DoubleType))
+  }
+
+  test("footer interval inference is limited to integral keys and bounded file sets") {
+    assert(MppRangeBoundsGenerator.supportsIntegralInterval(IntegerType))
+    assert(MppRangeBoundsGenerator.supportsIntegralInterval(DateType))
+    assert(!MppRangeBoundsGenerator.supportsIntegralInterval(StringType))
+  }
+
+  test("integral predicate bounds interpolate encoded dates by calendar day") {
+    val key = AttributeReference("first_play_utc_date", IntegerType, nullable = false)()
+    val ordering = Seq(SortOrder(key, Ascending, NullsFirst, Seq.empty))
+
+    val result = MppRangeBoundsGenerator
+      .fromIntegralInterval(
+        ordering,
+        20260101L,
+        20270101L,
+        requestedPartitions = 4,
+        basicIsoDateEncoding = true)
+      .get
+    val descriptor = new ObjectMapper().readTree(result.json)
+    val values = (0 until descriptor.get("bounds").size()).map {
+      index => descriptor.get("bounds").get(index).get(0).get("value").asInt()
+    }
+
+    assert(result.effectivePartitions == 4)
+    assert(values == Seq(20260402, 20260702, 20261001))
+  }
+
+  test("integral predicate bounds support secondary RANGE sort keys") {
+    val date = AttributeReference("first_play_utc_date", IntegerType, nullable = false)()
+    val hour = AttributeReference("first_play_utc_hour", IntegerType, nullable = true)()
+    val source = AttributeReference("source", StringType, nullable = true)()
+    val ordering = Seq(
+      SortOrder(date, Ascending, NullsFirst, Seq.empty),
+      SortOrder(hour, Ascending, NullsFirst, Seq.empty),
+      SortOrder(source, Ascending, NullsFirst, Seq.empty))
+
+    val result = MppRangeBoundsGenerator
+      .fromIntegralInterval(
+        ordering,
+        20260101L,
+        20270101L,
+        requestedPartitions = 4,
+        basicIsoDateEncoding = true)
+      .get
+    val descriptor = new ObjectMapper().readTree(result.json)
+    val bounds = descriptor.get("bounds")
+
+    assert(result.effectivePartitions == 4)
+    assert(
+      (0 until bounds.size()).map(bounds.get(_).get(0).get("value").asInt()) ==
+        Seq(20260402, 20260702, 20261001))
+    assert((0 until bounds.size()).forall(index => bounds.get(index).size() == 3))
+    assert(
+      (0 until bounds.size()).forall(
+        index =>
+          bounds.get(index).get(1).get("isNull").asBoolean() &&
+            bounds.get(index).get(2).get("isNull").asBoolean()))
   }
 
   test("D1 type guard rejects Spark 4 collated strings when that API is available") {

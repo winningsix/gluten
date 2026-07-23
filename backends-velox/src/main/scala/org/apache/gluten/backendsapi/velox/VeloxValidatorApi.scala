@@ -29,10 +29,15 @@ import org.apache.gluten.vectorized.NativePlanEvaluator
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.task.TaskResources
 
 import io.substrait.proto.SimpleExtensionDeclaration
+
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.util.{LinkedHashMap, Map => JMap, WeakHashMap}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
@@ -45,9 +50,12 @@ class VeloxValidatorApi extends ValidatorApi {
     true
 
   override def doNativeValidateWithFailureReason(plan: PlanNode): ValidationResult = {
-    TaskResources.runUnsafe {
-      val validator = NativePlanEvaluator.create(BackendsApiManager.getBackendName)
-      asValidationResult(validator.doNativeValidateWithFailureReason(plan.toProtobuf.toByteArray))
+    val planBytes = plan.toProtobuf.toByteArray
+    cachedPlanValidation(SQLConf.get, planBytes) {
+      TaskResources.runUnsafe {
+        val validator = NativePlanEvaluator.create(BackendsApiManager.getBackendName)
+        asValidationResult(validator.doNativeValidateWithFailureReason(planBytes))
+      }
     }
   }
 
@@ -103,6 +111,55 @@ class VeloxValidatorApi extends ValidatorApi {
 }
 
 object VeloxValidatorApi {
+  private val MaxCachedValidationsPerConf = 4096
+  private val validationCaches =
+    new WeakHashMap[SQLConf, LinkedHashMap[String, ValidationResult]]()
+
+  private def cachedPlanValidation(conf: SQLConf, plan: Array[Byte])(
+      validate: => ValidationResult): ValidationResult = {
+    val digest = MessageDigest.getInstance("SHA-256")
+    conf.getAllConfs.toSeq.sortBy(_._1).foreach {
+      case (key, value) =>
+        digest.update(key.getBytes(StandardCharsets.UTF_8))
+        digest.update(0.toByte)
+        digest.update(value.getBytes(StandardCharsets.UTF_8))
+        digest.update(0.toByte)
+    }
+    digest.update(plan)
+    val cacheKey = digest.digest().map(b => f"${b & 0xff}%02x").mkString
+    val cached = validationCaches.synchronized {
+      cacheFor(conf).get(cacheKey)
+    }
+    if (cached != null) {
+      cached
+    } else {
+      val result = validate
+      validationCaches.synchronized {
+        val cache = cacheFor(conf)
+        val concurrentlyCached = cache.get(cacheKey)
+        if (concurrentlyCached != null) {
+          concurrentlyCached
+        } else {
+          cache.put(cacheKey, result)
+          result
+        }
+      }
+    }
+  }
+
+  private def cacheFor(conf: SQLConf): LinkedHashMap[String, ValidationResult] = {
+    var cache = validationCaches.get(conf)
+    if (cache == null) {
+      cache = new LinkedHashMap[String, ValidationResult](128, 0.75f, true) {
+        override protected def removeEldestEntry(
+            eldest: JMap.Entry[String, ValidationResult]): Boolean =
+          size() > MaxCachedValidationsPerConf
+      }
+      validationCaches.put(conf, cache)
+    }
+    cache
+  }
+
   private def isPrimitiveType(dataType: DataType): Boolean = {
     dataType match {
       case BooleanType | ByteType | ShortType | IntegerType | LongType | FloatType | DoubleType |

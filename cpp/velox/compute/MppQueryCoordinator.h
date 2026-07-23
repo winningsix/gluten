@@ -28,6 +28,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef GLUTEN_ENABLE_GPU
+#include <rmm/cuda_stream.hpp>
+#endif
+
 #include "substrait/SubstraitToVeloxPlan.h"
 #include "velox/common/future/VeloxPromise.h"
 #include "velox/core/PlanFragment.h"
@@ -303,6 +307,12 @@ class MppQueryCoordinator {
   int32_t rootFetchCursor_{0};
   bool rootProducesOutput_{true};
   bool deviceRootOutput_{false};
+#ifdef GLUTEN_ENABLE_GPU
+  /// Root UCX buffers are synchronized by the producer before publication.
+  /// Associate them with a coordinator-owned non-default stream so downstream
+  /// GPU consumers and deferred deallocations do not serialize on stream 0.
+  rmm::cuda_stream deviceRootOutputStream_;
+#endif
   /// True for RANGE (order-preserving) drain; false for round-robin.
   bool rootDrainSequential_{false};
 

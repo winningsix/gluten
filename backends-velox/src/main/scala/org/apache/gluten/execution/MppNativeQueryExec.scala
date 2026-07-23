@@ -41,7 +41,7 @@ import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression, NamedExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeSet, Expression, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, Literal, NamedExpression}
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Complete, Final, Partial}
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
@@ -49,7 +49,7 @@ import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, FullOuter, Inner, Inn
 import org.apache.spark.sql.catalyst.plans.logical.{Join, LeafNode, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
 import org.apache.spark.sql.connector.read.SupportsReportStatistics
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCollapseTransformStages, ColumnarInputAdapter, ColumnarShuffleExchangeExec, ExecSubqueryExpression, ExternalRDDScanExec, FilterExec, InputAdapter, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
+import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCachedBatchSerializer, ColumnarCollapseTransformStages, ColumnarInputAdapter, ColumnarShuffleExchangeExec, ExecSubqueryExpression, ExternalRDDScanExec, FilterExec, InputAdapter, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
@@ -64,6 +64,9 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import com.google.common.collect.Lists
 import io.substrait.proto.ReadRel
+import org.apache.hadoop.fs.Path
+import org.apache.parquet.format.converter.ParquetMetadataConverter
+import org.apache.parquet.hadoop.ParquetFileReader
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
@@ -73,6 +76,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
+import scala.language.existentials
 import scala.util.control.NonFatal
 
 /**
@@ -137,12 +141,14 @@ private[execution] case class MppLocalStreamSlot(fragmentId: Int, slotIdx: Int)
 private[execution] object MppRangeTopology {
   def collapseRangesForSingleDriverConsumers(
       exchanges: Seq[ExchangeSpec],
-      fragments: Seq[NativeFragment]): Seq[ExchangeSpec] = {
+      fragments: Seq[NativeFragment],
+      distributedSingleDriverConsumerIds: Set[Int] = Set.empty): Seq[ExchangeSpec] = {
     val consumerParallelism = fragments.iterator.map(f => f.id -> f.parallelism).toMap
     exchanges.map {
       case spec
           if spec.exchangeType == "RANGE" &&
-            consumerParallelism.get(spec.consumerFragmentId).contains(1) =>
+            consumerParallelism.get(spec.consumerFragmentId).contains(1) &&
+            !distributedSingleDriverConsumerIds.contains(spec.consumerFragmentId) =>
         spec.copy(
           exchangeType = "SINGLE",
           numPartitions = 1,
@@ -257,6 +263,10 @@ private[gluten] object MppJvmStreamInputMatcher {
     case existing: RDDScanExec if isBatchExistingRddScan(existing) => Some(existing)
     case serializer: SerializeFromObjectExec if isExternalObjectSerializerIngress(serializer) =>
       Some(serializer)
+    case cache: InMemoryTableScanExec
+        if cache.supportsColumnar && cache.relation.cacheBuilder.serializer
+          .isInstanceOf[ColumnarCachedBatchSerializer] =>
+      Some(cache)
     case cia: ColumnarInputAdapter => rowInput(cia.child)
     case c2c: ColumnarToColumnarExec => rowInput(c2c.child)
     case r2c: RowToColumnarExecBase => rowInput(r2c.child)
@@ -453,7 +463,8 @@ case class MppNativeQueryExec(
     child: SparkPlan,
     fragments: Seq[NativeFragment],
     exchanges: Seq[ExchangeSpec],
-    @transient originalLogicalPlan: org.apache.spark.sql.catalyst.plans.logical.LogicalPlan = null
+    @transient originalLogicalPlan: org.apache.spark.sql.catalyst.plans.logical.LogicalPlan = null,
+    distributedWriteOutput: Boolean = false
 ) extends UnaryExecNode
   with GlutenPlan
   with Logging {
@@ -1460,14 +1471,83 @@ case class MppNativeQueryExec(
     // Sort fragments by ID (ensures topological order: producers before consumers)
     val sortedFragments = extractedFragments.sortBy(_.id).toSeq
     val cappedExchanges = capLocalHashExchangeTasks(extractedExchanges.toSeq)
+    // Experimental escape hatch for small globally sorted outputs. A SINGLE exchange still
+    // preserves total ordering, while avoiding the Spark-side RANGE sampling pre-action. Reduce
+    // the corresponding consumer fragment to one task as well so all rows are sorted by the same
+    // native driver.
+    val forceSingleRange = booleanConf("spark.gluten.mpp.forceSingleRange", defaultValue = false)
+    val forcedRangeConsumerIds =
+      if (forceSingleRange) {
+        cappedExchanges.iterator
+          .filter(_.exchangeType == "RANGE")
+          .map(_.consumerFragmentId)
+          .toSet
+      } else {
+        Set.empty[Int]
+      }
+    val rangePlanningFragments =
+      if (forcedRangeConsumerIds.nonEmpty) {
+        sortedFragments.map {
+          case fragment if forcedRangeConsumerIds.contains(fragment.id) =>
+            fragment.copy(parallelism = 1)
+          case fragment => fragment
+        }
+      } else {
+        sortedFragments
+      }
     val singleDriverExchanges =
-      MppRangeTopology.collapseRangesForSingleDriverConsumers(cappedExchanges, sortedFragments)
+      // Write fragments intentionally use one native writer per peer. Their local driver count is
+      // therefore one, but the RANGE consumer is still distributed globally across all peers.
+      // Collapsing such an edge to SINGLE gathers the entire ordered result onto every peer's
+      // CudfOrderBy and can OOM before the write starts.
+      {
+        val embeddedWriteConsumerIds = rangePlanningFragments.iterator
+          .filter(
+            fragment =>
+              fragment.rootOperator != null &&
+                fragment.rootOperator.find(_.isInstanceOf[WriteFilesExecTransformer]).isDefined)
+          .map(_.id)
+          .toSet
+        // A V2 write keeps its commit node outside MppNativeQueryExec, so its terminal native
+        // fragment does not contain WriteFilesExecTransformer. MppCollapseRule marks that exact
+        // boundary explicitly. A terminal fragment has no outgoing exchange and is consumed once
+        // per pinned Spark peer by the V2 writer.
+        val producerFragmentIds = cappedExchanges.iterator.map(_.producerFragmentId).toSet
+        val externalV2WriteConsumerIds =
+          if (distributedWriteOutput) {
+            cappedExchanges.iterator
+              .filter(
+                spec =>
+                  spec.exchangeType == "RANGE" &&
+                    !producerFragmentIds.contains(spec.consumerFragmentId))
+              .map(_.consumerFragmentId)
+              .toSet
+          } else {
+            Set.empty[Int]
+          }
+        val distributedWriteConsumerIds =
+          embeddedWriteConsumerIds ++ externalV2WriteConsumerIds
+        distributedWriteConsumerIds.foreach {
+          fragmentId =>
+            logInfo(
+              s"MppNativeQueryExec: preserving RANGE for distributed write consumer " +
+                s"F$fragmentId (one writer per peer)")
+        }
+        MppRangeTopology.collapseRangesForSingleDriverConsumers(
+          cappedExchanges,
+          rangePlanningFragments,
+          distributedWriteConsumerIds)
+      }
     cappedExchanges.zip(singleDriverExchanges).foreach {
       case (before, after) if before.exchangeType == "RANGE" && after.exchangeType == "SINGLE" =>
         logInfo(
           s"MppNativeQueryExec: planning RANGE exchange ${before.id} " +
             s"F${before.producerFragmentId}->F${before.consumerFragmentId} as SINGLE because " +
-            "the consumer fragment has exactly one native driver")
+            (if (forcedRangeConsumerIds.contains(before.consumerFragmentId)) {
+               "spark.gluten.mpp.forceSingleRange=true"
+             } else {
+               "the consumer fragment has exactly one native driver"
+             }))
       case _ =>
     }
     val sortedExchanges =
@@ -1475,7 +1555,7 @@ case class MppNativeQueryExec(
         .sortBy(_.id)
         .toSeq
     val adjustedFragments =
-      tunePostJoinFinalAggSplitParallelism(sortedFragments, sortedExchanges)
+      tunePostJoinFinalAggSplitParallelism(rangePlanningFragments, sortedExchanges)
     val frozenBroadcasts = broadcastsByConsumer.iterator.map {
       case (consumerId, buf) => consumerId -> buf.toSeq
     }.toMap
@@ -1517,7 +1597,15 @@ case class MppNativeQueryExec(
     val parallelSortSplitRule = MppParallelSortSplitRule()
     val finalAggTopNPartialRule = MppFinalAggTopNPartialRule()
     val rootTopNPartialRule = MppRootTopNPartialRule()
-    val afterHeuristicTransform = HeuristicTransform.static()(plan)
+    // A V2 writer remains outside MPP and consumes the wrapped query's root shuffle as its final
+    // distribution contract. Transforming that root exchange as though it were an internal query
+    // node can absorb the boundary into its producer WholeStageTransformer; dynamic fragment
+    // extraction then starts at the next exchange below it and silently routes writer output by
+    // the wrong distribution. Detach this external root boundary across the complete cross-cut
+    // pipeline, transform only its producer, then reattach it after the last columnar collapse.
+    val (distributedWriteRoot, planToTransform) =
+      MppNativeQueryExec.detachDistributedWriteRoot(plan, distributedWriteOutput)
+    val afterHeuristicTransform = HeuristicTransform.static()(planToTransform)
     val afterPostProject =
       afterHeuristicTransform.transformUp { case node => PullOutPostProject.rewrite(node) }
     val afterNativePostProject = rewriteNativePostProjects(afterPostProject)
@@ -1591,8 +1679,23 @@ case class MppNativeQueryExec(
     // more, then collapse again so the rewritten tail operators become part of the root native
     // fragment.
     val afterLateNativePostProject = rewriteNativePostProjects(collapsed)
-    val finalPlan = normalizeInputIteratorTransformers(
+    val collapsedPlan = normalizeInputIteratorTransformers(
       ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(afterLateNativePostProject))
+    val reattachedPlan =
+      MppNativeQueryExec.reattachDistributedWriteRoot(distributedWriteRoot, collapsedPlan)
+    // A root exchange has no relational consumer inside the query. The fragment walker discovers
+    // exchanges through a consumer WholeStageTransformer, so leaving the reattached exchange at
+    // the root would walk only its producer and silently omit the writer distribution again.
+    // Collapse the identity projection installed by reattachDistributedWriteRoot into a transparent
+    // native consumer fragment. It gives the external V2 writer a real terminal HASH/RANGE edge
+    // without changing rows or their schema.
+    val finalPlan =
+      if (distributedWriteRoot.isDefined) {
+        normalizeInputIteratorTransformers(
+          ColumnarCollapseTransformStages(new GlutenConfig(SQLConf.get))(reattachedPlan))
+      } else {
+        reattachedPlan
+      }
     // Cross-cut rules may have changed a shuffle join into a broadcast join after the final
     // columnar rule had already run. Defer the newly created exchange before any subsequent plan
     // inspection can trigger eager preparation. The runtime commit still owns irreversible
@@ -1600,21 +1703,6 @@ case class MppNativeQueryExec(
     MppBroadcastLifecycle.deferBroadcastPreparation(finalPlan)
     finalPlan
   }
-
-  /**
-   * Put a native hash-exchange boundary immediately below a native writer.
-   *
-   * A write fragment is deliberately limited to one driver per Spark peer because multiple
-   * TableWrite drivers share Spark's task-attempt output directory. If a wide, high-cardinality
-   * final aggregate is fused into that fragment, the same one-driver restriction also forces the
-   * whole aggregate state onto one GPU. Wide, high-cardinality final aggregates can exhaust a GPU
-   * even when the input scan and partial aggregate are bounded.
-   *
-   * This optional split leaves TableWrite single-driver, but moves its child pipeline into a
-   * producer fragment. Combined with more local HASH destinations/drivers, each final aggregate
-   * replica owns a smaller disjoint key range. The writer only drains their already-final rows, so
-   * no extra aggregation or CPU fallback is introduced.
-   */
   private def splitWriteRoot(plan: SparkPlan): SparkPlan = {
     if (!booleanConf("spark.gluten.mpp.splitWriteRoot.enabled", defaultValue = false)) {
       return plan
@@ -2040,7 +2128,11 @@ case class MppNativeQueryExec(
       throw new IllegalArgumentException(
         s"Expected an exact JVM-backed stream input, got ${plan.getClass.getSimpleName}")
     }
-    RowToVeloxColumnarExec(rowInput).executeColumnar()
+    if (rowInput.supportsColumnar) {
+      rowInput.executeColumnar()
+    } else {
+      RowToVeloxColumnarExec(rowInput).executeColumnar()
+    }
   }
 
   private def alignLocalStreamInputs(
@@ -3993,7 +4085,8 @@ case class MppNativeQueryExec(
         exchanges.map {
           spec =>
             if (
-              (spec.exchangeType == "HASH" || spec.exchangeType == "RANGE") &&
+              (spec.exchangeType == "HASH" ||
+                (spec.exchangeType == "RANGE" && !distributedWriteOutput)) &&
               spec.numPartitions > cap
             ) {
               logDebug(
@@ -4009,8 +4102,21 @@ case class MppNativeQueryExec(
     }
   }
 
-  private val smallMppRangeMaxBytes = BigInt(64L) << 20
-  private val smallMppRangeMaxRows = BigInt(1000000L)
+  private def smallMppRangeMaxBytes: BigInt = {
+    val key = "spark.gluten.mpp.smallRangeMaxEstimatedBytes"
+    val raw = SQLConf.get.getConfString(key, (64L << 20).toString).trim
+    val value = BigInt(raw)
+    require(value >= 0, s"$key must be non-negative: $raw")
+    value
+  }
+
+  private def smallMppRangeMaxRows: BigInt = {
+    val key = "spark.gluten.mpp.smallRangeMaxEstimatedRows"
+    val raw = SQLConf.get.getConfString(key, "1000000").trim
+    val value = BigInt(raw)
+    require(value >= 0, s"$key must be non-negative: $raw")
+    value
+  }
 
   /**
    * Translate Catalyst shuffle partitioning into MPP exchange partitioning.
@@ -4042,7 +4148,22 @@ case class MppNativeQueryExec(
               rangeEffectivePartitions = None
             )
           case None =>
-            val rangePartitions = math.min(spec.numPartitions, peerCount)
+            // A RANGE feeding an external distributed writer needs more than one sort bucket per
+            // GPU for large outputs. One bucket per peer can make CudfOrderBy retain an entire
+            // peer's share and exceed device memory. The native coordinator assigns logical RANGE
+            // destinations across peers, so keep a bounded number of independent buckets per peer
+            // while the Spark writer still owns one output task per physical peer.
+            val partitionsPerPeer = if (distributedWriteOutput) {
+              math.max(
+                1,
+                mppNonNegativeIntConf(
+                  "spark.gluten.mpp.distributedWrite.rangePartitionsPerPeer",
+                  4))
+            } else {
+              1
+            }
+            val rangePartitionCap = Math.multiplyExact(peerCount, partitionsPerPeer)
+            val rangePartitions = math.min(spec.numPartitions, rangePartitionCap)
             if (spec.numPartitions == rangePartitions) {
               spec
             } else {
@@ -4056,7 +4177,8 @@ case class MppNativeQueryExec(
               logInfo(
                 s"MppNativeQueryExec: aligning RANGE exchange ${spec.id} " +
                   s"F${spec.producerFragmentId}->F${spec.consumerFragmentId} partitions " +
-                  s"from ${spec.numPartitions} to MPP peer cap $rangePartitions ($estimate)")
+                  s"from ${spec.numPartitions} to MPP cap $rangePartitions " +
+                  s"($peerCount peers x $partitionsPerPeer partitions/peer; $estimate)")
               spec.copy(numPartitions = rangePartitions)
             }
         }
@@ -4121,29 +4243,50 @@ case class MppNativeQueryExec(
         require(
           spec.rangeSamplePlan != null,
           s"MPP RANGE exchange ${spec.id} is missing its producer sampling plan")
-        logWarning(
-          s"MppNativeQueryExec: *** SPARK PRE-ACTION FOR MPP RANGE *** exchange=${spec.id} " +
-            s"F${spec.producerFragmentId}->F${spec.consumerFragmentId} requestedPartitions=" +
-            s"${spec.numPartitions}. MppRangeBoundsGenerator will execute the Spark producer " +
-            s"plan to collect bounded samples before MppNativeQueryRDD starts; this launch is " +
-            s"hybrid preparation and is not an end-to-end fully-MPP execution.")
-
         // The shadow plan is shaped for native fragment extraction, not direct Spark execution.
         // In particular, a vanilla row ShuffleExchangeExec may have a columnar transformer child
         // after the MPP-specific rewrites. Spark rejects that tree with a column-support mismatch
         // before the sampling action starts. Reuse the same transition repair and WST preparation
         // as normal BSP fallback so the bounded pre-action executes a convention-correct producer.
         val executableSamplePlan = prepareColumnarBspFallbackPlan(spec.rangeSamplePlan)
+        val inferredBounds =
+          inferIntegralRangeBounds(executableSamplePlan, spec.rangeOrdering, spec.numPartitions)
+        val representativeScan =
+          if (inferredBounds.isEmpty) {
+            findRangeRepresentativeScan(executableSamplePlan, spec.rangeOrdering)
+          } else {
+            None
+          }
+        val footerBounds = representativeScan.flatMap {
+          case (scanPlan, scanOrdering) =>
+            inferParquetFooterRangeBounds(scanPlan, scanOrdering, spec.numPartitions)
+        }
+        if (inferredBounds.isEmpty && representativeScan.isEmpty) {
+          logWarning(
+            s"MppNativeQueryExec: *** SPARK PRE-ACTION FOR MPP RANGE *** exchange=${spec.id} " +
+              s"F${spec.producerFragmentId}->F${spec.consumerFragmentId} requestedPartitions=" +
+              s"${spec.numPartitions}. MppRangeBoundsGenerator will execute the Spark producer " +
+              s"plan to collect bounded samples before MppNativeQueryRDD starts; this launch is " +
+              s"hybrid preparation and is not an end-to-end fully-MPP execution.")
+        }
         val (bounds, reused) = rangeBoundsCache.getOrCompute(
           executableSamplePlan,
           executableSamplePlan.output,
           spec.rangeOrdering,
           spec.numPartitions) {
-          MppRangeBoundsGenerator.generate(
-            executableSamplePlan,
-            executableSamplePlan.output,
-            spec.rangeOrdering,
-            spec.numPartitions)
+          inferredBounds.orElse(footerBounds).getOrElse {
+            representativeScan match {
+              case Some((scanPlan, scanOrdering)) =>
+                MppRangeBoundsGenerator
+                  .generate(scanPlan, scanPlan.output, scanOrdering, spec.numPartitions)
+              case None =>
+                MppRangeBoundsGenerator.generate(
+                  executableSamplePlan,
+                  executableSamplePlan.output,
+                  spec.rangeOrdering,
+                  spec.numPartitions)
+            }
+          }
         }
         require(
           bounds.effectivePartitions <= spec.numPartitions,
@@ -4152,13 +4295,383 @@ case class MppNativeQueryExec(
         )
         logInfo(s"MppNativeQueryExec: RANGE exchange ${spec.id} " +
           (if (reused) "reused" else "computed") + " " +
-          s"${bounds.boundaryCount} Spark-compatible boundaries from bounded samples " +
+          s"${bounds.boundaryCount} Spark-compatible boundaries " +
+          (if (inferredBounds.isDefined) "from integral predicate bounds "
+           else if (footerBounds.isDefined) "from Parquet footer bounds "
+           else if (representativeScan.isDefined) "from a representative leaf scan "
+           else "from bounded samples ") +
           s"(${bounds.effectivePartitions}/${spec.numPartitions} effective/requested partitions, " +
           s"execution=${rangeBoundsCache.queryExecutionId})")
         spec.copy(
           rangeBoundsJson = Some(bounds.json),
           rangeEffectivePartitions = Some(bounds.effectivePartitions))
       case spec => spec
+    }
+  }
+
+  /** Infer the leading integral RANGE key's interval from existing query predicates. */
+  private def inferIntegralRangeBounds(
+      plan: SparkPlan,
+      ordering: Seq[SortOrder],
+      requestedPartitions: Int): Option[MppRangeBoundsGenerator.Result] = {
+    val keyAttribute = ordering.headOption.flatMap(_.child match {
+      case attribute: Attribute => Some(attribute)
+      case _ => None
+    })
+    if (ordering.isEmpty || keyAttribute.isEmpty) {
+      logInfo(
+        s"MppNativeQueryExec: RANGE interval inference requires an attribute leading key; " +
+          s"ordering=${ordering.map(_.sql).mkString("[", ",", "]")}")
+      return None
+    }
+
+    val outputKeyCandidates = plan.output.filter {
+      attribute =>
+        attribute.name == keyAttribute.get.name && attribute.dataType == keyAttribute.get.dataType
+    }
+    val outputKey = plan.output
+      .find(_.exprId == keyAttribute.get.exprId)
+      .orElse(Option.when(outputKeyCandidates.size == 1)(outputKeyCandidates.head))
+    if (outputKey.isEmpty) {
+      logInfo(
+        s"MppNativeQueryExec: RANGE interval inference could not anchor " +
+          s"key=${keyAttribute.get.name}#${keyAttribute.get.exprId.id} in sample output " +
+          s"${plan.output.map(a => s"${a.name}#${a.exprId.id}").mkString("[", ",", "]")}")
+      return None
+    }
+
+    val equivalentExprIds = mutable.Set(keyAttribute.get.exprId.id, outputKey.get.exprId.id)
+    val equivalentNames = mutable.Set(keyAttribute.get.name)
+    val aliases = mutable.ArrayBuffer.empty[(Long, String, Long, String)]
+    // Spark's Union output reuses the first child's exprIds. Connect every positional child
+    // attribute explicitly so predicates on later branches contribute to the RANGE envelope too.
+    // These edges are deliberately kept exprId-based: names alone are ambiguous in joins.
+    plan.foreach {
+      case union: UnionExecTransformer =>
+        union.output.zipWithIndex.foreach {
+          case (outputAttribute, ordinal) =>
+            union.children.foreach {
+              child =>
+                child.output.lift(ordinal).foreach {
+                  childAttribute =>
+                    aliases += ((
+                      outputAttribute.exprId.id,
+                      outputAttribute.name,
+                      childAttribute.exprId.id,
+                      childAttribute.name))
+                }
+            }
+        }
+      case _ =>
+    }
+    def foreachQueryExpression(visit: Expression => Unit): Unit = {
+      plan.foreach {
+        node =>
+          node.expressions.foreach(_.foreach(visit))
+          node match {
+            // V2 filter pushdown removes the FilterExec while retaining the predicates on the
+            // transformer. SparkPlan.expressions does not enumerate this optional field.
+            case scan: BasicScanExecTransformer =>
+              scan.pushDownFilters.toSeq.flatten.foreach(_.foreach(visit))
+            case _ =>
+          }
+      }
+      // Data-source pushdown can remove a Filter from the executable sampling tree. The original
+      // logical plan still carries the exact predicate and is safe to inspect: inferred bounds are
+      // only an ordering/load-balancing hint, while the scan itself continues to enforce filters.
+      Option(originalLogicalPlan).foreach {
+        logical => logical.foreach(node => node.expressions.foreach(_.foreach(visit)))
+      }
+    }
+    foreachQueryExpression {
+      case alias: Alias =>
+        alias.child match {
+          case attribute: Attribute =>
+            aliases += ((alias.exprId.id, alias.name, attribute.exprId.id, attribute.name))
+          case _ =>
+        }
+      case _ =>
+    }
+    var changed = true
+    while (changed) {
+      changed = false
+      aliases.foreach {
+        case (aliasId, _, childId, childName)
+            if equivalentExprIds.contains(aliasId) && !equivalentExprIds.contains(childId) =>
+          equivalentExprIds += childId
+          equivalentNames += childName
+          changed = true
+        case (aliasId, aliasName, childId, _)
+            if equivalentExprIds.contains(childId) && !equivalentExprIds.contains(aliasId) =>
+          equivalentExprIds += aliasId
+          equivalentNames += aliasName
+          changed = true
+        case _ =>
+      }
+    }
+
+    def integralValue(literal: Literal): Option[Long] = literal.value match {
+      case value: Byte => Some(value.toLong)
+      case value: Short => Some(value.toLong)
+      case value: Int => Some(value.toLong)
+      case value: Long => Some(value)
+      case _ => None
+    }
+    def isKey(attribute: Attribute): Boolean = equivalentExprIds.contains(attribute.exprId.id)
+
+    val lowerBounds = mutable.ArrayBuffer.empty[Long]
+    val upperExclusiveBounds = mutable.ArrayBuffer.empty[Long]
+    foreachQueryExpression {
+      case GreaterThanOrEqual(attribute: Attribute, literal: Literal) if isKey(attribute) =>
+        integralValue(literal).foreach(lowerBounds += _)
+      case GreaterThan(attribute: Attribute, literal: Literal) if isKey(attribute) =>
+        integralValue(literal).filter(_ < Long.MaxValue).foreach(v => lowerBounds += v + 1L)
+      case LessThan(attribute: Attribute, literal: Literal) if isKey(attribute) =>
+        integralValue(literal).foreach(upperExclusiveBounds += _)
+      case LessThanOrEqual(attribute: Attribute, literal: Literal) if isKey(attribute) =>
+        integralValue(literal)
+          .filter(_ < Long.MaxValue)
+          .foreach(v => upperExclusiveBounds += v + 1L)
+      case LessThanOrEqual(literal: Literal, attribute: Attribute) if isKey(attribute) =>
+        integralValue(literal).foreach(lowerBounds += _)
+      case LessThan(literal: Literal, attribute: Attribute) if isKey(attribute) =>
+        integralValue(literal).filter(_ < Long.MaxValue).foreach(v => lowerBounds += v + 1L)
+      case GreaterThan(literal: Literal, attribute: Attribute) if isKey(attribute) =>
+        integralValue(literal).foreach(upperExclusiveBounds += _)
+      case GreaterThanOrEqual(literal: Literal, attribute: Attribute) if isKey(attribute) =>
+        integralValue(literal)
+          .filter(_ < Long.MaxValue)
+          .foreach(v => upperExclusiveBounds += v + 1L)
+      case _ =>
+    }
+
+    // Diagnostic/operational escape hatch for ordered outputs whose key domain is known by the
+    // application but is not represented by a predicate in Catalyst (for example a surrogate key
+    // constrained indirectly through a dimension join). The interval only chooses load-balancing
+    // boundaries; RANGE ordering remains exact for values both inside and outside it.
+    val configuredInterval =
+      SQLConf.get.getConfString("spark.gluten.mpp.rangeIntegralFallbackInterval", "").trim match {
+        case "" => None
+        case raw =>
+          raw.split(":", -1).toSeq match {
+            case Seq(lower, upper) => Some((lower.toLong, upper.toLong))
+            case _ =>
+              throw new IllegalArgumentException(
+                "spark.gluten.mpp.rangeIntegralFallbackInterval must be lower:upper, found " + raw)
+          }
+      }
+    configuredInterval.foreach {
+      case (lower, upper) =>
+        lowerBounds += lower
+        upperExclusiveBounds += upper
+    }
+    val inferred = for {
+      // Predicates can belong to different Union branches. Use their outer envelope rather than
+      // intersecting them: boundaries outside the exact data range are still correct, while an
+      // intersection could become empty for adjacent incremental-load branches.
+      lower <- lowerBounds.reduceOption((left: Long, right: Long) => math.min(left, right))
+      upper <- upperExclusiveBounds.reduceOption((left: Long, right: Long) => math.max(left, right))
+      result <- MppRangeBoundsGenerator.fromIntegralInterval(
+        ordering,
+        lower,
+        upper,
+        requestedPartitions,
+        basicIsoDateEncoding = booleanConf(
+          "spark.gluten.mpp.rangeIntegralBasicIsoDateEncoding.enabled",
+          defaultValue = false)
+      )
+    } yield {
+      logInfo(
+        s"MppNativeQueryExec: inferred RANGE interval [$lower,$upper) for " +
+          s"${keyAttribute.get.name} from predicates over " +
+          s"${equivalentNames.toSeq.sorted.mkString("[", ",", "]")}; " +
+          "skipping the Spark producer sampling pre-action")
+      result
+    }
+    if (inferred.isEmpty) {
+      val sampleOutput =
+        plan.output.map(a => s"${a.name}#${a.exprId.id}").mkString("[", ",", "]")
+      logInfo(
+        s"MppNativeQueryExec: RANGE interval inference did not apply for " +
+          s"key=${keyAttribute.get.name}#${keyAttribute.get.exprId.id}; " +
+          s"sampleOutput=$sampleOutput; " +
+          s"equivalentExprIds=${equivalentExprIds.toSeq.sorted.mkString("[", ",", "]")}; " +
+          s"equivalentNames=${equivalentNames.toSeq.sorted.mkString("[", ",", "]")}; " +
+          s"lowerBounds=${lowerBounds.mkString("[", ",", "]")}; " +
+          s"upperExclusiveBounds=${upperExclusiveBounds.mkString("[", ",", "]")}")
+    }
+    inferred
+  }
+
+  /**
+   * Select the smallest leaf scan that carries every RANGE key as a representative sample.
+   *
+   * Bounds do not need to contain every producer value to preserve ordering: values below/above the
+   * sampled envelope route to the first/last bucket. A scan-side sample can therefore provide
+   * useful boundaries without executing joins, aggregates, and their shuffle dependencies twice. If
+   * no unambiguous scan contains all keys, the caller retains full-producer sampling.
+   */
+  private def findRangeRepresentativeScan(
+      plan: SparkPlan,
+      ordering: Seq[SortOrder]): Option[(SparkPlan, Seq[SortOrder])] = {
+    val candidates = mutable.ArrayBuffer.empty[(SparkPlan, Seq[SortOrder], BigInt)]
+    plan.foreach {
+      case scan: BatchScanExecTransformerBase =>
+        val mappedOrdering = ordering.map {
+          order =>
+            order.child match {
+              case key: Attribute =>
+                val matches = scan.output.filter {
+                  attribute => attribute.name == key.name && attribute.dataType == key.dataType
+                }
+                Option.when(matches.size == 1)(order.copy(child = matches.head))
+              case _ => None
+            }
+        }
+        if (mappedOrdering.nonEmpty && mappedOrdering.forall(_.isDefined)) {
+          val estimatedBytes = planLogicalStats(scan)
+            .map(_.sizeInBytes)
+            .filter(isConfidentSize)
+            .getOrElse(BigInt(Long.MaxValue))
+          candidates += ((scan, mappedOrdering.flatten, estimatedBytes))
+        }
+      case _ =>
+    }
+    candidates.sortBy(_._3).headOption.map {
+      case (scan, scanOrdering, estimatedBytes) =>
+        val executableScan = prepareColumnarBspFallbackPlan(scan)
+        val executableOrdering = scanOrdering.map {
+          order =>
+            val key = order.child.asInstanceOf[Attribute]
+            val outputKey = executableScan.output
+              .find {
+                attribute => attribute.name == key.name && attribute.dataType == key.dataType
+              }
+              .getOrElse {
+                throw new IllegalStateException(
+                  s"Representative RANGE scan lost key ${key.sql} during fallback preparation")
+              }
+            order.copy(child = outputKey)
+        }
+        logInfo(
+          s"MppNativeQueryExec: using representative RANGE leaf scan " +
+            s"${scan.nodeName} estimatedBytes=$estimatedBytes keys=" +
+            executableOrdering.map(_.child.sql).mkString("[", ",", "]"))
+        (executableScan, executableOrdering)
+    }
+  }
+
+  /** Read integral RANGE bounds from Parquet footers when table file metrics omit them. */
+  private def inferParquetFooterRangeBounds(
+      scanPlan: SparkPlan,
+      ordering: Seq[SortOrder],
+      requestedPartitions: Int): Option[MppRangeBoundsGenerator.Result] = {
+    val key = ordering.headOption.flatMap(_.child match {
+      case attribute: Attribute => Some(attribute)
+      case _ => None
+    })
+    if (
+      !key.exists(candidate => MppRangeBoundsGenerator.supportsIntegralInterval(candidate.dataType))
+    ) {
+      return None
+    }
+    val fileScan = scanPlan.collectFirst {
+      case scan: BasicScanExecTransformer
+          if key.exists(
+            candidate =>
+              scan.output.exists(
+                attribute =>
+                  attribute.name == candidate.name &&
+                    attribute.dataType == candidate.dataType)) =>
+        scan
+    }
+    if (key.isEmpty || fileScan.isEmpty) {
+      return None
+    }
+
+    val filePaths = fileScan.get.getSplitInfos.iterator
+      .collect { case localFiles: LocalFilesNode => localFiles.getPaths.asScala }
+      .flatten
+      .toSet
+    if (filePaths.isEmpty) {
+      return None
+    }
+    val maxFiles =
+      SQLConf.get
+        .getConfString("spark.gluten.mpp.rangeFooterInference.maxFiles", "256")
+        .toInt
+    require(
+      maxFiles >= 0,
+      s"spark.gluten.mpp.rangeFooterInference.maxFiles must be non-negative: $maxFiles")
+    if (maxFiles == 0 || filePaths.size > maxFiles) {
+      logInfo(
+        s"MppNativeQueryExec: skipping Parquet footer RANGE inference for ${key.get.name}; " +
+          s"${filePaths.size} files exceed the configured limit $maxFiles")
+      return None
+    }
+
+    var minimum: Option[Long] = None
+    var maximum: Option[Long] = None
+    var files = 0L
+    var filesWithBounds = 0L
+    filePaths.foreach {
+      filePath =>
+        files += 1L
+        try {
+          val footer = ParquetFileReader.readFooter(
+            sparkContext.hadoopConfiguration,
+            new Path(filePath),
+            ParquetMetadataConverter.NO_FILTER)
+          var fileHadBounds = false
+          footer.getBlocks.asScala.foreach {
+            block =>
+              block.getColumns.asScala.foreach {
+                column =>
+                  val statistics = column.getStatistics
+                  if (
+                    column.getPath.toDotString == key.get.name &&
+                    statistics != null &&
+                    statistics.hasNonNullValue
+                  ) {
+                    (statistics.genericGetMin(), statistics.genericGetMax()) match {
+                      case (lower: java.lang.Number, upper: java.lang.Number) =>
+                        val lowerValue = lower.longValue()
+                        val upperValue = upper.longValue()
+                        minimum = Some(minimum.fold(lowerValue)(math.min(_, lowerValue)))
+                        maximum = Some(maximum.fold(upperValue)(math.max(_, upperValue)))
+                        fileHadBounds = true
+                      case _ =>
+                    }
+                  }
+              }
+          }
+          if (fileHadBounds) {
+            filesWithBounds += 1L
+          }
+        } catch {
+          case NonFatal(error) =>
+            logDebug(s"Could not read RANGE footer statistics from $filePath", error)
+        }
+    }
+    for {
+      lower <- minimum
+      upperInclusive <- maximum
+      if upperInclusive < Long.MaxValue
+      result <- MppRangeBoundsGenerator.fromIntegralInterval(
+        ordering,
+        lower,
+        upperInclusive + 1L,
+        requestedPartitions,
+        basicIsoDateEncoding = booleanConf(
+          "spark.gluten.mpp.rangeIntegralBasicIsoDateEncoding.enabled",
+          defaultValue = false)
+      )
+    } yield {
+      logInfo(
+        s"MppNativeQueryExec: inferred Parquet footer RANGE interval " +
+          s"[$lower,${upperInclusive + 1L}) for ${key.get.name} from " +
+          s"$filesWithBounds/$files files in ${fileScan.get.nodeName}")
+      result
     }
   }
 
@@ -4735,6 +5248,16 @@ case class MppNativeQueryExec(
       case p if p.numPartitions > 0 => p.numPartitions
       case _ =>
         SQLConf.get.getConfString("spark.sql.shuffle.partitions", "200").toInt
+    }
+    val scanDriverOverride = positiveIntConf("spark.gluten.mpp.scanDriversPerFragment")
+      .filter(
+        _ =>
+          plan.find {
+            case _: BasicScanExecTransformer => true
+            case _ => false
+          }.isDefined)
+    if (scanDriverOverride.isDefined) {
+      return math.min(raw, scanDriverOverride.get)
     }
     val cores = SQLConf.get.getConfString("spark.executor.cores", "16").toInt
     val coreCapped = math.min(raw, math.max(cores, 1))
@@ -5567,4 +6090,32 @@ case class MppNativeQueryExec(
        |""".stripMargin
   }
 
+}
+
+object MppNativeQueryExec {
+  private[gluten] def detachDistributedWriteRoot(
+      plan: SparkPlan,
+      distributedWriteOutput: Boolean): (Option[ShuffleExchangeLike], SparkPlan) = {
+    if (distributedWriteOutput) {
+      plan match {
+        case rootExchange: ShuffleExchangeLike =>
+          (Some(rootExchange), rootExchange.child)
+        case _ => (None, plan)
+      }
+    } else {
+      (None, plan)
+    }
+  }
+
+  private[gluten] def reattachDistributedWriteRoot(
+      rootExchange: Option[ShuffleExchangeLike],
+      transformedProducer: SparkPlan): SparkPlan = {
+    rootExchange
+      .map {
+        exchange =>
+          val reattached = exchange.withNewChildren(Seq(transformedProducer))
+          ProjectExecTransformer.createUnsafe(reattached.output, reattached)
+      }
+      .getOrElse(transformedProducer)
+  }
 }
