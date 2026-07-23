@@ -23,10 +23,13 @@ import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.storage.BlockManagerUtil
 
 import java.util.Properties
+import java.util.concurrent.atomic.AtomicLong
 
 import scala.collection.JavaConverters._
 
 object SparkTaskUtil {
+  private val nextSyntheticTaskAttemptId = new AtomicLong(-1L)
+
   def setTaskContext(taskContext: TaskContext): Unit = {
     TaskContext.setTaskContext(taskContext)
   }
@@ -58,10 +61,13 @@ object SparkTaskUtil {
     val stageId = -1.asInstanceOf[Object]
     val stageAttemptNumber = -1.asInstanceOf[Object]
     val partitionId = -1.asInstanceOf[Object]
-    val taskAttemptId = -1L.asInstanceOf[Object]
+    val syntheticTaskAttemptId = nextSyntheticTaskAttemptId.getAndDecrement()
+    require(syntheticTaskAttemptId < 0, "Synthetic task attempt ID space is exhausted")
+    val taskAttemptId = syntheticTaskAttemptId.asInstanceOf[Object]
     val attemptNumber = -1.asInstanceOf[Object]
     val numPartitions = -1.asInstanceOf[Object] // Added in Spark 3.4.
-    val taskMemoryManager = new TaskMemoryManager(memoryManager, -1L).asInstanceOf[Object]
+    val taskMemoryManager =
+      new TaskMemoryManager(memoryManager, syntheticTaskAttemptId).asInstanceOf[Object]
     val localProperties = properties.asInstanceOf[Object]
     val metricsSystem =
       (if (sparkEnv != null) sparkEnv.metricsSystem

@@ -24,8 +24,12 @@ import org.apache.spark.util.SparkTaskUtil
 
 import org.scalatest.funsuite.AnyFunSuite
 
+import java.util.Properties
 import java.util.UUID
+import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Executors}
 import java.util.concurrent.atomic.AtomicReference
+
+import scala.collection.JavaConverters._
 
 class TaskResourceSuite extends AnyFunSuite with SQLHelper {
   test("Run unsafe") {
@@ -39,6 +43,49 @@ class TaskResourceSuite extends AnyFunSuite with SQLHelper {
     TaskResources.runUnsafe {
       assert(TaskResources.inSparkTask())
       assert(TaskResources.getLocalTaskContext() != null)
+    }
+  }
+
+  test("Synthetic task contexts have unique negative attempt IDs") {
+    val threadCount = 16
+    val start = new CountDownLatch(1)
+    val done = new CountDownLatch(threadCount)
+    val executor = Executors.newFixedThreadPool(threadCount)
+    val taskAttemptIds = new ConcurrentLinkedQueue[Long]()
+    val failure = new AtomicReference[Throwable]()
+    val taskAttemptIdField = classOf[org.apache.spark.memory.TaskMemoryManager]
+      .getDeclaredField("taskAttemptId")
+    taskAttemptIdField.setAccessible(true)
+    try {
+      (0 until threadCount).foreach {
+        _ =>
+          executor.execute(
+            () => {
+              try {
+                start.await()
+                val context = SparkTaskUtil.createTestTaskContext(new Properties())
+                taskAttemptIds.add(context.taskAttemptId())
+                assert(
+                  taskAttemptIdField.getLong(SparkTaskUtil.getTaskMemoryManager(context)) ==
+                    context.taskAttemptId())
+              } catch {
+                case t: Throwable => failure.compareAndSet(null, t)
+              } finally {
+                done.countDown()
+              }
+            })
+      }
+      start.countDown()
+      done.await()
+      if (failure.get() != null) {
+        throw failure.get()
+      }
+      val ids = taskAttemptIds.asScala.toSeq
+      assert(ids.size == threadCount)
+      assert(ids.forall(_ < 0))
+      assert(ids.distinct.size == ids.size)
+    } finally {
+      executor.shutdownNow()
     }
   }
 
