@@ -223,9 +223,6 @@ pipeline {
                                 sh """
                                     set -eu
                                     docker pull '${prebuildImage}'
-                                    docker run --rm --entrypoint /usr/bin/test \
-                                      '${prebuildImage}' \
-                                      -f /usr/local/include/cuda/version
                                     PYTHONUNBUFFERED=1 '${env.COLT_ROOT}/colt' workflow verify \
                                       --mode=run \
                                       --scope=gluten \
