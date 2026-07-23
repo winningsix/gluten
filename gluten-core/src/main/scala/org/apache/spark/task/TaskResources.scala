@@ -72,7 +72,7 @@ object TaskResources extends TaskListener with Logging {
     if (!inSparkTask()) {
       throw new IllegalStateException()
     }
-    if (getLocalTaskContext().taskAttemptId() != -1) {
+    if (getLocalTaskContext().taskAttemptId() >= 0) {
       throw new IllegalStateException()
     }
     TaskContext.unset()

@@ -62,7 +62,7 @@ public final class NativeBackendInitializer {
     initialize0(rl, conf);
     SparkShutdownManagerUtil.addHook(
         () -> {
-          shutdown();
+          shutdownAtJvmExit();
           return BoxedUnit.UNIT;
         });
   }
@@ -89,7 +89,9 @@ public final class NativeBackendInitializer {
 
   private native String getUcxListenerEndpoint0(String advertisedHost);
 
-  public void shutdown() {
+  // Called only by the JVM shutdown hook registered in initialize(). Keep this private so Spark
+  // plugin lifecycle callbacks cannot invoke terminal teardown.
+  private void shutdownAtJvmExit() {
     if (!initialized.get() || !shutDown.compareAndSet(false, true)) {
       return;
     }

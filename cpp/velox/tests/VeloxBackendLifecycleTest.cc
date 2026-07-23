@@ -14,33 +14,25 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.gluten.substrait.rel;
 
-import org.apache.iceberg.DeleteFile;
+#include "compute/VeloxBackend.h"
 
-import java.util.List;
-import java.util.Map;
+#include <gtest/gtest.h>
 
-public class IcebergLocalFilesBuilder {
-  public static IcebergLocalFilesNode makeIcebergLocalFiles(
-      Integer index,
-      List<String> paths,
-      List<Long> starts,
-      List<Long> lengths,
-      List<Long> fileSizes,
-      List<Map<String, String>> partitionColumns,
-      LocalFilesNode.ReadFileFormat fileFormat,
-      List<String> preferredLocations,
-      List<List<DeleteFile>> deleteFilesList) {
-    return new IcebergLocalFilesNode(
-        index,
-        paths,
-        starts,
-        lengths,
-        fileSizes,
-        partitionColumns,
-        fileFormat,
-        preferredLocations,
-        deleteFilesList);
-  }
+#include "memory/VeloxMemoryManager.h"
+#include "utils/Exception.h"
+
+namespace gluten {
+
+TEST(VeloxBackendLifecycleTest, RejectsMemoryManagerAccessAfterTerminalTearDown) {
+  VeloxBackend::create(AllocationListener::noop(), {});
+  ASSERT_NE(VeloxBackend::get()->getGlobalMemoryManager(), nullptr);
+
+  VeloxBackend::get()->tearDown();
+
+  EXPECT_THROW(VeloxBackend::get()->getGlobalMemoryManager(), GlutenException);
+  EXPECT_THROW(defaultLeafVeloxMemoryPool(), GlutenException);
+  EXPECT_NO_THROW(VeloxBackend::get()->tearDown());
 }
+
+} // namespace gluten

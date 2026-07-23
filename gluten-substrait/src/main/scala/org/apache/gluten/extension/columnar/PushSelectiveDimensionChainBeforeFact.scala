@@ -587,7 +587,8 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
 
   private def isDeduplicatedOn(plan: LogicalPlan, keys: AttributeSet, depth: Int): Boolean =
     plan match {
-      case Aggregate(groupingExpressions, _, _) =>
+      case aggregate: Aggregate =>
+        val groupingExpressions = aggregate.groupingExpressions
         // GROUP BY (a, b) is not unique on a. The grouping set must be a non-empty subset of the
         // RHS equi keys; joining on additional keys remains unique, but omitting a grouping key
         // does not. Restrict the proof to plain Attributes so expression/alias equivalence cannot

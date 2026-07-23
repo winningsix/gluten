@@ -18,7 +18,7 @@ package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.exception.GlutenException
-import org.apache.gluten.execution.{ColumnarUnionExec, FlushableHashAggregateExecTransformer, GenerateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, MppJvmStreamInputMatcher, MppNativeQueryExec, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, UnionExecTransformer, VeloxColumnarToRowExec}
+import org.apache.gluten.execution.{ColumnarCoalesceExec, ColumnarUnionExec, FlushableHashAggregateExecTransformer, GenerateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, MppJvmStreamInputMatcher, MppNativeQueryExec, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, UnionExecTransformer, VeloxColumnarToRowExec}
 import org.apache.gluten.expression.aggregate.VeloxCollectList
 import org.apache.gluten.extension.columnar.FallbackTags
 
@@ -89,6 +89,59 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
       outputPartitioning = HashPartitioning(Seq(child.output.head), 4),
       child = child,
       projectOutputAttributes = child.output)
+  }
+
+  test("strict MPP elides query HASH directly below an Iceberg RANGE exchange") {
+    val child = nativeLeaf()
+    val hash = ColumnarShuffleExchangeExec(
+      outputPartitioning = HashPartitioning(Seq(child.output.head), 4),
+      child = child,
+      projectOutputAttributes = child.output)
+    val range = ColumnarShuffleExchangeExec(
+      outputPartitioning =
+        RangePartitioning(Seq(SortOrder(hash.output.head, Ascending, NullsFirst, Seq.empty)), 8),
+      child = hash,
+      projectOutputAttributes = hash.output
+    )
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assert(rule.isFullyNativeSupported(range))
+    val collapsed = rule(range).asInstanceOf[MppNativeQueryExec]
+    val normalizedRange = collapsed.child.asInstanceOf[ColumnarShuffleExchangeExec]
+    assert(normalizedRange.outputPartitioning.isInstanceOf[RangePartitioning])
+    assert(normalizedRange.child eq child)
+    assert(!normalizedRange.child.isInstanceOf[ColumnarShuffleExchangeExec])
+  }
+
+  test("distributed V2 write preserves its root shuffle during dynamic extraction preparation") {
+    val child = nativeLeaf()
+    val ordering = Seq(SortOrder(child.output.head, Ascending, NullsFirst, Seq.empty))
+    val range = ColumnarShuffleExchangeExec(
+      outputPartitioning = RangePartitioning(ordering, 8),
+      child = child,
+      projectOutputAttributes = child.output)
+    val sorted = SortExecTransformer(ordering, global = true, range, testSpillFrequency = 0)
+    val coalesced = ColumnarCoalesceExec(200, sorted)
+    val writerDistribution = ColumnarShuffleExchangeExec(
+      outputPartitioning = HashPartitioning(Seq(coalesced.output.head), 128),
+      child = coalesced,
+      projectOutputAttributes = coalesced.output)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val normalized = rule.normalizeMppNativeOperators(writerDistribution)
+    val (rootExchange, producer) =
+      MppNativeQueryExec.detachDistributedWriteRoot(normalized, distributedWriteOutput = true)
+    val prepared = MppNativeQueryExec.reattachDistributedWriteRoot(rootExchange, producer)
+
+    assert(rootExchange.isDefined)
+    assert(producer eq normalized.asInstanceOf[ColumnarShuffleExchangeExec].child)
+    assert(prepared.isInstanceOf[ProjectExecTransformer])
+    val preparedRoot = prepared
+      .asInstanceOf[ProjectExecTransformer]
+      .child
+      .asInstanceOf[ColumnarShuffleExchangeExec]
+    assert(preparedRoot.outputPartitioning.isInstanceOf[HashPartitioning])
+    assert(preparedRoot.child.find(_.isInstanceOf[ColumnarShuffleExchangeExec]).isDefined)
   }
 
   private def collectStructAggregate(flushable: Boolean): HashAggregateExecBaseTransformer = {
@@ -412,6 +465,32 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(collapsed.isInstanceOf[MppNativeQueryExec])
     assert(collapsed.find(_.isInstanceOf[GenerateExecTransformer]).isDefined)
     assert(collapsed.find(_.isInstanceOf[ProjectExecTransformer]).isDefined)
+    assert(collapsed.find(_.isInstanceOf[VeloxColumnarToRowExec]).isEmpty)
+    assert(collapsed.find(_.isInstanceOf[RowToVeloxColumnarExec]).isEmpty)
+  }
+
+  test("direct closed Generate row island is repaired without admitting its nested C2R") {
+    val accountId = AttributeReference("account_id", LongType, nullable = true)()
+    val nestedJson = AttributeReference("sub_nested_json", StringType, nullable = true)()
+    val nativeInput = LocalTableScanExecTransformer(Seq(accountId, nestedJson), Seq.empty)
+    val nativeProject = ProjectExecTransformer(nativeInput.output, nativeInput)
+    val boundary = VeloxColumnarToRowExec(nativeProject)
+    val generatedJson = AttributeReference("consumption_json", StringType, nullable = true)()
+    val generate = GenerateExec(
+      Explode(CreateArray(Seq(nestedJson))),
+      requiredChildOutput = Seq(accountId),
+      outer = false,
+      generatorOutput = Seq(generatedJson),
+      child = boundary)
+    val closedIsland = RowToVeloxColumnarExec(generate)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assert(rule.findUnpairedNestedRowOutput(closedIsland).contains(boundary))
+
+    val collapsed = rule(closedIsland)
+
+    assert(collapsed.isInstanceOf[MppNativeQueryExec])
+    assert(collapsed.find(_.isInstanceOf[GenerateExecTransformer]).isDefined)
     assert(collapsed.find(_.isInstanceOf[VeloxColumnarToRowExec]).isEmpty)
     assert(collapsed.find(_.isInstanceOf[RowToVeloxColumnarExec]).isEmpty)
   }
@@ -754,6 +833,38 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(rewrittenSort.sortOrder.forall(_.child.isInstanceOf[AttributeReference]))
     assert(nativePlan.collect { case _: ProjectExecTransformer => 1 }.sum >= 2)
     assert(nativePlan.output == ingress.output)
+    assert(nativePlan.find(node => MppJvmStreamInputMatcher.scan(node).contains(scan)).isDefined)
+  }
+
+  test("ExistingRDD hybrid repairs a computed sort on a native-only sibling branch") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val scan = existingRddScan(attr)
+    val ingress = RowToVeloxColumnarExec(scan)
+    val nativeSibling = LocalTableScanExecTransformer(Seq(attr), Seq.empty)
+    val rowInput = VeloxColumnarToRowExec(nativeSibling)
+    val computedOrder = SortOrder(Cast(attr, LongType), Ascending, NullsFirst, Seq.empty)
+    val rowSort = org.apache.spark.sql.execution
+      .SortExec(Seq(computedOrder), global = false, rowInput, testSpillFrequency = 0)
+    val staleNativeSibling = RowToVeloxColumnarExec(rowSort)
+    val union = ColumnarUnionExec(Seq(ingress, staleNativeSibling), UnknownPartitioning(0))
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    val nativePlan = rule.normalizeMppNativeOperators(
+      union,
+      preserveJvmStreamIngress = true,
+      rewriteNativeUnion = _.transformUp {
+        case columnarUnion: ColumnarUnionExec => UnionExecTransformer(columnarUnion.children)
+      }
+    )
+
+    val rewrittenSort = nativePlan
+      .find(_.isInstanceOf[SortExecTransformer])
+      .get
+      .asInstanceOf[SortExecTransformer]
+    assert(rewrittenSort.sortOrder.forall(_.child.isInstanceOf[AttributeReference]))
+    assert(nativePlan.find(_.isInstanceOf[VeloxColumnarToRowExec]).isEmpty)
+    assert(nativePlan.find(_.isInstanceOf[ColumnarToRowExec]).isEmpty)
+    assert(nativePlan.find(_.isInstanceOf[RowToVeloxColumnarExec]).size == 1)
     assert(nativePlan.find(node => MppJvmStreamInputMatcher.scan(node).contains(scan)).isDefined)
   }
 

@@ -21,7 +21,7 @@ import org.apache.gluten.vectorized.ArrowWritableColumnVector
 
 import org.apache.spark.SparkConf
 import org.apache.spark.api.python.{ArrowUdfSerializationAckTestSupport, ColumnarArrowEvalPythonExec}
-import org.apache.spark.sql.{DataFrame, IntegratedUDFTestUtils}
+import org.apache.spark.sql.{DataFrame, IntegratedUDFTestUtils, Row}
 import org.apache.spark.sql.execution.python.{BatchEvalPythonExec, EvalPythonExecTransformer, UserDefinedPythonFunction}
 import org.apache.spark.sql.functions.lit
 import org.apache.spark.sql.types.{DataType, LongType, StringType}
@@ -190,7 +190,7 @@ class ArrowEvalPythonExecSuite extends WholeStageTransformerSuite {
       // Keep the tested Python input as a nullable AttributeReference. The engine deliberately
       // does not broaden its conservative pre-projection contract to arbitrary CASE expressions.
       .repartition(1)
-    var rowReference = Seq.empty[org.apache.spark.sql.Row]
+    var rowReference = Seq.empty[Row]
     withSQLConf(
       "spark.sql.execution.pythonUDF.arrow.enabled" -> "false",
       "spark.gluten.mpp.enabled" -> "false") {
@@ -557,11 +557,11 @@ class ArrowEvalPythonExecSuite extends WholeStageTransformerSuite {
         .find(_.getParameterCount == 5)
         .get
       val udfArgs: Array[AnyRef] = Array(
-          name,
-          function.asInstanceOf[AnyRef],
-          declaredReturnType,
-          Int.box(baseUdf.pythonEvalType),
-          Boolean.box(true))
+        name,
+        function.asInstanceOf[AnyRef],
+        declaredReturnType,
+        Int.box(baseUdf.pythonEvalType),
+        Boolean.box(true))
       udfConstructor
         .newInstance(udfArgs: _*)
         .asInstanceOf[UserDefinedPythonFunction]

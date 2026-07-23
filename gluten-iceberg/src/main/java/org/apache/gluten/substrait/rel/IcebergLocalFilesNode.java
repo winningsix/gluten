@@ -24,6 +24,7 @@ import io.substrait.proto.ReadRel;
 import org.apache.iceberg.DeleteFile;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -42,6 +43,7 @@ public class IcebergLocalFilesNode extends LocalFilesNode {
       List<String> paths,
       List<Long> starts,
       List<Long> lengths,
+      List<Long> fileSizes,
       List<Map<String, String>> partitionColumns,
       ReadFileFormat fileFormat,
       List<String> preferredLocations,
@@ -51,8 +53,8 @@ public class IcebergLocalFilesNode extends LocalFilesNode {
         paths,
         starts,
         lengths,
-        new ArrayList<>(),
-        new ArrayList<>(),
+        fileSizes,
+        Collections.nCopies(fileSizes.size(), 0L),
         partitionColumns,
         new ArrayList<>(),
         fileFormat,

@@ -132,7 +132,9 @@ class RewriteSelfMaxScalarToDenseRankSuite extends QueryTest with SharedSparkSes
     }
     assert(streamingPlan.isStreaming)
     val unchanged = RewriteSelfMaxScalarToDenseRank(spark).apply(streamingPlan)
-    assert(unchanged.fastEquals(streamingPlan), s"Streaming plan must remain unchanged:\n$unchanged")
+    assert(
+      unchanged.fastEquals(streamingPlan),
+      s"Streaming plan must remain unchanged:\n$unchanged")
     assert(containsScalarSubquery(unchanged), unchanged.treeString)
     assert(!unchanged.exists(_.isInstanceOf[Window]), unchanged.treeString)
   }

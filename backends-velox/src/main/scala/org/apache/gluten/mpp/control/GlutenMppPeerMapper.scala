@@ -18,6 +18,8 @@ package org.apache.gluten.mpp.control
 
 import org.apache.gluten.execution.{MppPeerInfo, UcxEndpointInfo}
 
+import com.google.common.net.InetAddresses
+
 import java.net.URI
 
 /**
@@ -29,8 +31,8 @@ import java.net.URI
  *   - take(requestedCount) of sortBy(executorId)-ordered endpoints
  *   - parse `nativeUcxListenerEndpoint` URI to extract listenerPort
  *   - reject listenerPort <= 3
- *   - UCX connection host selection: listener URI host falls through to blockManagerHost, then to
- *     `info.host`
+ *   - UCX connection host selection: a non-loopback literal blockManagerHost takes precedence over
+ *     the listener URI host, which then falls through to blockManagerHost and `info.host`
  *   - `port = listenerPort - 3` (this is the "remote connector port" native convention)
  *   - Spark placement remains `executor_<blockManagerHost>_<executorId>` so executor affinity is
  *     independent of the network address advertised to UCX
@@ -63,18 +65,28 @@ object GlutenMppPeerMapper {
         val endpointHost = Option(endpoint.getHost).filter(_.nonEmpty)
         val blockManagerHost = Option(info.blockManagerHost)
           .filter(_.nonEmpty)
-        // Native listener endpoints already advertise the routable address selected by UCX.
-        // Prefer that address for peer connections: feeding short Spark hostnames back through
-        // UCXX is both unnecessary and can fail hostname parsing under concurrent TableWrite
-        // startup. Spark task affinity must still use BlockManager's host string because that is
-        // the identity understood by TaskSchedulerImpl.
-        val connectionHost = endpointHost.getOrElse(blockManagerHost.getOrElse(info.host))
+        // A literal BlockManager address identifies the interface selected by Spark and
+        // UCX_NET_DEVICES. Prefer it when Java's interface enumeration advertised a different NIC.
+        // For hostnames and loopback placement, retain the native listener address to avoid UCXX
+        // hostname parsing failures under concurrent TableWrite startup.
+        val blockManagerIp = blockManagerHost.filter(isNonLoopbackIpLiteral)
+        val connectionHost =
+          blockManagerIp.orElse(endpointHost).getOrElse(blockManagerHost.getOrElse(info.host))
         val placementHost = blockManagerHost.getOrElse(info.host)
         MppPeerInfo(
           peerId = info.executorId,
           host = connectionHost,
           port = listenerPort - 3,
           preferredLocation = s"executor_${placementHost}_${info.executorId}")
+    }
+  }
+
+  private def isNonLoopbackIpLiteral(host: String): Boolean = {
+    if (!InetAddresses.isInetAddress(host)) {
+      false
+    } else {
+      val address = InetAddresses.forString(host)
+      !address.isAnyLocalAddress && !address.isLoopbackAddress
     }
   }
 

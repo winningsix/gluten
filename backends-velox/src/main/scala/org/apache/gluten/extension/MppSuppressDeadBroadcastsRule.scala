@@ -28,6 +28,7 @@ import org.apache.spark.sql.internal.SQLConf
 import java.util.{Collections, IdentityHashMap}
 
 private[gluten] object MppBroadcastLifecycle {
+
   /**
    * Mark every broadcast reachable from an MPP child as prepare-deferred.
    *

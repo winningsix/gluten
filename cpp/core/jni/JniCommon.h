@@ -87,9 +87,7 @@ static inline void checkException(JNIEnv* env) {
 static inline jclass createGlobalClassReference(JNIEnv* env, const char* className) {
   std::string normalizedClassName(className);
   // Accept both binary names (org/apache/Foo) and descriptor names (Lorg/apache/Foo;).
-  if (
-      normalizedClassName.size() > 2 && normalizedClassName.front() == 'L' &&
-      normalizedClassName.back() == ';') {
+  if (normalizedClassName.size() > 2 && normalizedClassName.front() == 'L' && normalizedClassName.back() == ';') {
     normalizedClassName = normalizedClassName.substr(1, normalizedClassName.size() - 2);
   }
   jclass localClass = env->FindClass(normalizedClassName.c_str());

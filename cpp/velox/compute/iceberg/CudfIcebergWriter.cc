@@ -2,7 +2,17 @@
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "compute/iceberg/CudfIcebergWriter.h"
@@ -417,10 +427,16 @@ struct CudfIcebergWriter::Impl {
     cudfInput->stream().synchronize();
 
     if (partitionChannels.empty()) {
+      // Keep one batch in flight so the MPP root can produce the next device
+      // batch while libcudf compresses this one.  The next call reaches this
+      // point only after that new input is already available; wait here before
+      // releasing the previous input buffers and queueing another write.
+      stream.synchronize();
+      inFlightInput.reset();
       auto& file = openFile("", folly::dynamic::array, table);
       file.writer->write(table);
       file.rows += table.num_rows();
-      stream.synchronize();
+      inFlightInput = input;
       return;
     }
 
@@ -463,6 +479,7 @@ struct CudfIcebergWriter::Impl {
       file->writer->close();
       file->writer.reset();
       stream.synchronize();
+      inFlightInput.reset();
       file->sink->close();
       file->bytes = file->sink->bytes_written();
       file->closed = true;
@@ -513,6 +530,7 @@ struct CudfIcebergWriter::Impl {
         try {
           file->writer->close();
           stream.synchronize();
+          inFlightInput.reset();
         } catch (const std::exception& error) {
           LOG(WARNING) << "Failed to close aborted libcudf Iceberg file "
                        << file->path << ": " << error.what();
@@ -550,6 +568,7 @@ struct CudfIcebergWriter::Impl {
   std::vector<facebook::velox::column_index_t> partitionChannels;
   std::vector<TypePtr> partitionTypes;
   rmm::cuda_stream_view stream;
+  facebook::velox::RowVectorPtr inFlightInput;
   std::unordered_map<std::string, std::unique_ptr<OpenFile>> files;
   uint64_t totalBytes{0};
   bool closed{false};

@@ -16,17 +16,20 @@
  */
 package org.apache.spark.util
 
-import org.apache.spark.{SparkConf, TaskContext, TaskContextImpl}
+import org.apache.spark.{SparkConf, SparkEnv, TaskContext, TaskContextImpl}
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.memory.{TaskMemoryManager, UnifiedMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.storage.BlockManagerUtil
 
 import java.util.Properties
+import java.util.concurrent.atomic.AtomicLong
 
 import scala.collection.JavaConverters._
 
 object SparkTaskUtil {
+  private val nextSyntheticTaskAttemptId = new AtomicLong(-1L)
+
   def setTaskContext(taskContext: TaskContext): Unit = {
     TaskContext.setTaskContext(taskContext)
   }
@@ -42,18 +45,33 @@ object SparkTaskUtil {
   def createTestTaskContext(properties: Properties): TaskContext = {
     val conf = new SparkConf()
     conf.setAll(properties.asScala)
-    val memoryManager = UnifiedMemoryManager(conf, 1)
-    BlockManagerUtil.setTestMemoryStore(conf, memoryManager, isDriver = false)
+    // Native plan validation creates many short-lived synthetic task contexts on the driver.
+    // Reuse the driver's already initialized services instead of constructing a new memory store
+    // and metrics system for every plan node. Tests without a SparkEnv retain the old standalone
+    // behavior.
+    val sparkEnv = SparkEnv.get
+    val memoryManager =
+      if (sparkEnv != null) {
+        sparkEnv.memoryManager
+      } else {
+        val manager = UnifiedMemoryManager(conf, 1)
+        BlockManagerUtil.setTestMemoryStore(conf, manager, isDriver = false)
+        manager
+      }
     val stageId = -1.asInstanceOf[Object]
     val stageAttemptNumber = -1.asInstanceOf[Object]
     val partitionId = -1.asInstanceOf[Object]
-    val taskAttemptId = -1L.asInstanceOf[Object]
+    val syntheticTaskAttemptId = nextSyntheticTaskAttemptId.getAndDecrement()
+    require(syntheticTaskAttemptId < 0, "Synthetic task attempt ID space is exhausted")
+    val taskAttemptId = syntheticTaskAttemptId.asInstanceOf[Object]
     val attemptNumber = -1.asInstanceOf[Object]
     val numPartitions = -1.asInstanceOf[Object] // Added in Spark 3.4.
-    val taskMemoryManager = new TaskMemoryManager(memoryManager, -1L).asInstanceOf[Object]
+    val taskMemoryManager =
+      new TaskMemoryManager(memoryManager, syntheticTaskAttemptId).asInstanceOf[Object]
     val localProperties = properties.asInstanceOf[Object]
     val metricsSystem =
-      MetricsSystem.createMetricsSystem("GLUTEN_UNSAFE", conf).asInstanceOf[Object]
+      (if (sparkEnv != null) sparkEnv.metricsSystem
+       else MetricsSystem.createMetricsSystem("GLUTEN_UNSAFE", conf)).asInstanceOf[Object]
     val taskMetrics = TaskMetrics.empty.asInstanceOf[Object]
     val cpus = 1.asInstanceOf[Object] // Added in Spark 3.3.
     val resources = Map.empty.asInstanceOf[Object]

@@ -16,21 +16,29 @@
  */
 package org.apache.spark.sql.execution.utils
 
-import org.apache.spark.RangePartitioner
+import org.apache.gluten.columnarbatch.VeloxColumnarBatches
+
+import org.apache.spark.{RangePartitioner, ShuffleDependency}
+import org.apache.spark.internal.Logging
 import org.apache.spark.network.util.JavaUtils
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, BoundReference, Descending, NullsFirst, NullsLast, SortOrder, UnsafeProjection, UnsafeRow}
+import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, BoundReference, Descending, GenericInternalRow, NullsFirst, NullsLast, SortOrder, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.expressions.codegen.LazilyGeneratedOrdering
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import com.fasterxml.jackson.databind.ObjectMapper
 
+import java.time.LocalDate
+import java.time.format.DateTimeFormatter
 import java.util.concurrent.{CompletableFuture, ExecutionException}
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
+import scala.util.Try
 import scala.util.control.NonFatal
 
 /**
@@ -46,7 +54,7 @@ import scala.util.control.NonFatal
  * at least one candidate per requested RANGE peer. A future mergeable global reservoir can make
  * those unused shares transferable without another producer scan.
  */
-object MppRangeBoundsGenerator {
+object MppRangeBoundsGenerator extends Logging {
 
   private val MaxSampleRowsKey = "spark.gluten.mpp.rangeSampleMaxRows"
   private val MaxSampleBytesKey = "spark.gluten.mpp.rangeSampleMaxBytes"
@@ -67,8 +75,13 @@ object MppRangeBoundsGenerator {
 
   private case class PrioritizedRow(priority: Long, row: UnsafeRow, serializedKeyBytes: Long)
 
+  private case class PrioritizedIndex(priority: Long, index: Int)
+
   implicit private val PrioritizedRowOrdering: Ordering[PrioritizedRow] =
     Ordering.by[PrioritizedRow, Long](_.priority)
+
+  implicit private val PrioritizedIndexOrdering: Ordering[PrioritizedIndex] =
+    Ordering.by[PrioritizedIndex, Long](_.priority)
 
   case class Result(json: String, boundaryCount: Int) {
     val effectivePartitions: Int = boundaryCount + 1
@@ -166,6 +179,12 @@ object MppRangeBoundsGenerator {
     case _ => false
   }
 
+  def supportsIntegralInterval(dataType: DataType): Boolean = dataType match {
+    case ByteType | ShortType | IntegerType | LongType | DateType | TimestampType => true
+    case timestampNtz if timestampNtz.typeName == "timestamp_ntz" => true
+    case _ => false
+  }
+
   def generate(
       samplePlan: SparkPlan,
       outputAttributes: Seq[Attribute],
@@ -208,6 +227,13 @@ object MppRangeBoundsGenerator {
       maxSampleRows,
       maxSampleBytes)
     val inputRddId = input.id
+    // A RANGE producer can contain many independent shuffle-map stages. DAGScheduler normally
+    // submits all missing parents together. Multi-peer MPP tasks cannot make progress until all
+    // peers run, so two such stages can otherwise split the available GPU slots and wait forever
+    // for peers held by the other stage. Materialize the existing shuffle boundaries in dependency
+    // order before the sampling action. This does not add a shuffle or rescan completed map stages;
+    // the subsequent collect consumes their registered map outputs.
+    materializeShuffleDependencies(input)
     val bounds = determineBounds(
       requestedPartitions,
       inputPartitions,
@@ -217,13 +243,6 @@ object MppRangeBoundsGenerator {
       input
         .mapPartitionsWithIndex {
           case (partitionId, batches) =>
-            val projection = UnsafeProjection.create(ordering.map(_.child), outputAttributes)
-            val projectedRows = batches.flatMap {
-              batch =>
-                ExecUtil
-                  .convertColumnarToRow(batch)
-                  .map(row => projection(row).asInstanceOf[UnsafeRow])
-            }
             val limits = partitionLimits(
               partitionId,
               inputPartitions,
@@ -232,8 +251,9 @@ object MppRangeBoundsGenerator {
               maxSampleRows,
               maxSampleBytes)
             Iterator.single(
-              sketchPartition(
-                projectedRows,
+              sketchColumnarPartition(
+                batches,
+                orderingOrdinals(outputAttributes, ordering),
                 limits._1,
                 limits._2,
                 sampleSeed(inputRddId, partitionId)))
@@ -241,6 +261,131 @@ object MppRangeBoundsGenerator {
         .collect()
     )
     Result(encode(ordering, bounds), bounds.length)
+  }
+
+  /**
+   * Build valid RANGE boundaries from an integral predicate interval without executing the
+   * producer. Exact quantiles are a load-balancing optimization, not an ordering requirement: any
+   * strictly ordered boundaries preserve Spark's global RANGE semantics. This fast path is useful
+   * for date/timestamp/integral keys whose physical plan already proves a bounded interval.
+   */
+  def fromIntegralInterval(
+      ordering: Seq[SortOrder],
+      lowerInclusive: Long,
+      upperExclusive: Long,
+      requestedPartitions: Int,
+      basicIsoDateEncoding: Boolean = false): Option[Result] = {
+    if (ordering.isEmpty || requestedPartitions <= 1 || lowerInclusive >= upperExclusive) {
+      return None
+    }
+    val dataType = ordering.head.dataType
+    if (!supportsIntegralInterval(dataType)) {
+      return None
+    }
+
+    // Some applications explicitly encode dates as IntegerType using BASIC_ISO_DATE. Only apply
+    // calendar interpolation when the caller declares that encoding; inferring semantics from an
+    // integer's digits could silently skew an unrelated numeric RANGE key.
+    val dateEncodedInterval = if (dataType == IntegerType && basicIsoDateEncoding) {
+      for {
+        lower <- parseBasicIsoDate(lowerInclusive)
+        upper <- parseBasicIsoDate(upperExclusive)
+        if lower.isBefore(upper)
+      } yield (lower.toEpochDay, upper.toEpochDay)
+    } else {
+      None
+    }
+    val interpolationLower = dateEncodedInterval.map(_._1).getOrElse(lowerInclusive)
+    val interpolationUpper = dateEncodedInterval.map(_._2).getOrElse(upperExclusive)
+    val span = BigInt(interpolationUpper) - BigInt(interpolationLower)
+    val ascendingValues = (1 until requestedPartitions).iterator
+      .map(index => BigInt(interpolationLower) + span * index / requestedPartitions)
+      .filter(value => value > interpolationLower && value < interpolationUpper)
+      .map(_.toLong)
+      .map {
+        value =>
+          dateEncodedInterval
+            .map(_ => DateTimeFormatter.BASIC_ISO_DATE.format(LocalDate.ofEpochDay(value)).toLong)
+            .getOrElse(value)
+      }
+      .toArray
+      .distinct
+    val boundaryValues = ordering.head.direction match {
+      case Ascending => ascendingValues
+      case Descending => ascendingValues.reverse
+    }
+    if (boundaryValues.isEmpty) {
+      return None
+    }
+
+    // Varying the leading key is sufficient to produce strictly ordered lexicographic boundaries.
+    // Trailing NULL sentinels only decide where rows equal to a leading boundary land; they do not
+    // change global ordering correctness. This lets a proven interval on the leading date/integral
+    // key avoid a Spark sampling pre-action even when the write has secondary sort columns.
+    val projection = UnsafeProjection.create(ordering.map(_.dataType).toArray)
+    val rows: Array[InternalRow] = boundaryValues.map {
+      value =>
+        val encoded: Any = dataType match {
+          case ByteType => value.toByte
+          case ShortType => value.toShort
+          case IntegerType | DateType => value.toInt
+          case LongType | TimestampType => value
+          case timestampNtz if timestampNtz.typeName == "timestamp_ntz" => value
+        }
+        projection(
+          new GenericInternalRow(Array[Any](encoded) ++ Array.fill[Any](ordering.size - 1)(null)))
+          .copy(): InternalRow
+    }
+    Some(Result(encode(ordering, rows), rows.length))
+  }
+
+  private def parseBasicIsoDate(encoded: Long): Option[LocalDate] = {
+    val text = encoded.toString
+    if (text.length != 8) {
+      None
+    } else {
+      Try(LocalDate.parse(text, DateTimeFormatter.BASIC_ISO_DATE)).toOption
+    }
+  }
+
+  private[utils] def materializeShuffleDependencies(rdd: RDD[_]): Unit = {
+    val dependencies = shuffleDependenciesInTopologicalOrder(rdd)
+    if (dependencies.nonEmpty) {
+      logInfo(
+        s"MPP RANGE preparation is materializing ${dependencies.size} shuffle map stage(s) " +
+          s"serially to preserve multi-peer MPP gang progress: " +
+          dependencies.map(_.shuffleId).mkString("[", ",", "]"))
+      dependencies.foreach {
+        dependency =>
+          rdd.sparkContext
+            .submitMapStage(dependency.asInstanceOf[ShuffleDependency[Any, Any, Any]])
+            .get()
+      }
+    }
+  }
+
+  private[utils] def shuffleDependenciesInTopologicalOrder(
+      rdd: RDD[_]): Seq[ShuffleDependency[_, _, _]] = {
+    val visitedRdds = mutable.HashSet.empty[Int]
+    val visitedShuffles = mutable.HashSet.empty[Int]
+    val ordered = ArrayBuffer.empty[ShuffleDependency[_, _, _]]
+
+    def visit(current: RDD[_]): Unit = {
+      if (visitedRdds.add(current.id)) {
+        current.dependencies.foreach {
+          case shuffle: ShuffleDependency[_, _, _] =>
+            visit(shuffle.rdd)
+            if (visitedShuffles.add(shuffle.shuffleId)) {
+              ordered += shuffle
+            }
+          case dependency =>
+            visit(dependency.rdd)
+        }
+      }
+    }
+
+    visit(rdd)
+    ordered.toSeq
   }
 
   private[utils] def determineBounds(
@@ -347,8 +492,8 @@ object MppRangeBoundsGenerator {
               s"exceeding the $maxSerializedKeyBytes-byte partition budget; increase " +
               s"$MaxSampleBytesKey"
           )
-          // UnsafeProjection reuses its output row. Copy only selected keys instead of allocating
-          // one UnsafeRow for every producer row scanned.
+          // The input iterator can reuse its output row. Copy only selected keys instead of
+          // allocating one UnsafeRow for every producer row scanned.
           retained.enqueue(PrioritizedRow(priority, row.copy(), rowBytes))
           serializedKeyBytes = admittedBytes
         } else if (priority < retained.head.priority) {
@@ -372,6 +517,105 @@ object MppRangeBoundsGenerator {
       entry: PrioritizedRow => entry.row
     }.toArray
     PartitionSketch(count, selected, serializedKeyBytes)
+  }
+
+  /**
+   * Produces the same deterministic priority sample without converting every input row to an
+   * UnsafeRow. Each batch first retains only its local `maxRows` lowest-priority indices. The
+   * native selection then projects the RANGE keys and gathers those rows. Device-backed batches
+   * perform that gather on the GPU and materialize only the bounded sample on the host.
+   *
+   * Keeping the lowest `maxRows` candidates from every batch is sufficient for the global lowest
+   * `maxRows` sample: a row outside a batch's local set has at least `maxRows` lower-priority rows
+   * in the same batch and therefore cannot enter the global set.
+   */
+  private[utils] def sketchColumnarPartition(
+      batches: Iterator[ColumnarBatch],
+      keyOrdinals: Array[Int],
+      maxRows: Int,
+      maxSerializedKeyBytes: Long,
+      seed: Long): PartitionSketch = {
+    require(maxRows > 0, s"MPP RANGE partition sample row limit must be positive: $maxRows")
+    require(
+      maxSerializedKeyBytes > 0L,
+      s"MPP RANGE partition sample byte limit must be positive: $maxSerializedKeyBytes")
+    require(keyOrdinals.nonEmpty, "MPP RANGE sampling requires at least one key column")
+
+    val retained = mutable.PriorityQueue.empty[PrioritizedRow]
+    val random = new java.util.Random(seed)
+    var count = 0L
+
+    batches.foreach {
+      batch =>
+        val local = mutable.PriorityQueue.empty[PrioritizedIndex]
+        var rowIndex = 0
+        while (rowIndex < batch.numRows()) {
+          count = Math.addExact(count, 1L)
+          val candidate = PrioritizedIndex(random.nextLong() & Long.MaxValue, rowIndex)
+          if (local.size < maxRows) {
+            local.enqueue(candidate)
+          } else if (candidate.priority < local.head.priority) {
+            local.dequeue()
+            local.enqueue(candidate)
+          }
+          rowIndex += 1
+        }
+
+        if (local.nonEmpty) {
+          // Keep priority and row-index arrays in the same order so gathered rows can be paired
+          // with their deterministic priorities after the bounded device-to-host conversion.
+          val candidates = local.dequeueAll.reverse
+          val selectedBatch =
+            VeloxColumnarBatches.select(batch, keyOrdinals, candidates.map(_.index).toArray)
+          try {
+            val selectedRows = ExecUtil
+              .convertColumnarToRow(selectedBatch)
+              .map(_.asInstanceOf[UnsafeRow].copy())
+              .toArray
+            require(
+              selectedRows.length == candidates.length,
+              s"MPP RANGE native sample returned ${selectedRows.length} rows for " +
+                s"${candidates.length} selected indices")
+            candidates.iterator.zip(selectedRows.iterator).foreach {
+              case (candidate, row) =>
+                val prioritized = PrioritizedRow(candidate.priority, row, row.getSizeInBytes.toLong)
+                if (retained.size < maxRows) {
+                  retained.enqueue(prioritized)
+                } else if (candidate.priority < retained.head.priority) {
+                  retained.dequeue()
+                  retained.enqueue(prioritized)
+                }
+            }
+          } finally {
+            selectedBatch.close()
+          }
+        }
+    }
+
+    val selected: Array[UnsafeRow] = retained.dequeueAll.reverseIterator.map {
+      entry: PrioritizedRow => entry.row
+    }.toArray
+    val serializedKeyBytes =
+      selected.foldLeft(0L)((sum, row) => Math.addExact(sum, row.getSizeInBytes.toLong))
+    require(
+      serializedKeyBytes <= maxSerializedKeyBytes,
+      s"MPP RANGE selected reservoir keys require $serializedKeyBytes serialized bytes, " +
+        s"exceeding the $maxSerializedKeyBytes-byte partition budget; increase " +
+        s"$MaxSampleBytesKey"
+    )
+    PartitionSketch(count, selected, serializedKeyBytes)
+  }
+
+  private def orderingOrdinals(
+      outputAttributes: Seq[Attribute],
+      ordering: Seq[SortOrder]): Array[Int] = {
+    ordering.map {
+      order =>
+        val attribute = order.child.asInstanceOf[Attribute]
+        val ordinal = outputAttributes.indexWhere(_.exprId == attribute.exprId)
+        require(ordinal >= 0, s"MPP RANGE sort key ${attribute.sql} is absent from producer output")
+        ordinal
+    }.toArray
   }
 
   private def partitionLimits(

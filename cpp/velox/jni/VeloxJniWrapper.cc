@@ -40,10 +40,15 @@
 #include "velox/common/file/FileSystems.h"
 
 #ifdef GLUTEN_ENABLE_GPU
+#include <cudf/copying.hpp>
+#include <rmm/device_uvector.hpp>
 #include "cudf/CudfPlanValidator.h"
 #include "cudf/GpuLock.h"
 #include "cudf/GpuMemoryTracker.h"
 #include "utils/GpuBufferBatchResizer.h"
+#include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include <cuda_runtime.h>
 #endif
@@ -723,6 +728,102 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_columnarbatch_VeloxColumnarBatchJ
 
   jlong prunedHandle = ctx->saveObject(prunedBatch);
   return prunedHandle;
+
+  JNI_METHOD_END(kInvalidObjectHandle)
+}
+
+JNIEXPORT jlong JNICALL Java_org_apache_gluten_columnarbatch_VeloxColumnarBatchJniWrapper_select( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jlong veloxBatchHandle,
+    jintArray columnIndices,
+    jintArray rowIndices) {
+  JNI_METHOD_START
+  auto ctx = getRuntime(env, wrapper);
+  auto runtime = dynamic_cast<VeloxRuntime*>(ctx);
+  auto batch = ObjectStore::retrieve<ColumnarBatch>(veloxBatchHandle);
+  auto veloxBatch = std::dynamic_pointer_cast<VeloxColumnarBatch>(batch);
+  VELOX_CHECK_NOT_NULL(
+      veloxBatch, "Expected VeloxColumnarBatch but got a different type");
+
+  auto safeColumns = getIntArrayElementsSafe(env, columnIndices);
+  auto safeRows = getIntArrayElementsSafe(env, rowIndices);
+  const auto numColumns = env->GetArrayLength(columnIndices);
+  const auto numRows = env->GetArrayLength(rowIndices);
+  VELOX_CHECK_GT(numColumns, 0, "Velox batch selection requires columns");
+  VELOX_CHECK_GT(numRows, 0, "Velox batch selection requires rows");
+
+  auto input = veloxBatch->getRowVector();
+  auto inputType = facebook::velox::asRowType(input->type());
+  std::vector<int32_t> columns(numColumns);
+  std::vector<std::string> names;
+  std::vector<facebook::velox::TypePtr> types;
+  names.reserve(numColumns);
+  types.reserve(numColumns);
+  for (int32_t i = 0; i < numColumns; ++i) {
+    const auto column = safeColumns.elems()[i];
+    VELOX_CHECK_GE(column, 0, "Negative selected column index");
+    VELOX_CHECK_LT(column, inputType->size(), "Selected column index out of bounds");
+    columns[i] = column;
+    names.push_back(inputType->nameOf(column));
+    types.push_back(inputType->childAt(column));
+  }
+  auto outputType = facebook::velox::ROW(std::move(names), std::move(types));
+
+  std::vector<facebook::velox::vector_size_t> rows(numRows);
+  for (int32_t i = 0; i < numRows; ++i) {
+    const auto row = safeRows.elems()[i];
+    VELOX_CHECK_GE(row, 0, "Negative selected row index");
+    VELOX_CHECK_LT(row, input->size(), "Selected row index out of bounds");
+    rows[i] = row;
+  }
+
+#ifdef GLUTEN_ENABLE_GPU
+  if (auto cudfVector = std::dynamic_pointer_cast<
+          facebook::velox::cudf_velox::CudfVector>(input)) {
+    GpuLockGuard gpuLock;
+    auto stream = cudfVector->stream();
+    rmm::device_uvector<cudf::size_type> deviceRows(numRows, stream);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        deviceRows.data(),
+        rows.data(),
+        numRows * sizeof(cudf::size_type),
+        cudaMemcpyHostToDevice,
+        stream.value()));
+    auto gatherMap = cudf::column_view{
+        cudf::device_span<cudf::size_type const>{deviceRows}};
+    auto gathered = cudf::gather(
+        cudfVector->getTableView().select(columns),
+        gatherMap,
+        cudf::out_of_bounds_policy::DONT_CHECK,
+        cudf::negative_index_policy::NOT_ALLOWED,
+        stream,
+        facebook::velox::cudf_velox::get_temp_mr());
+    auto hostVector = facebook::velox::cudf_velox::with_arrow::toVeloxColumn(
+        gathered->view(),
+        runtime->memoryManager()->getLeafMemoryPool().get(),
+        outputType,
+        "",
+        stream,
+        facebook::velox::cudf_velox::get_temp_mr());
+    stream.synchronize();
+    return ctx->saveObject(std::make_shared<VeloxColumnarBatch>(hostVector));
+  }
+#endif
+
+  auto pool = runtime->memoryManager()->getLeafMemoryPool();
+  auto indices = facebook::velox::AlignedBuffer::allocate<
+      facebook::velox::vector_size_t>(numRows, pool.get());
+  std::copy(rows.begin(), rows.end(), indices->asMutable<facebook::velox::vector_size_t>());
+  std::vector<facebook::velox::VectorPtr> children;
+  children.reserve(numColumns);
+  for (const auto column : columns) {
+    children.push_back(facebook::velox::BaseVector::wrapInDictionary(
+        nullptr, indices, numRows, input->childAt(column)));
+  }
+  auto selected = std::make_shared<facebook::velox::RowVector>(
+      pool.get(), outputType, nullptr, numRows, std::move(children));
+  return ctx->saveObject(std::make_shared<VeloxColumnarBatch>(selected));
 
   JNI_METHOD_END(kInvalidObjectHandle)
 }

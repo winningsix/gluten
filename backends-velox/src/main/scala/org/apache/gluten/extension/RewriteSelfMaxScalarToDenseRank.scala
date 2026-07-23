@@ -188,16 +188,21 @@ case class RewriteSelfMaxScalarToDenseRank(spark: SparkSession)
   }
 
   private def extractMaxAggregate(plan: LogicalPlan): Option[(Aggregate, Attribute)] = plan match {
-    case Aggregate(Seq(), Seq(alias: Alias), child: Aggregate) =>
-      alias.child match {
-        case aggregate: AggregateExpression if !aggregate.isDistinct && aggregate.filter.isEmpty =>
-          aggregate.aggregateFunction match {
+    case aggregate: Aggregate if aggregate.groupingExpressions.isEmpty =>
+      (aggregate.aggregateExpressions, aggregate.child) match {
+        case (Seq(alias: Alias), child: Aggregate) =>
+          alias.child match {
+            case expression: AggregateExpression
+                if !expression.isDistinct && expression.filter.isEmpty =>
+              expression.aggregateFunction match {
+                case Max(innerValue: Attribute) => Some((child, innerValue))
+                case _ => None
+              }
+            // Keep the direct form for plans passed to the rule before Spark wraps aggregate
+            // functions in AggregateExpression.
             case Max(innerValue: Attribute) => Some((child, innerValue))
             case _ => None
           }
-        // Keep the direct form for plans passed to the rule before Spark wraps aggregate
-        // functions in AggregateExpression.
-        case Max(innerValue: Attribute) => Some((child, innerValue))
         case _ => None
       }
     case Project(_, child) => extractMaxAggregate(child)

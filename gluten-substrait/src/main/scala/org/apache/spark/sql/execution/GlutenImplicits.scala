@@ -25,6 +25,7 @@ import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.plans.logical.{CommandResult, LogicalPlan}
 import org.apache.spark.sql.catalyst.util.StringUtils.PlanStringConcat
 import org.apache.spark.sql.classic.ClassicConversions._
+import org.apache.spark.sql.classic.ClassicTypes.ClassicSparkSession
 import org.apache.spark.sql.execution.ColumnarWriteFilesExec.NoopLeaf
 import org.apache.spark.sql.execution.adaptive.{AQEShuffleReadExec, AdaptiveSparkPlanExec, QueryStageExec}
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
@@ -130,7 +131,7 @@ object GlutenImplicits {
               val newSparkPlan = SparkShimLoader.getSparkShims.createSparkPlan(
                 spark, spark.sessionState.planner, p.inputPlan.logicalLink.get)
               val newExecutedPlan = QueryExecution.prepareExecutedPlan(
-                spark,
+                spark.asInstanceOf[ClassicSparkSession],
                 newSparkPlan
               )
               GlutenExplainUtils.processPlan(

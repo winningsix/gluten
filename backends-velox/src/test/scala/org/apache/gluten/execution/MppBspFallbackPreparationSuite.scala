@@ -14,33 +14,21 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.gluten.substrait.rel;
+package org.apache.gluten.execution
 
-import org.apache.iceberg.DeleteFile;
+import org.apache.spark.SparkFunSuite
+import org.apache.spark.sql.catalyst.expressions.AttributeReference
+import org.apache.spark.sql.types.IntegerType
 
-import java.util.List;
-import java.util.Map;
+class MppBspFallbackPreparationSuite extends SparkFunSuite {
 
-public class IcebergLocalFilesBuilder {
-  public static IcebergLocalFilesNode makeIcebergLocalFiles(
-      Integer index,
-      List<String> paths,
-      List<Long> starts,
-      List<Long> lengths,
-      List<Long> fileSizes,
-      List<Map<String, String>> partitionColumns,
-      LocalFilesNode.ReadFileFormat fileFormat,
-      List<String> preferredLocations,
-      List<List<DeleteFile>> deleteFilesList) {
-    return new IcebergLocalFilesNode(
-        index,
-        paths,
-        starts,
-        lengths,
-        fileSizes,
-        partitionColumns,
-        fileFormat,
-        preferredLocations,
-        deleteFilesList);
+  test("RANGE sampling removes the MPP-only replicated build marker") {
+    val child = LocalTableScanExecTransformer(
+      Seq(AttributeReference("a", IntegerType, nullable = true)()),
+      Seq.empty)
+    val marker = MppBspFallbackPreparation.replicatedJoinBuildMarkerForTests(child)
+
+    assert(marker.nodeName == "MppReplicatedJoinBuildInput")
+    assert(MppBspFallbackPreparation.stripNativeOnlyMarkers(marker) eq child)
   }
 }

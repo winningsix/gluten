@@ -135,18 +135,6 @@ void removeTaskOutputState(
                  << ") threw unknown exception";
     }
   }
-#ifdef GLUTEN_ENABLE_GPU
-  try {
-    auto queueMgr = facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
-    queueMgr->removeTask(tid);
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "MppQueryCoordinator[" << queryId << "]: UcxOutputQueueManager::removeTask(" << tid
-               << ") threw: " << e.what();
-  } catch (...) {
-    LOG(ERROR) << "MppQueryCoordinator[" << queryId << "]: UcxOutputQueueManager::removeTask(" << tid
-               << ") threw unknown exception";
-  }
-#endif
 }
 
 bool isSafeTaskIdComponent(const std::string& value) {
@@ -492,12 +480,10 @@ void MppQueryCoordinator::start() {
                << " localPeerId=" << localPeerId_;
 
   // Write-in-MPP: detect whether the root fragment is a distributed TableWrite.
-  // When it is, the root must NOT use the SELECT ORDER-BY drain model (one
-  // ordered stream on peer0). Instead every peer runs one TableWrite over the
-  // slice it owns and drains its own commit batch. This single flag flips the
-  // three places that otherwise special-case a root RANGE exchange for ordered
-  // SELECT: per-peer replica count (1 writer/peer), destination ownership (fan
-  // across peers, not peer0-only), and rootProducesOutput_ (all peers emit).
+  // A write root runs exactly one TableWrite per peer over all HASH/RANGE
+  // destinations that peer owns and drains its local commit batch. Non-write
+  // RANGE roots use the same peer ownership, but retain sequential local drain
+  // so RANGE destinations stay ordered within each Spark output partition.
   const bool rootIsWrite = [&]() {
     std::function<bool(const core::PlanNodePtr&)> hasTableWrite = [&](const core::PlanNodePtr& node) -> bool {
       if (node == nullptr) {
@@ -742,13 +728,6 @@ void MppQueryCoordinator::start() {
     if (peerCount_ <= 1 || exchange.partitionType == "BROADCAST") {
       return true;
     }
-    if (exchange.consumerFragmentId == rootFragmentId_ && exchange.partitionType == "RANGE" && !rootIsWrite) {
-      // Preserve final ORDER BY by draining the root RANGE exchange on
-      // peer0 until we implement a k-way merge across Spark partitions.
-      // A distributed write root instead fans destinations across peers
-      // (below), so each peer writes the slice it owns.
-      return peerIndex == 0;
-    }
     if (exchange.partitionType == "HASH" || exchange.partitionType == "RANGE") {
       for (int dest = 0; dest < std::max(1, exchange.numPartitions); ++dest) {
         if (destinationOwner(dest, std::max(1, exchange.numPartitions)) == peerIndex) {
@@ -838,12 +817,7 @@ void MppQueryCoordinator::start() {
       int32_t ownedDestinations = 0;
       const auto destinations = std::max(1, exchange.numPartitions);
       for (int32_t dest = 0; dest < destinations; ++dest) {
-        const bool owned =
-            exchange.consumerFragmentId == rootFragmentId_ &&
-                exchange.partitionType == "RANGE" && !rootIsWrite
-            ? peerIndex == 0
-            : destinationOwner(dest, destinations) == peerIndex;
-        ownedDestinations += owned ? 1 : 0;
+        ownedDestinations += destinationOwner(dest, destinations) == peerIndex ? 1 : 0;
       }
       return std::min(base, ownedDestinations);
     }
@@ -875,19 +849,12 @@ void MppQueryCoordinator::start() {
         rootDrainSequential_ = true;
       }
       if (peerCount_ > 1) {
-        if (exchange.partitionType == "RANGE") {
-          // Final ORDER BY uses RANGE partitions. Keep the final ordered drain
-          // on one Spark output partition until a k-way merge output iterator
-          // exists across peer coordinators.
-          rootProducesOutput_ = peerIndex_ == 0;
-        } else if (exchange.partitionType == "HASH") {
-          rootProducesOutput_ = false;
-          for (int dest = 0; dest < std::max(1, exchange.numPartitions); ++dest) {
-            if (destinationOwner(dest, std::max(1, exchange.numPartitions)) == peerIndex_) {
-              rootProducesOutput_ = true;
-              break;
-            }
-          }
+        if (exchange.partitionType == "HASH" || exchange.partitionType == "RANGE") {
+          // MppNativeQueryRDD partition index is the native peer index. The
+          // weighted owner function assigns contiguous destination ranges in
+          // peer order, so RANGE remains globally ordered across Spark output
+          // partitions while each peer drains its local replicas sequentially.
+          rootProducesOutput_ = fragmentReplicaCount_[rootFragmentId_] > 0;
         } else if (exchange.partitionType != "BROADCAST") {
           rootProducesOutput_ = peerIndex_ == 0;
         }
@@ -901,7 +868,7 @@ void MppQueryCoordinator::start() {
     // inbound exchange. peerHasFragment() above already zeroed replicaCount for
     // peers that own none: a SINGLE/ROUND_ROBIN gather (global top-N / global
     // aggregation / scalar subquery) is peer0-only, while HASH/RANGE is fanned
-    // dest % peerCount. Mirror that here. Forcing every peer to produce breaks
+    // across peers. Mirror that here. Forcing every peer to produce breaks
     // SINGLE-gather writes -- peer!=0 has no slice, so its TableWrite's inbound
     // exchange source blocks forever in WaitingForMetadata (no producer ever
     // targets that destination), hanging the query. HASH/RANGE writes still
@@ -1081,7 +1048,9 @@ void MppQueryCoordinator::start() {
       // enqueueBroadcastOutputLocked replicates every page to all N
       // consumer replicas and isFinishedLocked() can eventually return.
       // Bootstrap producers are started before their splits are added, so this
-      // still happens before any enqueue.
+      // still happens before any enqueue. Velox's registered partitioned-output
+      // manager forwards this update to the UCX queue as part of Task's generic
+      // output lifecycle.
       task->updateOutputBuffers(bcastN, /*noMoreBuffers=*/true);
     }
   };
@@ -1128,6 +1097,7 @@ void MppQueryCoordinator::start() {
     for (size_t i = 0; i < spec.scanNodeIds.size(); i++) {
       const auto& scanInfo = spec.scanInfos[i];
       const auto& scanNodeId = spec.scanNodeIds[i];
+      std::vector<bool> scanSplitConsumed(scanInfo->paths.size(), false);
       // Use the connector ID from the plan's TableScanNode.
       // This is critical: "test-hive" -> Velox Hive connector,
       // "cudf-hive" -> cuDF GPU connector (handles type casting).
@@ -1137,6 +1107,9 @@ void MppQueryCoordinator::start() {
 
       size_t addedSplits = 0;
       for (size_t j = 0; j < scanInfo->paths.size(); j++) {
+        if (scanSplitConsumed[j]) {
+          continue;
+        }
         // K-way distributed broadcast production: every scan-bearing fragment --
         // INCLUDING BROADCAST producers -- strides its files 1/peerCount so each
         // peer scans a distinct slice. For a BROADCAST producer this means each
@@ -1169,6 +1142,94 @@ void MppQueryCoordinator::start() {
             }
           }
           std::unordered_map<std::string, std::string> customSplitInfo{{"table_format", "hive-iceberg"}};
+          std::vector<connector::hive::iceberg::IcebergCoalescedFile>
+              coalescedFiles;
+#ifdef GLUTEN_ENABLE_GPU
+          const auto configuredMultiFileTarget =
+              queryCtx_->queryConfig().get<uint64_t>(
+                  kCudfIcebergMultiFileTargetBytes,
+                  kCudfIcebergMultiFileTargetBytesDefault);
+          const auto targetBytes = configuredMultiFileTarget > 0
+              ? configuredMultiFileTarget
+              : queryCtx_->queryConfig().get<uint64_t>(
+                    kCudfGpuTargetBatchBytes,
+                    std::stoull(kCudfGpuTargetBatchBytesDefault));
+          const auto maxFiles = queryCtx_->queryConfig().get<int32_t>(
+              kCudfIcebergMultiFileMaxFiles,
+              kCudfIcebergMultiFileMaxFilesDefault);
+          const auto maxFileBytes = queryCtx_->queryConfig().get<uint64_t>(
+              kCudfIcebergMultiFileMaxFileBytes,
+              kCudfIcebergMultiFileMaxFileBytesDefault);
+          const bool useExperimentalReader =
+              queryCtx_->queryConfig().get<bool>(
+                  kCudfHiveUseExperimentalReader, false);
+          // A whole-file Iceberg Parquet task covers [4, fileSize), excluding
+          // its PAR1 header. Require the range to reach EOF so genuine
+          // row-group splits are never coalesced.
+          const auto isWholeFile = [&](size_t index) {
+            return index < scanInfo->starts.size() &&
+                index < scanInfo->lengths.size() &&
+                index < scanInfo->properties.size() &&
+                scanInfo->starts[index] <= 4 &&
+                scanInfo->properties[index].has_value() &&
+                scanInfo->properties[index]->fileSize.has_value() &&
+                scanInfo->starts[index] <= static_cast<uint64_t>(
+                    *scanInfo->properties[index]->fileSize) &&
+                scanInfo->lengths[index] >= static_cast<uint64_t>(
+                    *scanInfo->properties[index]->fileSize) -
+                    scanInfo->starts[index];
+          };
+          const bool useCudfIceberg = connectorId == kCudfIcebergConnectorId;
+          const bool primaryCanCoalesce = useCudfIceberg &&
+              !useExperimentalReader &&
+              targetBytes > 0 && maxFiles > 1 && deleteFiles.empty() &&
+              isWholeFile(j) &&
+              static_cast<uint64_t>(*scanInfo->properties[j]->fileSize) <=
+                  targetBytes &&
+              static_cast<uint64_t>(*scanInfo->properties[j]->fileSize) <=
+                  maxFileBytes;
+          uint64_t accumulatedBytes = primaryCanCoalesce
+              ? static_cast<uint64_t>(*scanInfo->properties[j]->fileSize)
+              : 0;
+          if (primaryCanCoalesce) {
+            for (size_t next = j + 1;
+                 next < scanInfo->paths.size() &&
+                 coalescedFiles.size() + 1 < static_cast<size_t>(maxFiles) &&
+                 accumulatedBytes < targetBytes;
+                 ++next) {
+              if (scanSplitConsumed[next] ||
+                  scanSplitOwners.at(scanInfo.get())[next] != peerIndex_) {
+                continue;
+              }
+              const bool hasDeletes =
+                  next < icebergSplitInfo->deleteFilesVec.size() &&
+                  !icebergSplitInfo->deleteFilesVec[next].empty();
+              const bool samePartition =
+                  scanInfo->partitionColumns.empty() ||
+                  scanInfo->partitionColumns[next] ==
+                      scanInfo->partitionColumns[j];
+              const bool sameMetadata =
+                  scanInfo->metadataColumns[next] ==
+                  scanInfo->metadataColumns[j];
+              if (hasDeletes || !isWholeFile(next) || !samePartition ||
+                  !sameMetadata ||
+                  static_cast<uint64_t>(
+                      *scanInfo->properties[next]->fileSize) > maxFileBytes) {
+                continue;
+              }
+              const auto fileSize = static_cast<uint64_t>(
+                  *scanInfo->properties[next]->fileSize);
+              if (accumulatedBytes >= targetBytes ||
+                  fileSize > targetBytes - accumulatedBytes) {
+                continue;
+              }
+              coalescedFiles.push_back(
+                  {scanInfo->paths[next], fileSize});
+              accumulatedBytes += fileSize;
+              scanSplitConsumed[next] = true;
+            }
+          }
+#endif
           connectorSplit = std::make_shared<connector::hive::iceberg::HiveIcebergSplit>(
               connectorId,
               scanInfo->paths[j],
@@ -1182,7 +1243,9 @@ void MppQueryCoordinator::start() {
               true,
               std::move(deleteFiles),
               metadataColumn,
-              j < scanInfo->properties.size() ? scanInfo->properties[j] : std::nullopt);
+              j < scanInfo->properties.size() ? scanInfo->properties[j] : std::nullopt,
+              /*dataSequenceNumber=*/0,
+              std::move(coalescedFiles));
         } else
 #ifdef GLUTEN_ENABLE_GPU
             if (connectorId == kCudfHiveConnectorId && scanInfo->canUseCudfConnector()) {
@@ -1355,7 +1418,6 @@ void MppQueryCoordinator::start() {
     //   http://127.0.0.1:<port-3>/v1/task/<taskId>/results/<dest>
     const bool isHash = exchange.partitionType == "HASH";
     const bool isRange = exchange.partitionType == "RANGE";
-    const bool isRootConsumer = exchange.consumerFragmentId == rootFragmentId_;
     const auto totalDestinations = std::max(1, exchange.numPartitions);
     const auto peerOwnsDestination = [&](int dest) {
       if (peerCount_ <= 1) {
@@ -1363,9 +1425,6 @@ void MppQueryCoordinator::start() {
       }
       if (isBroadcast) {
         return true;
-      }
-      if (isRootConsumer && isRange && !rootIsWrite) {
-        return peerIndex_ == 0;
       }
       if (isHash || isRange) {
         return destinationOwner(dest, totalDestinations) == peerIndex_;
@@ -1892,12 +1951,12 @@ RowVectorPtr MppQueryCoordinator::fetchNextDeviceOutput() {
     auto state = std::make_shared<DeviceFetchState>();
     state->sequence = requestedSequence;
 
-    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
-                 << "]: fetchNextDeviceOutput rootTask=" << rootTaskId
-                 << " seq=" << requestedSequence
-                 << " rootState="
-                 << static_cast<int>(
-                        fragmentTasks_[rootFragmentId_][idx]->state());
+    VLOG(2) << "MppQueryCoordinator[" << queryId_
+            << "]: fetchNextDeviceOutput rootTask=" << rootTaskId
+            << " seq=" << requestedSequence
+            << " rootState="
+            << static_cast<int>(
+                   fragmentTasks_[rootFragmentId_][idx]->state());
 
     queueManager->getData(
         rootTaskId,
@@ -1908,10 +1967,10 @@ RowVectorPtr MppQueryCoordinator::fetchNextDeviceOutput() {
             std::shared_ptr<cudf::packed_columns> data,
             int64_t sequence,
             std::vector<int64_t> /*remainingBytes*/) {
-          LOG(WARNING) << "MppQueryCoordinator[" << qid
-                       << "]: device getData callback fired replica=" << idx
-                       << " sequence=" << sequence
-                       << " hasData=" << (data != nullptr);
+          VLOG(2) << "MppQueryCoordinator[" << qid
+                  << "]: device getData callback fired replica=" << idx
+                  << " sequence=" << sequence
+                  << " hasData=" << (data != nullptr);
           state->data = std::move(data);
           state->sequence = sequence;
           bool expected = false;
@@ -1971,7 +2030,7 @@ RowVectorPtr MppQueryCoordinator::fetchNextDeviceOutput() {
         outputType,
         tableView.num_rows(),
         std::move(packedTable),
-        rmm::cuda_stream_default);
+        deviceRootOutputStream_.view());
   }
 
   rethrowFirstTaskError();

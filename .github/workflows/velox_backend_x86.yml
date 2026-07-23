@@ -1308,7 +1308,16 @@ jobs:
           mkdir -p /work/.ccache
 
           cd /work
-          bash dev/builddeps-veloxbe.sh --run_setup_script=OFF --build_arrow=OFF --build_tests=ON --build_benchmarks=ON --enable_gpu=ON # TODO: re-enable tests with more disk space
+          # HPDA Velox builds the UCX exchange whenever cuDF is enabled. Check
+          # out Velox first so its pinned adapter setup can supply UCX when the
+          # prebuilt Gluten image does not already contain it.
+          bash dev/builddeps-veloxbe.sh --run_setup_script=OFF --build_arrow=OFF --build_tests=ON --build_benchmarks=ON --enable_gpu=ON get_velox
+          ldconfig
+          if [ ! -f /usr/local/include/ucp/api/ucp.h ] || ! ldconfig -p | grep -q 'libucp.so'; then
+            bash ep/build-velox/build/velox_ep/scripts/setup-centos-adapters.sh install_ucx
+            ldconfig
+          fi
+          bash dev/builddeps-veloxbe.sh --run_setup_script=OFF --build_arrow=OFF --build_tests=ON --build_benchmarks=ON --enable_gpu=ON build_velox_backend # TODO: re-enable tests with more disk space
           rm -rf ep/build-velox/build/velox_ep
           build/mvn clean package -Pbackends-velox -Pspark-3.4 -DskipTests
           ccache -s

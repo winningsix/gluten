@@ -18,18 +18,22 @@ package org.apache.gluten.execution
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, AttributeReference, CurrentRow, Descending, Expression, Rank, RowFrame, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
-import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Complete, Sum}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, AttributeReference, CurrentRow, Descending, Expression, Literal, RangeFrame, Rank, RowFrame, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedFollowing, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Complete, Count, Sum}
 import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan}
-import org.apache.spark.sql.types.{IntegerType, LongType}
+import org.apache.spark.sql.types.{DecimalType, DoubleType, IntegerType, LongType}
 
 import org.scalatest.funsuite.AnyFunSuite
 
 class MppWindowInputOrderingSuite extends AnyFunSuite {
   private val partition = AttributeReference("partition", LongType)()
   private val order = AttributeReference("order", LongType)()
+  private val secondOrder = AttributeReference("second_order", LongType)()
   private val value = AttributeReference("value", IntegerType)()
-  private val leaf = TestLeaf(Seq(partition, order, value))
+  private val doubleValue = AttributeReference("double_value", DoubleType)()
+  private val decimalValue = AttributeReference("decimal_value", DecimalType(12, 2))()
+  private val leaf =
+    TestLeaf(Seq(partition, order, secondOrder, value, doubleValue, decimalValue))
 
   private case class TestLeaf(override val output: Seq[Attribute]) extends LeafExecNode {
     override protected def doExecute(): RDD[InternalRow] =
@@ -44,6 +48,33 @@ class MppWindowInputOrderingSuite extends AnyFunSuite {
           Seq(partition),
           Seq(SortOrder(order, Ascending)),
           SpecifiedWindowFrame(RowFrame, UnboundedPreceding, CurrentRow))
+
+        assertMarked(window)
+    }
+  }
+
+  test("marks full-partition COUNT of a non-null literal") {
+    val count =
+      AggregateExpression(Count(Seq(Literal(1))), Complete, isDistinct = false, filter = None)
+    val window = makeWindow(
+      Seq(count),
+      Seq(partition),
+      Seq.empty,
+      SpecifiedWindowFrame(RowFrame, UnboundedPreceding, UnboundedFollowing))
+
+    assertMarked(window)
+  }
+
+  test("marks supported multi-column peer-aware RANGE SUM") {
+    Seq(value, doubleValue).foreach {
+      input =>
+        val sum = AggregateExpression(Sum(input), Complete, isDistinct = false, filter = None)
+        val window = makeWindow(
+          Seq(sum),
+          Seq(partition),
+          Seq(SortOrder(order, Ascending), SortOrder(secondOrder, Descending)),
+          SpecifiedWindowFrame(RangeFrame, UnboundedPreceding, CurrentRow)
+        )
 
         assertMarked(window)
     }
@@ -90,6 +121,35 @@ class MppWindowInputOrderingSuite extends AnyFunSuite {
       SpecifiedWindowFrame(RowFrame, UnboundedPreceding, CurrentRow))
 
     assertNotMarked(window)
+  }
+
+  test("rejects unsupported COUNT and RANGE SUM contracts") {
+    val countValue =
+      AggregateExpression(Count(Seq(value)), Complete, isDistinct = false, filter = None)
+    val countNull = AggregateExpression(
+      Count(Seq(Literal.create(null, IntegerType))),
+      Complete,
+      isDistinct = false,
+      filter = None)
+    val fullRowFrame =
+      SpecifiedWindowFrame(RowFrame, UnboundedPreceding, UnboundedFollowing)
+    assertNotMarked(makeWindow(Seq(countValue), Seq(partition), Seq.empty, fullRowFrame))
+    assertNotMarked(makeWindow(Seq(countNull), Seq(partition), Seq.empty, fullRowFrame))
+
+    val decimalSum =
+      AggregateExpression(Sum(decimalValue), Complete, isDistinct = false, filter = None)
+    val integerSum = AggregateExpression(Sum(value), Complete, isDistinct = false, filter = None)
+    val orderSpec =
+      Seq(SortOrder(order, Ascending), SortOrder(secondOrder, Descending))
+    val rangeFrame =
+      SpecifiedWindowFrame(RangeFrame, UnboundedPreceding, CurrentRow)
+    assertNotMarked(makeWindow(Seq(decimalSum), Seq(partition), orderSpec, rangeFrame))
+    assertNotMarked(
+      makeWindow(
+        Seq(integerSum),
+        Seq(partition),
+        orderSpec,
+        SpecifiedWindowFrame(RowFrame, UnboundedPreceding, CurrentRow)))
   }
 
   private def makeWindow(

@@ -31,6 +31,7 @@
 #endif
 #ifdef GLUTEN_ENABLE_GPU
 #include "cudf/CheckOverflowInTableInsertCudf.h"
+#include "cudf/GpuMemoryTracker.h"
 #include "operators/plannodes/CudfVectorStream.h"
 #include "ucs/config/global_opts.h"
 #include "ucs/debug/debug.h"
@@ -297,6 +298,13 @@ void VeloxBackend::init(
          backendConf_->get(
              kCudfExchangeBatchSizeMinThreshold,
              kCudfExchangeBatchSizeMinThresholdDefault)},
+        // Bound post-exchange concat independently from aggregation concat.
+        // Wide exchange inputs can exhaust the device before reaching the row
+        // target. Keep the default large enough to avoid excessive UCX batches.
+        {velox::cudf_velox::CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
+         backendConf_->get(
+             kCudfExchangeBatchSizeMinThresholdBytes,
+             kCudfExchangeBatchSizeMinThresholdBytesDefault)},
         // Keep the new bounded external-sort implementation. MPP uses the
         // previously validated 3 GiB run/output bounds so 30 TB Q2/Q11 do not
         // spill or split already materialized local sorts into thousands of
@@ -537,6 +545,13 @@ VeloxBackend* VeloxBackend::get() {
   return instance_.get();
 }
 
+VeloxMemoryManager* VeloxBackend::getGlobalMemoryManager() const {
+  if (!globalMemoryManager_) {
+    throw GlutenException("VeloxBackend global memory manager is unavailable after terminal teardown.");
+  }
+  return globalMemoryManager_.get();
+}
+
 void VeloxBackend::tearDown() {
   if (tornDown_.exchange(true, std::memory_order_acq_rel)) {
     return;
@@ -554,6 +569,7 @@ void VeloxBackend::tearDown() {
     // keepalive references, then release both owners in that order.
     facebook::velox::ucx_exchange::Communicator::shutdown();
     ucxCommunicator_.reset();
+    GpuMemoryTracker::shutdown();
 #endif
 
 #ifdef ENABLE_HDFS

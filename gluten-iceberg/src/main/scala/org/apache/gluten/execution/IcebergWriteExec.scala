@@ -88,7 +88,7 @@ trait IcebergWriteExec extends ColumnarV2TableWriteExec {
             f =>
               f.transform().toString != "identity" ||
                 !validatePartitionType(spec.schema(), f) || !topIds
-                .contains(f.sourceId()) || f.transform().isVoid)
+                  .contains(f.sourceId()) || f.transform().isVoid)
       ) {
         return ValidationResult.failed(
           "GPU write supports top-level identity partitions with primitive partition types only")

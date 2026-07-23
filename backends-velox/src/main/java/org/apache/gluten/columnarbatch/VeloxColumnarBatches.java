@@ -143,6 +143,26 @@ public final class VeloxColumnarBatches {
   }
 
   /**
+   * Selects the requested columns and rows from an offloaded Velox batch.
+   *
+   * <p>For a device-backed cuDF vector the selection is performed with a device gather and only the
+   * selected rows are materialized on the host. This is intentionally a bounded-selection API;
+   * callers must not use it as an unbounded device-to-host conversion path.
+   */
+  public static ColumnarBatch select(ColumnarBatch batch, int[] columnIndices, int[] rowIndices) {
+    Preconditions.checkArgument(columnIndices.length > 0, "No columns selected");
+    Preconditions.checkArgument(rowIndices.length > 0, "No rows selected");
+    Runtime runtime =
+        Runtimes.contextInstance(
+            BackendsApiManager.getBackendName(), "VeloxColumnarBatches#select");
+    long nativeHandle = ColumnarBatches.getNativeHandle(BackendsApiManager.getBackendName(), batch);
+    long handle =
+        VeloxColumnarBatchJniWrapper.create(runtime)
+            .select(nativeHandle, columnIndices, rowIndices);
+    return ColumnarBatches.create(handle);
+  }
+
+  /**
    * repeat batch1 using the array `rowId2RowNums` passed in and then compose with batch2.
    * rowId2RowNums records the number of each row after repeated.
    */

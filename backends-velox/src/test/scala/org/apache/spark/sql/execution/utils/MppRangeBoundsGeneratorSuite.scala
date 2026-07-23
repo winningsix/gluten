@@ -16,11 +16,12 @@
  */
 package org.apache.spark.sql.execution.utils
 
-import org.apache.spark.SparkFunSuite
+import org.apache.gluten.utils.LocalTableScanExecCompat
+
+import org.apache.spark.{HashPartitioner, SparkConf, SparkContext, SparkFunSuite}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Ascending, AttributeReference, Descending, GenericInternalRow, NullsFirst, NullsLast, SortOrder, UnsafeProjection, UnsafeRow}
-import org.apache.spark.sql.execution.LocalTableScanExec
-import org.apache.spark.sql.types.{DecimalType, DoubleType, FloatType, IntegerType, StringType}
+import org.apache.spark.sql.types.{DateType, DecimalType, DoubleType, FloatType, IntegerType, StringType}
 import org.apache.spark.unsafe.types.UTF8String
 
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -29,6 +30,45 @@ import java.util.concurrent.{Callable, CountDownLatch, ExecutionException, Execu
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 
 class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
+
+  test("RANGE preparation materializes shuffle dependencies in topological order") {
+    val conf = new SparkConf(false)
+      .setMaster("local[2]")
+      .setAppName(getClass.getSimpleName)
+      .set("spark.ui.enabled", "false")
+    val sc = new SparkContext(conf)
+    try {
+      val sourceRows = 0 until 12
+      val sourceCalls = sc.longAccumulator("range-source-calls")
+      val intermediateCalls = sc.longAccumulator("range-intermediate-calls")
+      val source = sc.parallelize(sourceRows, 2).map {
+        value =>
+          sourceCalls.add(1L)
+          value -> value
+      }
+      val firstShuffle = source.partitionBy(new HashPartitioner(2)).map {
+        pair =>
+          intermediateCalls.add(1L)
+          pair
+      }
+      val secondShuffle = firstShuffle.partitionBy(new HashPartitioner(3))
+
+      val dependencies =
+        MppRangeBoundsGenerator.shuffleDependenciesInTopologicalOrder(secondShuffle)
+      assert(dependencies.size == 2)
+      assert(dependencies.map(_.shuffleId).distinct.size == 2)
+
+      MppRangeBoundsGenerator.materializeShuffleDependencies(secondShuffle)
+      assert(sourceCalls.value == sourceRows.size)
+      assert(intermediateCalls.value == sourceRows.size)
+
+      assert(secondShuffle.collect().map(_._1).sorted.toSeq == sourceRows)
+      assert(sourceCalls.value == sourceRows.size)
+      assert(intermediateCalls.value == sourceRows.size)
+    } finally {
+      sc.stop()
+    }
+  }
 
   test("range descriptor preserves mixed directions, null ordering, and boundary values") {
     val intKey = AttributeReference("i", IntegerType, nullable = true)()
@@ -60,6 +100,65 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
     assert(!MppRangeBoundsGenerator.supports(DecimalType(18, 2)))
     assert(!MppRangeBoundsGenerator.supports(FloatType))
     assert(!MppRangeBoundsGenerator.supports(DoubleType))
+  }
+
+  test("footer interval inference is limited to integral keys and bounded file sets") {
+    assert(MppRangeBoundsGenerator.supportsIntegralInterval(IntegerType))
+    assert(MppRangeBoundsGenerator.supportsIntegralInterval(DateType))
+    assert(!MppRangeBoundsGenerator.supportsIntegralInterval(StringType))
+  }
+
+  test("integral predicate bounds interpolate encoded dates by calendar day") {
+    val key = AttributeReference("first_play_utc_date", IntegerType, nullable = false)()
+    val ordering = Seq(SortOrder(key, Ascending, NullsFirst, Seq.empty))
+
+    val result = MppRangeBoundsGenerator
+      .fromIntegralInterval(
+        ordering,
+        20260101L,
+        20270101L,
+        requestedPartitions = 4,
+        basicIsoDateEncoding = true)
+      .get
+    val descriptor = new ObjectMapper().readTree(result.json)
+    val values = (0 until descriptor.get("bounds").size()).map {
+      index => descriptor.get("bounds").get(index).get(0).get("value").asInt()
+    }
+
+    assert(result.effectivePartitions == 4)
+    assert(values == Seq(20260402, 20260702, 20261001))
+  }
+
+  test("integral predicate bounds support secondary RANGE sort keys") {
+    val date = AttributeReference("first_play_utc_date", IntegerType, nullable = false)()
+    val hour = AttributeReference("first_play_utc_hour", IntegerType, nullable = true)()
+    val source = AttributeReference("source", StringType, nullable = true)()
+    val ordering = Seq(
+      SortOrder(date, Ascending, NullsFirst, Seq.empty),
+      SortOrder(hour, Ascending, NullsFirst, Seq.empty),
+      SortOrder(source, Ascending, NullsFirst, Seq.empty))
+
+    val result = MppRangeBoundsGenerator
+      .fromIntegralInterval(
+        ordering,
+        20260101L,
+        20270101L,
+        requestedPartitions = 4,
+        basicIsoDateEncoding = true)
+      .get
+    val descriptor = new ObjectMapper().readTree(result.json)
+    val bounds = descriptor.get("bounds")
+
+    assert(result.effectivePartitions == 4)
+    assert(
+      (0 until bounds.size()).map(bounds.get(_).get(0).get("value").asInt()) ==
+        Seq(20260402, 20260702, 20261001))
+    assert((0 until bounds.size()).forall(index => bounds.get(index).size() == 3))
+    assert(
+      (0 until bounds.size()).forall(
+        index =>
+          bounds.get(index).get(1).get("isNull").asBoolean() &&
+            bounds.get(index).get(2).get("isNull").asBoolean()))
   }
 
   test("D1 type guard rejects Spark 4 collated strings when that API is available") {
@@ -285,7 +384,7 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
 
   test("query cache computes equivalent RANGE bounds once under concurrent access") {
     val key = AttributeReference("key", IntegerType, nullable = false)()
-    val plan = LocalTableScanExec(Seq(key), Seq.empty[InternalRow])
+    val plan = LocalTableScanExecCompat(Seq(key), Seq.empty[InternalRow])
     val ordering = Seq(SortOrder(key, Ascending, NullsFirst, Seq.empty))
     val cache = new MppRangeBoundsGenerator.QueryCache("execution-1")
     val calls = new AtomicInteger(0)
@@ -327,7 +426,7 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
 
   test("query cache separates ordering and partition count and evicts failures") {
     val key = AttributeReference("key", IntegerType, nullable = false)()
-    val plan = LocalTableScanExec(Seq(key), Seq.empty[InternalRow])
+    val plan = LocalTableScanExecCompat(Seq(key), Seq.empty[InternalRow])
     val ascending = Seq(SortOrder(key, Ascending, NullsFirst, Seq.empty))
     val descending = Seq(SortOrder(key, Descending, NullsLast, Seq.empty))
     val cache = new MppRangeBoundsGenerator.QueryCache("execution-2")
@@ -358,7 +457,7 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
 
   test("concurrent cache failure reaches all waiters before a clean retry generation") {
     val key = AttributeReference("key", IntegerType, nullable = false)()
-    val plan = LocalTableScanExec(Seq(key), Seq.empty[InternalRow])
+    val plan = LocalTableScanExecCompat(Seq(key), Seq.empty[InternalRow])
     val ordering = Seq(SortOrder(key, Ascending, NullsFirst, Seq.empty))
     val cache = new MppRangeBoundsGenerator.QueryCache("execution-failure")
     val failure = new IllegalStateException("concurrent sample failed")
