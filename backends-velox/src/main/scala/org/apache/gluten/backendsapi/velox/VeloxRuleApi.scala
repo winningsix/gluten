@@ -143,6 +143,8 @@ object VeloxRuleApi {
           offloads))
 
     // Legacy: Post-transform rules.
+    injector.injectPostTransform(_ => PipelinedScalarSubqueryRule())
+    injector.injectPostTransform(_ => PipelinedStreamingBroadcastJoinRule())
     injector.injectPostTransform(_ => AppendBatchResizeForShuffleInputAndOutput())
     injector.injectPostTransform(_ => GpuBufferBatchResizeForShuffleInputOutput())
     injector.injectPostTransform(_ => UnionTransformerRule())

@@ -21,6 +21,17 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.Utils
 
+private[spark] case class UcxShuffleNativeWriterRuntimeStats(
+    noMoreData: Boolean,
+    finished: Boolean,
+    queuedBytes: Long,
+    queuedPages: Long,
+    totalBytesSent: Long,
+    totalRowsSent: Long,
+    totalPagesSent: Long,
+    averageBufferTimeMs: Long,
+    blocked: Boolean)
+
 private[spark] trait UcxShuffleNativeBridge {
   def localShuffleEndpointPort(): Int = -1
 
@@ -33,6 +44,10 @@ private[spark] trait UcxShuffleNativeBridge {
   def writeBatch(writerHandle: Long, partitionId: Int, batch: ColumnarBatch): Unit
 
   def closeWriter(writerHandle: Long, success: Boolean): Unit
+
+  def writerNoMoreData(nativeTaskId: String): Boolean = false
+
+  def writerRuntimeStats(nativeTaskId: String): Option[UcxShuffleNativeWriterRuntimeStats] = None
 
   def openReader(
       shuffleId: Int,

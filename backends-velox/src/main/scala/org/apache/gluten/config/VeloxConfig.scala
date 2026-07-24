@@ -101,12 +101,33 @@ class VeloxConfig(conf: SQLConf) extends GlutenConfig(conf) {
 
   def hashProbeDynamicFilterPushdownEnabled: Boolean =
     getConf(HASH_PROBE_DYNAMIC_FILTER_PUSHDOWN_ENABLED)
+
+  def nativeValidationCacheEnabled: Boolean =
+    getConf(NATIVE_VALIDATION_CACHE_ENABLED)
+
+  def nativeValidationCacheMaximumSize: Long =
+    getConf(NATIVE_VALIDATION_CACHE_MAXIMUM_SIZE)
 }
 
 object VeloxConfig extends ConfigRegistry {
   override def get: VeloxConfig = {
     new VeloxConfig(SQLConf.get)
   }
+
+  val NATIVE_VALIDATION_CACHE_ENABLED =
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.nativeValidationCache.enabled")
+      .doc(
+        "Cache native validation results by serialized Substrait plan in the driver JVM. " +
+          "This avoids repeated JNI validation for identical plans.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val NATIVE_VALIDATION_CACHE_MAXIMUM_SIZE =
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.nativeValidationCache.maximumSize")
+      .doc("Maximum number of native validation results retained in the driver JVM.")
+      .longConf
+      .checkValue(_ > 0, "Native validation cache maximum size must be positive.")
+      .createWithDefault(4096L)
 
   // velox caching options.
   val COLUMNAR_VELOX_CACHE_ENABLED =

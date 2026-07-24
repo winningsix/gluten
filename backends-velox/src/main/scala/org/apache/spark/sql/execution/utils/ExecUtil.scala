@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution.utils
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.columnarbatch.{ColumnarBatches, VeloxColumnarBatches}
 import org.apache.gluten.config.ShuffleWriterType
+import org.apache.gluten.execution.ReplicatedPartitioning
 import org.apache.gluten.iterator.Iterators
 import org.apache.gluten.memory.arrow.alloc.ArrowBufferAllocators
 import org.apache.gluten.runtime.Runtimes
@@ -170,6 +171,8 @@ object ExecUtil {
         new NativePartitioning(GlutenShuffleUtils.RoundRobinPartitioningShortName, n)
       case HashPartitioning(exprs, n) =>
         new NativePartitioning(GlutenShuffleUtils.HashPartitioningShortName, n)
+      case ReplicatedPartitioning(n) =>
+        new NativePartitioning(GlutenShuffleUtils.BroadcastPartitioningShortName, n)
       // range partitioning fall back to row-based partition id computation
       case RangePartitioning(orders, n) =>
         new NativePartitioning(GlutenShuffleUtils.RangePartitioningShortName, n)

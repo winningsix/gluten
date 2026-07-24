@@ -146,6 +146,15 @@ core::PlanNodePtr wrapNativeUcxPartitionedOutput(
         source,
         core::PartitionedOutputNode::TransportType::kUcx);
   }
+  if (partitioning == "broadcast") {
+    return core::PartitionedOutputNode::broadcast(
+        outputNodeId,
+        numPartitions,
+        outputType,
+        std::string{"Presto"},
+        source,
+        core::PartitionedOutputNode::TransportType::kUcx);
+  }
 
   std::vector<core::TypedExprPtr> keys;
   core::PartitionFunctionSpecPtr funcSpec;

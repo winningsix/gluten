@@ -415,7 +415,7 @@ JNIEXPORT void JNICALL Java_org_apache_gluten_memory_NativeMemoryManagerJniWrapp
     jlong nmmHandle) {
   JNI_METHOD_START
   auto* memoryManager = jniCastOrThrow<MemoryManager>(nmmHandle);
-  MemoryManager::release(memoryManager);
+  MemoryManager::releaseOrDefer(memoryManager);
   JNI_METHOD_END()
 }
 

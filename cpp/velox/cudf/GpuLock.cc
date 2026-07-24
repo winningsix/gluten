@@ -16,16 +16,20 @@
  */
 
 #include "GpuLock.h"
+#include <algorithm>
+#include <cctype>
 #include <condition_variable>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <glog/logging.h>
+#include <nvtx3/nvtx3.hpp>
+#include "velox/experimental/cudf/exec/NvtxHelper.h"
 
-// MPP livelock diagnosis: GpuLock is bypassed entirely. lockGpu/unlockGpu
-// early-return with no futex/cv wait so we can prove the lock is a symptom,
-// not the root cause of the MppNativeQueryExec hang on Q1.
-// Symbols are kept exported so other TUs that reference them still link.
+// Keep the old MPP-diagnosis bypass as the default. Streaming shuffle POC can
+// opt back into the counting semaphore with GLUTEN_GPULOCK_ENABLED=true.
 // Stderr markers are compiled out to keep executor logs quiet; flip
 // GLUTEN_GPULOCK_TRACE to 1 to re-enable.
 #ifndef GLUTEN_GPULOCK_TRACE
@@ -48,6 +52,26 @@ GpuLockState& getState() {
   return state;
 }
 
+bool gpuLockEnabled() {
+  static const bool enabled = [] {
+    const auto* value = std::getenv("GLUTEN_GPULOCK_ENABLED");
+    if (value == nullptr) {
+      return false;
+    }
+    std::string normalized{value};
+    std::transform(
+        normalized.begin(),
+        normalized.end(),
+        normalized.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return !normalized.empty() && normalized != "0" &&
+        normalized != "false" && normalized != "off" && normalized != "no";
+  }();
+  return enabled;
+}
+
+thread_local int tLocalRefCount = 0;
+
 } // namespace
 
 void setMaxConcurrentGpuTasks(int n) {
@@ -55,8 +79,9 @@ void setMaxConcurrentGpuTasks(int n) {
   std::unique_lock<std::mutex> lock(s.mutex);
   int prev = s.maxConcurrent;
   s.maxConcurrent = std::max(1, n);
-  LOG(INFO) << "GPU concurrency (bypassed): " << prev << " -> "
-            << s.maxConcurrent;
+  LOG(INFO) << "GPU concurrency"
+            << (gpuLockEnabled() ? "" : " (bypassed)") << ": " << prev
+            << " -> " << s.maxConcurrent;
   if (s.maxConcurrent > prev) {
     s.cv.notify_all();
   }
@@ -69,19 +94,70 @@ int getMaxConcurrentGpuTasks() {
 }
 
 void lockGpu() {
-  // MPP livelock diagnosis: no-op. No futex/cv wait.
+  if (!gpuLockEnabled()) {
 #if GLUTEN_GPULOCK_TRACE
-  std::cerr << "GPU_LOCK [lockGpu-bypass] tid="
-            << std::this_thread::get_id() << std::endl;
+    std::cerr << "GPU_LOCK [lockGpu-bypass] tid="
+              << std::this_thread::get_id() << std::endl;
 #endif
+    return;
+  }
+  if (tLocalRefCount > 0) {
+    ++tLocalRefCount;
+    VLOG(2) << "GPU_LOCK [lockGpu-reentrant] tid="
+            << std::this_thread::get_id()
+            << " refCount=" << tLocalRefCount;
+    return;
+  }
+  auto& s = getState();
+  std::unique_lock<std::mutex> lock(s.mutex);
+  VLOG(2) << "GPU_LOCK [lockGpu-wait] tid=" << std::this_thread::get_id()
+          << " activeCount=" << s.activeCount
+          << " maxConcurrent=" << s.maxConcurrent;
+  {
+    nvtx3::scoped_range_in<
+        facebook::velox::cudf_velox::VeloxDomain>
+        waitRange(nvtx3::event_attributes{
+            "GpuLock::wait",
+            nvtx3::rgb{255, 69, 0}});
+    s.cv.wait(lock, [&] {
+      return s.activeCount < s.maxConcurrent;
+    });
+  }
+  ++s.activeCount;
+  tLocalRefCount = 1;
+  VLOG(2) << "GPU_LOCK [lockGpu-acquired] tid=" << std::this_thread::get_id()
+          << " activeCount=" << s.activeCount
+          << " refCount=" << tLocalRefCount;
 }
 
 void unlockGpu() {
-  // MPP livelock diagnosis: no-op. Paired with the bypassed lockGpu.
+  if (!gpuLockEnabled()) {
 #if GLUTEN_GPULOCK_TRACE
-  std::cerr << "GPU_LOCK [unlockGpu-bypass] tid="
-            << std::this_thread::get_id() << std::endl;
+    std::cerr << "GPU_LOCK [unlockGpu-bypass] tid="
+              << std::this_thread::get_id() << std::endl;
 #endif
+    return;
+  }
+  if (tLocalRefCount <= 0) {
+    VLOG(2) << "GPU_LOCK [unlockGpu-noop] tid=" << std::this_thread::get_id()
+            << " refCount=" << tLocalRefCount;
+    return;
+  }
+  --tLocalRefCount;
+  if (tLocalRefCount > 0) {
+    VLOG(2) << "GPU_LOCK [unlockGpu-reentrant] tid="
+            << std::this_thread::get_id()
+            << " refCount=" << tLocalRefCount;
+    return;
+  }
+  auto& s = getState();
+  std::unique_lock<std::mutex> lock(s.mutex);
+  --s.activeCount;
+  VLOG(2) << "GPU_LOCK [unlockGpu-released] tid="
+          << std::this_thread::get_id()
+          << " activeCount=" << s.activeCount;
+  lock.unlock();
+  s.cv.notify_one();
 }
 
 } // namespace gluten

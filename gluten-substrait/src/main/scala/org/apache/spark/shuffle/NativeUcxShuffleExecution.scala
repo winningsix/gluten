@@ -43,7 +43,9 @@ case class NativeUcxShuffleReadSpec(
     startMapIndex: Int,
     endMapIndex: Int,
     expectedMaps: Int,
-    initialEndpoints: Seq[UcxShuffleEndpoint])
+    initialEndpoints: Seq[UcxShuffleEndpoint],
+    taskAttemptId: Long = -1L,
+    nativeReaderId: String = "")
 
 trait NativeUcxShuffleReadMetadata {
   def nativeUcxShuffleReadSpec: NativeUcxShuffleReadSpec
@@ -114,7 +116,7 @@ object NativeUcxShuffleExecution extends Logging {
   def enabled(conf: SparkConf): Boolean = conf.getBoolean(EnabledConf, false)
 
   def writerTaskId(shuffleId: Int, mapId: Long, attemptId: Long): String =
-    s"Gluten_UCX_Shuffle_${shuffleId}_Map_${mapId}_Attempt_${attemptId}"
+    s"Gluten_UCX_Shuffle_${shuffleId}_Map_${mapId}_Attempt_$attemptId"
 
   def exchangeNodeId(streamIdx: Int): String = s"ucx_exchange_$streamIdx"
 
@@ -165,15 +167,18 @@ object NativeUcxShuffleExecution extends Logging {
           None
         } else {
           seen.put(ref, java.lang.Boolean.TRUE)
-          iteratorFields(iterator.getClass).iterator.flatMap {
-            field =>
-              try {
-                field.setAccessible(true)
-                readSpec(field.get(ref), seen, depth + 1)
-              } catch {
-                case NonFatal(_) => None
-              }
-          }.toSeq.headOption
+          iteratorFields(iterator.getClass).iterator
+            .flatMap {
+              field =>
+                try {
+                  field.setAccessible(true)
+                  readSpec(field.get(ref), seen, depth + 1)
+                } catch {
+                  case NonFatal(_) => None
+                }
+            }
+            .toSeq
+            .headOption
         }
       case _ => None
     }
@@ -183,8 +188,8 @@ object NativeUcxShuffleExecution extends Logging {
     val fields = scala.collection.mutable.ArrayBuffer[java.lang.reflect.Field]()
     var current = clazz
     while (current != null && current != classOf[Object]) {
-      fields ++= current.getDeclaredFields.filterNot { field =>
-        Modifier.isStatic(field.getModifiers)
+      fields ++= current.getDeclaredFields.filterNot {
+        field => Modifier.isStatic(field.getModifiers)
       }
       current = current.getSuperclass
     }
@@ -235,21 +240,24 @@ object NativeUcxShuffleExecution extends Logging {
         val columnarDependency =
           handle.dependency.asInstanceOf[ColumnarShuffleDependencyLike]
         val partitioning = columnarDependency.nativePartitioning.getShortName
+        val ucxMapId = context.partitionId().toLong
         val attemptId = context.taskAttemptId()
         val writerContext = NativeUcxShuffleWriterContext(
           shuffleId = handle.shuffleId,
-          mapId = mapId,
+          mapId = ucxMapId,
           attemptId = attemptId,
-          nativeTaskId = writerTaskId(handle.shuffleId, mapId, attemptId),
+          nativeTaskId = writerTaskId(handle.shuffleId, ucxMapId, attemptId),
           numPartitions = handle.dependency.partitioner.numPartitions,
           partitioning = partitioning,
           startPartitionId = GlutenShuffleUtils.getStartPartitionId(
             columnarDependency.nativePartitioning,
             context.partitionId()),
-          dropFirstColumn = partitioning == GlutenShuffleUtils.HashPartitioningShortName)
+          dropFirstColumn = partitioning == GlutenShuffleUtils.HashPartitioningShortName
+        )
         logInfo(
           s"Installing native UCX shuffle writer context before map iterator creation " +
-            s"shuffleId=${handle.shuffleId} mapId=$mapId attemptId=$attemptId " +
+            s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId sparkMapId=$mapId " +
+            s"attemptId=$attemptId " +
             s"nativeTaskId=${writerContext.nativeTaskId} " +
             s"partitions=${writerContext.numPartitions} " +
             s"partitioning=$partitioning " +
@@ -280,7 +288,8 @@ object NativeUcxShuffleExecution extends Logging {
       WriteNumPartitionsConf -> context.numPartitions.toString,
       WritePartitioningConf -> context.partitioning,
       WriteStartPartitionIdConf -> context.startPartitionId.toString,
-      WriteDropFirstColumnConf -> context.dropFirstColumn.toString)
+      WriteDropFirstColumnConf -> context.dropFirstColumn.toString
+    )
   }
 
   def readerExtraConf(streamIndices: Seq[Int]): Map[String, String] = {
@@ -312,11 +321,17 @@ object NativeUcxShuffleExecution extends Logging {
           val startNs = System.nanoTime()
           var noMoreSent = false
           try {
-            spec.initialEndpoints.foreach { endpoint =>
-              if (inMapRange(spec, endpoint.mapId) && seen.add(endpoint.mapId)) {
-                addSplits(Array(remoteTaskUrl(endpoint, spec.reducePartitionId)))
-              }
+            spec.initialEndpoints.foreach {
+              endpoint =>
+                if (inMapRange(spec, endpoint.mapId) && seen.add(endpoint.mapId)) {
+                  addSplits(Array(remoteTaskUrl(endpoint, spec.reducePartitionId)))
+                }
             }
+            logInfo(
+              s"Started Velox UCX ExchangeNode split poller $exchangeNodeId " +
+                s"shuffleId=${spec.shuffleId} reduce=${spec.reducePartitionId} " +
+                s"initialSeen=${seen.size}/${spec.expectedMaps} " +
+                s"mapRange=[${spec.startMapIndex},${spec.endMapIndex})")
             while (!noMoreSent) {
               val response = coordinator.getAvailableWriters(spec.shuffleId).getOrElse {
                 throw new SparkException(
@@ -341,20 +356,31 @@ object NativeUcxShuffleExecution extends Logging {
                     s"$exchangeNodeId shuffleId=${spec.shuffleId} " +
                     s"reduce=${spec.reducePartitionId} seen=${seen.size}/${spec.expectedMaps}")
               }
-              if (seen.size >= spec.expectedMaps) {
+              val completedMaps = completedMapCount(spec, response, seen)
+              if (completedMaps >= spec.expectedMaps) {
                 noMoreSplits()
+                reportNativeReaderState(
+                  coordinator,
+                  spec,
+                  seenMaps = seen.size,
+                  completedMaps = completedMaps,
+                  noMoreSplits = true,
+                  finished = false)
                 noMoreSent = true
                 logInfo(
                   s"Velox UCX ExchangeNode $exchangeNodeId reached noMoreSplits " +
                     s"shuffleId=${spec.shuffleId} reduce=${spec.reducePartitionId} " +
-                    s"seen=${seen.size}/${spec.expectedMaps}")
+                    s"knownProducers=${seen.size}/${spec.expectedMaps} " +
+                    s"completed=$completedMaps/${spec.expectedMaps}")
               } else {
                 val elapsedMs = (System.nanoTime() - startNs) / 1000000L
                 if (elapsedMs > timeoutMs) {
                   throw new SparkException(
                     s"Timed out after ${timeoutMs}ms polling UCX producer endpoints for " +
                       s"Velox ExchangeNode $exchangeNodeId shuffleId=${spec.shuffleId} " +
-                      s"reduce=${spec.reducePartitionId} seen=${seen.size}/${spec.expectedMaps}")
+                      s"reduce=${spec.reducePartitionId} " +
+                      s"knownProducers=${seen.size}/${spec.expectedMaps} " +
+                      s"completed=$completedMaps/${spec.expectedMaps}")
                 }
                 Thread.sleep(pollMs)
               }
@@ -369,10 +395,41 @@ object NativeUcxShuffleExecution extends Logging {
           }
         }
       },
-      s"velox-ucx-exchange-split-poller-${spec.shuffleId}-${spec.reducePartitionId}-$streamIdx")
+      s"velox-ucx-exchange-split-poller-${spec.shuffleId}-${spec.reducePartitionId}-$streamIdx"
+    )
     poller.setDaemon(true)
     poller.start()
     poller
+  }
+
+  private def reportNativeReaderState(
+      coordinator: UcxShuffleCoordinator,
+      spec: NativeUcxShuffleReadSpec,
+      seenMaps: Int,
+      completedMaps: Int,
+      noMoreSplits: Boolean,
+      finished: Boolean): Unit = {
+    val response =
+      coordinator.reportNativeReaderState(
+        UcxNativeReaderState(
+          shuffleId = spec.shuffleId,
+          reducePartitionId = spec.reducePartitionId,
+          taskAttemptId = spec.taskAttemptId,
+          nativeReaderId = spec.nativeReaderId,
+          seenMaps = seenMaps,
+          completedMaps = completedMaps,
+          expectedMaps = spec.expectedMaps,
+          noMoreSplits = noMoreSplits,
+          finished = finished,
+          timestampMs = System.currentTimeMillis()))
+    if (!response.accepted) {
+      logWarning(
+        s"Native UCX reader state rejected by query coordinator " +
+          s"shuffleId=${spec.shuffleId} reduce=${spec.reducePartitionId} " +
+          s"taskAttemptId=${spec.taskAttemptId} groupId=${response.groupId} " +
+          s"queryId=${response.queryId} queryState=${response.queryState} " +
+          s"reason=${response.reason}")
+    }
   }
 
   private def remoteTaskUrl(endpoint: UcxShuffleEndpoint, reducePartitionId: Int): String = {
@@ -386,5 +443,14 @@ object NativeUcxShuffleExecution extends Logging {
     } else {
       mapId >= spec.startMapIndex && mapId < spec.endMapIndex
     }
+  }
+
+  private def completedMapCount(
+      spec: NativeUcxShuffleReadSpec,
+      response: UcxShuffleEndpointResponse,
+      seen: java.util.HashSet[Long]): Int = {
+    val finishedWithoutEndpoint =
+      response.finishedMapIds.count(mapId => inMapRange(spec, mapId) && !seen.contains(mapId))
+    seen.size + finishedWithoutEndpoint
   }
 }

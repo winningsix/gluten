@@ -827,6 +827,59 @@ Java_org_apache_gluten_vectorized_UcxShuffleJniWrapper_nativeCloseWriter( // NOL
   JNI_METHOD_END()
 }
 
+JNIEXPORT jboolean JNICALL
+Java_org_apache_gluten_vectorized_UcxShuffleJniWrapper_nativeWriterNoMoreData( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jstring nativeTaskId) {
+  JNI_METHOD_START
+#ifndef GLUTEN_ENABLE_GPU
+  failGpuRequired("writerNoMoreData");
+#else
+  (void)wrapper;
+  const auto taskId = jStringToCString(env, nativeTaskId);
+  auto queueManager = UcxOutputQueueManager::getInstanceRef();
+  auto stats = queueManager->stats(taskId);
+  return stats.has_value() && stats->noMoreData ? JNI_TRUE : JNI_FALSE;
+#endif
+  JNI_METHOD_END(JNI_FALSE)
+}
+
+JNIEXPORT jlongArray JNICALL
+Java_org_apache_gluten_vectorized_UcxShuffleJniWrapper_nativeWriterStats( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jstring nativeTaskId) {
+  JNI_METHOD_START
+#ifndef GLUTEN_ENABLE_GPU
+  failGpuRequired("writerStats");
+#else
+  (void)wrapper;
+  const auto taskId = jStringToCString(env, nativeTaskId);
+  auto queueManager = UcxOutputQueueManager::getInstanceRef();
+  auto stats = queueManager->stats(taskId);
+  jlong values[10] = {0};
+  if (stats.has_value()) {
+    const auto blockedThreshold = static_cast<int64_t>(outputBufferBytes());
+    values[0] = 1;
+    values[1] = stats->noMoreData ? 1 : 0;
+    values[2] = stats->finished ? 1 : 0;
+    values[3] = stats->bufferedBytes;
+    values[4] = stats->bufferedPages;
+    values[5] = stats->totalBytesSent;
+    values[6] = stats->totalRowsSent;
+    values[7] = stats->totalPagesSent;
+    values[8] = stats->averageBufferTimeMs;
+    values[9] =
+        (!stats->finished && stats->bufferedBytes >= blockedThreshold) ? 1 : 0;
+  }
+  auto out = env->NewLongArray(10);
+  env->SetLongArrayRegion(out, 0, 10, values);
+  return out;
+#endif
+  JNI_METHOD_END(nullptr)
+}
+
 JNIEXPORT jlong JNICALL
 Java_org_apache_gluten_vectorized_UcxShuffleJniWrapper_nativeOpenReader( // NOLINT
     JNIEnv* env,

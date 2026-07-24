@@ -576,6 +576,9 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
       partitioning: Partitioning,
       output: Seq[Attribute]): ShuffleWriterType = {
     val conf = GlutenConfig.get
+    if (partitioning.isInstanceOf[ReplicatedPartitioning]) {
+      return HashShuffleWriterType
+    }
     // todo: remove isUseCelebornShuffleManager here
     if (conf.isUseCelebornShuffleManager) {
       if (conf.celebornShuffleWriterType == ReservedKeys.GLUTEN_SORT_SHUFFLE_WRITER) {

@@ -17,6 +17,7 @@
 package org.apache.gluten.backendsapi.velox
 
 import org.apache.gluten.backendsapi.{BackendsApiManager, ValidatorApi}
+import org.apache.gluten.config.VeloxConfig
 import org.apache.gluten.execution.ValidationResult
 import org.apache.gluten.substrait.`type`.TypeNode
 import org.apache.gluten.substrait.SubstraitContext
@@ -32,7 +33,12 @@ import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.types._
 import org.apache.spark.task.TaskResources
 
+import com.google.common.cache.{Cache, CacheBuilder}
+import com.google.common.util.concurrent.{ExecutionError, UncheckedExecutionException}
 import io.substrait.proto.SimpleExtensionDeclaration
+import org.apache.gluten.shaded.com.google.protobuf.ByteString
+
+import java.util.concurrent.{Callable, ExecutionException}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable.ArrayBuffer
@@ -45,9 +51,20 @@ class VeloxValidatorApi extends ValidatorApi {
     true
 
   override def doNativeValidateWithFailureReason(plan: PlanNode): ValidationResult = {
+    val planBytes = plan.toProtobuf.toByteString
+    if (VeloxConfig.get.nativeValidationCacheEnabled) {
+      getOrLoadNativeValidation(planBytes) {
+        doNativeValidate(planBytes)
+      }
+    } else {
+      doNativeValidate(planBytes)
+    }
+  }
+
+  private def doNativeValidate(planBytes: ByteString): ValidationResult = {
     TaskResources.runUnsafe {
       val validator = NativePlanEvaluator.create(BackendsApiManager.getBackendName)
-      asValidationResult(validator.doNativeValidateWithFailureReason(plan.toProtobuf.toByteArray))
+      asValidationResult(validator.doNativeValidateWithFailureReason(planBytes.toByteArray))
     }
   }
 
@@ -103,6 +120,31 @@ class VeloxValidatorApi extends ValidatorApi {
 }
 
 object VeloxValidatorApi {
+  private lazy val nativeValidationCache: Cache[ByteString, ValidationResult] =
+    CacheBuilder
+      .newBuilder()
+      .maximumSize(VeloxConfig.get.nativeValidationCacheMaximumSize)
+      .build[ByteString, ValidationResult]()
+
+  private[velox] def getOrLoadNativeValidation(
+      planBytes: ByteString)(loader: => ValidationResult): ValidationResult = {
+    try {
+      nativeValidationCache.get(
+        planBytes,
+        new Callable[ValidationResult] {
+          override def call(): ValidationResult = loader
+        })
+    } catch {
+      case e: ExecutionException => throw e.getCause
+      case e: UncheckedExecutionException => throw e.getCause
+      case e: ExecutionError => throw e.getCause
+    }
+  }
+
+  private[velox] def invalidateNativeValidationCache(): Unit = {
+    nativeValidationCache.invalidateAll()
+  }
+
   private def isPrimitiveType(dataType: DataType): Boolean = {
     dataType match {
       case BooleanType | ByteType | ShortType | IntegerType | LongType | FloatType | DoubleType |

@@ -39,6 +39,12 @@ class UcxColumnarShuffleManager(conf: SparkConf, isDriver: Boolean)
     UcxShuffleCoordinator.getOrCreate(conf, isDriver)
   private lazy val nativeBridge: UcxShuffleNativeBridge =
     UcxShuffleNativeBridge.getOrCreate(conf)
+  private val maxActiveWriterTasksPerQuery =
+    math.max(
+      0,
+      conf.getInt(
+        UcxColumnarShuffleManager.WriterMaxActiveTasksPerQueryConf,
+        conf.getInt(UcxColumnarShuffleManager.WriterMaxActiveTasksPerGroupConf, 0)))
 
   logInfo(
     s"Using ${UcxColumnarShuffleManager.ClassName} " +
@@ -130,6 +136,14 @@ class UcxColumnarShuffleManager(conf: SparkConf, isDriver: Boolean)
   override def requiresAllPipelinedShuffleReadersResident(
       group: PipelinedShuffleGroupMetadata): Boolean = true
 
+  override def maxConcurrentPipelinedShuffleProducers(groupId: String): Option[Int] = {
+    Option.when(isDriver && maxActiveWriterTasksPerQuery > 0) {
+      UcxShuffleCoordinator.pipelinedProducerLaunchCap(
+        groupId,
+        maxActiveWriterTasksPerQuery)
+    }
+  }
+
   override def admitPipelinedShuffleGroup(groupId: String): Unit = {
     coordinator.admitPipelinedShuffleGroup(groupId)
   }
@@ -140,6 +154,14 @@ class UcxColumnarShuffleManager(conf: SparkConf, isDriver: Boolean)
 
   override def abortPipelinedShuffleGroup(groupId: String, reason: String): Unit = {
     coordinator.abortPipelinedShuffleGroup(groupId, reason)
+  }
+
+  override def completePipelinedQuery(queryExecutionId: Long): Unit = {
+    coordinator.completePipelinedQuery(queryExecutionId)
+  }
+
+  override def abortPipelinedQuery(queryExecutionId: Long, reason: String): Unit = {
+    coordinator.abortPipelinedQuery(queryExecutionId, reason)
   }
 
   override def shuffleBlockResolver: ShuffleBlockResolver = {
@@ -166,10 +188,36 @@ private[spark] object UcxColumnarShuffleManager {
     "spark.gluten.ucx.shuffle.reader.slowNextBatchLogMs"
   val WriterWaitForReadersReadyConf: String =
     "spark.gluten.ucx.shuffle.writer.waitForReadersReady"
+  val WriterWaitForGroupReadersReadyConf: String =
+    "spark.gluten.ucx.shuffle.writer.waitForGroupReadersReady"
   val WriterReadersReadyWaitMsConf: String =
     "spark.gluten.ucx.shuffle.writer.readersReadyWaitMs"
   val WriterReadersReadyPollMsConf: String =
     "spark.gluten.ucx.shuffle.writer.readersReadyPollMs"
+  val WriterMaxActiveTasksPerShuffleConf: String =
+    "spark.gluten.ucx.shuffle.writer.maxActiveTasksPerShuffle"
+  val WriterMaxActiveTasksPerGroupConf: String =
+    "spark.gluten.ucx.shuffle.writer.maxActiveTasksPerGroup"
+  val WriterMaxActiveTasksPerQueryConf: String =
+    "spark.gluten.ucx.shuffle.query.maxActiveWriters"
+  val WriterMinFrontierTasksPerQueryConf: String =
+    "spark.gluten.ucx.shuffle.query.minFrontierWriters"
+  val QueryMaxQueuedBytesConf: String =
+    "spark.gluten.ucx.shuffle.query.maxQueuedBytes"
+  val QueryResumeQueuedBytesConf: String =
+    "spark.gluten.ucx.shuffle.query.resumeQueuedBytes"
+  val QueryBackpressuredLaunchWritersConf: String =
+    "spark.gluten.ucx.shuffle.query.backpressuredLaunchWriters"
+  val WriterCreditWaitMsConf: String =
+    "spark.gluten.ucx.shuffle.writer.creditWaitMs"
+  val WriterCreditPollMsConf: String =
+    "spark.gluten.ucx.shuffle.writer.creditPollMs"
+  val NativeWriterNoMoreDataPollMsConf: String =
+    "spark.gluten.ucx.shuffle.native.writer.noMoreDataPollMs"
+  val NativeWriterNoMoreDataWaitMsConf: String =
+    "spark.gluten.ucx.shuffle.native.writer.noMoreDataWaitMs"
+  val NativeWriterStateReportMsConf: String =
+    "spark.gluten.ucx.shuffle.native.writer.stateReportMs"
 
   def dataPlaneNotImplemented(operation: String, handle: ShuffleHandle): SparkException = {
     new SparkException(
@@ -197,18 +245,26 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
   private val columnarDependency =
     handle.dependency.asInstanceOf[ColumnarShuffleDependencyLike]
   private val numPartitions = handle.dependency.partitioner.numPartitions
+  private val ucxMapId = context.partitionId().toLong
   private val attemptId = context.taskAttemptId()
   @volatile private var endpointRegistered = false
   @volatile private var nativeWriterHandle = -1L
+  @volatile private var writerCreditAcquired = false
+  @volatile private var writerFinishedMarked = false
+  @volatile private var nativeWriterNoMoreDataPoller: Thread = _
+  @volatile private var nativeWriterNoMoreDataPollerStopRequested = false
   @volatile private var stopped = false
 
   context.addTaskCompletionListener[Unit] {
     taskContext =>
       if (taskContext.isFailed() || taskContext.isInterrupted()) {
+        stopNativeWriterNoMoreDataPoller()
+        releaseWriterCreditIfNeeded()
         coordinator.abortShuffle(
           handle.shuffleId,
           s"UCX shuffle writer task ended unsuccessfully: shuffleId=${handle.shuffleId} " +
-            s"mapId=$mapId attemptId=$attemptId failed=${taskContext.isFailed()} " +
+            s"ucxMapId=$ucxMapId sparkMapId=$mapId attemptId=$attemptId " +
+            s"failed=${taskContext.isFailed()} " +
             s"interrupted=${taskContext.isInterrupted()}"
         )
       }
@@ -220,6 +276,7 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
       writeNativeExchange(records, tracker)
       return
     }
+    acquireWriterCreditIfNeeded(tracker)
     val endpoint = registerEndpointIfNeeded()
     val openStartNs = System.nanoTime()
     try {
@@ -253,28 +310,40 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
   private def writeNativeExchange(
       records: Iterator[Product2[K, V]],
       tracker: TaskWallTimeTracker): Unit = {
+    acquireWriterCreditIfNeeded(tracker)
     val endpoint = registerEndpointIfNeeded()
-    waitForReadersReadyIfNeeded(tracker)
-    val partitioning = columnarDependency.nativePartitioning.getShortName
-    val writerContext = NativeUcxShuffleWriterContext(
-      shuffleId = handle.shuffleId,
-      mapId = mapId,
-      attemptId = attemptId,
-      nativeTaskId = endpoint.nativeTaskId,
-      numPartitions = numPartitions,
-      partitioning = partitioning,
-      startPartitionId = GlutenShuffleUtils.getStartPartitionId(
-        columnarDependency.nativePartitioning,
-        context.partitionId()),
-      dropFirstColumn = partitioning == GlutenShuffleUtils.HashPartitioningShortName)
-    logInfo(
-      s"Driving Velox native UCX shuffle producer shuffleId=${handle.shuffleId} " +
-        s"mapId=$mapId attemptId=$attemptId nativeTaskId=${endpoint.nativeTaskId} " +
-        s"partitions=$numPartitions partitioning=$partitioning")
-    NativeUcxShuffleExecution.withWriterContext(writerContext) {
-      records.foreach {
-        _ =>
-          tracker.ucxWriterWriteBatchCalls += 1
+    nativeWriterNoMoreDataPoller = startNativeWriterNoMoreDataPoller(endpoint)
+    var nativeExchangeCompleted = false
+    try {
+      waitForReadersReadyIfNeeded(tracker)
+      val partitioning = columnarDependency.nativePartitioning.getShortName
+      val writerContext = NativeUcxShuffleWriterContext(
+        shuffleId = handle.shuffleId,
+        mapId = ucxMapId,
+        attemptId = attemptId,
+        nativeTaskId = endpoint.nativeTaskId,
+        numPartitions = numPartitions,
+        partitioning = partitioning,
+        startPartitionId = GlutenShuffleUtils.getStartPartitionId(
+          columnarDependency.nativePartitioning,
+          context.partitionId()),
+        dropFirstColumn = partitioning == GlutenShuffleUtils.HashPartitioningShortName
+      )
+      logInfo(
+        s"Driving Velox native UCX shuffle producer shuffleId=${handle.shuffleId} " +
+          s"ucxMapId=$ucxMapId sparkMapId=$mapId attemptId=$attemptId " +
+          s"nativeTaskId=${endpoint.nativeTaskId} " +
+          s"partitions=$numPartitions partitioning=$partitioning")
+      NativeUcxShuffleExecution.withWriterContext(writerContext) {
+        records.foreach(_ => tracker.ucxWriterWriteBatchCalls += 1)
+      }
+      nativeExchangeCompleted = true
+    } finally {
+      reportFinalNativeWriterNoMoreDataIfReady(endpoint)
+      // The native producer can remain detached after the Spark task returns while UCX drains
+      // its output queue. Keep its telemetry alive so query-level admission sees that drain.
+      if (!nativeExchangeCompleted) {
+        stopNativeWriterNoMoreDataPoller()
       }
     }
   }
@@ -291,19 +360,357 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
           nativeWriterHandle = -1L
         }
       }
+      releaseWriterCreditIfNeeded()
       if (success) {
-        coordinator.markWriterFinished(handle.shuffleId, mapId, attemptId)
+        markWriterFinishedIfNeeded("shuffle writer stop")
       } else {
+        stopNativeWriterNoMoreDataPoller()
         coordinator.abortShuffle(
           handle.shuffleId,
           s"UCX shuffle writer stopped unsuccessfully: shuffleId=${handle.shuffleId} " +
-            s"mapId=$mapId attemptId=$attemptId")
+            s"ucxMapId=$ucxMapId sparkMapId=$mapId attemptId=$attemptId")
       }
     }
     Some(MapStatus(SparkEnv.get.blockManager.shuffleServerId, getPartitionLengths(), mapId))
   }
 
   override def getPartitionLengths(): Array[Long] = Array.fill(numPartitions)(0L)
+
+  private def acquireWriterCreditIfNeeded(tracker: TaskWallTimeTracker): Unit = {
+    if (!writerCreditEnabled || writerCreditAcquired) {
+      return
+    }
+    synchronized {
+      if (writerCreditAcquired) {
+        return
+      }
+      val timeoutMs =
+        conf.getLong(UcxColumnarShuffleManager.WriterCreditWaitMsConf, 300000L)
+      val pollMs =
+        math.max(1L, conf.getLong(UcxColumnarShuffleManager.WriterCreditPollMsConf, 10L))
+      val waitStartNs = System.nanoTime()
+      try {
+        val credit =
+          coordinator.waitUntilWriterCreditAvailable(
+            handle.shuffleId,
+            ucxMapId,
+            attemptId,
+            context.stageId(),
+            context.stageAttemptNumber(),
+            timeoutMs,
+            pollMs)
+        writerCreditAcquired = true
+        val elapsedMs = (System.nanoTime() - waitStartNs) / 1000000L
+        logInfo(
+            s"UCX shuffle writer credit gate opened shuffleId=${handle.shuffleId} " +
+            s"ucxMapId=$ucxMapId sparkMapId=$mapId attemptId=$attemptId " +
+            s"stage=${context.stageId()}.${context.stageAttemptNumber()} " +
+            s"elapsedMs=$elapsedMs " +
+            s"groupId=${credit.groupId} queryId=${credit.queryId} " +
+            s"queryState=${credit.queryState} " +
+            s"shuffleActive=${credit.activeShuffleWriters}/${credit.maxShuffleWriters} " +
+            s"queryActive=${credit.activeGroupWriters}/${credit.maxGroupWriters} " +
+            s"queryQueuedBytes=${credit.queryQueuedBytes} " +
+            s"queryBlockedWriters=${credit.queryBlockedWriters} " +
+            s"queryBackpressured=${credit.queryBackpressured}")
+      } finally {
+        tracker.ucxWriterCreditWaitNanos += System.nanoTime() - waitStartNs
+      }
+    }
+  }
+
+  private def releaseWriterCreditIfNeeded(): Unit = {
+    if (!writerCreditAcquired) {
+      return
+    }
+    synchronized {
+      if (!writerCreditAcquired) {
+        return
+      }
+      try {
+        coordinator.releaseWriterCredit(handle.shuffleId, ucxMapId, attemptId)
+      } catch {
+        case NonFatal(e) =>
+          logWarning(
+            s"Failed to release UCX shuffle writer credit shuffleId=${handle.shuffleId} " +
+              s"ucxMapId=$ucxMapId sparkMapId=$mapId attemptId=$attemptId",
+            e)
+      } finally {
+        writerCreditAcquired = false
+      }
+    }
+  }
+
+  private def writerCreditEnabled: Boolean = {
+    conf.getInt(UcxColumnarShuffleManager.WriterMaxActiveTasksPerShuffleConf, 0) > 0 ||
+    conf.getInt(UcxColumnarShuffleManager.WriterMaxActiveTasksPerGroupConf, 0) > 0 ||
+    conf.getInt(UcxColumnarShuffleManager.WriterMaxActiveTasksPerQueryConf, 0) > 0
+  }
+
+  private def markWriterFinishedIfNeeded(reason: String): Unit = synchronized {
+    if (writerFinishedMarked) {
+      return
+    }
+    val marked = coordinator.markWriterFinished(handle.shuffleId, ucxMapId, attemptId)
+    writerFinishedMarked = true
+    logInfo(
+      s"Marked UCX shuffle writer finished shuffleId=${handle.shuffleId} " +
+        s"ucxMapId=$ucxMapId sparkMapId=$mapId attemptId=$attemptId " +
+        s"reason=$reason marked=$marked")
+  }
+
+  private def reportNativeWriterState(
+      endpoint: UcxShuffleEndpoint,
+      noMoreData: Boolean,
+      stats: Option[UcxShuffleNativeWriterRuntimeStats] = None): UcxNativeWriterStateResponse =
+    synchronized {
+      val runtimeStats = stats.getOrElse(
+        UcxShuffleNativeWriterRuntimeStats(
+          noMoreData = noMoreData,
+          finished = false,
+          queuedBytes = -1L,
+          queuedPages = -1L,
+          totalBytesSent = -1L,
+          totalRowsSent = -1L,
+          totalPagesSent = -1L,
+          averageBufferTimeMs = -1L,
+          blocked = false))
+      val response =
+        coordinator.reportNativeWriterState(
+          UcxNativeWriterState(
+            shuffleId = handle.shuffleId,
+            mapId = ucxMapId,
+            attemptId = attemptId,
+            nativeTaskId = endpoint.nativeTaskId,
+            noMoreData = noMoreData || runtimeStats.noMoreData,
+            queuedBytes = runtimeStats.queuedBytes,
+            blocked = runtimeStats.blocked,
+            timestampMs = System.currentTimeMillis(),
+            finished = runtimeStats.finished,
+            queuedPages = runtimeStats.queuedPages,
+            totalBytesSent = runtimeStats.totalBytesSent,
+            totalRowsSent = runtimeStats.totalRowsSent,
+            totalPagesSent = runtimeStats.totalPagesSent,
+            averageBufferTimeMs = runtimeStats.averageBufferTimeMs))
+      if (response.writerFinishedMarked) {
+        writerFinishedMarked = true
+      }
+      if (response.writerCreditReleased) {
+        writerCreditAcquired = false
+      }
+      response
+    }
+
+  private def startNativeWriterNoMoreDataPoller(endpoint: UcxShuffleEndpoint): Thread = {
+    val pollMs = math.max(
+      1L,
+      conf.getLong(
+        UcxColumnarShuffleManager.NativeWriterNoMoreDataPollMsConf,
+        conf.getLong(UcxColumnarShuffleManager.WriterCreditPollMsConf, 10L)))
+    val timeoutMs =
+      conf.getLong(
+        UcxColumnarShuffleManager.NativeWriterNoMoreDataWaitMsConf,
+        conf.getLong(UcxColumnarShuffleManager.WriterCreditWaitMsConf, 300000L))
+    val stateReportMs =
+      conf.getLong(UcxColumnarShuffleManager.NativeWriterStateReportMsConf, 1000L)
+    val detachedStatePollMs = math.max(1L, if (stateReportMs > 0) stateReportMs else 1000L)
+    nativeWriterNoMoreDataPollerStopRequested = false
+    val poller = new Thread(
+      new Runnable {
+        override def run(): Unit = {
+          val startNs = System.nanoTime()
+          var nextLogMs = 5000L
+          var nextStateReportMs = stateReportMs
+          var observedNoMoreData = false
+          var lastStats: Option[UcxShuffleNativeWriterRuntimeStats] = None
+          try {
+            while (!nativeWriterNoMoreDataPollerStopRequested &&
+                !Thread.currentThread().isInterrupted) {
+              val stats = nativeBridge.writerRuntimeStats(endpoint.nativeTaskId)
+              if (stats.nonEmpty) {
+                lastStats = stats
+              }
+              val noMoreData =
+                stats
+                  .map(_.noMoreData)
+                  .getOrElse(nativeBridge.writerNoMoreData(endpoint.nativeTaskId))
+              val elapsedMs = (System.nanoTime() - startNs) / 1000000L
+              if (noMoreData && !observedNoMoreData) {
+                val response = reportNativeWriterState(endpoint, noMoreData = true, stats)
+                observedNoMoreData = true
+                logInfo(
+                  s"Observed native UCX shuffle writer noMoreData " +
+                    s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
+                    s"sparkMapId=$mapId attemptId=$attemptId " +
+                    s"nativeTaskId=${endpoint.nativeTaskId} elapsedMs=$elapsedMs " +
+                    s"queuedBytes=${stats.map(_.queuedBytes)} " +
+                    s"finished=${stats.map(_.finished)} " +
+                    s"blocked=${stats.map(_.blocked)} " +
+                    s"accepted=${response.accepted} groupId=${response.groupId} " +
+                    s"queryId=${response.queryId} queryState=${response.queryState} " +
+                    s"writerFinishedMarked=${response.writerFinishedMarked} " +
+                    s"writerCreditReleased=${response.writerCreditReleased} " +
+                    s"queryQueuedBytes=${response.queryQueuedBytes} " +
+                    s"queryBlockedWriters=${response.queryBlockedWriters} " +
+                    s"reason=${response.reason}")
+                if (!response.accepted || stats.exists(_.finished)) {
+                  return
+                }
+                nextStateReportMs = elapsedMs + detachedStatePollMs
+              } else if (observedNoMoreData && stats.isEmpty) {
+                val drainedStats =
+                  lastStats
+                    .map(
+                      _.copy(
+                        noMoreData = true,
+                        finished = true,
+                        queuedBytes = 0L,
+                        queuedPages = 0L,
+                        blocked = false))
+                    .orElse(
+                      Some(
+                        UcxShuffleNativeWriterRuntimeStats(
+                          noMoreData = true,
+                          finished = true,
+                          queuedBytes = 0L,
+                          queuedPages = 0L,
+                          totalBytesSent = -1L,
+                          totalRowsSent = -1L,
+                          totalPagesSent = -1L,
+                          averageBufferTimeMs = -1L,
+                          blocked = false)))
+                val response =
+                  reportNativeWriterState(endpoint, noMoreData = true, drainedStats)
+                logInfo(
+                  s"Observed drained detached native UCX shuffle writer " +
+                    s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
+                    s"sparkMapId=$mapId attemptId=$attemptId " +
+                    s"nativeTaskId=${endpoint.nativeTaskId} elapsedMs=$elapsedMs " +
+                    s"accepted=${response.accepted} groupId=${response.groupId} " +
+                    s"queryId=${response.queryId} queryState=${response.queryState} " +
+                    s"queryQueuedBytes=${response.queryQueuedBytes} reason=${response.reason}")
+                return
+              } else if (elapsedMs >= nextStateReportMs &&
+                  (stateReportMs > 0 || observedNoMoreData)) {
+                val response = reportNativeWriterState(endpoint, noMoreData = false, stats)
+                if (!response.accepted) {
+                  logWarning(
+                    s"Native UCX shuffle writer state rejected by query coordinator " +
+                      s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
+                      s"sparkMapId=$mapId attemptId=$attemptId " +
+                      s"nativeTaskId=${endpoint.nativeTaskId} " +
+                      s"groupId=${response.groupId} queryId=${response.queryId} " +
+                      s"queryState=${response.queryState} reason=${response.reason}")
+                  return
+                }
+                if (observedNoMoreData && stats.exists(_.finished)) {
+                  logInfo(
+                    s"Observed finished detached native UCX shuffle writer " +
+                      s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
+                      s"sparkMapId=$mapId attemptId=$attemptId " +
+                      s"nativeTaskId=${endpoint.nativeTaskId} elapsedMs=$elapsedMs " +
+                      s"queuedBytes=${stats.map(_.queuedBytes)} " +
+                      s"queryQueuedBytes=${response.queryQueuedBytes}")
+                  return
+                }
+                nextStateReportMs = elapsedMs +
+                  (if (observedNoMoreData) detachedStatePollMs else stateReportMs)
+              }
+              if (!observedNoMoreData && elapsedMs >= nextLogMs) {
+                logInfo(
+                  s"Waiting for native UCX shuffle writer noMoreData " +
+                    s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
+                    s"sparkMapId=$mapId attemptId=$attemptId " +
+                    s"nativeTaskId=${endpoint.nativeTaskId} elapsedMs=$elapsedMs")
+                nextLogMs += 5000L
+              }
+              if (timeoutMs > 0 && elapsedMs >= timeoutMs) {
+                logWarning(
+                  s"Timed out after ${timeoutMs}ms waiting for native UCX shuffle writer " +
+                    s"noMoreData shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
+                    s"sparkMapId=$mapId attemptId=$attemptId " +
+                    s"nativeTaskId=${endpoint.nativeTaskId}")
+                return
+              }
+              Thread.sleep(if (observedNoMoreData) detachedStatePollMs else pollMs)
+            }
+          } catch {
+            case _: InterruptedException =>
+              Thread.currentThread().interrupt()
+            case NonFatal(e) =>
+              logWarning(
+                s"Native UCX shuffle writer noMoreData poller failed " +
+                  s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
+                  s"sparkMapId=$mapId attemptId=$attemptId " +
+                  s"nativeTaskId=${endpoint.nativeTaskId}",
+                e)
+          }
+        }
+      },
+      s"ucx-shuffle-writer-no-more-data-${handle.shuffleId}-$ucxMapId"
+    )
+    poller.setDaemon(true)
+    poller.start()
+    poller
+  }
+
+  private def reportFinalNativeWriterNoMoreDataIfReady(endpoint: UcxShuffleEndpoint): Unit = {
+    if (writerFinishedMarked && !writerCreditAcquired) {
+      return
+    }
+    try {
+      val stats = nativeBridge.writerRuntimeStats(endpoint.nativeTaskId)
+      val noMoreData =
+        stats.map(_.noMoreData).getOrElse(nativeBridge.writerNoMoreData(endpoint.nativeTaskId))
+      if (noMoreData) {
+        val response = reportNativeWriterState(endpoint, noMoreData = true, stats)
+        logInfo(
+          s"Reported final native UCX shuffle writer noMoreData " +
+            s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
+            s"sparkMapId=$mapId attemptId=$attemptId " +
+            s"nativeTaskId=${endpoint.nativeTaskId} accepted=${response.accepted} " +
+            s"queuedBytes=${stats.map(_.queuedBytes)} " +
+            s"finished=${stats.map(_.finished)} " +
+            s"blocked=${stats.map(_.blocked)} " +
+            s"groupId=${response.groupId} queryId=${response.queryId} " +
+            s"queryState=${response.queryState} " +
+            s"writerFinishedMarked=${response.writerFinishedMarked} " +
+            s"writerCreditReleased=${response.writerCreditReleased} " +
+            s"queryQueuedBytes=${response.queryQueuedBytes} " +
+            s"queryBlockedWriters=${response.queryBlockedWriters} " +
+            s"reason=${response.reason}")
+      }
+    } catch {
+      case NonFatal(e) =>
+        logWarning(
+          s"Failed to report final native UCX shuffle writer state " +
+            s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
+            s"sparkMapId=$mapId attemptId=$attemptId " +
+            s"nativeTaskId=${endpoint.nativeTaskId}",
+          e)
+    }
+  }
+
+  private def stopNativeWriterNoMoreDataPoller(): Unit = {
+    val poller = nativeWriterNoMoreDataPoller
+    nativeWriterNoMoreDataPoller = null
+    nativeWriterNoMoreDataPollerStopRequested = true
+    if (poller != null && poller.isAlive) {
+      poller.interrupt()
+      try {
+        poller.join(500L)
+      } catch {
+        case _: InterruptedException =>
+          Thread.currentThread().interrupt()
+      }
+      if (poller.isAlive) {
+        logWarning(
+          s"Native UCX shuffle writer noMoreData poller is still stopping " +
+            s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
+            s"sparkMapId=$mapId attemptId=$attemptId")
+      }
+    }
+  }
 
   private def waitForReadersReadyIfNeeded(tracker: TaskWallTimeTracker): Unit = {
     if (!conf.getBoolean(UcxColumnarShuffleManager.WriterWaitForReadersReadyConf, true)) {
@@ -317,15 +724,22 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
       conf.getLong(UcxColumnarShuffleManager.WriterReadersReadyWaitMsConf, 300000L)
     val pollMs =
       math.max(1L, conf.getLong(UcxColumnarShuffleManager.WriterReadersReadyPollMsConf, 10L))
+    val requireGroupReadersReady =
+      conf.getBoolean(UcxColumnarShuffleManager.WriterWaitForGroupReadersReadyConf, false)
     val waitStartNs = System.nanoTime()
     try {
       val state =
-        coordinator.waitUntilPipelinedReadersReady(handle.shuffleId, timeoutMs, pollMs)
+        coordinator.waitUntilPipelinedReadersReady(
+          handle.shuffleId,
+          timeoutMs,
+          pollMs,
+          requireGroupReadersReady)
       val elapsedMs = (System.nanoTime() - waitStartNs) / 1000000L
       logInfo(
         s"UCX pipelined writer readers-ready gate opened shuffleId=${handle.shuffleId} " +
-          s"mapId=$mapId attemptId=$attemptId elapsedMs=$elapsedMs " +
-          s"groupId=${state.groupId} coverage=${state.readerCoverage}")
+          s"ucxMapId=$ucxMapId sparkMapId=$mapId attemptId=$attemptId elapsedMs=$elapsedMs " +
+          s"groupId=${state.groupId} requireGroupReadersReady=$requireGroupReadersReady " +
+          s"coverage=${state.readerCoverage}")
     } finally {
       tracker.ucxWriterReadersReadyWaitNanos += System.nanoTime() - waitStartNs
     }
@@ -340,17 +754,22 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
         return endpoint
       }
       endpoint =
-        UcxColumnarShuffleWriter.buildEndpoint(conf, nativeBridge, handle.shuffleId, mapId, context)
-      val registered = coordinator.registerWriter(handle.shuffleId, mapId, endpoint)
+        UcxColumnarShuffleWriter.buildEndpoint(
+          conf,
+          nativeBridge,
+          handle.shuffleId,
+          ucxMapId,
+          context)
+      val registered = coordinator.registerWriter(handle.shuffleId, ucxMapId, endpoint)
       if (!registered) {
         throw new SparkException(
           s"Failed to register UCX shuffle writer endpoint for shuffleId=${handle.shuffleId} " +
-            s"mapId=$mapId attemptId=$attemptId")
+            s"ucxMapId=$ucxMapId sparkMapId=$mapId attemptId=$attemptId")
       }
       endpointRegistered = true
       logInfo(
-        s"Registered UCX shuffle writer endpoint shuffleId=${handle.shuffleId} mapId=$mapId " +
-          s"attemptId=$attemptId endpoint=$endpoint")
+        s"Registered UCX shuffle writer endpoint shuffleId=${handle.shuffleId} " +
+          s"ucxMapId=$ucxMapId sparkMapId=$mapId attemptId=$attemptId endpoint=$endpoint")
       endpoint
     }
   }
@@ -394,7 +813,7 @@ private[spark] object UcxColumnarShuffleWriter {
       throw new SparkException(
         s"Unable to determine local UCX shuffle endpoint port for shuffleId=$shuffleId " +
           s"mapId=$mapId attemptId=$attemptId. Set $UcxPortConf or use a native bridge that " +
-            "exposes the Velox UCX exchange listener.")
+          "exposes the Velox UCX exchange listener.")
     }
     val nativeTaskId = NativeUcxShuffleExecution.writerTaskId(shuffleId, mapId, attemptId)
     UcxShuffleEndpoint(
@@ -404,6 +823,8 @@ private[spark] object UcxColumnarShuffleWriter {
       shuffleId = shuffleId,
       mapId = mapId,
       attemptId = attemptId,
+      stageId = context.stageId(),
+      stageAttemptNumber = context.stageAttemptNumber(),
       nativeTaskId = nativeTaskId,
       deviceId = gpuDeviceId(context),
       epoch = attemptId
@@ -465,6 +886,11 @@ private[spark] class UcxColumnarShuffleReader[K, C](
   with Logging {
 
   @volatile private var nativeReaderHandle = -1L
+  @volatile private var registeredReaderEndpoint: UcxShuffleReaderEndpoint = _
+  @volatile private var registeredReaderExpectedMaps = -1
+  @volatile private var registeredReaderSeenMaps = -1
+  @volatile private var registeredReaderCompletedMaps = -1
+  @volatile private var registeredReaderNoMoreSplits = false
   private val columnarDependency =
     handle.dependency.asInstanceOf[ColumnarShuffleDependencyLike]
 
@@ -478,6 +904,24 @@ private[spark] class UcxColumnarShuffleReader[K, C](
             s"attemptId=${taskContext.taskAttemptId()} failed=${taskContext.isFailed()} " +
             s"interrupted=${taskContext.isInterrupted()}"
         )
+      } else {
+        val endpoint = registeredReaderEndpoint
+        if (endpoint != null) {
+          val completedMaps =
+            if (registeredReaderExpectedMaps >= 0 &&
+                registeredReaderCompletedMaps < registeredReaderExpectedMaps) {
+              registeredReaderExpectedMaps
+            } else {
+              registeredReaderCompletedMaps
+            }
+          reportNativeReaderState(
+            endpoint,
+            seenMaps = math.max(registeredReaderSeenMaps, completedMaps),
+            completedMaps = completedMaps,
+            expectedMaps = registeredReaderExpectedMaps,
+            noMoreSplits = true,
+            finished = true)
+        }
       }
   }
 
@@ -495,12 +939,18 @@ private[spark] class UcxColumnarShuffleReader[K, C](
         s"Failed to register UCX shuffle reader endpoint for shuffleId=${handle.shuffleId} " +
           s"reducePartitionId=$reducePartitionId attemptId=${context.taskAttemptId()}")
     }
+    registeredReaderEndpoint = readerEndpoint
     val initialResponse = coordinator.getAvailableWriters(handle.shuffleId).getOrElse {
       throw new SparkException(
         s"UCX shuffle ${handle.shuffleId} is not registered or has been aborted")
     }
     val expectedMaps = expectedMapCount(initialResponse)
     val initialEndpoints = availableEndpoints(initialResponse)
+    val initialSeen = new java.util.HashSet[Long]()
+    initialEndpoints.foreach(endpoint => initialSeen.add(endpoint.mapId))
+    registeredReaderExpectedMaps = expectedMaps
+    registeredReaderSeenMaps = initialSeen.size
+    registeredReaderCompletedMaps = completedMapCount(initialResponse, initialSeen)
     logInfo(
       s"Opening UCX streaming shuffle reader with ${initialEndpoints.size}/$expectedMaps " +
         s"initial writer endpoint(s) for shuffleId=${handle.shuffleId} " +
@@ -541,6 +991,7 @@ private[spark] class UcxColumnarShuffleReader[K, C](
     }
 
     val endpointPoller = startEndpointPoller(
+      readerEndpoint,
       nativeReaderHandle,
       initialEndpoints,
       expectedMaps,
@@ -646,12 +1097,18 @@ private[spark] class UcxColumnarShuffleReader[K, C](
           s"for shuffleId=${handle.shuffleId} " +
           s"reducePartitionId=$reducePartitionId attemptId=${context.taskAttemptId()}")
     }
+    registeredReaderEndpoint = readerEndpoint
     val initialResponse = coordinator.getAvailableWriters(handle.shuffleId).getOrElse {
       throw new SparkException(
         s"UCX shuffle ${handle.shuffleId} is not registered or has been aborted")
     }
     val expectedMaps = expectedMapCount(initialResponse)
     val initialEndpoints = availableEndpoints(initialResponse)
+    val initialSeen = new java.util.HashSet[Long]()
+    initialEndpoints.foreach(endpoint => initialSeen.add(endpoint.mapId))
+    registeredReaderExpectedMaps = expectedMaps
+    registeredReaderSeenMaps = initialSeen.size
+    registeredReaderCompletedMaps = completedMapCount(initialResponse, initialSeen)
     logInfo(
       s"Registered Velox native UCX Exchange reader with ${initialEndpoints.size}/$expectedMaps " +
         s"initial producer endpoint(s) for shuffleId=${handle.shuffleId} " +
@@ -663,9 +1120,51 @@ private[spark] class UcxColumnarShuffleReader[K, C](
       startMapIndex = startMapIndex,
       endMapIndex = endMapIndex,
       expectedMaps = expectedMaps,
-      initialEndpoints = initialEndpoints)
+      initialEndpoints = initialEndpoints,
+      taskAttemptId = context.taskAttemptId(),
+      nativeReaderId = readerEndpoint.nativeReaderId
+    )
     NativeUcxShuffleExecution.captureReadSpec(spec)
     new NativeUcxShuffleReadProductIterator[K, C](spec)
+  }
+
+  private def reportNativeReaderState(
+      endpoint: UcxShuffleReaderEndpoint,
+      seenMaps: Int,
+      completedMaps: Int,
+      expectedMaps: Int,
+      noMoreSplits: Boolean,
+      finished: Boolean): Unit = {
+    try {
+      val response =
+        coordinator.reportNativeReaderState(
+          UcxNativeReaderState(
+            shuffleId = handle.shuffleId,
+            reducePartitionId = endpoint.reducePartitionId,
+            taskAttemptId = endpoint.taskAttemptId,
+            nativeReaderId = endpoint.nativeReaderId,
+            seenMaps = seenMaps,
+            completedMaps = completedMaps,
+            expectedMaps = expectedMaps,
+            noMoreSplits = noMoreSplits,
+            finished = finished,
+            timestampMs = System.currentTimeMillis()))
+      if (!response.accepted) {
+        logWarning(
+          s"UCX native reader state rejected by query coordinator " +
+            s"shuffleId=${handle.shuffleId} reduce=${endpoint.reducePartitionId} " +
+            s"taskAttemptId=${endpoint.taskAttemptId} groupId=${response.groupId} " +
+            s"queryId=${response.queryId} queryState=${response.queryState} " +
+            s"reason=${response.reason}")
+      }
+    } catch {
+      case NonFatal(e) =>
+        logWarning(
+          s"Failed to report UCX native reader state shuffleId=${handle.shuffleId} " +
+            s"reduce=${endpoint.reducePartitionId} taskAttemptId=${endpoint.taskAttemptId} " +
+            s"noMoreSplits=$noMoreSplits finished=$finished",
+          e)
+    }
   }
 
   private def logSlowNextBatch(elapsedNs: Long): Unit = {
@@ -690,6 +1189,7 @@ private[spark] class UcxColumnarShuffleReader[K, C](
   }
 
   private def startEndpointPoller(
+      readerEndpoint: UcxShuffleReaderEndpoint,
       readerHandle: Long,
       initialEndpoints: Seq[UcxShuffleEndpoint],
       expectedMaps: Int,
@@ -706,9 +1206,8 @@ private[spark] class UcxColumnarShuffleReader[K, C](
       pollMs,
       SparkEnv.get.conf.getLong(UcxColumnarShuffleManager.ReaderStatePollMsConf, 1000L))
     val dataWaitAfterWritersFinishedMs =
-      SparkEnv.get.conf.getLong(
-        UcxColumnarShuffleManager.ReaderDataWaitAfterWritersFinishedMsConf,
-        300000L)
+      SparkEnv.get.conf
+        .getLong(UcxColumnarShuffleManager.ReaderDataWaitAfterWritersFinishedMsConf, 300000L)
     val seen = new java.util.HashSet[Long]()
     initialEndpoints.foreach(endpoint => seen.add(endpoint.mapId))
     val poller = new Thread(
@@ -727,6 +1226,7 @@ private[spark] class UcxColumnarShuffleReader[K, C](
               val endpoints = availableEndpoints(response)
               val newEndpoints = endpoints.filter(endpoint => seen.add(endpoint.mapId))
               if (newEndpoints.nonEmpty) {
+                registeredReaderSeenMaps = seen.size
                 nativeBridge.addReaderEndpoints(readerHandle, newEndpoints)
                 logInfo(
                   s"Added ${newEndpoints.size} UCX writer endpoint(s) to streaming reader " +
@@ -734,13 +1234,23 @@ private[spark] class UcxColumnarShuffleReader[K, C](
                     s"mapRange=[$startMapIndex,$endMapIndex) " +
                     s"seen=${seen.size}/$expectedMaps")
               }
-              if (!noMoreEndpointsSent && seen.size >= expectedMaps) {
+              val completedMaps = completedMapCount(response, seen)
+              registeredReaderCompletedMaps = completedMaps
+              if (!noMoreEndpointsSent && completedMaps >= expectedMaps) {
                 nativeBridge.noMoreReaderEndpoints(readerHandle)
                 noMoreEndpointsSent = true
+                registeredReaderNoMoreSplits = true
+                reportNativeReaderState(
+                  readerEndpoint,
+                  seenMaps = seen.size,
+                  completedMaps = completedMaps,
+                  expectedMaps = expectedMaps,
+                  noMoreSplits = true,
+                  finished = false)
                 logInfo(
                   s"UCX streaming shuffle reader reached noMoreEndpoints " +
                     s"shuffleId=${handle.shuffleId} mapRange=[$startMapIndex,$endMapIndex) " +
-                    s"seen=${seen.size}/$expectedMaps")
+                    s"seen=${seen.size}/$expectedMaps completed=$completedMaps/$expectedMaps")
               }
               if (seen.size != lastSeen) {
                 lastSeen = seen.size
@@ -764,8 +1274,10 @@ private[spark] class UcxColumnarShuffleReader[K, C](
               }
               if (noMoreEndpointsSent && finished >= expectedMaps) {
                 val idleMs = (System.nanoTime() - lastReaderProgressNs.get()) / 1000000L
-                if (dataWaitAfterWritersFinishedMs > 0 &&
-                    idleMs > dataWaitAfterWritersFinishedMs) {
+                if (
+                  dataWaitAfterWritersFinishedMs > 0 &&
+                  idleMs > dataWaitAfterWritersFinishedMs
+                ) {
                   throw new SparkException(
                     s"Timed out after ${dataWaitAfterWritersFinishedMs}ms waiting for UCX " +
                       s"shuffle reader data/EOS after all writers finished " +
@@ -808,6 +1320,14 @@ private[spark] class UcxColumnarShuffleReader[K, C](
 
   private def finishedMapCount(response: UcxShuffleEndpointResponse): Int = {
     response.finishedMapIds.count(inMapRange)
+  }
+
+  private def completedMapCount(
+      response: UcxShuffleEndpointResponse,
+      seen: java.util.HashSet[Long]): Int = {
+    val finishedWithoutEndpoint =
+      response.finishedMapIds.count(mapId => inMapRange(mapId) && !seen.contains(mapId))
+    seen.size + finishedWithoutEndpoint
   }
 
   private def expectedMapCount(response: UcxShuffleEndpointResponse): Int = {

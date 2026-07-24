@@ -30,6 +30,9 @@ class MemoryManager {
   static void registerFactory(const std::string& kind, Factory factory, Releaser releaser);
   static MemoryManager* create(const std::string& kind, std::unique_ptr<AllocationListener> listener);
   static void release(MemoryManager*);
+  static void releaseOrDefer(MemoryManager*);
+  static void retainForAsyncTask(MemoryManager*, const std::string& reason);
+  static void releaseAsyncTaskRetain(MemoryManager*, const std::string& reason);
 
   MemoryManager(const std::string& kind) : kind_(kind){};
 

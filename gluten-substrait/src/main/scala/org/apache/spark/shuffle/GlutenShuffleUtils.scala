@@ -36,6 +36,7 @@ object GlutenShuffleUtils {
   val RoundRobinPartitioningShortName = "rr"
   val HashPartitioningShortName = "hash"
   val RangePartitioningShortName = "range"
+  val BroadcastPartitioningShortName = "broadcast"
 
   // Follow arrow default compression level `kUseDefaultCompressionLevel`
   val DEFAULT_COMPRESSION_LEVEL: Int = Int.MinValue

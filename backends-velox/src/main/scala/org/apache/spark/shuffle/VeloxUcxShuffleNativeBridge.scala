@@ -44,6 +44,7 @@ private[spark] class VeloxUcxShuffleNativeBridge(conf: SparkConf)
 
   private val mapper = new ObjectMapper()
   private val readerJnis = new ConcurrentHashMap[Long, UcxShuffleJniWrapper]()
+  private lazy val controlJni = jni()
 
   private def jni(): UcxShuffleJniWrapper = {
     UcxShuffleJniWrapper.create(
@@ -59,7 +60,7 @@ private[spark] class VeloxUcxShuffleNativeBridge(conf: SparkConf)
   }
 
   override def localShuffleEndpointPort(): Int = {
-    val listenerPort = jni().nativeGetListenerPort()
+    val listenerPort = controlJni.nativeGetListenerPort()
     if (listenerPort > 3) {
       listenerPort - 3
     } else {
@@ -102,6 +103,30 @@ private[spark] class VeloxUcxShuffleNativeBridge(conf: SparkConf)
 
   override def closeWriter(writerHandle: Long, success: Boolean): Unit = {
     jni().nativeCloseWriter(writerHandle, success)
+  }
+
+  override def writerNoMoreData(nativeTaskId: String): Boolean = {
+    controlJni.nativeWriterNoMoreData(nativeTaskId)
+  }
+
+  override def writerRuntimeStats(
+      nativeTaskId: String): Option[UcxShuffleNativeWriterRuntimeStats] = {
+    val raw = controlJni.nativeWriterStats(nativeTaskId)
+    if (raw == null || raw.length < 10 || raw(0) == 0L) {
+      None
+    } else {
+      Some(
+        UcxShuffleNativeWriterRuntimeStats(
+          noMoreData = raw(1) != 0L,
+          finished = raw(2) != 0L,
+          queuedBytes = raw(3),
+          queuedPages = raw(4),
+          totalBytesSent = raw(5),
+          totalRowsSent = raw(6),
+          totalPagesSent = raw(7),
+          averageBufferTimeMs = raw(8),
+          blocked = raw(9) != 0L))
+    }
   }
 
   override def openReader(

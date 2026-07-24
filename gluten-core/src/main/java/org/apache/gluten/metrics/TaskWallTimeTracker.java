@@ -60,6 +60,8 @@ public class TaskWallTimeTracker {
   public long ucxWriterOpenNanos;
   // Driver-side control-plane wait before a UCX writer starts pushing data.
   public long ucxWriterReadersReadyWaitNanos;
+  // Driver-side credit wait before a UCX writer starts pushing data.
+  public long ucxWriterCreditWaitNanos;
   // UCX incremental shuffle writer native write calls.
   public long ucxWriterWriteBatchNanos;
   // UCX incremental shuffle writer close.
@@ -108,6 +110,7 @@ public class TaskWallTimeTracker {
             + " shuffleWriteMetaNanos={}"
             + " ucxWriterOpenNanos={}"
             + " ucxWriterReadersReadyWaitNanos={}"
+            + " ucxWriterCreditWaitNanos={}"
             + " ucxWriterWriteBatchNanos={}"
             + " ucxWriterCloseNanos={}"
             + " ucxReaderOpenNanos={}"
@@ -134,6 +137,7 @@ public class TaskWallTimeTracker {
         shuffleWriteMetaNanos,
         ucxWriterOpenNanos,
         ucxWriterReadersReadyWaitNanos,
+        ucxWriterCreditWaitNanos,
         ucxWriterWriteBatchNanos,
         ucxWriterCloseNanos,
         ucxReaderOpenNanos,

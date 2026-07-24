@@ -128,6 +128,11 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
   /// Stop and release the Velox task before the Spark task memory manager is released.
   void closeVeloxTask();
 
+  /// Detach a UCX root PartitionedOutput task after it has produced EOS.
+  /// The detached task is retained by a process-level registry until its UCX
+  /// output queue is drained by downstream readers.
+  void detachUcxPartitionedOutputTask(const std::string& reason);
+
   /// Return a certain type of runtime metric. Supported metric types are: sum, count, min, max.
   static int64_t runtimeMetric(
       const std::string& type,
@@ -151,6 +156,7 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
   bool parallelTaskProducesOutput_ = false;
   bool parallelTaskStarted_ = false;
   bool parallelTaskFinished_ = false;
+  bool detachedUcxPartitionedOutputTask_ = false;
 
   /// Spill.
   std::string spillStrategy_;

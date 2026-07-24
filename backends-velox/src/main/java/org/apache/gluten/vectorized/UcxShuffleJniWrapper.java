@@ -56,6 +56,10 @@ public class UcxShuffleJniWrapper implements RuntimeAware {
 
   public native void nativeCloseWriter(long writerHandle, boolean success);
 
+  public native boolean nativeWriterNoMoreData(String nativeTaskId);
+
+  public native long[] nativeWriterStats(String nativeTaskId);
+
   public native long nativeOpenReader(
       int shuffleId, int reducePartitionId, byte[] endpointsJson, long cSchema);
 

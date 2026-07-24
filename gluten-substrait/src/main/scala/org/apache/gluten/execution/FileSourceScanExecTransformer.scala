@@ -123,7 +123,7 @@ abstract class FileSourceScanExecTransformerBase(
 
   override def getMetadataColumns(): Seq[AttributeReference] = metadataColumns
 
-  override def getPartitions: Seq[Partition] = {
+  @transient private lazy val plannedPartitions: Seq[Partition] = {
     if (SparkVersionUtil.gteSpark40) {
       getPartitionsSeq()
     } else {
@@ -141,6 +141,8 @@ abstract class FileSourceScanExecTransformerBase(
         )
     }
   }
+
+  override def getPartitions: Seq[Partition] = plannedPartitions
 
   override def getPartitionWithReadFileFormats: Seq[(Partition, ReadFileFormat)] =
     getPartitions.map((_, fileFormat))

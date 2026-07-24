@@ -20,6 +20,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.optimizer.BuildSide
 import org.apache.spark.sql.catalyst.plans._
+import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.joins.BuildSideRelation
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -44,6 +45,11 @@ case class ShuffledHashJoinExecTransformer(
     left,
     right,
     isSkewJoin) {
+
+  override def outputPartitioning: Partitioning = buildPlan.outputPartitioning match {
+    case _: ReplicatedPartitioning => streamedPlan.outputPartitioning
+    case _ => super.outputPartitioning
+  }
 
   override protected lazy val substraitJoinType: JoinRel.JoinType = joinType match {
     case _: InnerLike =>

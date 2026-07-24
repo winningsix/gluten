@@ -19,6 +19,7 @@ package org.apache.spark.sql.execution
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.config.ShuffleWriterType
 import org.apache.gluten.execution.{ValidatablePlan, ValidationResult}
+import org.apache.gluten.execution.ReplicatedPartitioning
 import org.apache.gluten.extension.columnar.transition.Convention
 
 import org.apache.spark._
@@ -104,6 +105,7 @@ abstract class ColumnarShuffleExchangeExecBase(
       case _: RangePartitioning => ValidationResult.succeeded
       case SinglePartition => ValidationResult.succeeded
       case _: RoundRobinPartitioning => ValidationResult.succeeded
+      case _: ReplicatedPartitioning => ValidationResult.succeeded
       case _ =>
         ValidationResult.failed(
           s"Unsupported partitioning ${outputPartitioning.getClass.getSimpleName}")

@@ -15,11 +15,16 @@
  * limitations under the License.
  */
 #include "WholeStageResultIterator.h"
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <deque>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <thread>
+#include <unordered_map>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include "VeloxBackend.h"
 #include "VeloxPlanConverter.h"
@@ -39,6 +44,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #endif
 #include "operators/plannodes/RowVectorStream.h"
 
@@ -104,6 +110,261 @@ bool planRootIsPartitionedOutput(
   return std::dynamic_pointer_cast<const velox::core::PartitionedOutputNode>(
              planNode) != nullptr;
 }
+
+std::string describeUcxOutputQueue(
+    const std::shared_ptr<velox::exec::Task>& task) {
+#ifdef GLUTEN_ENABLE_GPU
+  if (task == nullptr) {
+    return "task=null";
+  }
+  try {
+    auto queueMgr =
+        facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+    auto stats = queueMgr->stats(task->taskId());
+    if (!stats.has_value()) {
+      return "ucxQueue=missing";
+    }
+    return fmt::format(
+        "ucxQueue=noMoreData:{} finished:{} bufferedBytes:{} "
+        "bufferedPages:{} totalBytesSent:{} totalRowsSent:{} "
+        "totalPagesSent:{} buffers:{}",
+        stats->noMoreData,
+        stats->finished,
+        stats->bufferedBytes,
+        stats->bufferedPages,
+        stats->totalBytesSent,
+        stats->totalRowsSent,
+        stats->totalPagesSent,
+        stats->buffersStats.size());
+  } catch (const std::exception& e) {
+    return fmt::format("ucxQueueStatsError={}", e.what());
+  }
+#else
+  return "ucxQueue=disabled";
+#endif
+}
+
+#ifdef GLUTEN_ENABLE_GPU
+bool ucxOutputQueueNoMoreData(
+    const std::shared_ptr<velox::exec::Task>& task) {
+  if (task == nullptr) {
+    return false;
+  }
+  try {
+    auto queueMgr =
+        facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+    auto stats = queueMgr->stats(task->taskId());
+    return stats.has_value() && stats->noMoreData;
+  } catch (const std::exception& e) {
+    VLOG(1) << "Failed to inspect UCX output queue noMoreData taskId="
+            << task->taskId() << " error=" << e.what();
+    return false;
+  }
+}
+
+int64_t detachedUcxTaskTimeoutMs() {
+  if (const char* value =
+          std::getenv("GLUTEN_UCX_SHUFFLE_DETACHED_TASK_TIMEOUT_MS")) {
+    try {
+      return std::max<int64_t>(0, std::stoll(value));
+    } catch (...) {
+      LOG(WARNING) << "Invalid GLUTEN_UCX_SHUFFLE_DETACHED_TASK_TIMEOUT_MS="
+                   << value << ", using default 300000";
+    }
+  }
+  return 300000;
+}
+
+class DetachedUcxProducerTaskRegistry {
+ public:
+  void retain(
+      std::shared_ptr<velox::exec::Task> task,
+      std::shared_ptr<folly::Executor> taskExecutor,
+      std::shared_ptr<folly::Executor> spillExecutor,
+      MemoryManager* memoryManager,
+      const std::string& reason) {
+    if (task == nullptr) {
+      return;
+    }
+    startReaperIfNeeded();
+    const auto taskId = task->taskId();
+    MemoryManager::retainForAsyncTask(
+        memoryManager,
+        fmt::format("detached UCX producer taskId={} reason={}", taskId, reason));
+    const auto now = std::chrono::steady_clock::now();
+    DetachedTask entry{
+        std::move(task),
+        std::move(taskExecutor),
+        std::move(spillExecutor),
+        memoryManager,
+        now,
+        now + std::chrono::milliseconds(detachedUcxTaskTimeoutMs()),
+        reason};
+    auto logTask = entry.task;
+    {
+      std::lock_guard<std::mutex> l(mutex_);
+      tasks_[taskId] = std::move(entry);
+    }
+    LOG(WARNING) << "[UCX-DETACH] retained root partitioned output task"
+                 << " taskId=" << taskId << " reason=" << reason
+                 << " queueStats=" << describeUcxOutputQueue(logTask);
+  }
+
+ private:
+  struct DetachedTask {
+    std::shared_ptr<velox::exec::Task> task;
+    std::shared_ptr<folly::Executor> taskExecutor;
+    std::shared_ptr<folly::Executor> spillExecutor;
+    MemoryManager* memoryManager;
+    std::chrono::steady_clock::time_point retainedAt;
+    std::chrono::steady_clock::time_point deadline;
+    std::string reason;
+  };
+
+  void startReaperIfNeeded() {
+    bool expected = false;
+    if (!reaperStarted_.compare_exchange_strong(expected, true)) {
+      return;
+    }
+    std::thread([this]() { reaperLoop(); }).detach();
+  }
+
+  void reaperLoop() {
+    while (true) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      reapOnce();
+    }
+  }
+
+  void reapOnce() {
+    std::vector<std::pair<std::string, DetachedTask>> finished;
+    std::vector<std::pair<std::string, DetachedTask>> expired;
+    const auto now = std::chrono::steady_clock::now();
+    {
+      std::lock_guard<std::mutex> l(mutex_);
+      for (auto it = tasks_.begin(); it != tasks_.end();) {
+        const auto& taskId = it->first;
+        auto& entry = it->second;
+        if (isReadyToRelease(taskId, entry)) {
+          finished.emplace_back(taskId, std::move(entry));
+          it = tasks_.erase(it);
+        } else if (now >= entry.deadline) {
+          expired.emplace_back(taskId, std::move(entry));
+          it = tasks_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    for (auto& pair : finished) {
+      releaseFinished(pair.first, pair.second);
+    }
+    for (auto& pair : expired) {
+      cancelExpired(pair.first, pair.second);
+    }
+  }
+
+  bool isReadyToRelease(const std::string& taskId, DetachedTask& entry) {
+    try {
+      auto future = entry.task->taskCompletionFuture();
+      if (future.valid() && future.isReady()) {
+        return true;
+      }
+      auto queueMgr =
+          facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+      auto stats = queueMgr->stats(taskId);
+      if (stats.has_value()) {
+        return stats->finished;
+      }
+      return !entry.task->isRunning();
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "[UCX-DETACH] failed to inspect detached task"
+                   << " taskId=" << taskId << " error=" << e.what()
+                   << "; keeping task retained";
+      return false;
+    }
+  }
+
+  void releaseFinished(const std::string& taskId, DetachedTask& entry) {
+    try {
+      auto future = entry.task->taskCompletionFuture();
+      if (future.valid() && future.isReady()) {
+        future.wait();
+      } else if (entry.task->isRunning()) {
+        auto cancelFuture = entry.task->requestCancel();
+        if (cancelFuture.valid()) {
+          cancelFuture.wait();
+        }
+      } else if (future.valid()) {
+        future.wait();
+      }
+      LOG(WARNING) << "[UCX-DETACH] releasing drained detached task"
+                   << " taskId=" << taskId
+                   << " retainedMs="
+                   << std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - entry.retainedAt)
+                          .count()
+                   << " queueStats=" << describeUcxOutputQueue(entry.task);
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "[UCX-DETACH] releasing detached task after error"
+                   << " taskId=" << taskId << " error=" << e.what();
+    }
+    releaseRetainedResources(taskId, entry, "drained");
+  }
+
+  void cancelExpired(const std::string& taskId, DetachedTask& entry) {
+    try {
+      LOG(WARNING) << "[UCX-DETACH] cancelling expired detached task"
+                   << " taskId=" << taskId << " reason=" << entry.reason
+                   << " queueStats=" << describeUcxOutputQueue(entry.task);
+      auto future = entry.task->requestCancel();
+      if (future.valid()) {
+        future.wait();
+      }
+    } catch (const std::exception& e) {
+      LOG(WARNING) << "[UCX-DETACH] failed to cancel expired detached task"
+                   << " taskId=" << taskId << " error=" << e.what();
+    }
+    releaseRetainedResources(taskId, entry, "expired");
+  }
+
+  void releaseRetainedResources(
+      const std::string& taskId,
+      DetachedTask& entry,
+      const std::string& reason) {
+    if (entry.task != nullptr) {
+      auto deletionFuture = entry.task->taskDeletionFuture();
+      entry.task.reset();
+      if (deletionFuture.valid()) {
+        std::move(deletionFuture).wait(std::chrono::seconds(30));
+      }
+    }
+    entry.taskExecutor.reset();
+    entry.spillExecutor.reset();
+    if (entry.memoryManager != nullptr) {
+      MemoryManager::releaseAsyncTaskRetain(
+          entry.memoryManager,
+          fmt::format("detached UCX producer taskId={} {}", taskId, reason));
+      entry.memoryManager = nullptr;
+    }
+  }
+
+  std::mutex mutex_;
+  std::unordered_map<std::string, DetachedTask> tasks_;
+  std::atomic<bool> reaperStarted_{false};
+};
+
+DetachedUcxProducerTaskRegistry& detachedUcxProducerTaskRegistry() {
+  static auto* registry = new DetachedUcxProducerTaskRegistry();
+  return *registry;
+}
+#else
+bool ucxOutputQueueNoMoreData(
+    const std::shared_ptr<velox::exec::Task>& task) {
+  (void)task;
+  return false;
+}
+#endif
 
 } // namespace
 
@@ -336,6 +597,13 @@ WholeStageResultIterator::WholeStageResultIterator(
       /*memoryArbitrationPriority=*/0,
       /*spillDiskOpts=*/spillOpts,
       /*onError=*/std::move(onError));
+  LOG(INFO) << "[WS-ITER] created taskId=" << veloxTaskId
+            << " rootNode=" << veloxPlan_->id()
+            << " rootPlan=" << veloxPlan_->toString()
+            << " requiresParallelExecution=" << requiresParallelExecution_
+            << " parallelTaskProducesOutput=" << parallelTaskProducesOutput_
+            << " scanNodes=" << scanNodeIds_.size()
+            << " streamNodes=" << streamIds_.size();
   if (!requiresParallelExecution_ && !task_->supportSerialExecutionMode()) {
     throw std::runtime_error("Task doesn't support single threaded execution: " + planNode->toString());
   }
@@ -511,6 +779,18 @@ void WholeStageResultIterator::closeVeloxTask() {
   }
 
   const auto taskId = task_->taskId();
+  if (detachedUcxPartitionedOutputTask_) {
+    LOG(WARNING) << "Releasing detached UCX partitioned output task from "
+                 << "WholeStageResultIterator without cancellation, taskId="
+                 << taskId << ", state=" << static_cast<int>(task_->state())
+                 << ", running=" << task_->isRunning()
+                 << ", queueStats=" << describeUcxOutputQueue(task_);
+    task_.reset();
+    parallelResultQueue_.reset();
+    taskExecutor_.reset();
+    spillExecutor_.reset();
+    return;
+  }
   std::shared_ptr<velox::memory::MemoryPool> taskPool;
   if (task_->pool() != nullptr) {
     taskPool = task_->pool()->shared_from_this();
@@ -553,6 +833,24 @@ void WholeStageResultIterator::closeVeloxTask() {
   taskExecutor_.reset();
 }
 
+void WholeStageResultIterator::detachUcxPartitionedOutputTask(
+    const std::string& reason) {
+#ifdef GLUTEN_ENABLE_GPU
+  if (detachedUcxPartitionedOutputTask_ || task_ == nullptr) {
+    return;
+  }
+  detachedUcxProducerTaskRegistry().retain(
+      task_, taskExecutor_, spillExecutor_, memoryManager_, reason);
+  detachedUcxPartitionedOutputTask_ = true;
+  LOG(WARNING) << "[UCX-DETACH] detached root partitioned output task from "
+               << "Spark task lifecycle taskId=" << task_->taskId()
+               << " reason=" << reason
+               << " queueStats=" << describeUcxOutputQueue(task_);
+#else
+  (void)reason;
+#endif
+}
+
 std::shared_ptr<velox::core::QueryCtx> WholeStageResultIterator::createNewVeloxQueryCtx() {
   std::unordered_map<std::string, std::shared_ptr<velox::config::ConfigBase>> connectorConfigs;
   auto hiveConnectorSessionConfig = createHiveConnectorSessionConfig(veloxCfg_);
@@ -582,7 +880,14 @@ void WholeStageResultIterator::startParallelTaskIfNeeded() {
   }
   parallelTaskStarted_ = true;
   try {
+    LOG(INFO) << "[WS-ITER] starting parallel task taskId=" << task_->taskId()
+              << " requestedDrivers=" << kParallelTaskMaxDrivers
+              << " producesOutput=" << parallelTaskProducesOutput_;
     task_->start(kParallelTaskMaxDrivers);
+    LOG(INFO) << "[WS-ITER] started parallel task taskId=" << task_->taskId()
+              << " numOutputDrivers=" << task_->numOutputDrivers()
+              << " numTotalDrivers=" << task_->numTotalDrivers()
+              << " queueStats=" << describeUcxOutputQueue(task_);
     if (parallelResultQueue_ != nullptr) {
       parallelResultQueue_->setNumProducers(task_->numOutputDrivers());
     }
@@ -723,6 +1028,40 @@ std::shared_ptr<ColumnarBatch> WholeStageResultIterator::nextParallel() {
     auto veloxStart = std::chrono::steady_clock::now();
     auto future = task_->taskCompletionFuture();
     if (future.valid()) {
+      int64_t waitedMs = 0;
+      int64_t nextLogMs = 5000;
+      while (!future.isReady()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        waitedMs += 10;
+        if (ucxOutputQueueNoMoreData(task_)) {
+          LOG(WARNING) << "[WS-ITER] detaching root partitioned output task "
+                       << "after UCX noMoreData taskId=" << task_->taskId()
+                       << " waitedMs=" << waitedMs
+                       << " state=" << static_cast<int>(task_->state())
+                       << " running=" << task_->isRunning()
+                       << " numFinishedDrivers="
+                       << task_->numFinishedDrivers()
+                       << "/" << task_->numTotalDrivers()
+                       << " queueStats=" << describeUcxOutputQueue(task_);
+          detachUcxPartitionedOutputTask("ucx output noMoreData");
+          parallelTaskFinished_ = true;
+          checkTaskError();
+          return recordAndReturn(nullptr);
+        }
+        if (waitedMs >= nextLogMs) {
+          LOG(WARNING) << "[WS-ITER] waiting for root partitioned output task"
+                       << " taskId=" << task_->taskId()
+                       << " waitedMs=" << waitedMs
+                       << " state=" << static_cast<int>(task_->state())
+                       << " running=" << task_->isRunning()
+                       << " numFinishedDrivers="
+                       << task_->numFinishedDrivers()
+                       << "/" << task_->numTotalDrivers()
+                       << " queueStats=" << describeUcxOutputQueue(task_);
+          nextLogMs += 5000;
+        }
+        checkTaskError();
+      }
       future.wait();
     }
     auto veloxEnd = std::chrono::steady_clock::now();
