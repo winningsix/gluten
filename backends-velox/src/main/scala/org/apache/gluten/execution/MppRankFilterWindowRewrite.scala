@@ -16,7 +16,7 @@
  */
 package org.apache.gluten.execution
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, And, Ascending, Attribute, AttributeSet, EqualTo, Expression, Literal, Murmur3Hash, PredicateHelper, Rank, RowNumber, SortOrder, WindowExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, And, Ascending, Attribute, AttributeSet, EqualTo, Expression, Literal, Murmur3Hash, NamedExpression, PredicateHelper, Rank, RowNumber, SortOrder, WindowExpression}
 import org.apache.spark.sql.catalyst.plans.physical.{ClusteredDistribution, HashPartitioning}
 import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, InputIteratorTransformer, ProjectExec, SparkPlan}
 import org.apache.spark.sql.execution.exchange.ENSURE_REQUIREMENTS
@@ -52,6 +52,11 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
       fusedRankFilters: Int,
       insertedHashExchanges: Int)
   private type HashContract = (Seq[Expression], Seq[Attribute])
+  private case class LocalSortPath(
+      sort: SortExecTransformer,
+      projectsAboveSort: Seq[SparkPlan],
+      partitionSpec: Seq[Expression],
+      orderSpec: Seq[SortOrder])
 
   def apply(plan: SparkPlan, enabled: Boolean, numPartitions: Int): (SparkPlan, RewriteStats) = {
     if (!enabled) {
@@ -118,28 +123,37 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
   private def fuseExactRankOneFilter(
       filter: FilterExecTransformer,
       numPartitions: Int): Option[(SparkPlan, Boolean)] = filter.child match {
-    case window: WindowExecTransformer
-        if window.partitionSpec.nonEmpty &&
-          hasRequiredLocalSort(window) =>
-      extractRankOneConjunct(filter.condition, window).flatMap {
-        case (rankAlias, residualPredicate) =>
-          val sort = window.child.asInstanceOf[SortExecTransformer]
-          retainMatchingFinalGroupLimit(sort.child, window, numPartitions).flatMap {
-            case (finalGroupLimit, insertedExchange) =>
-              val rankOne = rankAlias.copy(child = Literal.create(1, rankAlias.dataType))(
-                rankAlias.exprId,
-                rankAlias.qualifier,
-                rankAlias.explicitMetadata,
-                rankAlias.nonInheritableMetadataKeys)
-              val projected =
-                ProjectExecTransformer(finalGroupLimit.output :+ rankOne, finalGroupLimit)
-              residualPredicate match {
-                case Some(predicate)
-                    if predicate.deterministic &&
-                      predicate.references.subsetOf(AttributeSet(projected.output)) =>
-                  Some(filter.copy(condition = predicate, child = projected) -> insertedExchange)
-                case Some(_) => None
-                case None => Some(projected -> insertedExchange)
+    case window: WindowExecTransformer if window.partitionSpec.nonEmpty =>
+      findRequiredLocalSort(window).flatMap {
+        localSort =>
+          extractRankOneConjunct(filter.condition, window).flatMap {
+            case (rankAlias, residualPredicate) =>
+              retainMatchingFinalGroupLimit(
+                localSort.sort.child,
+                localSort.partitionSpec,
+                localSort.orderSpec,
+                window,
+                numPartitions).flatMap {
+                case (finalGroupLimit, insertedExchange) =>
+                  val withoutSort = localSort.projectsAboveSort.reverse.foldLeft(finalGroupLimit) {
+                    case (child, project) => project.withNewChildren(Seq(child))
+                  }
+                  val rankOne = rankAlias.copy(child = Literal.create(1, rankAlias.dataType))(
+                    rankAlias.exprId,
+                    rankAlias.qualifier,
+                    rankAlias.explicitMetadata,
+                    rankAlias.nonInheritableMetadataKeys)
+                  val projected =
+                    ProjectExecTransformer(withoutSort.output :+ rankOne, withoutSort)
+                  residualPredicate match {
+                    case Some(predicate)
+                        if predicate.deterministic &&
+                          predicate.references.subsetOf(AttributeSet(projected.output)) =>
+                      Some(
+                        filter.copy(condition = predicate, child = projected) -> insertedExchange)
+                    case Some(_) => None
+                    case None => Some(projected -> insertedExchange)
+                  }
               }
           }
       }
@@ -187,28 +201,34 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
 
   private def retainMatchingFinalGroupLimit(
       child: SparkPlan,
+      partitionSpec: Seq[Expression],
+      orderSpec: Seq[SortOrder],
       window: WindowExecTransformer,
       numPartitions: Int): Option[(SparkPlan, Boolean)] = child match {
     case groupLimit: WindowGroupLimitExecTransformer
         if groupLimit.limit == 1 &&
           groupLimit.mode == GlutenFinal &&
-          matchesWindow(groupLimit, window) =>
-      stripMatchingPartialGroupLimit(groupLimit.child, window).flatMap {
+          matchesWindow(groupLimit, partitionSpec, orderSpec, window) =>
+      stripMatchingPartialGroupLimitForContract(
+        groupLimit.child,
+        groupLimit.partitionSpec,
+        groupLimit.orderSpec,
+        window).flatMap {
         withoutPartial =>
-          val partitionReferences = window.partitionSpec.foldLeft(AttributeSet.empty) {
+          val partitionReferences = groupLimit.partitionSpec.foldLeft(AttributeSet.empty) {
             case (references, expression) => references ++ expression.references
           }
           if (!partitionReferences.subsetOf(AttributeSet(withoutPartial.output))) {
             None
           } else {
             val hasDistribution =
-              hasCompatibleNativeHashDistribution(withoutPartial, window.partitionSpec)
+              hasCompatibleNativeHashDistribution(withoutPartial, groupLimit.partitionSpec)
             val distributedChild =
               if (hasDistribution) {
                 withoutPartial
               } else {
                 ColumnarShuffleExchangeExec(
-                  HashPartitioning(window.partitionSpec, math.max(1, numPartitions)),
+                  HashPartitioning(groupLimit.partitionSpec, math.max(1, numPartitions)),
                   withoutPartial,
                   ENSURE_REQUIREMENTS,
                   withoutPartial.output,
@@ -218,16 +238,93 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
           }
       }
     case project: ProjectExecTransformer if project.projectList.forall(_.deterministic) =>
-      retainMatchingFinalGroupLimit(project.child, window, numPartitions).map {
-        case (rewrittenChild, insertedExchange) =>
-          project.withNewChildren(Seq(rewrittenChild)) -> insertedExchange
+      rewriteWindowContractThroughProject(partitionSpec, orderSpec, project.projectList).flatMap {
+        case (childPartitionSpec, childOrderSpec) =>
+          retainMatchingFinalGroupLimit(
+            project.child,
+            childPartitionSpec,
+            childOrderSpec,
+            window,
+            numPartitions).map {
+            case (rewrittenChild, insertedExchange) =>
+              project.withNewChildren(Seq(rewrittenChild)) -> insertedExchange
+          }
       }
     case project: ProjectExec if project.projectList.forall(_.deterministic) =>
-      retainMatchingFinalGroupLimit(project.child, window, numPartitions).map {
-        case (rewrittenChild, insertedExchange) =>
-          project.withNewChildren(Seq(rewrittenChild)) -> insertedExchange
+      rewriteWindowContractThroughProject(partitionSpec, orderSpec, project.projectList).flatMap {
+        case (childPartitionSpec, childOrderSpec) =>
+          retainMatchingFinalGroupLimit(
+            project.child,
+            childPartitionSpec,
+            childOrderSpec,
+            window,
+            numPartitions).map {
+            case (rewrittenChild, insertedExchange) =>
+              project.withNewChildren(Seq(rewrittenChild)) -> insertedExchange
+          }
       }
     case _ => None
+  }
+
+  private def findRequiredLocalSort(window: WindowExecTransformer): Option[LocalSortPath] = {
+    def find(
+        child: SparkPlan,
+        partitionSpec: Seq[Expression],
+        orderSpec: Seq[SortOrder],
+        projectsAboveSort: Seq[SparkPlan]): Option[LocalSortPath] = child match {
+      case sort: SortExecTransformer if !sort.global =>
+        val requiredOrdering = partitionSpec.map(SortOrder(_, Ascending)) ++ orderSpec
+        if (
+          sort.sortOrder.length == requiredOrdering.length &&
+          SortOrder.orderingSatisfies(sort.sortOrder, requiredOrdering)
+        ) {
+          Some(LocalSortPath(sort, projectsAboveSort, partitionSpec, orderSpec))
+        } else {
+          None
+        }
+      case project: ProjectExecTransformer if project.projectList.forall(_.deterministic) =>
+        rewriteWindowContractThroughProject(partitionSpec, orderSpec, project.projectList).flatMap {
+          case (childPartitionSpec, childOrderSpec) =>
+            find(project.child, childPartitionSpec, childOrderSpec, projectsAboveSort :+ project)
+        }
+      case project: ProjectExec if project.projectList.forall(_.deterministic) =>
+        rewriteWindowContractThroughProject(partitionSpec, orderSpec, project.projectList).flatMap {
+          case (childPartitionSpec, childOrderSpec) =>
+            find(project.child, childPartitionSpec, childOrderSpec, projectsAboveSort :+ project)
+        }
+      case _ => None
+    }
+
+    find(window.child, window.partitionSpec, window.orderSpec, Seq.empty)
+  }
+
+  private def rewriteWindowContractThroughProject(
+      partitionSpec: Seq[Expression],
+      orderSpec: Seq[SortOrder],
+      projectList: Seq[NamedExpression]): Option[(Seq[Expression], Seq[SortOrder])] = {
+    val projectOutput = AttributeSet(projectList.map(_.toAttribute))
+    val references =
+      partitionSpec.foldLeft(AttributeSet.empty)(_ ++ _.references) ++
+        orderSpec.foldLeft(AttributeSet.empty)(_ ++ _.references)
+    if (!references.subsetOf(projectOutput)) {
+      return None
+    }
+
+    val replacements = projectList.map {
+      case alias: Alias => alias.exprId -> alias.child
+      case attribute: Attribute => attribute.exprId -> attribute
+      case expression => expression.exprId -> expression
+    }.toMap
+    def rewrite(expression: Expression): Expression = {
+      expression.transform {
+        case attribute: Attribute if replacements.contains(attribute.exprId) =>
+          replacements(attribute.exprId)
+      }
+    }
+
+    Some(
+      partitionSpec.map(rewrite) ->
+        orderSpec.map(order => rewrite(order).asInstanceOf[SortOrder]))
   }
 
   private def hasRequiredLocalSort(window: WindowExecTransformer): Boolean = {
@@ -265,17 +362,33 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
   private def stripMatchingPartialGroupLimit(
       child: SparkPlan,
       window: WindowExecTransformer,
+      hashContract: Option[HashContract] = None): Option[SparkPlan] = {
+    stripMatchingPartialGroupLimitForContract(
+      child,
+      window.partitionSpec,
+      window.orderSpec,
+      window,
+      hashContract)
+  }
+
+  private def stripMatchingPartialGroupLimitForContract(
+      child: SparkPlan,
+      partitionSpec: Seq[Expression],
+      orderSpec: Seq[SortOrder],
+      window: WindowExecTransformer,
       hashContract: Option[HashContract] = None): Option[SparkPlan] = child match {
     case groupLimit: WindowGroupLimitExecTransformer
         if groupLimit.limit == 1 &&
           groupLimit.mode == GlutenPartial &&
-          matchesWindow(groupLimit, window) =>
+          matchesWindow(groupLimit, partitionSpec, orderSpec, window) =>
       Some(groupLimit.child)
     case exchange: ColumnarShuffleExchangeExec =>
       exchange.outputPartitioning match {
         case HashPartitioning(expressions, _) =>
-          stripMatchingPartialGroupLimit(
+          stripMatchingPartialGroupLimitForContract(
             exchange.child,
+            partitionSpec,
+            orderSpec,
             window,
             Some(expressions -> exchange.output))
             .map(rewrittenChild => exchange.withNewChildren(Seq(rewrittenChild)))
@@ -288,7 +401,12 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
         if hashContract.nonEmpty &&
           !wholeStage.wholeStageTransformerContextDefined &&
           wholeStage.child.isInstanceOf[ProjectExecTransformer] =>
-      stripMatchingPartialGroupLimit(wholeStage.child, window, hashContract)
+      stripMatchingPartialGroupLimitForContract(
+        wholeStage.child,
+        partitionSpec,
+        orderSpec,
+        window,
+        hashContract)
         .flatMap {
           rewrittenChild =>
             val sameOutput =
@@ -304,11 +422,12 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
       input.child match {
         case adapter: ColumnarInputAdapter
             if adapter.child.isInstanceOf[ColumnarShuffleExchangeExec] =>
-          stripMatchingPartialGroupLimit(adapter.child, window).map {
-            rewrittenChild =>
-              val rewrittenAdapter = adapter.withNewChildren(Seq(rewrittenChild))
-              input.withNewChildren(Seq(rewrittenAdapter))
-          }
+          stripMatchingPartialGroupLimitForContract(adapter.child, partitionSpec, orderSpec, window)
+            .map {
+              rewrittenChild =>
+                val rewrittenAdapter = adapter.withNewChildren(Seq(rewrittenChild))
+                input.withNewChildren(Seq(rewrittenAdapter))
+            }
         case _ => None
       }
     // GPU shuffle preparation prepends one private Murmur3 hash column while exposing only the
@@ -317,7 +436,12 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
           case (hashExpressions, exchangeOutput) =>
             isSyntheticHashProject(project, hashExpressions, exchangeOutput)
         } =>
-      stripMatchingPartialGroupLimit(project.child, window, hashContract)
+      stripMatchingPartialGroupLimitForContract(
+        project.child,
+        partitionSpec,
+        orderSpec,
+        window,
+        hashContract)
         .map(rewrittenChild => project.withNewChildren(Seq(rewrittenChild)))
     case _ => None
   }
@@ -354,8 +478,16 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
   private def matchesWindow(
       groupLimit: WindowGroupLimitExecTransformer,
       window: WindowExecTransformer): Boolean = {
-    sameExpressions(groupLimit.partitionSpec, window.partitionSpec) &&
-    sameSortOrders(groupLimit.orderSpec, window.orderSpec) &&
+    matchesWindow(groupLimit, window.partitionSpec, window.orderSpec, window)
+  }
+
+  private def matchesWindow(
+      groupLimit: WindowGroupLimitExecTransformer,
+      partitionSpec: Seq[Expression],
+      orderSpec: Seq[SortOrder],
+      window: WindowExecTransformer): Boolean = {
+    sameExpressions(groupLimit.partitionSpec, partitionSpec) &&
+    sameSortOrders(groupLimit.orderSpec, orderSpec) &&
     sameRankFunction(groupLimit.rankLikeFunction, window)
   }
 

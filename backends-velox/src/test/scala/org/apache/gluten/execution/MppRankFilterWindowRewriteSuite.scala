@@ -132,8 +132,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     val rankAttribute = window.windowExpression.head.toAttribute
     val payload = window.child.output.find(_.name == "rank_conjunct_payload").get
     val residual = EqualTo(payload, Literal(7))
-    val plan = original.copy(
-      condition = And(EqualTo(rankAttribute, Literal(1)), residual))
+    val plan = original.copy(condition = And(EqualTo(rankAttribute, Literal(1)), residual))
     val originalOutputExprIds = plan.output.map(_.exprId)
 
     val (rewritten, stats) = MppRankFilterWindowRewrite(plan, enabled = true, numPartitions = 4)
@@ -151,6 +150,71 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(groupLimits.size == 1)
     assert(groupLimits.head.mode == GlutenFinal)
     assert(groupLimits.head.rankLikeFunction.isInstanceOf[Rank])
+    assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
+  }
+
+  test("rank one fusion resolves deterministic aliases on both sides of the local Sort") {
+    val partition = AttributeReference("aliased_partition", LongType)()
+    val order = AttributeReference("aliased_order", LongType)()
+    val payload = AttributeReference("aliased_payload", IntegerType)()
+    val baseRank = Rank(Seq(order))
+    val baseOrderSpec = Seq(SortOrder(order, Ascending))
+    val scan = TestLeaf(Seq(partition, order, payload))
+    val partial = WindowGroupLimitExecTransformer(
+      Seq(partition),
+      baseOrderSpec,
+      baseRank,
+      limit = 1,
+      GlutenPartial,
+      scan)
+    val finalGroupLimit = WindowGroupLimitExecTransformer(
+      Seq(partition),
+      baseOrderSpec,
+      baseRank,
+      limit = 1,
+      GlutenFinal,
+      partial)
+    val duplicateOrder = Alias(order, "aliased_duplicate_order")()
+    val preSortProject =
+      ProjectExecTransformer(finalGroupLimit.output :+ duplicateOrder, finalGroupLimit)
+    val sort = SortExecTransformer(
+      Seq(SortOrder(partition, Ascending), SortOrder(duplicateOrder.toAttribute, Ascending)),
+      global = false,
+      preSortProject)
+    val windowPartition = Alias(partition, "aliased_window_partition")()
+    val windowOrder = Alias(duplicateOrder.toAttribute, "aliased_window_order")()
+    val windowPayload = Alias(payload, "aliased_window_payload")()
+    val postSortProject =
+      ProjectExecTransformer(Seq(windowPartition, windowOrder, windowPayload), sort)
+    val windowPartitionSpec = Seq(windowPartition.toAttribute)
+    val windowOrderSpec = Seq(SortOrder(windowOrder.toAttribute, Ascending))
+    val windowSpec = WindowSpecDefinition(
+      windowPartitionSpec,
+      windowOrderSpec,
+      SpecifiedWindowFrame(RowFrame, UnboundedPreceding, CurrentRow))
+    val rankAlias =
+      Alias(WindowExpression(Rank(Seq(windowOrder.toAttribute)), windowSpec), "aliased_rank")()
+    val window =
+      WindowExecTransformer(Seq(rankAlias), windowPartitionSpec, windowOrderSpec, postSortProject)
+    val residual = EqualTo(windowPayload.toAttribute, Literal(7))
+    val plan =
+      FilterExecTransformer(And(EqualTo(rankAlias.toAttribute, Literal(1)), residual), window)
+    val originalOutputExprIds = plan.output.map(_.exprId)
+
+    val (rewritten, stats) = MppRankFilterWindowRewrite(plan, enabled = true, numPartitions = 4)
+
+    assert(stats.fusedRankFilters == 1)
+    assert(stats.rewrittenWindows == 0)
+    assert(stats.insertedHashExchanges == 1)
+    assert(rewritten.collect { case _: WindowExecTransformer => 1 }.isEmpty)
+    assert(rewritten.collect { case _: SortExecTransformer => 1 }.isEmpty)
+    val filters = rewritten.collect { case filter: FilterExecTransformer => filter }
+    assert(filters.size == 1)
+    assert(filters.head.condition.semanticEquals(residual))
+    val groupLimits =
+      rewritten.collect { case groupLimit: WindowGroupLimitExecTransformer => groupLimit }
+    assert(groupLimits.size == 1)
+    assert(groupLimits.head.mode == GlutenFinal)
     assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
   }
 
