@@ -4331,7 +4331,13 @@ case class MppNativeQueryExec(
     }
     val outputKey = plan.output
       .find(_.exprId == keyAttribute.get.exprId)
-      .orElse(Option.when(outputKeyCandidates.size == 1)(outputKeyCandidates.head))
+      .orElse {
+        if (outputKeyCandidates.size == 1) {
+          Some(outputKeyCandidates.head)
+        } else {
+          None
+        }
+      }
     if (outputKey.isEmpty) {
       logInfo(
         s"MppNativeQueryExec: RANGE interval inference could not anchor " +
@@ -4524,7 +4530,11 @@ case class MppNativeQueryExec(
                 val matches = scan.output.filter {
                   attribute => attribute.name == key.name && attribute.dataType == key.dataType
                 }
-                Option.when(matches.size == 1)(order.copy(child = matches.head))
+                if (matches.size == 1) {
+                  Some(order.copy(child = matches.head))
+                } else {
+                  None
+                }
               case _ => None
             }
         }
