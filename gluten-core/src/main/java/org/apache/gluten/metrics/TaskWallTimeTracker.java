@@ -94,6 +94,14 @@ public class TaskWallTimeTracker {
   }
 
   public void logAndReset(int stageId, long taskAttemptId) {
+    // Gluten also creates TaskContext instances while validating plans on the driver. They use
+    // negative identifiers and are not real Spark tasks, so emitting task metrics for them both
+    // pollutes the logs and adds avoidable planning-path logging overhead.
+    if (stageId < 0 || taskAttemptId < 0) {
+      reset();
+      return;
+    }
+
     long taskWallNanos = (taskStartNanos > 0) ? System.nanoTime() - taskStartNanos : 0;
     LOG.warn(
         "[TASK_TIMING] stageId={} taskAttemptId={}"
