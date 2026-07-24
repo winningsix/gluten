@@ -29,9 +29,10 @@ import org.apache.spark.sql.execution.window.{GlutenFinal, GlutenPartial}
  * below the original Window. The Velox backend maps those pruning operators to TopNRowNumber.
  *
  * An exact rank() = 1 subtree can use the Final TopNRowNumber as its semantic operator because it
- * preserves every first-place tie. For that shape, this rewrite removes the redundant Partial
- * TopNRowNumber, local Sort, Window and Filter. Other supported shapes remove both pruning
- * operators while retaining the semantic Window, its local Sort and the upper Filter.
+ * preserves every first-place tie. For that shape, this rewrite removes the outer local Sort,
+ * Window and rank Filter while retaining the Partial TopNRowNumber as a bounded pre-shuffle
+ * barrier. Other supported shapes remove both pruning operators while retaining the semantic
+ * Window, its local Sort and the upper Filter.
  *
  * A partitioned Window must see every row for a partition on the same MPP peer. Spark normally
  * inserts a HASH exchange for the Final WindowGroupLimit. We preserve that exchange and insert one
@@ -213,7 +214,8 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
         groupLimit.child,
         groupLimit.partitionSpec,
         groupLimit.orderSpec,
-        window).flatMap {
+        window,
+        retainPartial = true).flatMap {
         withoutPartial =>
           val partitionReferences = groupLimit.partitionSpec.foldLeft(AttributeSet.empty) {
             case (references, expression) => references ++ expression.references
@@ -376,12 +378,13 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
       partitionSpec: Seq[Expression],
       orderSpec: Seq[SortOrder],
       window: WindowExecTransformer,
-      hashContract: Option[HashContract] = None): Option[SparkPlan] = child match {
+      hashContract: Option[HashContract] = None,
+      retainPartial: Boolean = false): Option[SparkPlan] = child match {
     case groupLimit: WindowGroupLimitExecTransformer
         if groupLimit.limit == 1 &&
           groupLimit.mode == GlutenPartial &&
           matchesWindow(groupLimit, partitionSpec, orderSpec, window) =>
-      Some(groupLimit.child)
+      Some(if (retainPartial) groupLimit else groupLimit.child)
     case exchange: ColumnarShuffleExchangeExec =>
       exchange.outputPartitioning match {
         case HashPartitioning(expressions, _) =>
@@ -390,7 +393,8 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
             partitionSpec,
             orderSpec,
             window,
-            Some(expressions -> exchange.output))
+            Some(expressions -> exchange.output),
+            retainPartial)
             .map(rewrittenChild => exchange.withNewChildren(Seq(rewrittenChild)))
         case _ => None
       }
@@ -406,7 +410,8 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
         partitionSpec,
         orderSpec,
         window,
-        hashContract)
+        hashContract,
+        retainPartial)
         .flatMap {
           rewrittenChild =>
             val sameOutput =
@@ -422,7 +427,12 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
       input.child match {
         case adapter: ColumnarInputAdapter
             if adapter.child.isInstanceOf[ColumnarShuffleExchangeExec] =>
-          stripMatchingPartialGroupLimitForContract(adapter.child, partitionSpec, orderSpec, window)
+          stripMatchingPartialGroupLimitForContract(
+            adapter.child,
+            partitionSpec,
+            orderSpec,
+            window,
+            retainPartial = retainPartial)
             .map {
               rewrittenChild =>
                 val rewrittenAdapter = adapter.withNewChildren(Seq(rewrittenChild))
@@ -441,7 +451,8 @@ private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
         partitionSpec,
         orderSpec,
         window,
-        hashContract)
+        hashContract,
+        retainPartial)
         .map(rewrittenChild => project.withNewChildren(Seq(rewrittenChild)))
     case _ => None
   }

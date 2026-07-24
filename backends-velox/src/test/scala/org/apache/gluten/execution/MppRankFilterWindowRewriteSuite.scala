@@ -110,9 +110,9 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(rewritten.collect { case _: FilterExecTransformer => 1 }.isEmpty)
     val groupLimits =
       rewritten.collect { case groupLimit: WindowGroupLimitExecTransformer => groupLimit }
-    assert(groupLimits.size == 1)
-    assert(groupLimits.head.mode == GlutenFinal)
-    assert(groupLimits.head.rankLikeFunction.isInstanceOf[Rank])
+    assert(groupLimits.size == 2)
+    assert(groupLimits.map(_.mode).toSet == Set(GlutenPartial, GlutenFinal))
+    assert(groupLimits.forall(_.rankLikeFunction.isInstanceOf[Rank]))
     assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
     val outputProject = rewritten.asInstanceOf[ProjectExecTransformer]
     outputProject.projectList.last match {
@@ -147,9 +147,9 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(filters.head.condition.semanticEquals(residual))
     val groupLimits =
       rewritten.collect { case groupLimit: WindowGroupLimitExecTransformer => groupLimit }
-    assert(groupLimits.size == 1)
-    assert(groupLimits.head.mode == GlutenFinal)
-    assert(groupLimits.head.rankLikeFunction.isInstanceOf[Rank])
+    assert(groupLimits.size == 2)
+    assert(groupLimits.map(_.mode).toSet == Set(GlutenPartial, GlutenFinal))
+    assert(groupLimits.forall(_.rankLikeFunction.isInstanceOf[Rank]))
     assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
   }
 
@@ -213,8 +213,8 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(filters.head.condition.semanticEquals(residual))
     val groupLimits =
       rewritten.collect { case groupLimit: WindowGroupLimitExecTransformer => groupLimit }
-    assert(groupLimits.size == 1)
-    assert(groupLimits.head.mode == GlutenFinal)
+    assert(groupLimits.size == 2)
+    assert(groupLimits.map(_.mode).toSet == Set(GlutenPartial, GlutenFinal))
     assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
   }
 
