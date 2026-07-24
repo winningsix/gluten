@@ -19,6 +19,10 @@ package org.apache.gluten.extension
 import org.apache.gluten.config.{HashShuffleWriterType, VeloxConfig}
 import org.apache.gluten.execution.{GpuResizeBufferColumnarBatchExec, VeloxResizeBatchesExec}
 
+import org.apache.spark.SparkEnv
+import org.apache.spark.shuffle.NativeUcxShuffleExecution
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{ColumnarShuffleExchangeExec, ColumnarShuffleExchangeExecBase, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.{AQEShuffleReadExec, ShuffleQueryStageExec}
@@ -32,6 +36,29 @@ case class GpuBufferBatchResizeForShuffleInputOutput() extends Rule[SparkPlan] {
   override def apply(plan: SparkPlan): SparkPlan = {
     if (!VeloxConfig.get.enableColumnarCudf) {
       return plan
+    }
+    val nativeUcxSessionEnabled =
+      SparkSession.getActiveSession
+        .orElse(SparkSession.getDefaultSession)
+        .exists(session => NativeUcxShuffleExecution.enabled(session.sparkContext.getConf))
+    val nativeUcxSqlConfEnabled = SQLConf.get
+      .getConfString(NativeUcxShuffleExecution.EnabledConf, "false")
+      .toBoolean
+    val nativeUcxSparkEnvEnabled =
+      Option(SparkEnv.get).exists(env => NativeUcxShuffleExecution.enabled(env.conf))
+    val nativeUcxExchangeEnabled =
+      nativeUcxSessionEnabled || nativeUcxSqlConfEnabled || nativeUcxSparkEnvEnabled
+    if (nativeUcxExchangeEnabled) {
+      // Native UCX feeds Cudf batches directly into the Velox pipeline. The JVM-side resize
+      // iterator is bypassed. CudfNodeValidationRule may already have wrapped a non-AQE GPU
+      // exchange, so remove only those shuffle wrappers and preserve every other batch resizer.
+      return plan.transformUp {
+        case GpuResizeBufferColumnarBatchExec(
+              exchange: ColumnarShuffleExchangeExecBase,
+              _,
+              _) =>
+          exchange
+      }
     }
     val range = VeloxConfig.get.veloxResizeBatchesShuffleInputOutputRange
     val preferredBatchBytes = VeloxConfig.get.veloxPreferredBatchBytes

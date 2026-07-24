@@ -197,6 +197,11 @@ class VeloxIteratorApi extends IteratorApi with Logging {
     assert(
       inputPartition.isInstanceOf[GlutenPartition],
       "Velox backend only accept GlutenPartition.")
+    val glutenPartition = inputPartition.asInstanceOf[GlutenPartition]
+    val plannedInputBytes = glutenPartition.splitInfos.collect {
+      case localFiles: LocalFilesNode =>
+        localFiles.getLengths.asScala.foldLeft(0L)(_ + _.longValue())
+    }.sum
 
     val planBuildStart = System.nanoTime()
 
@@ -221,9 +226,7 @@ class VeloxIteratorApi extends IteratorApi with Logging {
     val transKernel = NativePlanEvaluator
       .create(BackendsApiManager.getBackendName, extraConf)
 
-    val splitInfoByteArray = inputPartition
-      .asInstanceOf[GlutenPartition]
-      .splitInfos
+    val splitInfoByteArray = glutenPartition.splitInfos
       .map(splitInfo => splitInfo.toProtobuf.toByteArray)
       .toArray
     val spillDirPath = SparkDirectoryUtil
@@ -261,7 +264,14 @@ class VeloxIteratorApi extends IteratorApi with Logging {
       .recycleIterator {
         stopNativeUcxExchangePollers(nativeUcxPollers)
         updateNativeMetrics(itrMetrics.fetch(resIter))
-        updateInputMetrics(context.taskMetrics().inputMetrics)
+        val inputMetrics = context.taskMetrics().inputMetrics
+        updateInputMetrics(inputMetrics)
+        // A native UCX sink may still be draining when Spark snapshots the task. In that case
+        // live Velox scan statistics can be empty even though all file splits were consumed.
+        // Preserve the actual split lengths as a conservative Stage "Input Size" fallback.
+        if (inputMetrics.bytesRead == 0L && plannedInputBytes > 0L) {
+          inputMetrics.bridgeIncBytesRead(plannedInputBytes)
+        }
         resIter.close()
         if (enableCudf) {
           tryStopTaskTracking(context)

@@ -56,11 +56,14 @@ abstract class ColumnarShuffleExchangeExecBase(
     .createColumnarBatchSerializer(schema, metrics, shuffleWriterType)
 
   // Note: "metrics" is made transient to avoid sending driver-side metrics to tasks.
-  @transient override lazy val metrics =
-    BackendsApiManager.getMetricsApiInstance
+  @transient override lazy val metrics = {
+    val exchangeMetrics = BackendsApiManager.getMetricsApiInstance
       .genColumnarShuffleExchangeMetrics(
         sparkContext,
         shuffleWriterType) ++ readMetrics ++ writeMetrics
+    exchangeMetrics.get("numPartitions").foreach(_.set(outputPartitioning.numPartitions))
+    exchangeMetrics
+  }
 
   @transient lazy val inputColumnarRDD: RDD[ColumnarBatch] = child.executeColumnar()
 

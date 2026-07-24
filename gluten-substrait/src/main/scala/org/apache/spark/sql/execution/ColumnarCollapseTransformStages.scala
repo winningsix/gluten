@@ -61,7 +61,7 @@ case class InputIteratorTransformer(child: SparkPlan) extends UnaryTransformSupp
 
   override def metricsUpdater(): MetricsUpdater =
     BackendsApiManager.getMetricsApiInstance
-      .genInputIteratorTransformerMetricsUpdater(metrics, forBroadcast())
+      .genInputIteratorTransformerMetricsUpdater(metrics, forBroadcast(), forShuffle())
 
   override def output: Seq[Attribute] = child.output
   override def outputPartitioning: Partitioning = child.outputPartitioning
@@ -84,22 +84,26 @@ case class InputIteratorTransformer(child: SparkPlan) extends UnaryTransformSupp
   }
 
   private def forBroadcast(): Boolean = {
-    child match {
-      case ColumnarInputAdapter(c)
-          if c.isInstanceOf[BroadcastQueryStageExec] ||
-            c.isInstanceOf[BroadcastExchangeLike] =>
+    inputPlan(child) match {
+      case c if c.isInstanceOf[BroadcastQueryStageExec] ||
+          c.isInstanceOf[BroadcastExchangeLike] =>
         true
       case _ => false
     }
   }
 
   private def forShuffle(): Boolean = {
-    child match {
-      case ColumnarInputAdapter(c)
-          if c.isInstanceOf[ShuffleQueryStageExec] || c.isInstanceOf[ShuffleExchangeLike] =>
+    inputPlan(child) match {
+      case c if c.isInstanceOf[ShuffleQueryStageExec] || c.isInstanceOf[ShuffleExchangeLike] =>
         true
       case _ => false
     }
+  }
+
+  private def inputPlan(plan: SparkPlan): SparkPlan = plan match {
+    case ColumnarInputAdapter(c) => inputPlan(c)
+    case c: ColumnarToColumnarExec => inputPlan(c.child)
+    case _ => plan
   }
 }
 

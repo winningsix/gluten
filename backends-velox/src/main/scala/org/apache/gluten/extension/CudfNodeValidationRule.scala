@@ -22,6 +22,7 @@ import org.apache.gluten.execution._
 import org.apache.gluten.extension.CudfNodeValidationRule.{createGPUColumnarExchange, setTagForWholeStageTransformer}
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.shuffle.NativeUcxShuffleExecution
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{ColumnarShuffleExchangeExec, GPUColumnarShuffleExchangeExec, SparkPlan}
@@ -132,7 +133,13 @@ object CudfNodeValidationRule extends Logging {
           s"GPUColumnarShuffleExchangeExec validation failed: ${res.reason()}")
       return shuffle
     }
-    if (!preserveExchange && !SQLConf.get.adaptiveExecutionEnabled) {
+    val nativeUcxExchangeEnabled = SQLConf.get
+      .getConfString(NativeUcxShuffleExecution.EnabledConf, "false")
+      .toBoolean
+    if (
+      !preserveExchange &&
+      !SQLConf.get.adaptiveExecutionEnabled &&
+      !nativeUcxExchangeEnabled) {
       val batchSize = VeloxConfig.get.cudfBatchSize
       val batchSizeInBytes = VeloxConfig.get.cudfBatchSizeInBytes
       GpuResizeBufferColumnarBatchExec(exec, batchSize, batchSizeInBytes)

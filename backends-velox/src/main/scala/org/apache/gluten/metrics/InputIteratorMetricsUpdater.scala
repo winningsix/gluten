@@ -17,8 +17,14 @@
 package org.apache.gluten.metrics
 
 import org.apache.spark.sql.execution.metric.SQLMetric
+import org.apache.spark.SparkEnv
+import org.apache.spark.shuffle.NativeUcxShuffleExecution
+import org.apache.spark.sql.utils.SparkTaskMetricsUtil
 
-case class InputIteratorMetricsUpdater(metrics: Map[String, SQLMetric], forBroadcast: Boolean)
+case class InputIteratorMetricsUpdater(
+    metrics: Map[String, SQLMetric],
+    forBroadcast: Boolean,
+    forShuffle: Boolean)
   extends MetricsUpdater {
   override def updateNativeMetrics(opMetrics: IOperatorMetrics): Unit = {
     if (opMetrics != null) {
@@ -27,6 +33,11 @@ case class InputIteratorMetricsUpdater(metrics: Map[String, SQLMetric], forBroad
       metrics("wallNanos") += operatorMetrics.wallNanos
       metrics("numCoalescedBatches") += operatorMetrics.numCoalescedBatches
       metrics.get("gpuComputeTime").foreach(_ += operatorMetrics.gpuComputeTime)
+      if (forShuffle && NativeUcxShuffleExecution.enabled(SparkEnv.get.conf)) {
+        SparkTaskMetricsUtil.incNativeShuffleRead(
+          operatorMetrics.inputBytes,
+          operatorMetrics.inputRows)
+      }
       if (!forBroadcast) {
         if (operatorMetrics.outputRows == 0 && operatorMetrics.outputVectors == 0) {
           // Sometimes, velox does not update metrics for intermediate operator,

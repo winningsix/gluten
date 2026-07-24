@@ -42,7 +42,8 @@ trait MetricsApi extends Serializable {
 
   def genInputIteratorTransformerMetricsUpdater(
       metrics: Map[String, SQLMetric],
-      forBroadcast: Boolean): MetricsUpdater
+      forBroadcast: Boolean,
+      forShuffle: Boolean): MetricsUpdater
 
   def metricsUpdatingFunction(
       child: SparkPlan,

@@ -251,6 +251,7 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
   @volatile private var nativeWriterHandle = -1L
   @volatile private var writerCreditAcquired = false
   @volatile private var writerFinishedMarked = false
+  @volatile private var nativeWriterMetricsReported = false
   @volatile private var nativeWriterNoMoreDataPoller: Thread = _
   @volatile private var nativeWriterNoMoreDataPollerStopRequested = false
   @volatile private var stopped = false
@@ -339,12 +340,51 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
       }
       nativeExchangeCompleted = true
     } finally {
+      reportNativeWriterMetrics(endpoint)
       reportFinalNativeWriterNoMoreDataIfReady(endpoint)
       // The native producer can remain detached after the Spark task returns while UCX drains
       // its output queue. Keep its telemetry alive so query-level admission sees that drain.
       if (!nativeExchangeCompleted) {
         stopNativeWriterNoMoreDataPoller()
       }
+    }
+  }
+
+  private def reportNativeWriterMetrics(endpoint: UcxShuffleEndpoint): Unit = synchronized {
+    if (nativeWriterMetricsReported) {
+      return
+    }
+    nativeBridge.writerRuntimeStats(endpoint.nativeTaskId) match {
+      case Some(stats) =>
+        def addExchangeMetric(name: String, value: Long): Unit = {
+          if (value >= 0) {
+            columnarDependency.metrics.get(name).foreach(_.add(value))
+          }
+        }
+
+        addExchangeMetric("dataSize", stats.totalBytesSent)
+        addExchangeMetric("numInputRows", stats.totalRowsSent)
+        addExchangeMetric("inputBatches", stats.totalPagesSent)
+        if (stats.totalBytesSent >= 0) {
+          metrics.incBytesWritten(stats.totalBytesSent)
+        }
+        if (stats.totalRowsSent >= 0) {
+          metrics.incRecordsWritten(stats.totalRowsSent)
+        }
+        nativeWriterMetricsReported = true
+        logInfo(
+          s"Reported native UCX shuffle writer SQL metrics " +
+            s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
+            s"sparkMapId=$mapId attemptId=$attemptId " +
+            s"nativeTaskId=${endpoint.nativeTaskId} " +
+            s"bytes=${stats.totalBytesSent} rows=${stats.totalRowsSent} " +
+            s"pages=${stats.totalPagesSent}")
+      case None =>
+        logWarning(
+          s"Native UCX shuffle writer runtime stats unavailable for SQL metrics " +
+            s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
+            s"sparkMapId=$mapId attemptId=$attemptId " +
+            s"nativeTaskId=${endpoint.nativeTaskId}")
     }
   }
 

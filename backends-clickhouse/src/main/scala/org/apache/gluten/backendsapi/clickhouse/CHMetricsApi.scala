@@ -75,7 +75,8 @@ class CHMetricsApi extends MetricsApi with Logging with LogLevelUtil {
 
   override def genInputIteratorTransformerMetricsUpdater(
       metrics: Map[String, SQLMetric],
-      forBroadcast: Boolean): MetricsUpdater = {
+      forBroadcast: Boolean,
+      forShuffle: Boolean): MetricsUpdater = {
     InputIteratorMetricsUpdater(metrics)
   }
 

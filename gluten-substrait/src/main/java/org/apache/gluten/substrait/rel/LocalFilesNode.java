@@ -97,6 +97,10 @@ public class LocalFilesNode implements SplitInfo {
     return paths;
   }
 
+  public List<Long> getLengths() {
+    return lengths;
+  }
+
   public void setPaths(List<String> newPaths) {
     paths.clear();
     paths.addAll(newPaths);

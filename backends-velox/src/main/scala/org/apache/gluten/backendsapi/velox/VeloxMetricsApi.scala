@@ -18,6 +18,7 @@ package org.apache.gluten.backendsapi.velox
 
 import org.apache.gluten.backendsapi.MetricsApi
 import org.apache.gluten.config.{GpuHashShuffleWriterType, HashShuffleWriterType, RssSortShuffleWriterType, ShuffleWriterType, SortShuffleWriterType}
+import org.apache.gluten.execution.ColumnarToColumnarExec
 import org.apache.gluten.metrics._
 import org.apache.gluten.substrait.{AggregationParams, JoinParams}
 
@@ -26,6 +27,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.execution.{ColumnarInputAdapter, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.QueryStageExec
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
+import org.apache.spark.shuffle.NativeUcxShuffleExecution
 
 import java.lang.{Long => JLong}
 import java.util.{List => JList, Map => JMap}
@@ -47,14 +49,28 @@ class VeloxMetricsApi extends MetricsApi with Logging {
     def metricsPlan(plan: SparkPlan): SparkPlan = {
       plan match {
         case ColumnarInputAdapter(child) => metricsPlan(child)
+        case c: ColumnarToColumnarExec => metricsPlan(c.child)
         case q: QueryStageExec => metricsPlan(q.plan)
         case _ => plan
       }
     }
 
+    val nativeUcxShuffle =
+      forShuffle && NativeUcxShuffleExecution.enabled(sparkContext.getConf)
+    val childMetrics = metricsPlan(child).metrics
+
     val outputMetrics = if (forBroadcast) {
-      metricsPlan(child).metrics
+      childMetrics
         .filterKeys(key => key.equals("numOutputRows") || key.equals("outputVectors"))
+    } else if (nativeUcxShuffle) {
+      Map(
+        "numOutputRows" -> childMetrics.getOrElse(
+          "numOutputRows",
+          SQLMetrics.createMetric(sparkContext, "number of output rows")),
+        "outputVectors" -> SQLMetrics.createMetric(
+          sparkContext,
+          "number of output vectors")
+      )
     } else {
       Map(
         "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
@@ -62,7 +78,11 @@ class VeloxMetricsApi extends MetricsApi with Logging {
       )
     }
 
-    val wallNanosMetric = if (forShuffle) {
+    val wallNanosMetric = if (nativeUcxShuffle) {
+      childMetrics.getOrElse(
+        "shuffleWallTime",
+        SQLMetrics.createNanoTimingMetric(sparkContext, "time of reducer input"))
+    } else if (forShuffle) {
       // For input from shuffle, the time of shuffle read is inclusive to the metrics.
       SQLMetrics.createNanoTimingMetric(sparkContext, "time of reducer input")
     } else if (forBroadcast) {
@@ -83,8 +103,9 @@ class VeloxMetricsApi extends MetricsApi with Logging {
 
   override def genInputIteratorTransformerMetricsUpdater(
       metrics: Map[String, SQLMetric],
-      forBroadcast: Boolean): MetricsUpdater = {
-    InputIteratorMetricsUpdater(metrics, forBroadcast)
+      forBroadcast: Boolean,
+      forShuffle: Boolean): MetricsUpdater = {
+    InputIteratorMetricsUpdater(metrics, forBroadcast, forShuffle)
   }
 
   override def genBatchScanTransformerMetrics(sparkContext: SparkContext): Map[String, SQLMetric] =
