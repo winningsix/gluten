@@ -69,11 +69,10 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
 
     assert(rewritten eq plan)
     assert(stats.rewrittenWindows == 0)
-    assert(stats.fusedRankFilters == 0)
     assert(stats.insertedHashExchanges == 0)
   }
 
-  test("three rank-filter branches preserve Window Filter and local Sort without TopN") {
+  test("three rank-filter branches preserve Window Filter local Sort and bounded Partial TopN") {
     val plan = UnionExec(
       Seq(
         rankFilterBranch("first", includeExchange = false),
@@ -83,45 +82,34 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     val (rewritten, stats) = MppRankFilterWindowRewrite(plan, enabled = true, numPartitions = 4)
 
     assert(stats.rewrittenWindows == 3)
-    assert(stats.fusedRankFilters == 0)
     assert(stats.insertedHashExchanges == 3)
     assert(rewritten.collect { case _: WindowExecTransformer => 1 }.size == 3)
     assert(rewritten.collect { case _: FilterExecTransformer => 1 }.size == 3)
     val sorts = rewritten.collect { case sort: SortExecTransformer => sort }
     assert(sorts.size == 3)
     assert(sorts.forall(!_.global))
-    assert(rewritten.collect { case _: WindowGroupLimitExecTransformer => 1 }.isEmpty)
+    assertRetainsOnlyPartial(rewritten, expectedCount = 3)
     val exchanges = rewritten.collect { case exchange: ColumnarShuffleExchangeExec => exchange }
     assert(exchanges.size == 3)
     assert(exchanges.forall(_.outputPartitioning.isInstanceOf[HashPartitioning]))
   }
 
-  test("exact rank one uses Final TopN as the semantic operator") {
+  test("exact rank one retains the semantic Window") {
     val plan =
       rankFilterBranch("rank", includeExchange = false, options = BranchOptions(rankKind = "rank"))
     val originalOutputExprIds = plan.output.map(_.exprId)
     val (rewritten, stats) = MppRankFilterWindowRewrite(plan, enabled = true, numPartitions = 4)
 
-    assert(stats.rewrittenWindows == 0)
-    assert(stats.fusedRankFilters == 1)
+    assert(stats.rewrittenWindows == 1)
     assert(stats.insertedHashExchanges == 1)
-    assert(rewritten.collect { case _: WindowExecTransformer => 1 }.isEmpty)
-    assert(rewritten.collect { case _: SortExecTransformer => 1 }.isEmpty)
-    assert(rewritten.collect { case _: FilterExecTransformer => 1 }.isEmpty)
-    val groupLimits =
-      rewritten.collect { case groupLimit: WindowGroupLimitExecTransformer => groupLimit }
-    assert(groupLimits.size == 2)
-    assert(groupLimits.map(_.mode).toSet == Set(GlutenPartial, GlutenFinal))
-    assert(groupLimits.forall(_.rankLikeFunction.isInstanceOf[Rank]))
+    assert(rewritten.collect { case _: WindowExecTransformer => 1 }.size == 1)
+    assert(rewritten.collect { case _: SortExecTransformer => 1 }.size == 1)
+    assert(rewritten.collect { case _: FilterExecTransformer => 1 }.size == 1)
+    assertRetainsOnlyPartial(rewritten)
     assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
-    val outputProject = rewritten.asInstanceOf[ProjectExecTransformer]
-    outputProject.projectList.last match {
-      case Alias(literal: Literal, "rank_rank") => assert(literal.value == 1)
-      case other => fail(s"Expected a literal rank output, found $other")
-    }
   }
 
-  test("rank one conjunct keeps its deterministic residual filter above Final TopN") {
+  test("rank one conjunct keeps the semantic Window and complete filter") {
     val original =
       rankFilterBranch(
         "rank_conjunct",
@@ -137,23 +125,18 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
 
     val (rewritten, stats) = MppRankFilterWindowRewrite(plan, enabled = true, numPartitions = 4)
 
-    assert(stats.rewrittenWindows == 0)
-    assert(stats.fusedRankFilters == 1)
+    assert(stats.rewrittenWindows == 1)
     assert(stats.insertedHashExchanges == 1)
-    assert(rewritten.collect { case _: WindowExecTransformer => 1 }.isEmpty)
-    assert(rewritten.collect { case _: SortExecTransformer => 1 }.isEmpty)
+    assert(rewritten.collect { case _: WindowExecTransformer => 1 }.size == 1)
+    assert(rewritten.collect { case _: SortExecTransformer => 1 }.size == 1)
     val filters = rewritten.collect { case filter: FilterExecTransformer => filter }
     assert(filters.size == 1)
-    assert(filters.head.condition.semanticEquals(residual))
-    val groupLimits =
-      rewritten.collect { case groupLimit: WindowGroupLimitExecTransformer => groupLimit }
-    assert(groupLimits.size == 2)
-    assert(groupLimits.map(_.mode).toSet == Set(GlutenPartial, GlutenFinal))
-    assert(groupLimits.forall(_.rankLikeFunction.isInstanceOf[Rank]))
+    assert(filters.head.condition.semanticEquals(plan.condition))
+    assertRetainsOnlyPartial(rewritten)
     assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
   }
 
-  test("rank one fusion resolves deterministic aliases on both sides of the local Sort") {
+  test("semantic Window rewrite resolves deterministic aliases on both sides of the local Sort") {
     val partition = AttributeReference("aliased_partition", LongType)()
     val order = AttributeReference("aliased_order", LongType)()
     val payload = AttributeReference("aliased_payload", IntegerType)()
@@ -203,18 +186,14 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
 
     val (rewritten, stats) = MppRankFilterWindowRewrite(plan, enabled = true, numPartitions = 4)
 
-    assert(stats.fusedRankFilters == 1)
-    assert(stats.rewrittenWindows == 0)
+    assert(stats.rewrittenWindows == 1)
     assert(stats.insertedHashExchanges == 1)
-    assert(rewritten.collect { case _: WindowExecTransformer => 1 }.isEmpty)
-    assert(rewritten.collect { case _: SortExecTransformer => 1 }.isEmpty)
+    assert(rewritten.collect { case _: WindowExecTransformer => 1 }.size == 1)
+    assert(rewritten.collect { case _: SortExecTransformer => 1 }.size == 1)
     val filters = rewritten.collect { case filter: FilterExecTransformer => filter }
     assert(filters.size == 1)
-    assert(filters.head.condition.semanticEquals(residual))
-    val groupLimits =
-      rewritten.collect { case groupLimit: WindowGroupLimitExecTransformer => groupLimit }
-    assert(groupLimits.size == 2)
-    assert(groupLimits.map(_.mode).toSet == Set(GlutenPartial, GlutenFinal))
+    assert(filters.head.condition.semanticEquals(plan.condition))
+    assertRetainsOnlyPartial(rewritten)
     assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
   }
 
@@ -233,9 +212,8 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     val (rewritten, stats) = MppRankFilterWindowRewrite(plan, enabled = true, numPartitions = 4)
 
     assert(stats.rewrittenWindows == 1)
-    assert(stats.fusedRankFilters == 0)
     assert(rewritten.collect { case _: WindowExecTransformer => 1 }.size == 1)
-    assert(rewritten.collect { case _: WindowGroupLimitExecTransformer => 1 }.isEmpty)
+    assertRetainsOnlyPartial(rewritten)
   }
 
   test("a non-one rank predicate retains the semantic Window path") {
@@ -252,9 +230,8 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     val (rewritten, stats) = MppRankFilterWindowRewrite(plan, enabled = true, numPartitions = 4)
 
     assert(stats.rewrittenWindows == 1)
-    assert(stats.fusedRankFilters == 0)
     assert(rewritten.collect { case _: WindowExecTransformer => 1 }.size == 1)
-    assert(rewritten.collect { case _: WindowGroupLimitExecTransformer => 1 }.isEmpty)
+    assertRetainsOnlyPartial(rewritten)
   }
 
   test("an existing compatible native HASH exchange is retained") {
@@ -264,7 +241,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(stats.rewrittenWindows == 1)
     assert(stats.insertedHashExchanges == 0)
     assert(rewritten.collect { case _: ColumnarShuffleExchangeExec => 1 }.size == 1)
-    assert(rewritten.collect { case _: WindowGroupLimitExecTransformer => 1 }.isEmpty)
+    assertRetainsOnlyPartial(rewritten)
   }
 
   test("MPP value-stream wrappers and the synthetic hash project are retained") {
@@ -309,7 +286,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(rewritten.collect { case _: ColumnarShuffleExchangeExec => 1 }.size == 1)
     assert(rewritten.collect { case _: WholeStageTransformer => 1 }.size == 1)
     assert(rewritten.collect { case _: SortExecTransformer => 1 }.size == 1)
-    assert(rewritten.collect { case _: WindowGroupLimitExecTransformer => 1 }.isEmpty)
+    assertRetainsOnlyPartial(rewritten)
     val rewrittenHashProject = rewritten.collectFirst {
       case project: ProjectExecTransformer
           if project.projectList.headOption.exists(_.name == "hash_partition_key") =>
@@ -396,7 +373,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(stats.rewrittenWindows == 1)
     val rewrittenProject = rewritten.collectFirst { case project: ProjectExec => project }.get
     assert(rewrittenProject.output.map(_.exprId) == originalExprIds)
-    assert(rewritten.collect { case _: WindowGroupLimitExecTransformer => 1 }.isEmpty)
+    assertRetainsOnlyPartial(rewritten)
   }
 
   test("a nondeterministic pre-project keeps both group-limit pruning boundaries") {
@@ -494,6 +471,13 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(stats.rewrittenWindows == 0)
     assert(stats.insertedHashExchanges == 0)
     assert(rewritten.collect { case _: WindowGroupLimitExecTransformer => 1 }.size == 2)
+  }
+
+  private def assertRetainsOnlyPartial(plan: SparkPlan, expectedCount: Int = 1): Unit = {
+    val groupLimits =
+      plan.collect { case groupLimit: WindowGroupLimitExecTransformer => groupLimit }
+    assert(groupLimits.size == expectedCount)
+    assert(groupLimits.forall(_.mode == GlutenPartial))
   }
 
   private def rankFilterBranch(

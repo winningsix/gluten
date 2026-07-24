@@ -1631,10 +1631,11 @@ case class MppNativeQueryExec(
     val afterFinalAggSplit = splitFinalAggBeforeJoinHub(afterRootTopNPartial)
     val afterExistenceSplit = splitExistenceFinalBeforeJoinHub(afterFinalAggSplit)
     val afterNativeLocalSorts = offloadLocalSorts(afterExistenceSplit)
-    // Remove Spark's WindowGroupLimit pruning operators by default only for cuDF MPP. Generic
-    // Substrait-to-Velox conversion independently enables streaming for a partitioned rank Window
-    // whose retained OrderBy proves the complete required ordering. An explicit false setting is a
-    // kill switch; non-cuDF MPP retains the existing physical plan unless explicitly enabled.
+    // Keep Spark's bounded Partial WindowGroupLimit pre-filter but remove the redundant Final
+    // operator for cuDF MPP. Generic Substrait-to-Velox conversion independently enables
+    // streaming for a partitioned rank Window whose retained OrderBy proves the complete required
+    // ordering. An explicit false setting is a kill switch; non-cuDF MPP retains the existing
+    // physical plan unless explicitly enabled.
     val rankFilterWindowEnabled = MppRankFilterWindowRewrite.isEnabled(
       optionalBooleanConf(MppRankFilterWindowRewrite.EnabledKey),
       GlutenConfig.get.enableColumnarCudf)
@@ -1642,23 +1643,22 @@ case class MppNativeQueryExec(
       afterNativeLocalSorts,
       enabled = rankFilterWindowEnabled,
       numPartitions = mppSparkPartitionCount)
-    if (
-      rankFilterWindowStats.rewrittenWindows > 0 ||
-      rankFilterWindowStats.fusedRankFilters > 0
-    ) {
+    if (rankFilterWindowStats.rewrittenWindows > 0) {
       logInfo(
         s"MppNativeQueryExec: selected native Window for " +
-          rankFilterWindowStats.rewrittenWindows + " rank-filter subtree(s) and fused " +
-          rankFilterWindowStats.fusedRankFilters + " exact rank=1 subtree(s) into Final TopN; " +
-          s"retained or inserted HASH distribution (inserted " +
+          rankFilterWindowStats.rewrittenWindows +
+          " rank-filter subtree(s); retained or inserted HASH distribution (inserted " +
           rankFilterWindowStats.insertedHashExchanges + " exchange(s))")
     }
     val (afterWindowInputOrdering, windowInputOrderingStats) =
       MppWindowInputOrdering(afterRankFilterWindow)
-    if (windowInputOrderingStats.markedWindows > 0) {
+    if (windowInputOrderingStats.candidateWindows > 0) {
       logInfo(
-        s"MppNativeQueryExec: preserved verified local ordering for " +
-          windowInputOrderingStats.markedWindows + " native Window subtree(s)")
+        s"MppNativeQueryExec: native Window sorted-input verification: candidates=" +
+          windowInputOrderingStats.candidateWindows + ", verifiedSorts=" +
+          windowInputOrderingStats.verifiedSortWindows + ", supportedShapes=" +
+          windowInputOrderingStats.supportedShapeWindows + ", marked=" +
+          windowInputOrderingStats.markedWindows)
     }
     val afterNativeHashJoins = offloadLocalHashJoins(afterWindowInputOrdering)
     val afterSmjHashJoinRewrite = rewriteMppSortMergeJoinToHashJoin(afterNativeHashJoins)

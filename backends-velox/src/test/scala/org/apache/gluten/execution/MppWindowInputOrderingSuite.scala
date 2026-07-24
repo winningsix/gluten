@@ -53,6 +53,85 @@ class MppWindowInputOrderingSuite extends AnyFunSuite {
     }
   }
 
+  test("marks ordering preserved through a deterministic projection") {
+    val projectedPartition = Alias(partition, "projected_partition")()
+    val projectedOrder = Alias(order, "projected_order")()
+    val sort = SortExecTransformer(
+      Seq(SortOrder(partition, Ascending), SortOrder(order, Ascending)),
+      global = false,
+      leaf)
+    val project = ProjectExecTransformer(
+      Seq(projectedPartition, projectedOrder, value),
+      sort)
+    val frame = SpecifiedWindowFrame(RowFrame, UnboundedPreceding, CurrentRow)
+    val spec = WindowSpecDefinition(
+      Seq(projectedPartition.toAttribute),
+      Seq(SortOrder(projectedOrder.toAttribute, Ascending)),
+      frame)
+    val window = WindowExecTransformer(
+      Seq(Alias(WindowExpression(Rank(Seq(projectedOrder.toAttribute)), spec), "rank")()),
+      spec.partitionSpec,
+      spec.orderSpec,
+      project)
+
+    assertMarked(window)
+  }
+
+  test("resolves equivalent projected aliases in the Sort contract") {
+    val actualOrder = Alias(order, "actual_order")()
+    val requiredOrder = Alias(order, "required_order")()
+    val preSortProject = ProjectExecTransformer(
+      Seq(partition, actualOrder, requiredOrder, value),
+      leaf)
+    val sort = SortExecTransformer(
+      Seq(SortOrder(partition, Ascending), SortOrder(actualOrder.toAttribute, Ascending)),
+      global = false,
+      preSortProject)
+    val postSortProject = ProjectExecTransformer(
+      Seq(partition, requiredOrder.toAttribute, value),
+      sort)
+    val frame = SpecifiedWindowFrame(RowFrame, UnboundedPreceding, CurrentRow)
+    val spec = WindowSpecDefinition(
+      Seq(partition),
+      Seq(SortOrder(requiredOrder.toAttribute, Ascending)),
+      frame)
+    val window = WindowExecTransformer(
+      Seq(Alias(WindowExpression(Rank(Seq(requiredOrder.toAttribute)), spec), "rank")()),
+      spec.partitionSpec,
+      spec.orderSpec,
+      postSortProject)
+
+    assertMarked(window)
+  }
+
+  test("uses the physical Window contract after projection rewrites") {
+    val embeddedOrder = Alias(order, "embedded_order")()
+    val physicalOrder = Alias(order, "physical_order")()
+    val preSortProject = ProjectExecTransformer(
+      Seq(partition, embeddedOrder, physicalOrder, value),
+      leaf)
+    val sort = SortExecTransformer(
+      Seq(SortOrder(partition, Ascending), SortOrder(embeddedOrder.toAttribute, Ascending)),
+      global = false,
+      preSortProject)
+    val postSortProject = ProjectExecTransformer(
+      Seq(partition, physicalOrder.toAttribute, value),
+      sort)
+    val frame = SpecifiedWindowFrame(RowFrame, UnboundedPreceding, CurrentRow)
+    val embeddedSpec = WindowSpecDefinition(
+      Seq(partition),
+      Seq(SortOrder(embeddedOrder.toAttribute, Ascending)),
+      frame)
+    val physicalOrderSpec = Seq(SortOrder(physicalOrder.toAttribute, Ascending))
+    val window = WindowExecTransformer(
+      Seq(Alias(WindowExpression(Rank(Seq(embeddedOrder.toAttribute)), embeddedSpec), "rank")()),
+      Seq(partition),
+      physicalOrderSpec,
+      postSortProject)
+
+    assertMarked(window)
+  }
+
   test("marks full-partition COUNT of a non-null literal") {
     val count =
       AggregateExpression(Count(Seq(Literal(1))), Complete, isDistinct = false, filter = None)

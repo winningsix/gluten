@@ -71,20 +71,21 @@ core::SortOrder toSortOrder(const ::substrait::SortField& sortField) {
   }
 }
 
-core::TopNRowNumberNode::RankFunction windowGroupLimitRankFunction(
-    const ::substrait::WindowGroupLimitRel& windowGroupLimitRel) {
-  std::string functionName = "row_number";
+std::string windowGroupLimitParameter(
+    const ::substrait::WindowGroupLimitRel& windowGroupLimitRel,
+    std::string_view key,
+    std::string defaultValue) {
   if (windowGroupLimitRel.has_advanced_extension()) {
     const auto& extension = windowGroupLimitRel.advanced_extension();
     if (extension.has_optimization()) {
       google::protobuf::StringValue msg;
       if (extension.optimization().UnpackTo(&msg)) {
-        static const std::string kWindowFunctionPrefix = "window_function=";
-        const auto start = msg.value().find(kWindowFunctionPrefix);
+        const auto prefix = fmt::format("{}=", key);
+        const auto start = msg.value().find(prefix);
         if (start != std::string::npos) {
-          const auto valueStart = start + kWindowFunctionPrefix.size();
+          const auto valueStart = start + prefix.size();
           const auto valueEnd = msg.value().find('\n', valueStart);
-          functionName = msg.value().substr(
+          return msg.value().substr(
               valueStart,
               valueEnd == std::string::npos ? std::string::npos
                                              : valueEnd - valueStart);
@@ -92,7 +93,20 @@ core::TopNRowNumberNode::RankFunction windowGroupLimitRankFunction(
       }
     }
   }
-  return core::TopNRowNumberNode::rankFunctionFromName(functionName);
+  return defaultValue;
+}
+
+core::TopNRowNumberNode::RankFunction windowGroupLimitRankFunction(
+    const ::substrait::WindowGroupLimitRel& windowGroupLimitRel) {
+  return core::TopNRowNumberNode::rankFunctionFromName(
+      windowGroupLimitParameter(
+          windowGroupLimitRel, "window_function", "row_number"));
+}
+
+bool isPartialWindowGroupLimit(
+    const ::substrait::WindowGroupLimitRel& windowGroupLimitRel) {
+  return windowGroupLimitParameter(
+             windowGroupLimitRel, "execution_mode", "final") == "partial";
 }
 
 std::vector<TypePtr> toVeloxAggregateRawInputTypes(
@@ -1197,19 +1211,34 @@ const core::WindowNode::Frame SubstraitToVeloxPlanConverter::createWindowFrame(
 detail::WindowInputOrdering detail::selectWindowInputOrdering(
     const core::PlanNodePtr& input,
     bool preserveSortedInput) {
+  const auto hasOrderByInput = [](const core::PlanNodePtr& node) {
+    auto current = node;
+    while (current) {
+      if (std::dynamic_pointer_cast<const core::OrderByNode>(current)) {
+        return true;
+      }
+      if (!std::dynamic_pointer_cast<const core::ProjectNode>(current) ||
+          current->sources().size() != 1) {
+        return false;
+      }
+      current = current->sources().front();
+    }
+    return false;
+  };
+
+  if (preserveSortedInput) {
+    VELOX_CHECK(
+        hasOrderByInput(input),
+        "Window inputsSorted contract requires an OrderBy input, optionally through Projects.");
+    return {input, true};
+  }
+
   if (auto orderBy =
           std::dynamic_pointer_cast<const core::OrderByNode>(input)) {
-    if (preserveSortedInput) {
-      return {input, true};
-    }
-
     VELOX_CHECK_EQ(orderBy->sources().size(), 1);
     return {orderBy->sources().front(), false};
   }
 
-  VELOX_CHECK(
-      !preserveSortedInput,
-      "Window inputsSorted contract requires an immediate OrderBy input.");
   return {input, false};
 }
 
@@ -1365,7 +1394,8 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(
       sortingOrders,
       rowNumberColumnName,
       static_cast<int32_t>(windowGroupLimitRel.limit()),
-      childNode);
+      childNode,
+      isPartialWindowGroupLimit(windowGroupLimitRel));
 }
 
 core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::SetRel& setRel) {
