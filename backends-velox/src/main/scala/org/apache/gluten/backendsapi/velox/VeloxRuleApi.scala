@@ -102,6 +102,9 @@ object VeloxRuleApi {
     // Push an already-enforced selective dimension key set below a correlated per-key aggregate
     // (for example TPC-H Q17). DISTINCT keys preserve aggregate input multiplicity.
     injector.injectOptimizerRule(PushFilteredKeysIntoAggregate.apply)
+    // Merge paired EXISTS / NOT EXISTS min/max summaries over the same relation into one
+    // conditional aggregate (for example TPC-H Q21).
+    injector.injectOptimizerRule(MergeExistenceJoinSummaries.apply)
     if (BackendsApiManager.getSettings.supportAppendDataExec()) {
       injector.injectPlannerStrategy(SparkShimLoader.getSparkShims.getRewriteCreateTableAsSelect(_))
     }
