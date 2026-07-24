@@ -1642,11 +1642,15 @@ case class MppNativeQueryExec(
       afterNativeLocalSorts,
       enabled = rankFilterWindowEnabled,
       numPartitions = mppSparkPartitionCount)
-    if (rankFilterWindowStats.rewrittenWindows > 0) {
+    if (
+      rankFilterWindowStats.rewrittenWindows > 0 ||
+      rankFilterWindowStats.fusedRankFilters > 0
+    ) {
       logInfo(
         s"MppNativeQueryExec: selected native Window for " +
-          rankFilterWindowStats.rewrittenWindows + " rank-filter subtree(s); retained or " +
-          s"inserted HASH distribution (inserted " +
+          rankFilterWindowStats.rewrittenWindows + " rank-filter subtree(s) and fused " +
+          rankFilterWindowStats.fusedRankFilters + " exact rank=1 subtree(s) into Final TopN; " +
+          s"retained or inserted HASH distribution (inserted " +
           rankFilterWindowStats.insertedHashExchanges + " exchange(s))")
     }
     val (afterWindowInputOrdering, windowInputOrderingStats) =

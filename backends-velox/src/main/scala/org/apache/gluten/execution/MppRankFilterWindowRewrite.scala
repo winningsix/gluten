@@ -16,19 +16,22 @@
  */
 package org.apache.gluten.execution
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, AttributeSet, Expression, Murmur3Hash, Rank, RowNumber, SortOrder, WindowExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, AttributeSet, EqualTo, Expression, Literal, Murmur3Hash, Rank, RowNumber, SortOrder, WindowExpression}
 import org.apache.spark.sql.catalyst.plans.physical.{ClusteredDistribution, HashPartitioning}
 import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, InputIteratorTransformer, ProjectExec, SparkPlan}
 import org.apache.spark.sql.execution.exchange.ENSURE_REQUIREMENTS
 import org.apache.spark.sql.execution.window.{GlutenFinal, GlutenPartial}
 
 /**
- * Selects the real Window implementation for Spark's rank-filter plan shape.
+ * Selects the native implementation for Spark's rank-filter plan shape.
  *
  * Spark's InferWindowGroupLimit optimization places Partial and Final WindowGroupLimit operators
- * below the original Window. The Velox backend maps those pruning operators to TopNRowNumber. This
- * rewrite removes only matched pruning operators while retaining the semantic Window, its local
- * Sort and the upper Filter.
+ * below the original Window. The Velox backend maps those pruning operators to TopNRowNumber.
+ *
+ * An exact rank() = 1 subtree can use the Final TopNRowNumber as its semantic operator because it
+ * preserves every first-place tie. For that shape, this rewrite removes the redundant Partial
+ * TopNRowNumber, local Sort, Window and Filter. Other supported shapes remove both pruning
+ * operators while retaining the semantic Window, its local Sort and the upper Filter.
  *
  * A partitioned Window must see every row for a partition on the same MPP peer. Spark normally
  * inserts a HASH exchange for the Final WindowGroupLimit. We preserve that exchange and insert one
@@ -44,17 +47,34 @@ private[execution] object MppRankFilterWindowRewrite {
     configured.getOrElse(cudfEnabled)
   }
 
-  private[execution] case class RewriteStats(rewrittenWindows: Int, insertedHashExchanges: Int)
+  private[execution] case class RewriteStats(
+      rewrittenWindows: Int,
+      fusedRankFilters: Int,
+      insertedHashExchanges: Int)
   private type HashContract = (Seq[Expression], Seq[Attribute])
 
   def apply(plan: SparkPlan, enabled: Boolean, numPartitions: Int): (SparkPlan, RewriteStats) = {
     if (!enabled) {
-      return plan -> RewriteStats(0, 0)
+      return plan -> RewriteStats(0, 0, 0)
     }
 
     var rewrittenWindows = 0
+    var fusedRankFilters = 0
     var insertedHashExchanges = 0
-    val rewritten = plan.transformUp {
+    val afterRankOneFusion = plan.transformDown {
+      case filter: FilterExecTransformer =>
+        fuseExactRankOneFilter(filter, numPartitions) match {
+          case Some((fused, insertedExchange)) =>
+            fusedRankFilters += 1
+            if (insertedExchange) {
+              insertedHashExchanges += 1
+            }
+            fused
+          case None => filter
+        }
+    }
+
+    val rewritten = afterRankOneFusion.transformUp {
       case window: WindowExecTransformer
           if window.partitionSpec.nonEmpty &&
             hasRequiredLocalSort(window) &&
@@ -92,7 +112,105 @@ private[execution] object MppRankFilterWindowRewrite {
         }
     }
 
-    rewritten -> RewriteStats(rewrittenWindows, insertedHashExchanges)
+    rewritten -> RewriteStats(rewrittenWindows, fusedRankFilters, insertedHashExchanges)
+  }
+
+  private def fuseExactRankOneFilter(
+      filter: FilterExecTransformer,
+      numPartitions: Int): Option[(SparkPlan, Boolean)] = filter.child match {
+    case window: WindowExecTransformer
+        if window.partitionSpec.nonEmpty &&
+          hasRequiredLocalSort(window) &&
+          exactRankOneAlias(filter.condition, window).nonEmpty =>
+      val rankAlias = exactRankOneAlias(filter.condition, window).get
+      val sort = window.child.asInstanceOf[SortExecTransformer]
+      retainMatchingFinalGroupLimit(sort.child, window, numPartitions).map {
+        case (finalGroupLimit, insertedExchange) =>
+          val rankOne = rankAlias.copy(child = Literal.create(1, rankAlias.dataType))(
+            rankAlias.exprId,
+            rankAlias.qualifier,
+            rankAlias.explicitMetadata,
+            rankAlias.nonInheritableMetadataKeys)
+          ProjectExecTransformer(finalGroupLimit.output :+ rankOne, finalGroupLimit) ->
+            insertedExchange
+      }
+    case _ => None
+  }
+
+  private def exactRankOneAlias(
+      condition: Expression,
+      window: WindowExecTransformer): Option[Alias] = {
+    window.windowExpression match {
+      case Seq(rankAlias @ Alias(WindowExpression(_: Rank, _), _))
+          if isRankOnePredicate(condition, rankAlias.toAttribute) =>
+        Some(rankAlias)
+      case _ => None
+    }
+  }
+
+  private def isRankOnePredicate(condition: Expression, rankAttribute: Attribute): Boolean = {
+    condition match {
+      case EqualTo(attribute: Attribute, literal: Literal) =>
+        attribute.semanticEquals(rankAttribute) && isIntegralOne(literal)
+      case EqualTo(literal: Literal, attribute: Attribute) =>
+        attribute.semanticEquals(rankAttribute) && isIntegralOne(literal)
+      case _ => false
+    }
+  }
+
+  private def isIntegralOne(literal: Literal): Boolean = {
+    literal.value match {
+      case value: Byte => value == 1
+      case value: Short => value == 1
+      case value: Int => value == 1
+      case value: Long => value == 1L
+      case _ => false
+    }
+  }
+
+  private def retainMatchingFinalGroupLimit(
+      child: SparkPlan,
+      window: WindowExecTransformer,
+      numPartitions: Int): Option[(SparkPlan, Boolean)] = child match {
+    case groupLimit: WindowGroupLimitExecTransformer
+        if groupLimit.limit == 1 &&
+          groupLimit.mode == GlutenFinal &&
+          matchesWindow(groupLimit, window) =>
+      stripMatchingPartialGroupLimit(groupLimit.child, window).flatMap {
+        withoutPartial =>
+          val partitionReferences = window.partitionSpec.foldLeft(AttributeSet.empty) {
+            case (references, expression) => references ++ expression.references
+          }
+          if (!partitionReferences.subsetOf(AttributeSet(withoutPartial.output))) {
+            None
+          } else {
+            val hasDistribution =
+              hasCompatibleNativeHashDistribution(withoutPartial, window.partitionSpec)
+            val distributedChild =
+              if (hasDistribution) {
+                withoutPartial
+              } else {
+                ColumnarShuffleExchangeExec(
+                  HashPartitioning(window.partitionSpec, math.max(1, numPartitions)),
+                  withoutPartial,
+                  ENSURE_REQUIREMENTS,
+                  withoutPartial.output,
+                  None)
+              }
+            Some(groupLimit.withNewChildren(Seq(distributedChild)) -> !hasDistribution)
+          }
+      }
+    case project: ProjectExecTransformer if project.projectList.forall(_.deterministic) =>
+      retainMatchingFinalGroupLimit(project.child, window, numPartitions).map {
+        case (rewrittenChild, insertedExchange) =>
+          project.withNewChildren(Seq(rewrittenChild)) -> insertedExchange
+      }
+    case project: ProjectExec if project.projectList.forall(_.deterministic) =>
+      retainMatchingFinalGroupLimit(project.child, window, numPartitions).map {
+        case (rewrittenChild, insertedExchange) =>
+          project.withNewChildren(Seq(rewrittenChild)) -> insertedExchange
+      }
+    case _ => None
   }
 
   private def hasRequiredLocalSort(window: WindowExecTransformer): Boolean = {

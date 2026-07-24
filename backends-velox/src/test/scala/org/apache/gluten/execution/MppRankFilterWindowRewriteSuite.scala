@@ -69,6 +69,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
 
     assert(rewritten eq plan)
     assert(stats.rewrittenWindows == 0)
+    assert(stats.fusedRankFilters == 0)
     assert(stats.insertedHashExchanges == 0)
   }
 
@@ -82,6 +83,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     val (rewritten, stats) = MppRankFilterWindowRewrite(plan, enabled = true, numPartitions = 4)
 
     assert(stats.rewrittenWindows == 3)
+    assert(stats.fusedRankFilters == 0)
     assert(stats.insertedHashExchanges == 3)
     assert(rewritten.collect { case _: WindowExecTransformer => 1 }.size == 3)
     assert(rewritten.collect { case _: FilterExecTransformer => 1 }.size == 3)
@@ -94,12 +96,46 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(exchanges.forall(_.outputPartitioning.isInstanceOf[HashPartitioning]))
   }
 
-  test("rank uses the Window path when its local ordering is complete") {
+  test("exact rank one uses Final TopN as the semantic operator") {
     val plan =
       rankFilterBranch("rank", includeExchange = false, options = BranchOptions(rankKind = "rank"))
+    val originalOutputExprIds = plan.output.map(_.exprId)
+    val (rewritten, stats) = MppRankFilterWindowRewrite(plan, enabled = true, numPartitions = 4)
+
+    assert(stats.rewrittenWindows == 0)
+    assert(stats.fusedRankFilters == 1)
+    assert(stats.insertedHashExchanges == 1)
+    assert(rewritten.collect { case _: WindowExecTransformer => 1 }.isEmpty)
+    assert(rewritten.collect { case _: SortExecTransformer => 1 }.isEmpty)
+    assert(rewritten.collect { case _: FilterExecTransformer => 1 }.isEmpty)
+    val groupLimits =
+      rewritten.collect { case groupLimit: WindowGroupLimitExecTransformer => groupLimit }
+    assert(groupLimits.size == 1)
+    assert(groupLimits.head.mode == GlutenFinal)
+    assert(groupLimits.head.rankLikeFunction.isInstanceOf[Rank])
+    assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
+    val outputProject = rewritten.asInstanceOf[ProjectExecTransformer]
+    outputProject.projectList.last match {
+      case Alias(literal: Literal, "rank_rank") => assert(literal.value == 1)
+      case other => fail(s"Expected a literal rank output, found $other")
+    }
+  }
+
+  test("a non-one rank predicate retains the semantic Window path") {
+    val original =
+      rankFilterBranch(
+        "rank_two",
+        includeExchange = false,
+        options = BranchOptions(rankKind = "rank"))
+        .asInstanceOf[FilterExecTransformer]
+    val window = original.child.asInstanceOf[WindowExecTransformer]
+    val rankAttribute = window.windowExpression.head.toAttribute
+    val plan = original.copy(condition = EqualTo(rankAttribute, Literal(2)))
+
     val (rewritten, stats) = MppRankFilterWindowRewrite(plan, enabled = true, numPartitions = 4)
 
     assert(stats.rewrittenWindows == 1)
+    assert(stats.fusedRankFilters == 0)
     assert(rewritten.collect { case _: WindowExecTransformer => 1 }.size == 1)
     assert(rewritten.collect { case _: WindowGroupLimitExecTransformer => 1 }.isEmpty)
   }
