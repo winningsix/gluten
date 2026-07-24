@@ -29,10 +29,7 @@ import org.apache.iceberg.types.TypeUtil
 
 abstract class AbstractIcebergWriteExec extends IcebergWriteExec {
 
-  override protected def executeColumnarForWrite(): RDD[ColumnarBatch] = query match {
-    case mpp: MppNativeQueryExec => mpp.executeColumnarForGpuSink()
-    case _ => query.executeColumnar()
-  }
+  override protected def executeColumnarForWrite(): RDD[ColumnarBatch] = query.executeColumnar()
 
   // the writer factory works for both batch and streaming
   private def createIcebergDataWriteFactory(schema: StructType): IcebergDataWriteFactory = {

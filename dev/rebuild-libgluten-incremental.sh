@@ -111,8 +111,8 @@ fi
 # refactored symbols are present we can grow this list as the refactor settles.
 echo "==> JNI symbol sanity check"
 for sym in \
-  Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery \
-  Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeStartMppQuery \
+  Java_org_apache_gluten_vectorized_UcxShuffleJniWrapper_nativeGetListenerPort \
+  Java_org_apache_gluten_vectorized_UcxShuffleJniWrapper_nativeOpenReader \
   ; do
   if ! nm -D "$OUT_LIB" 2>/dev/null | awk -v sym="$sym" '$2 == "T" && $3 == sym { found = 1 } END { exit !found }'; then
     echo "fatal: expected JNI symbol absent: $sym" >&2

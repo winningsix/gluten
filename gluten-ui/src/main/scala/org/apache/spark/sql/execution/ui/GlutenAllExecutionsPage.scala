@@ -225,7 +225,6 @@ private[ui] class GlutenExecutionPagedTable(
       }
       concat.append("\n\n")
       concat.append(execution.fallbackDescription)
-      appendMppPlanDetails(execution, concat)
 
       <span onclick="this.parentNode.querySelector('.stage-details').classList.toggle('collapsed')"
             class="expand-details">
@@ -246,47 +245,6 @@ private[ui] class GlutenExecutionPagedTable(
     }
 
     <div>{desc}{details}</div>
-  }
-
-  private def appendMppPlanDetails(
-      execution: GlutenSQLExecutionUIData,
-      concat: PlanStringConcat): Unit = {
-    val mppPlan = execution.mppPlan
-    if (mppPlan == null) {
-      return
-    }
-
-    concat.append("\n\n== MPP Final Velox Plan ==\n")
-    concat.append(s"Query ID: ${mppPlan.queryId}\n")
-    concat.append(s"Spark SQL page: ${executionURL(execution.executionId)}\n")
-    concat.append(s"Fragments: ${mppPlan.numFragments}, Exchanges: ${mppPlan.numExchanges}\n")
-    if (mppPlan.dumpPath != null && mppPlan.dumpPath.nonEmpty) {
-      concat.append(s"Substrait dump path: ${mppPlan.dumpPath}\n")
-    }
-    concat.append(s"Capture enabled: ${mppPlan.captureEnabled}\n")
-    concat.append(s"Original chars: ${mppPlan.totalOriginalCharCount}\n")
-    if (mppPlan.planSha256 != null && mppPlan.planSha256.nonEmpty) {
-      concat.append(s"Plan sha256: ${mppPlan.planSha256}\n")
-    }
-    if (mppPlan.truncated) {
-      concat.append("Plan text was truncated for event-log size control.\n")
-    }
-    if (mppPlan.captureError != null && mppPlan.captureError.nonEmpty) {
-      concat.append(s"Capture error: ${mppPlan.captureError}\n")
-    }
-    if (mppPlan.fragments == null || mppPlan.fragments.isEmpty) {
-      concat.append("No final Velox plan text captured.\n")
-      return
-    }
-    mppPlan.fragments.foreach {
-      fragment =>
-        concat.append(
-          s"\n-- Fragment ${fragment.fragmentId} " +
-            s"(chars=${fragment.originalCharCount}, truncated=${fragment.truncated}, " +
-            s"sha256=${fragment.sha256}) --\n")
-        concat.append(fragment.plan)
-        concat.append("\n")
-    }
   }
 
   private def executionURL(executionID: Long): String =

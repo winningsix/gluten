@@ -335,7 +335,6 @@ object OffloadOthers {
                 reason =>
                   rowTransformer.setTagValue(ARROW_SCALAR_NORMALIZATION_REJECTION_TAG, reason)
                   logWarning(reason)
-                  failStrictMppOnArrowNormalizationRejection(reason)
               }
               rowTransformer
           }
@@ -457,19 +456,6 @@ object OffloadOthers {
         // The pre-project columns are implementation details. Restore BatchEvalPythonExec's
         // original output so callers never observe them above the Arrow boundary.
         ProjectExecTransformer(plan.output, arrowExec)
-      }
-    }
-
-    private def failStrictMppOnArrowNormalizationRejection(reason: String): Unit = {
-      val conf = SQLConf.get
-      if (
-        conf.getConfString("spark.gluten.mpp.enabled", "false").toBoolean &&
-        conf.getConfString("spark.gluten.mpp.failOnFallback", "false").toBoolean
-      ) {
-        // EvalPythonExecTransformer validation falls back to Spark's original
-        // BatchEvalPythonExec, which cannot retain the transformer tag. Fail here while the
-        // precise semantic reason is still available.
-        throw new IllegalStateException(reason)
       }
     }
 

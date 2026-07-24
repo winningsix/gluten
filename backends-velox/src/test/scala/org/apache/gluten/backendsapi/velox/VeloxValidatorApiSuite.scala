@@ -18,7 +18,7 @@ package org.apache.gluten.backendsapi.velox
 
 import org.apache.gluten.execution.ValidationResult
 
-import org.apache.gluten.shaded.com.google.protobuf.ByteString
+import com.google.protobuf.ByteString
 import org.scalatest.funsuite.AnyFunSuite
 
 class VeloxValidatorApiSuite extends AnyFunSuite {

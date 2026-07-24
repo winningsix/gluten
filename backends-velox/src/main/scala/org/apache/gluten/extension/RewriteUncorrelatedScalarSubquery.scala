@@ -17,7 +17,7 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.backendsapi.BackendsApiManager
-import org.apache.gluten.execution.{BasicScanExecTransformer, ColumnarToColumnarExec, ColumnarToRowExecBase, FilterExecTransformer, FilterExecTransformerBase, MppNativeQueryExec, MppPreparedChildExec, ProjectExecTransformer, TransformSupport}
+import org.apache.gluten.execution.{BasicScanExecTransformer, ColumnarToColumnarExec, ColumnarToRowExecBase, FilterExecTransformer, FilterExecTransformerBase, ProjectExecTransformer, TransformSupport}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression, NamedExpression}
@@ -27,8 +27,6 @@ import org.apache.spark.sql.catalyst.plans.physical.IdentityBroadcastMode
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.internal.SQLConf
-
-import java.util.Locale
 
 /**
  * Presto-style rewrite of uncorrelated [[ScalarSubquery]] references into an inner
@@ -40,11 +38,7 @@ import java.util.Locale
  * materialize into a single-value literal before the main plan runs -- that value is then plugged
  * into the filter via [[org.apache.gluten.expression.ScalarSubqueryTransformer]].
  *
- * Keeping the subquery on the driver means:
- *   - the outer plan stays out of MPP until we whitelist the enclosing Filter/Project (S8 patch);
- *   - the subquery itself never runs on GPU even when MPP claims the outer plan.
- *
- * This rule removes both gaps by transforming, for each qualifying Filter/Project node:
+ * This rule keeps the subquery on GPU by transforming each qualifying Filter/Project node:
  * {{{
  *     Filter(cond, child)                                    [cond refs ScalarSubquery(q)]
  *       =>
@@ -62,15 +56,9 @@ import java.util.Locale
  * (and the driver-side caller) sees the same attributes. The scalar is introduced strictly inside
  * the Filter/Project replacement.
  *
- * In the legacy MPP path, reused subqueries share a single broadcast. Spark's
- * [[ReusedSubqueryExec]] wraps the original [[org.apache.spark.sql.execution.SubqueryExec]]; we
- * key the shared broadcast on the inner subquery child's canonicalized form so multiple
- * [[ScalarSubquery]] expressions against the same physical plan collapse to one
- * [[ColumnarBroadcastExchangeExec]].
- *
- * The pipelined UCX path deliberately builds an independent broadcast and nested shuffle tree for
- * each consumer. UCX destination queues currently have one destructive sequence space, so sharing
- * a scalar producer between two downstream filters would let one consumer steal the other's data.
+ * Every consumer gets an independent broadcast and nested shuffle tree. UCX destination queues
+ * currently have one destructive sequence space, so sharing a scalar producer between two
+ * downstream filters would let one consumer steal the other's data.
  *
  * Correlated scalar subqueries and other [[PlanExpression]] flavours (DynamicPruning,
  * InSubqueryExec, ...) are left alone -- they either don't reach this layer or need different
@@ -82,69 +70,43 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
   private val PIPELINED_SHUFFLE_ENABLED = "spark.sql.shuffle.pipelined.enabled"
   private val PIPELINED_STREAMING_BROADCAST_ENABLED =
     "spark.gluten.sql.columnar.pipelined.streamingBroadcast.enabled"
-  private val MPP_ENABLED = "spark.gluten.mpp.enabled"
-
-  /**
-   * Apply the rewrite to every Filter/Project in the plan tree that has an uncorrelated
-   * [[ScalarSubquery]] in its expressions. A shared cache ensures identical subqueries reuse the
-   * same broadcast across the whole plan.
-   */
-  def apply(plan: SparkPlan): SparkPlan =
-    rewrite(plan, rewriteRuntimeBloomFilter = false)
-
   /**
    * Moves scalar subqueries, including runtime Bloom filters, into a pipelined query DAG.
    *
    * The following streaming-broadcast rule replaces the temporary broadcast boundary with a
-   * replicated UCX exchange. Keep this path opt-in and separate from MPP, whose runtime Bloom
-   * handling intentionally remains driver-materialized.
+   * replicated UCX exchange.
    */
   def applyPipelined(plan: SparkPlan): SparkPlan = {
     val conf = SQLConf.get
     val enabled =
       conf.getConfString(PIPELINED_SCALAR_SUBQUERY_ENABLED, "false").toBoolean &&
         conf.getConfString(PIPELINED_SHUFFLE_ENABLED, "false").toBoolean &&
-        conf.getConfString(PIPELINED_STREAMING_BROADCAST_ENABLED, "false").toBoolean &&
-        !conf.getConfString(MPP_ENABLED, "false").toBoolean
+        conf.getConfString(PIPELINED_STREAMING_BROADCAST_ENABLED, "false").toBoolean
     if (enabled) {
-      rewrite(plan, rewriteRuntimeBloomFilter = true)
+      rewrite(plan)
     } else {
       plan
     }
   }
 
-  private def rewrite(
-      plan: SparkPlan,
-      rewriteRuntimeBloomFilter: Boolean): SparkPlan = {
-    val broadcastCache = new BroadcastCache
+  private def rewrite(plan: SparkPlan): SparkPlan = {
     plan.transformUp {
       case f: FilterExec if hasUncorrelatedScalarSubquery(f.condition) =>
-        rewriteFilter(f, broadcastCache, rewriteRuntimeBloomFilter)
+        rewriteFilter(f)
       case p: ProjectExec if p.projectList.exists(hasUncorrelatedScalarSubquery) =>
-        rewriteProject(p, broadcastCache, rewriteRuntimeBloomFilter)
-      // By the time MppCollapseRule (Post rule) sees the plan, Gluten's HeuristicTransform /
-      // OffloadOthers has already converted vanilla FilterExec / ProjectExec carrying
-      // ScalarSubquery into their transformer variants -- ScalarSubquery IS a supported
-      // expression in ExpressionConverter, so offload succeeds. Match those too.
+        rewriteProject(p)
       case f: FilterExecTransformerBase if hasUncorrelatedScalarSubquery(f.cond) =>
-        rewriteFilterTransformer(f, broadcastCache, rewriteRuntimeBloomFilter)
+        rewriteFilterTransformer(f)
       case p: ProjectExecTransformer if p.projectList.exists(hasUncorrelatedScalarSubquery) =>
-        rewriteProjectTransformer(p, broadcastCache, rewriteRuntimeBloomFilter)
+        rewriteProjectTransformer(p)
     }
   }
 
-  private def rewriteFilterTransformer(
-      filter: FilterExecTransformerBase,
-      cache: BroadcastCache,
-      rewriteRuntimeBloomFilter: Boolean): SparkPlan = {
+  private def rewriteFilterTransformer(filter: FilterExecTransformerBase): SparkPlan = {
     val subqueries = collectUncorrelatedScalarSubqueries(filter.cond)
     val scalarFreeChild = stripRewrittenScalarPushdowns(filter.child, subqueries)
     val (joinedChild, replacements) =
-      buildBroadcastStack(
-        scalarFreeChild,
-        subqueries,
-        cache,
-        rewriteRuntimeBloomFilter)
+      buildBroadcastStack(scalarFreeChild, subqueries)
     if (replacements.isEmpty) return filter
     val rewrittenCondition = replaceScalarSubqueries(filter.cond, replacements)
     val newFilter = FilterExecTransformer(rewrittenCondition, joinedChild)
@@ -152,17 +114,10 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
     ProjectExecTransformer(restoringProjectList, newFilter)
   }
 
-  private def rewriteProjectTransformer(
-      project: ProjectExecTransformer,
-      cache: BroadcastCache,
-      rewriteRuntimeBloomFilter: Boolean): SparkPlan = {
+  private def rewriteProjectTransformer(project: ProjectExecTransformer): SparkPlan = {
     val subqueries = project.projectList.flatMap(collectUncorrelatedScalarSubqueries).distinct
     val (joinedChild, replacements) =
-      buildBroadcastStack(
-        project.child,
-        subqueries,
-        cache,
-        rewriteRuntimeBloomFilter)
+      buildBroadcastStack(project.child, subqueries)
     if (replacements.isEmpty) return project
     val rewritten = project.projectList.map(
       e => replaceScalarSubqueries(e, replacements).asInstanceOf[NamedExpression])
@@ -175,18 +130,11 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
    * The restoring [[ProjectExecTransformer]] on top re-projects the original filter output so
    * callers never see the scalar column.
    */
-  private def rewriteFilter(
-      filter: FilterExec,
-      cache: BroadcastCache,
-      rewriteRuntimeBloomFilter: Boolean): SparkPlan = {
+  private def rewriteFilter(filter: FilterExec): SparkPlan = {
     val subqueries = collectUncorrelatedScalarSubqueries(filter.condition)
     val scalarFreeChild = stripRewrittenScalarPushdowns(filter.child, subqueries)
     val (joinedChild, replacements) =
-      buildBroadcastStack(
-        scalarFreeChild,
-        subqueries,
-        cache,
-        rewriteRuntimeBloomFilter)
+      buildBroadcastStack(scalarFreeChild, subqueries)
     if (replacements.isEmpty) {
       // All subqueries were correlated / unsupported; leave the node for the fallback path.
       return filter
@@ -194,8 +142,7 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
     val rewrittenCondition = replaceScalarSubqueries(filter.condition, replacements)
     val newFilter = FilterExecTransformer(rewrittenCondition, joinedChild)
     // Strip the scalar columns introduced by the BNLJ so the filter's callers see the original
-    // output schema. ProjectExecTransformer is a plain TransformSupport, so MppCollapseRule will
-    // absorb it into the native fragment alongside the filter and the BNLJ.
+    // output schema.
     val restoringProjectList: Seq[NamedExpression] = filter.output.map(a => a: NamedExpression)
     ProjectExecTransformer(restoringProjectList, newFilter)
   }
@@ -205,7 +152,7 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
    * pushDownFilters. When this rule later replaces a ScalarSubquery conjunct with a broadcast
    * attribute, the copied scan predicate otherwise keeps the original ScalarSubquery alive. Spark
    * then materializes that stale copy even though the rewritten filter computes the same predicate
-   * inside the main MPP graph.
+   * inside the main native graph.
    *
    * Remove only pushdown predicates containing a scalar that this filter is about to rewrite. The
    * enclosing filter remains in place with the equivalent broadcast-attribute predicate, so this
@@ -245,17 +192,10 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
    * The projection itself produces the final output schema (including any attributes the rewritten
    * expressions reference), so no extra restoring project is needed.
    */
-  private def rewriteProject(
-      project: ProjectExec,
-      cache: BroadcastCache,
-      rewriteRuntimeBloomFilter: Boolean): SparkPlan = {
+  private def rewriteProject(project: ProjectExec): SparkPlan = {
     val subqueries = project.projectList.flatMap(collectUncorrelatedScalarSubqueries).distinct
     val (joinedChild, replacements) =
-      buildBroadcastStack(
-        project.child,
-        subqueries,
-        cache,
-        rewriteRuntimeBloomFilter)
+      buildBroadcastStack(project.child, subqueries)
     if (replacements.isEmpty) {
       return project
     }
@@ -277,9 +217,7 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
    */
   private def buildBroadcastStack(
       child: SparkPlan,
-      subqueries: Seq[ScalarSubquery],
-      cache: BroadcastCache,
-      rewriteRuntimeBloomFilter: Boolean): (SparkPlan, Map[ScalarSubquery, AttributeReference]) = {
+      subqueries: Seq[ScalarSubquery]): (SparkPlan, Map[ScalarSubquery, AttributeReference]) = {
     val replacements = scala.collection.mutable.Map[ScalarSubquery, AttributeReference]()
     var current: SparkPlan = child
 
@@ -307,29 +245,15 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
       // wrapping the real native plan -- the driver-side eval() path needs rows. For the
       // broadcast side we want the underlying TransformSupport, so peel row/columnar shims.
       val innerPlan = peelColumnarWrappers(innerExec.child)
-      if (isRuntimeBloomFilterSubquery(innerExec.child) && !rewriteRuntimeBloomFilter) {
-        // Runtime-DPP bloom filters are already driven by materializeScalarSubqueries.
-        // Keeping them materialized avoids embedding a SINGLE->BROADCAST bloom producer
-        // chain inside the main multi-peer MPP graph, which can leave Q21 waiting on
-        // cross-peer broadcast/SINGLE completion. Ordinary scalar subqueries still use
-        // the exchange-based rewrite.
-        logDebug(
-          "RewriteUncorrelatedScalarSubquery: leaving runtime bloom-filter scalar " +
-            "subquery for materializeScalarSubqueries")
-      } else if (!innerPlan.isInstanceOf[TransformSupport]) {
+      if (!innerPlan.isInstanceOf[TransformSupport]) {
         logWarning(
           "RewriteUncorrelatedScalarSubquery: leaving ScalarSubquery unrewritten because " +
             s"its inner plan root is not TransformSupport: ${innerPlan.getClass.getSimpleName}")
         abort = true
       } else {
-        val exchange =
-          if (rewriteRuntimeBloomFilter) {
-            ColumnarBroadcastExchangeExec(
-              IdentityBroadcastMode,
-              duplicatePipelinedShuffleBoundaries(innerPlan))
-          } else {
-            cache.getOrBuild(innerPlan)
-          }
+        val exchange = ColumnarBroadcastExchangeExec(
+          IdentityBroadcastMode,
+          duplicatePipelinedShuffleBoundaries(innerPlan))
         // Use the exchange's actual output attribute, not the current subquery plan's attribute.
         // Spark may create several ScalarSubquery instances with different exprIds for the same
         // canonicalized plan; rewritten predicates must bind to the exchange selected above.
@@ -337,20 +261,10 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
           case ar: AttributeReference => ar
           case other => other.toAttribute.asInstanceOf[AttributeReference]
         }
-        // The pipelined rule replaces this broadcast boundary with a regular replicated shuffle.
-        // Leave that exchange unwrapped so the later collapse rule can insert an input iterator
-        // against the final plan shape. The MPP path still needs an immediately transformable
-        // broadcast child because it consumes this join tree directly.
-        val buildInput =
-          if (rewriteRuntimeBloomFilter) {
-            exchange
-          } else {
-            ColumnarCollapseTransformStages.wrapInputIteratorTransformer(exchange)
-          }
         val bnlj = BackendsApiManager.getSparkPlanExecApiInstance
           .genBroadcastNestedLoopJoinExecTransformer(
             left = current,
-            right = buildInput,
+            right = exchange,
             buildSide = BuildRight,
             joinType = Inner,
             condition = None)
@@ -409,11 +323,6 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
     // access is not possible -- but it extends UnaryExecNode, so children.head is the child.
     case c2r: ColumnarToRowExecBase => peelColumnarWrappers(c2r.children.head)
     case c2c: ColumnarToColumnarExec => peelColumnarWrappers(c2c.child)
-    // MppCollapseRule wraps already-collapsed subquery plans in MppNativeQueryExec before the
-    // outer plan's rewrite runs. Peel it so we reach the underlying TransformSupport tree that
-    // we can wrap in a ColumnarBroadcastExchangeExec on the broadcast side.
-    case mpp: MppNativeQueryExec => peelColumnarWrappers(mpp.child)
-    case prepared: MppPreparedChildExec => peelColumnarWrappers(prepared.hiddenPlan)
     case other => other
   }
 
@@ -422,26 +331,6 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
     // expressions (decorrelation would have pulled them out) or as a LateralSubquery marker.
     // We also treat anything Spark labels a PlanExpression with non-empty children as correlated.
     sq.children.isEmpty
-  }
-
-  private def isRuntimeBloomFilterSubquery(plan: SparkPlan): Boolean = {
-    var found = false
-    plan.foreach {
-      node =>
-        if (node.output.exists(_.name.toLowerCase(Locale.ROOT).contains("bloomfilter"))) {
-          found = true
-        }
-        if (
-          node.expressions.exists {
-            expr =>
-              val text = expr.toString.toLowerCase(Locale.ROOT)
-              text.contains("bloom_filter_agg") || text.contains("velox_bloom_filter_agg")
-          }
-        ) {
-          found = true
-        }
-    }
-    found
   }
 
   /**
@@ -459,23 +348,6 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
     case other => other
   }
 
-  /**
-   * Cache mapping a canonicalized subquery child plan to the [[ColumnarBroadcastExchangeExec]] that
-   * should broadcast it. Reusing the same object across every BNLJ we build lets downstream Spark
-   * reuse logic (`ReuseExchangeAndSubquery`) dedup identical broadcasts automatically, and also
-   * keeps our BNLJ-per-subquery count in sync with how many ColumnarBroadcastExchangeExec instances
-   * end up in the fragment graph.
-   */
-  final private class BroadcastCache {
-    private val byCanonicalized =
-      scala.collection.mutable.HashMap[SparkPlan, ColumnarBroadcastExchangeExec]()
-
-    def getOrBuild(innerPlan: SparkPlan): ColumnarBroadcastExchangeExec = {
-      byCanonicalized.getOrElseUpdate(
-        innerPlan.canonicalized,
-        ColumnarBroadcastExchangeExec(IdentityBroadcastMode, innerPlan))
-    }
-  }
 }
 
 case class PipelinedScalarSubqueryRule() extends Rule[SparkPlan] {

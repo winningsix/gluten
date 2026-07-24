@@ -31,7 +31,6 @@ import org.apache.spark.sql.connector.catalog.Table
 import org.apache.spark.sql.connector.read.Scan
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.execution.metric.SQLMetrics
-import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{ArrayType, DataType, StructType}
 
 import org.apache.iceberg.{BaseTable, MetadataColumns, Schema, SnapshotSummary, TableProperties}
@@ -66,56 +65,7 @@ case class IcebergScanTransformer(
   // So use Metric to get NumSplits, NumDeletes is not reported by native metric
   private val numSplits = SQLMetrics.createMetric(sparkContext, new NumSplits().description())
 
-  @transient override protected lazy val finalPartitions: Seq[Partition] = {
-    coalesceIcebergInputPartitions(planFinalPartitions())
-  }
-
-  private def coalesceIcebergInputPartitions(planned: Seq[Partition]): Seq[Partition] = {
-    val inputPartitionGroups = planned.map {
-      case partition: SparkDataSourceRDDPartition => partition.inputPartitions
-      case _ => return planned
-    }
-
-    val conf = SQLConf.get
-    val mppEnabled = conf
-      .getConfString("spark.gluten.mpp.enabled", "false")
-      .equalsIgnoreCase("true")
-    val singleTaskMode = !conf
-      .getConfString("spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode", "false")
-      .equalsIgnoreCase("false")
-    val targetBytes = conf.filesMaxPartitionBytes
-    val openCostInBytes = conf.filesOpenCostInBytes
-
-    val coalesced = InputPartitionCoalescer.coalesceAdjacentIfSupported(
-      inputPartitionGroups,
-      targetBytes,
-      InputPartitionCoalescer.Eligibility(
-        mppEnabled,
-        singleTaskMode,
-        outputPartitioning,
-        outputOrdering.nonEmpty,
-        keyGroupedPartitioning.isDefined,
-        commonPartitionValues.isDefined,
-        applyPartialClustering || replicatePartitions
-      )
-    )(
-      inputPartition =>
-        GlutenIcebergSourceUtil.inputPartitionPlanningInfo(inputPartition, openCostInBytes))
-
-    if (coalesced.size == inputPartitionGroups.size) {
-      planned
-    } else {
-      logInfo(
-        s"Coalesced ${inputPartitionGroups.size} Iceberg V2 scan partitions " +
-          s"(${inputPartitionGroups.map(_.size).sum} input partitions) into " +
-          s"${coalesced.size} partitions with targetBytes=$targetBytes and " +
-          s"openCostInBytes=$openCostInBytes.")
-      coalesced.zipWithIndex.map {
-        case (inputPartitions, index) =>
-          new SparkDataSourceRDDPartition(index, inputPartitions)
-      }
-    }
-  }
+  @transient override protected lazy val finalPartitions: Seq[Partition] = planFinalPartitions()
 
   override def withNewPushdownFilters(filters: Seq[Expression]): BatchScanExecTransformerBase = {
     this.copy(pushDownFilters = Some(filters))

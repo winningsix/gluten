@@ -1799,10 +1799,9 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
     val blockedWriters = queryBlockedWriters(query)
     val backpressured = updateQueryBackpressure(query, queuedBytes)
 
-    // Like MppQueryCoordinator, start the full downstream drain chain before releasing bulk
-    // producers. A writer below the frontier is also a reader of an upstream exchange. Blocking
-    // any deeper level can leave most exchange partitions undrained and turn streaming execution
-    // into a stage fence.
+    // Start the full downstream drain chain before releasing bulk producers. A writer below the
+    // frontier is also a reader of an upstream exchange. Blocking any deeper level can leave most
+    // exchange partitions undrained and turn streaming execution into a stage fence.
     val downstreamDrain =
       frontierDepth.exists(depth => writerDepth > depth)
     val hasUnfinishedDirectDownstream =

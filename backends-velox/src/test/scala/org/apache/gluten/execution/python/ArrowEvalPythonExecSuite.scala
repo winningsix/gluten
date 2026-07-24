@@ -16,7 +16,7 @@
  */
 package org.apache.gluten.execution.python
 
-import org.apache.gluten.execution.{MppNativeQueryExec, WholeStageTransformerSuite}
+import org.apache.gluten.execution.WholeStageTransformerSuite
 import org.apache.gluten.vectorized.ArrowWritableColumnVector
 
 import org.apache.spark.SparkConf
@@ -401,55 +401,6 @@ class ArrowEvalPythonExecSuite extends WholeStageTransformerSuite {
       assert(!plan.exists(_.isInstanceOf[BatchEvalPythonExec]), plan.mkString("\n"))
       assert(actual == rowReference)
       assert(actual.head.isNullAt(0))
-    }
-  }
-
-  testWithMaxSparkVersion("strict MPP reports nullable ordinary Arrow UDF semantic guard", "4.0") {
-    assume(SparkVersionUtil.gteSpark35, "ordinary scalar Arrow UDF eval type requires Spark 3.5+")
-    withSQLConf(
-      "spark.sql.execution.pythonUDF.arrow.enabled" -> "true",
-      "spark.gluten.sql.columnar.arrowUdf" -> "true",
-      "spark.gluten.sql.columnar.arrowUdf.nullPreservingInput" -> "false",
-      "spark.gluten.mpp.enabled" -> "true",
-      "spark.gluten.mpp.strategy.enabled" -> "false",
-      "spark.gluten.mpp.failOnFallback" -> "true"
-    ) {
-      val base = Seq[String](null, "value").toDF("payload")
-      val df = base.select(ordinaryPythonUDFString(base("payload")).as("decoded"))
-
-      val error = intercept[IllegalStateException] {
-        df.queryExecution.executedPlan
-      }
-      assert(error.getMessage.contains("ordinary Arrow UDF semantic guard"), error.getMessage)
-      assert(error.getMessage.contains("nullable input"), error.getMessage)
-    }
-  }
-
-  testWithMaxSparkVersion(
-    "strict MPP treats ColumnarArrowEvalPythonExec as intentional columnar B1 boundary",
-    "4.0") {
-    assume(SparkVersionUtil.gteSpark35, "ordinary scalar Arrow UDF eval type requires Spark 3.5+")
-    withSQLConf(
-      "spark.sql.execution.pythonUDF.arrow.enabled" -> "true",
-      "spark.gluten.sql.columnar.arrowUdf" -> "true",
-      "spark.gluten.mpp.enabled" -> "true",
-      "spark.gluten.mpp.strategy.enabled" -> "false",
-      "spark.gluten.mpp.failOnFallback" -> "true"
-    ) {
-      // ColumnarRange is a separate external-ingress limitation (Job381). Use a native Parquet
-      // scan here so this test isolates the intentional ColumnarArrow Python B1 boundary.
-      val tableDir = getClass.getResource(resourcePath).getFile
-      val base = spark.read.parquet(new File(tableDir, "part").getAbsolutePath)
-      val df = base.select(ordinaryPythonUDFString(lit("safe")).as("decoded"))
-      val plan = df.queryExecution.executedPlan
-      val arrowStages = plan.collect { case stage: ColumnarArrowEvalPythonExec => stage }
-
-      assert(arrowStages.size == 1, plan.treeString)
-      assert(arrowStages.head.collect { case _: MppNativeQueryExec => 1 }.nonEmpty, plan.treeString)
-      val pythonBoundaryTree = arrowStages.head.treeString
-      assert(!pythonBoundaryTree.contains("BatchEvalPythonExec"), pythonBoundaryTree)
-      assert(!pythonBoundaryTree.contains("RowToVeloxColumnarExec"), pythonBoundaryTree)
-      assert(!pythonBoundaryTree.contains("ColumnarToRow"), pythonBoundaryTree)
     }
   }
 

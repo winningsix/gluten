@@ -35,8 +35,8 @@ import org.apache.spark.task.TaskResources
 
 import com.google.common.cache.{Cache, CacheBuilder}
 import com.google.common.util.concurrent.{ExecutionError, UncheckedExecutionException}
+import com.google.protobuf.ByteString
 import io.substrait.proto.SimpleExtensionDeclaration
-import org.apache.gluten.shaded.com.google.protobuf.ByteString
 
 import java.util.concurrent.{Callable, ExecutionException}
 

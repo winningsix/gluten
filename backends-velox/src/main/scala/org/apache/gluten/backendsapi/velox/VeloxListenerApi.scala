@@ -30,9 +30,6 @@ import org.apache.gluten.memory.{MemoryUsageRecorder, SimpleMemoryUsageRecorder}
 import org.apache.gluten.memory.listener.ReservationListener
 import org.apache.gluten.memory.memtarget.MemoryTarget
 import org.apache.gluten.monitor.VeloxMemoryProfiler
-import org.apache.gluten.mpp.control.GlutenMppDriverService
-import org.apache.gluten.mpp.control.GlutenMppExecutorService
-import org.apache.gluten.mpp.control.GlutenMppQueryControlListener
 import org.apache.gluten.udf.UdfJniWrapper
 import org.apache.gluten.utils._
 
@@ -141,14 +138,9 @@ class VeloxListenerApi extends ListenerApi with Logging {
     if (inLocalMode(conf)) {
       initializeGpuConcurrency(conf)
     }
-    GlutenMppDriverService.init(conf)
-    GlutenMppDriverService.get().foreach {
-      service => sc.addSparkListener(new GlutenMppQueryControlListener(service))
-    }
   }
 
   override def onDriverShutdown(): Unit = {
-    GlutenMppDriverService.shutdown()
     try {
       GpuMemoryTrackerJniWrapper.shutdown()
     } catch {
@@ -173,7 +165,6 @@ class VeloxListenerApi extends ListenerApi with Logging {
       // Driver already did that.
       logInfo(
         "Gluten is running with Spark local mode. Skip running static initializer for executor.")
-      GlutenMppExecutorService.onExecutorStart(pc)
       return
     }
 
@@ -181,11 +172,9 @@ class VeloxListenerApi extends ListenerApi with Logging {
     initialize(conf, isDriver = false)
     initializeGpuConcurrency(conf)
     addIfNeedMemoryDumpShutdownHook(conf)
-    GlutenMppExecutorService.onExecutorStart(pc)
   }
 
   override def onExecutorShutdown(): Unit = {
-    GlutenMppExecutorService.onExecutorShutdown()
     try {
       GpuMemoryTrackerJniWrapper.shutdown()
     } catch {

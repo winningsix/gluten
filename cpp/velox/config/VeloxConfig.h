@@ -132,34 +132,6 @@ const std::string kVeloxSsdCheckSumReadVerificationEnabled =
 const std::string kVeloxIOThreads = "spark.gluten.sql.columnar.backend.velox.IOThreads";
 const uint32_t kVeloxIOThreadsDefault = 0;
 
-// MPP local mode: collapse all fragments into one Velox Task connected via
-// LocalPartitionNode (intra-task), bypassing UcxExchange entirely. This is the
-// default path for the single-worker/local-task GPU backend. It supports
-// SINGLE/HASH/RANGE/ROUND_ROBIN via LocalPartition and BROADCAST by inlining the
-// producer plan.
-const std::string kMppSingleTaskMode =
-    "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode";
-const bool kMppSingleTaskModeDefault = true;
-
-// Per-fragment UCX output queue high-water mark.  A multi-fragment query can
-// have dozens of producers alive at once, so the old fixed 1 GiB allowance per
-// fragment can exhaust a GPU long before backpressure engages.
-const std::string kMppMaxOutputBufferSize =
-    "spark.gluten.sql.columnar.backend.velox.mpp.maxOutputBufferSize";
-const uint64_t kMppMaxOutputBufferSizeDefault = 1L << 30;
-
-// Cap on per-task driver count (= local-partition lane count) when single-
-// task mode is active. Mirrors IBM's pbench GPU deployment choice
-// (velox-testing/.../generate_presto_config.sh sets VCPU_PER_WORKER=2 for
-// GPU variant, which becomes task.max-drivers-per-task=2 in
-// config_native.properties). The reason: cuDF GPU operators saturate one
-// stream pretty effectively, so adding more drivers per task adds
-// contention (RMM mutex, cuda runtime) more than parallelism. Same number
-// also caps how many partitions a HASH/RANGE LocalPartitionNode emits in
-// single-task mode (= consumer pipeline driver count).
-const std::string kMppSingleTaskMaxDrivers =
-    "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMaxDrivers";
-const int32_t kMppSingleTaskMaxDriversDefault = 2;
 const std::string kVeloxAsyncTimeoutOnTaskStopping =
     "spark.gluten.sql.columnar.backend.velox.asyncTimeoutOnTaskStopping";
 const int32_t kVeloxAsyncTimeoutOnTaskStoppingDefault = 30000; // 30s

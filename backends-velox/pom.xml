@@ -60,12 +60,6 @@
     <spark.gluten.sql.columnar.backend.velox.cudf.hive.use-buffered-input/>
     <spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk-read-limit/>
     <spark.gluten.sql.columnar.backend.velox.parquet.reader.pass-read-limit/>
-    <spark.gluten.mpp.maxInboundExchangesPerFragment/>
-    <spark.gluten.mpp.maxHashInboundExchangesPerFragment/>
-    <spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment/>
-    <spark.gluten.mpp.forceLeftSemiBuildLeft/>
-    <spark.gluten.mpp.normalizeOuterJoinBuildSide/>
-    <spark.gluten.mpp.forceOuterJoinPreservedBuildSide/>
   </properties>
 
   <dependencies>
@@ -355,19 +349,6 @@
             <spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk-read-limit>${spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk-read-limit}</spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk-read-limit>
             <spark.gluten.sql.columnar.backend.velox.parquet.reader.pass-read-limit>${spark.gluten.sql.columnar.backend.velox.parquet.reader.pass-read-limit}</spark.gluten.sql.columnar.backend.velox.parquet.reader.pass-read-limit>
             <spark.sql.shuffle.partitions>${spark.sql.shuffle.partitions}</spark.sql.shuffle.partitions>
-            <spark.gluten.mpp.localHashExchangeTasks>${spark.gluten.mpp.localHashExchangeTasks}</spark.gluten.mpp.localHashExchangeTasks>
-            <spark.gluten.mpp.maxDriversPerFragment>${spark.gluten.mpp.maxDriversPerFragment}</spark.gluten.mpp.maxDriversPerFragment>
-            <spark.gluten.mpp.maxInboundExchangesPerFragment>${spark.gluten.mpp.maxInboundExchangesPerFragment}</spark.gluten.mpp.maxInboundExchangesPerFragment>
-            <spark.gluten.mpp.maxHashInboundExchangesPerFragment>${spark.gluten.mpp.maxHashInboundExchangesPerFragment}</spark.gluten.mpp.maxHashInboundExchangesPerFragment>
-            <spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment>${spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment}</spark.gluten.mpp.maxBroadcastInboundExchangesPerFragment>
-            <spark.gluten.mpp.q3.replicateOrdersPath>${spark.gluten.mpp.q3.replicateOrdersPath}</spark.gluten.mpp.q3.replicateOrdersPath>
-            <spark.gluten.mpp.fuseBroadcastBuilds>${spark.gluten.mpp.fuseBroadcastBuilds}</spark.gluten.mpp.fuseBroadcastBuilds>
-            <spark.gluten.mpp.normalizeJoinBuildSide>${spark.gluten.mpp.normalizeJoinBuildSide}</spark.gluten.mpp.normalizeJoinBuildSide>
-            <spark.gluten.mpp.normalizeOuterJoinBuildSide>${spark.gluten.mpp.normalizeOuterJoinBuildSide}</spark.gluten.mpp.normalizeOuterJoinBuildSide>
-            <spark.gluten.mpp.forceOuterJoinPreservedBuildSide>${spark.gluten.mpp.forceOuterJoinPreservedBuildSide}</spark.gluten.mpp.forceOuterJoinPreservedBuildSide>
-            <spark.gluten.mpp.forceLeftSemiBuildLeft>${spark.gluten.mpp.forceLeftSemiBuildLeft}</spark.gluten.mpp.forceLeftSemiBuildLeft>
-            <spark.gluten.mpp.q4ExistsLineitemDedup>${spark.gluten.mpp.q4ExistsLineitemDedup}</spark.gluten.mpp.q4ExistsLineitemDedup>
-            <spark.gluten.mpp.q21ExistsAggRewrite>${spark.gluten.mpp.q21ExistsAggRewrite}</spark.gluten.mpp.q21ExistsAggRewrite>
           </systemProperties>
         </configuration>
       </plugin>

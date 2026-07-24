@@ -16,12 +16,10 @@ def command_plan(spark, statement):
 
 
 def assert_native_write_plan(name, plan, writer):
-    required_nodes = (writer, "MppNativeQuery")
+    required_nodes = (writer,)
     missing = [node for node in required_nodes if node not in plan]
     if missing:
         raise RuntimeError(f"{name} plan is missing {missing}:\n{plan}")
-    if plan.index("MppNativeQuery") < plan.index(writer):
-        raise RuntimeError(f"{name} MPP query is outside the Iceberg writer boundary:\n{plan}")
     if "ColumnarToRow" in plan:
         raise RuntimeError(f"{name} plan contains a row boundary:\n{plan}")
 
@@ -86,7 +84,6 @@ def main():
     nested_source = (Path(warehouse_path) / "_smoke_input" / "nested").as_uri()
 
     spark.conf.set("spark.gluten.enabled", "false")
-    spark.conf.set("spark.gluten.mpp.enabled", "false")
     spark.conf.set("spark.gluten.sql.native.writer.enabled", "false")
     spark.range(0, 10000, 1, 16).selectExpr(
         "id",
@@ -115,7 +112,6 @@ def main():
         "'score', id * 10) AS detail",
     ).write.mode("overwrite").parquet(nested_source)
     spark.conf.set("spark.gluten.enabled", "true")
-    spark.conf.set("spark.gluten.mpp.enabled", "true")
 
     spark.sql(f"CREATE NAMESPACE IF NOT EXISTS {catalog}.{namespace}")
     spark.sql(f"DROP TABLE IF EXISTS {table}")
@@ -216,9 +212,8 @@ def main():
     )
 
     # Validate committed Iceberg state through Spark's reference readers. Iceberg metadata tables
-    # are intentionally outside the native write boundary and are not supported by strict MPP.
+    # are intentionally outside the native write boundary.
     spark.conf.set("spark.gluten.enabled", "false")
-    spark.conf.set("spark.gluten.mpp.enabled", "false")
 
     rows_by_partition = {
         str(row["p"]): row["count"]

@@ -95,13 +95,16 @@ object VeloxRuleApi {
     // fire there. Root cause not investigated; revisit if cleaner upstream APIs become
     // available. See the rule's apply() doc comment for the full reasoning.
     injector.injectOptimizerRule(RewriteLargeLeftSemiToInnerDistinct.apply)
+    // Reuse a filtered per-key aggregate when a parent rejoins the same fact relation only to
+    // recompute the same sum (for example TPC-H Q18). The rule self-registers a post-subquery pass
+    // because the matching inner-join shape is produced by Spark's Subquery optimizer batch.
+    injector.injectOptimizerRule(RewriteFilteredAggregateRejoin.apply)
+    // Push an already-enforced selective dimension key set below a correlated per-key aggregate
+    // (for example TPC-H Q17). DISTINCT keys preserve aggregate input multiplicity.
+    injector.injectOptimizerRule(PushFilteredKeysIntoAggregate.apply)
     if (BackendsApiManager.getSettings.supportAppendDataExec()) {
       injector.injectPlannerStrategy(SparkShimLoader.getSparkShims.getRewriteCreateTableAsSelect(_))
     }
-    // Plan C: MPP strategy -- intercepts entire logical plan before EnsureRequirements.
-    // Must be injected after other strategies so it can see the full logical plan.
-    // extraStrategies are tried BEFORE built-in strategies, so MppStrategy gets first shot.
-    injector.injectPlannerStrategy(session => MppStrategy(session))
   }
 
   /**
@@ -172,14 +175,6 @@ object VeloxRuleApi {
     SparkShimLoader.getSparkShims
       .getExtendedColumnarPostRules()
       .foreach(each => injector.injectPost(c => each(c.session)))
-    // MPP collapse runs BEFORE BSP collapse: if the plan is fully MPP-eligible,
-    // MppCollapseRule wraps it in MppNativeQueryExec and ColumnarCollapseTransformStages becomes
-    // a no-op on that subtree. Do not run MPP shuffle-shape rewrites as global Spark columnar
-    // rules: AQE verifies that custom columnar rules preserve ShuffleExchange nodes, and these
-    // rules intentionally rewrite or remove them. MppNativeQueryExec re-runs the same opt-in
-    // rewrites inside its wrapped child during fragment extraction, after Spark's shuffle
-    // preservation check has passed.
-    injector.injectPost(c => MppCollapseRule(new GlutenConfig(c.sqlConf)))
     injector.injectPost(c => ColumnarCollapseTransformStages(new GlutenConfig(c.sqlConf)))
     injector.injectPost(_ => GenerateTransformStageId())
     injector.injectPost(c => CudfNodeValidationRule(new GlutenConfig(c.sqlConf)))
@@ -194,11 +189,6 @@ object VeloxRuleApi {
       c => GlutenAutoAdjustStageResourceProfile(new GlutenConfig(c.sqlConf), c.session))
     injector.injectFinal(c => GlutenFallbackReporter(new GlutenConfig(c.sqlConf), c.session))
     injector.injectFinal(_ => RemoveFallbackTagRule())
-    // Runs after all transforms and ColumnarBroadcastExchangeExec insertion: mark every
-    // BroadcastExchange under an MppNativeQueryExec as dead so SparkPlan.prepare()'s
-    // recursive doPrepare chain does not driver-collect a build side that the native
-    // single-task merge has already inlined into the consumer fragment.
-    injector.injectFinal(_ => MppSuppressDeadBroadcastsRule())
   }
 
   /**
@@ -286,11 +276,6 @@ object VeloxRuleApi {
     SparkShimLoader.getSparkShims
       .getExtendedColumnarPostRules()
       .foreach(each => injector.injectPostTransform(c => each(c.session)))
-    // MPP collapse runs BEFORE BSP collapse in the RAS path as well. Keep MPP shuffle-shape
-    // rewrites out of Spark's global post-transform rule list for the same AQE shuffle-node
-    // preservation reason described in injectVanilla(); MppNativeQueryExec applies them locally
-    // during fragment extraction.
-    injector.injectPostTransform(c => MppCollapseRule(new GlutenConfig(c.sqlConf)))
     injector.injectPostTransform(c => ColumnarCollapseTransformStages(new GlutenConfig(c.sqlConf)))
     injector.injectPostTransform(_ => GenerateTransformStageId())
     injector.injectPostTransform(c => CudfNodeValidationRule(new GlutenConfig(c.sqlConf)))
