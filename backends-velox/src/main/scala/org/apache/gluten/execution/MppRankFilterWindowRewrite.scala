@@ -16,7 +16,7 @@
  */
 package org.apache.gluten.execution
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, AttributeSet, EqualTo, Expression, Literal, Murmur3Hash, Rank, RowNumber, SortOrder, WindowExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, And, Ascending, Attribute, AttributeSet, EqualTo, Expression, Literal, Murmur3Hash, PredicateHelper, Rank, RowNumber, SortOrder, WindowExpression}
 import org.apache.spark.sql.catalyst.plans.physical.{ClusteredDistribution, HashPartitioning}
 import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, InputIteratorTransformer, ProjectExec, SparkPlan}
 import org.apache.spark.sql.execution.exchange.ENSURE_REQUIREMENTS
@@ -40,7 +40,7 @@ import org.apache.spark.sql.execution.window.{GlutenFinal, GlutenPartial}
  * Global (empty partitionSpec) windows are deliberately left unchanged: changing them here would
  * require a SINGLE exchange and would serialize the query onto one peer.
  */
-private[execution] object MppRankFilterWindowRewrite {
+private[execution] object MppRankFilterWindowRewrite extends PredicateHelper {
   val EnabledKey: String = "spark.gluten.mpp.rankFilterWindow.enabled"
 
   private[execution] def isEnabled(configured: Option[Boolean], cudfEnabled: Boolean): Boolean = {
@@ -120,30 +120,47 @@ private[execution] object MppRankFilterWindowRewrite {
       numPartitions: Int): Option[(SparkPlan, Boolean)] = filter.child match {
     case window: WindowExecTransformer
         if window.partitionSpec.nonEmpty &&
-          hasRequiredLocalSort(window) &&
-          exactRankOneAlias(filter.condition, window).nonEmpty =>
-      val rankAlias = exactRankOneAlias(filter.condition, window).get
-      val sort = window.child.asInstanceOf[SortExecTransformer]
-      retainMatchingFinalGroupLimit(sort.child, window, numPartitions).map {
-        case (finalGroupLimit, insertedExchange) =>
-          val rankOne = rankAlias.copy(child = Literal.create(1, rankAlias.dataType))(
-            rankAlias.exprId,
-            rankAlias.qualifier,
-            rankAlias.explicitMetadata,
-            rankAlias.nonInheritableMetadataKeys)
-          ProjectExecTransformer(finalGroupLimit.output :+ rankOne, finalGroupLimit) ->
-            insertedExchange
+          hasRequiredLocalSort(window) =>
+      extractRankOneConjunct(filter.condition, window).flatMap {
+        case (rankAlias, residualPredicate) =>
+          val sort = window.child.asInstanceOf[SortExecTransformer]
+          retainMatchingFinalGroupLimit(sort.child, window, numPartitions).flatMap {
+            case (finalGroupLimit, insertedExchange) =>
+              val rankOne = rankAlias.copy(child = Literal.create(1, rankAlias.dataType))(
+                rankAlias.exprId,
+                rankAlias.qualifier,
+                rankAlias.explicitMetadata,
+                rankAlias.nonInheritableMetadataKeys)
+              val projected =
+                ProjectExecTransformer(finalGroupLimit.output :+ rankOne, finalGroupLimit)
+              residualPredicate match {
+                case Some(predicate)
+                    if predicate.deterministic &&
+                      predicate.references.subsetOf(AttributeSet(projected.output)) =>
+                  Some(filter.copy(condition = predicate, child = projected) -> insertedExchange)
+                case Some(_) => None
+                case None => Some(projected -> insertedExchange)
+              }
+          }
       }
     case _ => None
   }
 
-  private def exactRankOneAlias(
+  private def extractRankOneConjunct(
       condition: Expression,
-      window: WindowExecTransformer): Option[Alias] = {
+      window: WindowExecTransformer): Option[(Alias, Option[Expression])] = {
     window.windowExpression match {
-      case Seq(rankAlias @ Alias(WindowExpression(_: Rank, _), _))
-          if isRankOnePredicate(condition, rankAlias.toAttribute) =>
-        Some(rankAlias)
+      case Seq(rankAlias @ Alias(WindowExpression(_: Rank, _), _)) =>
+        val conjuncts = splitConjunctivePredicates(condition)
+        val rankPredicateIndex =
+          conjuncts.indexWhere(isRankOnePredicate(_, rankAlias.toAttribute))
+        if (rankPredicateIndex < 0) {
+          None
+        } else {
+          val residualPredicate =
+            conjuncts.patch(rankPredicateIndex, Nil, 1).reduceOption(And)
+          Some(rankAlias -> residualPredicate)
+        }
       case _ => None
     }
   }

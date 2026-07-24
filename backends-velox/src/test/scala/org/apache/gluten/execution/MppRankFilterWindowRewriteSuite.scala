@@ -18,7 +18,7 @@ package org.apache.gluten.execution
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, Attribute, AttributeReference, CurrentRow, DenseRank, EqualTo, Literal, Murmur3Hash, Rand, Rank, RowFrame, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, And, Ascending, Attribute, AttributeReference, CurrentRow, DenseRank, EqualTo, Literal, Murmur3Hash, Rand, Rank, RowFrame, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, InputIteratorTransformer, LeafExecNode, ProjectExec, SparkPlan, UnionExec}
@@ -119,6 +119,59 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
       case Alias(literal: Literal, "rank_rank") => assert(literal.value == 1)
       case other => fail(s"Expected a literal rank output, found $other")
     }
+  }
+
+  test("rank one conjunct keeps its deterministic residual filter above Final TopN") {
+    val original =
+      rankFilterBranch(
+        "rank_conjunct",
+        includeExchange = false,
+        options = BranchOptions(rankKind = "rank"))
+        .asInstanceOf[FilterExecTransformer]
+    val window = original.child.asInstanceOf[WindowExecTransformer]
+    val rankAttribute = window.windowExpression.head.toAttribute
+    val payload = window.child.output.find(_.name == "rank_conjunct_payload").get
+    val residual = EqualTo(payload, Literal(7))
+    val plan = original.copy(
+      condition = And(EqualTo(rankAttribute, Literal(1)), residual))
+    val originalOutputExprIds = plan.output.map(_.exprId)
+
+    val (rewritten, stats) = MppRankFilterWindowRewrite(plan, enabled = true, numPartitions = 4)
+
+    assert(stats.rewrittenWindows == 0)
+    assert(stats.fusedRankFilters == 1)
+    assert(stats.insertedHashExchanges == 1)
+    assert(rewritten.collect { case _: WindowExecTransformer => 1 }.isEmpty)
+    assert(rewritten.collect { case _: SortExecTransformer => 1 }.isEmpty)
+    val filters = rewritten.collect { case filter: FilterExecTransformer => filter }
+    assert(filters.size == 1)
+    assert(filters.head.condition.semanticEquals(residual))
+    val groupLimits =
+      rewritten.collect { case groupLimit: WindowGroupLimitExecTransformer => groupLimit }
+    assert(groupLimits.size == 1)
+    assert(groupLimits.head.mode == GlutenFinal)
+    assert(groupLimits.head.rankLikeFunction.isInstanceOf[Rank])
+    assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
+  }
+
+  test("a nondeterministic rank one residual retains the semantic Window path") {
+    val original =
+      rankFilterBranch(
+        "rank_nondeterministic",
+        includeExchange = false,
+        options = BranchOptions(rankKind = "rank"))
+        .asInstanceOf[FilterExecTransformer]
+    val window = original.child.asInstanceOf[WindowExecTransformer]
+    val rankAttribute = window.windowExpression.head.toAttribute
+    val plan = original.copy(
+      condition = And(EqualTo(rankAttribute, Literal(1)), EqualTo(Rand(42L), Literal(0.5))))
+
+    val (rewritten, stats) = MppRankFilterWindowRewrite(plan, enabled = true, numPartitions = 4)
+
+    assert(stats.rewrittenWindows == 1)
+    assert(stats.fusedRankFilters == 0)
+    assert(rewritten.collect { case _: WindowExecTransformer => 1 }.size == 1)
+    assert(rewritten.collect { case _: WindowGroupLimitExecTransformer => 1 }.isEmpty)
   }
 
   test("a non-one rank predicate retains the semantic Window path") {
