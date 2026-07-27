@@ -65,24 +65,22 @@ private[execution] object MppWindowInputOrdering {
   }
 
   private def hasCompleteLocalSort(window: WindowExecTransformer): Boolean = {
-    def find(
-        child: SparkPlan,
-        partitionSpec: Seq[Expression],
-        orderSpec: Seq[SortOrder]): Boolean = child match {
-      case sort: SortExecTransformer if !sort.global =>
-        hasRequiredOrdering(sort, partitionSpec, orderSpec)
-      case project: ProjectExecTransformer if project.projectList.forall(_.deterministic) =>
-        rewriteOrderingThroughProject(partitionSpec, orderSpec, project.projectList).exists {
-          case (childPartitionSpec, childOrderSpec) =>
-            find(project.child, childPartitionSpec, childOrderSpec)
-        }
-      case project: ProjectExec if project.projectList.forall(_.deterministic) =>
-        rewriteOrderingThroughProject(partitionSpec, orderSpec, project.projectList).exists {
-          case (childPartitionSpec, childOrderSpec) =>
-            find(project.child, childPartitionSpec, childOrderSpec)
-        }
-      case _ => false
-    }
+    def find(child: SparkPlan, partitionSpec: Seq[Expression], orderSpec: Seq[SortOrder]): Boolean =
+      child match {
+        case sort: SortExecTransformer if !sort.global =>
+          hasRequiredOrdering(sort, partitionSpec, orderSpec)
+        case project: ProjectExecTransformer if project.projectList.forall(_.deterministic) =>
+          rewriteOrderingThroughProject(partitionSpec, orderSpec, project.projectList).exists {
+            case (childPartitionSpec, childOrderSpec) =>
+              find(project.child, childPartitionSpec, childOrderSpec)
+          }
+        case project: ProjectExec if project.projectList.forall(_.deterministic) =>
+          rewriteOrderingThroughProject(partitionSpec, orderSpec, project.projectList).exists {
+            case (childPartitionSpec, childOrderSpec) =>
+              find(project.child, childPartitionSpec, childOrderSpec)
+          }
+        case _ => false
+      }
 
     window.partitionSpec.nonEmpty &&
     find(window.child, window.partitionSpec, window.orderSpec)
@@ -124,9 +122,7 @@ private[execution] object MppWindowInputOrdering {
       partitionSpec: Seq[Expression],
       orderSpec: Seq[SortOrder],
       projectList: Seq[NamedExpression]): Option[(Seq[Expression], Seq[SortOrder])] = {
-    rewriteExpressionsThroughProject(
-      partitionSpec ++ orderSpec,
-      projectList).map {
+    rewriteExpressionsThroughProject(partitionSpec ++ orderSpec, projectList).map {
       rewritten =>
         val (partitions, orders) = rewritten.splitAt(partitionSpec.size)
         partitions -> orders.map(_.asInstanceOf[SortOrder])

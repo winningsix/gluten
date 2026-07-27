@@ -27,8 +27,8 @@ import org.apache.spark.sql.execution.window.{GlutenFinal, GlutenPartial}
  *
  * Spark's InferWindowGroupLimit optimization places Partial and Final WindowGroupLimit operators
  * below the original Window. The Velox backend maps those pruning operators to TopNRowNumber. This
- * rewrite removes the redundant pruning operators and keeps the semantic Window, its local Sort
- * and the upper Filter.
+ * rewrite removes the redundant pruning operators and keeps the semantic Window, its local Sort and
+ * the upper Filter.
  *
  * A partitioned Window must see every row for a partition on the same MPP peer. Spark normally
  * inserts a HASH exchange for the Final WindowGroupLimit. We preserve that exchange and insert one
@@ -83,9 +83,7 @@ private[execution] object MppRankFilterWindowRewrite {
             } else {
               val distributedChild =
                 if (
-                  hasCompatibleNativeHashDistribution(
-                    withoutGroupLimits,
-                    localSort.partitionSpec)
+                  hasCompatibleNativeHashDistribution(withoutGroupLimits, localSort.partitionSpec)
                 ) {
                   withoutGroupLimits
                 } else {
@@ -168,22 +166,16 @@ private[execution] object MppRankFilterWindowRewrite {
         .rewriteOrderingThroughProject(partitionSpec, orderSpec, project.projectList)
         .flatMap {
           case (childPartitionSpec, childOrderSpec) =>
-            stripMatchingGroupLimits(
-              project.child,
-              childPartitionSpec,
-              childOrderSpec,
-              window).map(rewrittenChild => project.withNewChildren(Seq(rewrittenChild)))
+            stripMatchingGroupLimits(project.child, childPartitionSpec, childOrderSpec, window).map(
+              rewrittenChild => project.withNewChildren(Seq(rewrittenChild)))
         }
     case project: ProjectExec if project.projectList.forall(_.deterministic) =>
       MppWindowInputOrdering
         .rewriteOrderingThroughProject(partitionSpec, orderSpec, project.projectList)
         .flatMap {
           case (childPartitionSpec, childOrderSpec) =>
-            stripMatchingGroupLimits(
-              project.child,
-              childPartitionSpec,
-              childOrderSpec,
-              window).map(rewrittenChild => project.withNewChildren(Seq(rewrittenChild)))
+            stripMatchingGroupLimits(project.child, childPartitionSpec, childOrderSpec, window).map(
+              rewrittenChild => project.withNewChildren(Seq(rewrittenChild)))
         }
     case _ => None
   }
@@ -239,11 +231,7 @@ private[execution] object MppRankFilterWindowRewrite {
       input.child match {
         case adapter: ColumnarInputAdapter
             if adapter.child.isInstanceOf[ColumnarShuffleExchangeExec] =>
-          stripMatchingPartialGroupLimit(
-            adapter.child,
-            partitionSpec,
-            orderSpec,
-            window)
+          stripMatchingPartialGroupLimit(adapter.child, partitionSpec, orderSpec, window)
             .map {
               rewrittenChild =>
                 val rewrittenAdapter = adapter.withNewChildren(Seq(rewrittenChild))
@@ -257,12 +245,7 @@ private[execution] object MppRankFilterWindowRewrite {
           case (hashExpressions, exchangeOutput) =>
             isSyntheticHashProject(project, hashExpressions, exchangeOutput)
         } =>
-      stripMatchingPartialGroupLimit(
-        project.child,
-        partitionSpec,
-        orderSpec,
-        window,
-        hashContract)
+      stripMatchingPartialGroupLimit(project.child, partitionSpec, orderSpec, window, hashContract)
         .map(rewrittenChild => project.withNewChildren(Seq(rewrittenChild)))
     case _ => None
   }
