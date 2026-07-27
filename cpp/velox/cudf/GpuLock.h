@@ -21,23 +21,20 @@
 
 namespace gluten {
 
-/// Set the executor-wide GPU task admission limit.
+/// Set the maximum number of concurrent GPU operations.
+/// Default is 1 (serial, same as the original mutex behavior).
+/// Values > 1 allow multiple threads to use the GPU concurrently.
 void setMaxConcurrentGpuTasks(int n);
 
-/// Get the executor-wide GPU task admission limit.
+/// Get the current max concurrent GPU tasks setting.
 int getMaxConcurrentGpuTasks();
 
-/// Fine-grained GPU locking is bypassed for MPP execution.
+/// Acquire GPU access. Blocks if the concurrency limit is reached.
+/// Reentrant: multiple calls from the same thread are ref-counted.
 void lockGpu();
 
+/// Release GPU access. Only truly releases when the ref count reaches zero.
 void unlockGpu();
-
-/// Acquire one executor-wide task admission permit. This is separate from the
-/// fine-grained GPU lock, which remains bypassed for MPP execution.
-void lockGpuTask();
-
-/// Release one executor-wide task admission permit.
-void unlockGpuTask();
 
 class GpuLockGuard {
  public:
@@ -49,18 +46,6 @@ class GpuLockGuard {
   }
   GpuLockGuard(const GpuLockGuard&) = delete;
   GpuLockGuard& operator=(const GpuLockGuard&) = delete;
-};
-
-class GpuTaskLockGuard {
- public:
-  GpuTaskLockGuard() {
-    lockGpuTask();
-  }
-  ~GpuTaskLockGuard() {
-    unlockGpuTask();
-  }
-  GpuTaskLockGuard(const GpuTaskLockGuard&) = delete;
-  GpuTaskLockGuard& operator=(const GpuTaskLockGuard&) = delete;
 };
 
 } // namespace gluten

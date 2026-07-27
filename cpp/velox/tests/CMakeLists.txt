@@ -95,7 +95,6 @@ if(ENABLE_GPU)
 
   add_velox_gpu_test(velox_gpu_shuffle_writer_test SOURCES
                      VeloxGpuShuffleWriterTest.cc)
-  add_velox_gpu_test(gpu_lock_test SOURCES GpuLockTest.cc)
   add_velox_gpu_test(velox_gpu_buffer_scatter_bench SOURCES
                      GpuBufferScatterBench.cc)
   add_executable(check_overflow_in_table_insert_gpu_test

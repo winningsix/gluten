@@ -31,9 +31,6 @@ abstract class AbstractIcebergWriteExec extends IcebergWriteExec {
 
   override protected def executeColumnarForWrite(): RDD[ColumnarBatch] = query match {
     case mpp: MppNativeQueryExec => mpp.executeColumnarForGpuSink()
-    case wholeStage: WholeStageTransformer if wholeStage.isCudf =>
-      wholeStage.setTagValue(CudfTag.GpuShuffleStageTag, true)
-      wholeStage.executeColumnar()
     case _ => query.executeColumnar()
   }
 

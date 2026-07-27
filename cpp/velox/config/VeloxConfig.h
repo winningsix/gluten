@@ -328,9 +328,6 @@ const std::string kCudfGpuTargetBatchRowsDefault = "1000000";
 
 const std::string kCudfGpuTargetBatchBytes = "spark.gluten.sql.columnar.backend.velox.cudf.gpuTargetBatchBytes";
 const std::string kCudfGpuTargetBatchBytesDefault = "2147483648"; // 2 GiB
-const std::string kCudfGpuSemaphoreEnabled =
-    "spark.gluten.sql.columnar.backend.velox.cudf.gpuSemaphore.enabled";
-const bool kCudfGpuSemaphoreEnabledDefault = false;
 const std::string kCudfIcebergMultiFileTargetBytes =
     "spark.gluten.sql.columnar.backend.velox.cudf.iceberg.multi_file.target_bytes";
 const uint64_t kCudfIcebergMultiFileTargetBytesDefault = 0;
@@ -365,8 +362,9 @@ const std::string kCudfHostAsPinnedThresholdDefault = "0";
 const std::string kCudfPackedDtoH = "spark.gluten.sql.columnar.backend.velox.cudf.packedDtoH";
 const std::string kCudfPackedDtoHDefault = "true";
 
-// When true, the last GPU operator keeps CudfVector output on the device for
-// a GPU-aware downstream consumer.
+// When true, the last GPU operator skips inserting CudfToVelox so CudfVector
+// flows directly to VeloxGpuHashShuffleWriter::gpuPartitionAndEvict.
+// Set at plan build time for WholeStageTransformers that feed GPU shuffle.
 const std::string kCudfSkipOutputToVelox = "spark.gluten.sql.columnar.cudf.skipOutputToVelox";
 const bool kCudfSkipOutputToVeloxDefault = false;
 

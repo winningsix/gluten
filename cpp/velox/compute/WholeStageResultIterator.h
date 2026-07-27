@@ -118,7 +118,6 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
   const std::shared_ptr<facebook::velox::config::ConfigBase> veloxCfg_;
 #ifdef GLUTEN_ENABLE_GPU
   const bool enableCudf_;
-  const bool enableGpuTaskAdmission_;
 #endif
   const SparkTaskInfo taskInfo_;
   std::shared_ptr<facebook::velox::exec::Task> task_;
