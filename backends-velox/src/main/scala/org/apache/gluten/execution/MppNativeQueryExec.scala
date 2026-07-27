@@ -1631,11 +1631,11 @@ case class MppNativeQueryExec(
     val afterFinalAggSplit = splitFinalAggBeforeJoinHub(afterRootTopNPartial)
     val afterExistenceSplit = splitExistenceFinalBeforeJoinHub(afterFinalAggSplit)
     val afterNativeLocalSorts = offloadLocalSorts(afterExistenceSplit)
-    // Keep Spark's bounded Partial WindowGroupLimit pre-filter but remove the redundant Final
-    // operator for cuDF MPP. Generic Substrait-to-Velox conversion independently enables
-    // streaming for a partitioned rank Window whose retained OrderBy proves the complete required
-    // ordering. An explicit false setting is a kill switch; non-cuDF MPP retains the existing
-    // physical plan unless explicitly enabled.
+    // Remove Spark's matched Partial and Final WindowGroupLimit pruning operators for cuDF MPP,
+    // while retaining the semantic Window and its complete ordering. Generic Substrait-to-Velox
+    // conversion independently enables streaming for a partitioned rank Window whose retained
+    // OrderBy proves the complete required ordering. An explicit false setting is a kill switch;
+    // non-cuDF MPP retains the existing physical plan unless explicitly enabled.
     val rankFilterWindowEnabled = MppRankFilterWindowRewrite.isEnabled(
       optionalBooleanConf(MppRankFilterWindowRewrite.EnabledKey),
       GlutenConfig.get.enableColumnarCudf)

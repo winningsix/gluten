@@ -27,8 +27,8 @@ import org.apache.spark.sql.execution.window.{GlutenFinal, GlutenPartial}
  *
  * Spark's InferWindowGroupLimit optimization places Partial and Final WindowGroupLimit operators
  * below the original Window. The Velox backend maps those pruning operators to TopNRowNumber. This
- * rewrite removes the redundant Final operator, retains the bounded Partial pre-filter, and keeps
- * the semantic Window, its local Sort and the upper Filter.
+ * rewrite removes the redundant pruning operators and keeps the semantic Window, its local Sort
+ * and the upper Filter.
  *
  * A partitioned Window must see every row for a partition on the same MPP peer. Spark normally
  * inserts a HASH exchange for the Final WindowGroupLimit. We preserve that exchange and insert one
@@ -154,7 +154,7 @@ private[execution] object MppRankFilterWindowRewrite {
         if groupLimit.limit == 1 &&
           groupLimit.mode == GlutenFinal &&
           matchesWindow(groupLimit, partitionSpec, orderSpec, window) =>
-      stripMatchingPartialGroupLimitForContract(
+      stripMatchingPartialGroupLimit(
         groupLimit.child,
         groupLimit.partitionSpec,
         groupLimit.orderSpec,
@@ -188,7 +188,7 @@ private[execution] object MppRankFilterWindowRewrite {
     case _ => None
   }
 
-  private def stripMatchingPartialGroupLimitForContract(
+  private def stripMatchingPartialGroupLimit(
       child: SparkPlan,
       partitionSpec: Seq[Expression],
       orderSpec: Seq[SortOrder],
@@ -198,11 +198,11 @@ private[execution] object MppRankFilterWindowRewrite {
         if groupLimit.limit == 1 &&
           groupLimit.mode == GlutenPartial &&
           matchesWindow(groupLimit, partitionSpec, orderSpec, window) =>
-      Some(groupLimit)
+      Some(groupLimit.child)
     case exchange: ColumnarShuffleExchangeExec =>
       exchange.outputPartitioning match {
         case HashPartitioning(expressions, _) =>
-          stripMatchingPartialGroupLimitForContract(
+          stripMatchingPartialGroupLimit(
             exchange.child,
             partitionSpec,
             orderSpec,
@@ -218,7 +218,7 @@ private[execution] object MppRankFilterWindowRewrite {
         if hashContract.nonEmpty &&
           !wholeStage.wholeStageTransformerContextDefined &&
           wholeStage.child.isInstanceOf[ProjectExecTransformer] =>
-      stripMatchingPartialGroupLimitForContract(
+      stripMatchingPartialGroupLimit(
         wholeStage.child,
         partitionSpec,
         orderSpec,
@@ -239,7 +239,7 @@ private[execution] object MppRankFilterWindowRewrite {
       input.child match {
         case adapter: ColumnarInputAdapter
             if adapter.child.isInstanceOf[ColumnarShuffleExchangeExec] =>
-          stripMatchingPartialGroupLimitForContract(
+          stripMatchingPartialGroupLimit(
             adapter.child,
             partitionSpec,
             orderSpec,
@@ -257,7 +257,7 @@ private[execution] object MppRankFilterWindowRewrite {
           case (hashExpressions, exchangeOutput) =>
             isSyntheticHashProject(project, hashExpressions, exchangeOutput)
         } =>
-      stripMatchingPartialGroupLimitForContract(
+      stripMatchingPartialGroupLimit(
         project.child,
         partitionSpec,
         orderSpec,

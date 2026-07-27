@@ -120,15 +120,9 @@ case class WindowGroupLimitExecTransformer(
         case _: DenseRank => ExpressionNames.DENSE_RANK
         case _ => throw new GlutenNotSupportException(s"Unknown window function $rankLikeFunction")
       }
-      val executionMode = mode match {
-        case GlutenPartial => "partial"
-        case GlutenFinal => "final"
-      }
       val message = StringValue
         .newBuilder()
-        .setValue(
-          s"WindowGroupLimitParameters:window_function=$windowFunction\n" +
-            s"execution_mode=$executionMode\n")
+        .setValue(s"WindowGroupLimitParameters:window_function=$windowFunction\n")
         .build()
       val extensionNode = ExtensionBuilder.makeAdvancedExtension(
         BackendsApiManager.getTransformerApiInstance.packPBMessage(message),

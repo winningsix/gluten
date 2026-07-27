@@ -72,7 +72,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(stats.insertedHashExchanges == 0)
   }
 
-  test("three rank-filter branches preserve Window Filter local Sort and bounded Partial TopN") {
+  test("three rank-filter branches preserve Window Filter and local Sort without TopN") {
     val plan = UnionExec(
       Seq(
         rankFilterBranch("first", includeExchange = false),
@@ -88,7 +88,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     val sorts = rewritten.collect { case sort: SortExecTransformer => sort }
     assert(sorts.size == 3)
     assert(sorts.forall(!_.global))
-    assertRetainsOnlyPartial(rewritten, expectedCount = 3)
+    assertNoGroupLimits(rewritten)
     val exchanges = rewritten.collect { case exchange: ColumnarShuffleExchangeExec => exchange }
     assert(exchanges.size == 3)
     assert(exchanges.forall(_.outputPartitioning.isInstanceOf[HashPartitioning]))
@@ -105,7 +105,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(rewritten.collect { case _: WindowExecTransformer => 1 }.size == 1)
     assert(rewritten.collect { case _: SortExecTransformer => 1 }.size == 1)
     assert(rewritten.collect { case _: FilterExecTransformer => 1 }.size == 1)
-    assertRetainsOnlyPartial(rewritten)
+    assertNoGroupLimits(rewritten)
     assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
   }
 
@@ -132,7 +132,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     val filters = rewritten.collect { case filter: FilterExecTransformer => filter }
     assert(filters.size == 1)
     assert(filters.head.condition.semanticEquals(plan.condition))
-    assertRetainsOnlyPartial(rewritten)
+    assertNoGroupLimits(rewritten)
     assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
   }
 
@@ -193,7 +193,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     val filters = rewritten.collect { case filter: FilterExecTransformer => filter }
     assert(filters.size == 1)
     assert(filters.head.condition.semanticEquals(plan.condition))
-    assertRetainsOnlyPartial(rewritten)
+    assertNoGroupLimits(rewritten)
     assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
   }
 
@@ -213,7 +213,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
 
     assert(stats.rewrittenWindows == 1)
     assert(rewritten.collect { case _: WindowExecTransformer => 1 }.size == 1)
-    assertRetainsOnlyPartial(rewritten)
+    assertNoGroupLimits(rewritten)
   }
 
   test("a non-one rank predicate retains the semantic Window path") {
@@ -231,7 +231,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
 
     assert(stats.rewrittenWindows == 1)
     assert(rewritten.collect { case _: WindowExecTransformer => 1 }.size == 1)
-    assertRetainsOnlyPartial(rewritten)
+    assertNoGroupLimits(rewritten)
   }
 
   test("an existing compatible native HASH exchange is retained") {
@@ -241,7 +241,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(stats.rewrittenWindows == 1)
     assert(stats.insertedHashExchanges == 0)
     assert(rewritten.collect { case _: ColumnarShuffleExchangeExec => 1 }.size == 1)
-    assertRetainsOnlyPartial(rewritten)
+    assertNoGroupLimits(rewritten)
   }
 
   test("MPP value-stream wrappers and the synthetic hash project are retained") {
@@ -286,7 +286,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(rewritten.collect { case _: ColumnarShuffleExchangeExec => 1 }.size == 1)
     assert(rewritten.collect { case _: WholeStageTransformer => 1 }.size == 1)
     assert(rewritten.collect { case _: SortExecTransformer => 1 }.size == 1)
-    assertRetainsOnlyPartial(rewritten)
+    assertNoGroupLimits(rewritten)
     val rewrittenHashProject = rewritten.collectFirst {
       case project: ProjectExecTransformer
           if project.projectList.headOption.exists(_.name == "hash_partition_key") =>
@@ -373,7 +373,7 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(stats.rewrittenWindows == 1)
     val rewrittenProject = rewritten.collectFirst { case project: ProjectExec => project }.get
     assert(rewrittenProject.output.map(_.exprId) == originalExprIds)
-    assertRetainsOnlyPartial(rewritten)
+    assertNoGroupLimits(rewritten)
   }
 
   test("a nondeterministic pre-project keeps both group-limit pruning boundaries") {
@@ -473,11 +473,8 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(rewritten.collect { case _: WindowGroupLimitExecTransformer => 1 }.size == 2)
   }
 
-  private def assertRetainsOnlyPartial(plan: SparkPlan, expectedCount: Int = 1): Unit = {
-    val groupLimits =
-      plan.collect { case groupLimit: WindowGroupLimitExecTransformer => groupLimit }
-    assert(groupLimits.size == expectedCount)
-    assert(groupLimits.forall(_.mode == GlutenPartial))
+  private def assertNoGroupLimits(plan: SparkPlan): Unit = {
+    assert(plan.collect { case _: WindowGroupLimitExecTransformer => 1 }.isEmpty)
   }
 
   private def rankFilterBranch(
