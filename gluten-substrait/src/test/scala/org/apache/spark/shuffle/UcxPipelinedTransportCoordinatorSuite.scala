@@ -28,13 +28,20 @@ class UcxPipelinedTransportCoordinatorSuite extends AnyFunSuite {
       .set("spark.gluten.ucx.shuffle.query.maxActiveWriters", "1")
       .set("spark.gluten.ucx.shuffle.query.maxQueuedBytes", "1")
       .set("spark.gluten.ucx.shuffle.query.backpressuredLaunchWriters", "0")
+      .set(UcxColumnarShuffleManager.ProducerMinRunningTasksPerStageConf, "4")
+      .set(UcxColumnarShuffleManager.ProducerMaxRunningTasksPerStageConf, "10")
 
     val metadata = group("group-a", 10, 1, 2)
     Seq(true, false).foreach {
       isDriver =>
-        assert(
+        val requirements =
           new UcxColumnarShuffleManager(legacyQueryPolicyConf, isDriver)
-            .requiresAllPipelinedShuffleReadersResident(metadata))
+            .schedulingRequirements(metadata)
+        assert(
+          requirements === PipelinedGroupSchedulingRequirements(
+            residencyPolicy = ReaderResidencyWithElasticProducers(
+              minProducerTasksPerStage = 4,
+              maxProducerTasksPerStage = Some(10))))
     }
   }
 

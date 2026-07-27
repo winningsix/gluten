@@ -31,7 +31,8 @@ import scala.util.control.NonFatal
 
 class UcxColumnarShuffleManager(conf: SparkConf, isDriver: Boolean)
   extends ShuffleManager
-  with RequiresAllPipelinedShuffleReadersResident
+  with PipelinedShuffleSchedulingProvider
+  with PipelinedShuffleControlPlane
   with SupportsColumnarShuffle
   with Logging {
 
@@ -139,6 +140,18 @@ class UcxColumnarShuffleManager(conf: SparkConf, isDriver: Boolean)
     true
   }
 
+  override def schedulingRequirements(
+      group: PipelinedShuffleGroupMetadata): PipelinedGroupSchedulingRequirements = {
+    PipelinedGroupSchedulingRequirements(
+      residencyPolicy = ReaderResidencyWithElasticProducers(
+        minProducerTasksPerStage =
+          conf.getInt(UcxColumnarShuffleManager.ProducerMinRunningTasksPerStageConf, 1),
+        maxProducerTasksPerStage =
+          conf.getOption(UcxColumnarShuffleManager.ProducerMaxRunningTasksPerStageConf)
+            .map(_.toInt)
+            .filter(_ > 0)))
+  }
+
   override def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {
     coordinator.registerPipelinedShuffleGroup(group)
   }
@@ -170,6 +183,10 @@ class UcxColumnarShuffleManager(conf: SparkConf, isDriver: Boolean)
 private[spark] object UcxColumnarShuffleManager {
   val ClassName: String = "org.apache.spark.shuffle.UcxColumnarShuffleManager"
   val DataPlaneStatus: String = "velox-native-ucx-exchange"
+  val ProducerMinRunningTasksPerStageConf: String =
+    "spark.scheduler.pipelined.group.producer.minRunningTasksPerStage"
+  val ProducerMaxRunningTasksPerStageConf: String =
+    "spark.scheduler.pipelined.group.producer.maxRunningTasksPerStage"
   val ReaderEndpointWaitMsConf: String = "spark.gluten.ucx.shuffle.reader.endpointWaitMs"
   val ReaderEndpointPollMsConf: String = "spark.gluten.ucx.shuffle.reader.endpointPollMs"
   val ReaderStatePollMsConf: String = "spark.gluten.ucx.shuffle.reader.statePollMs"
