@@ -31,7 +31,7 @@ import scala.util.control.NonFatal
 
 class UcxColumnarShuffleManager(conf: SparkConf, isDriver: Boolean)
   extends ShuffleManager
-  with PipelinedShuffleControlPlane
+  with RequiresAllPipelinedShuffleReadersResident
   with SupportsColumnarShuffle
   with Logging {
 
@@ -39,12 +39,6 @@ class UcxColumnarShuffleManager(conf: SparkConf, isDriver: Boolean)
     UcxShuffleCoordinator.getOrCreate(conf, isDriver)
   private lazy val nativeBridge: UcxShuffleNativeBridge =
     UcxShuffleNativeBridge.getOrCreate(conf)
-  private val maxActiveWriterTasksPerQuery =
-    math.max(
-      0,
-      conf.getInt(
-        UcxColumnarShuffleManager.WriterMaxActiveTasksPerQueryConf,
-        conf.getInt(UcxColumnarShuffleManager.WriterMaxActiveTasksPerGroupConf, 0)))
 
   logInfo(
     s"Using ${UcxColumnarShuffleManager.ClassName} " +
@@ -133,35 +127,16 @@ class UcxColumnarShuffleManager(conf: SparkConf, isDriver: Boolean)
     coordinator.registerPipelinedShuffleGroup(group)
   }
 
-  override def requiresAllPipelinedShuffleReadersResident(
-      group: PipelinedShuffleGroupMetadata): Boolean = true
-
-  override def maxConcurrentPipelinedShuffleProducers(groupId: String): Option[Int] = {
-    Option.when(isDriver && maxActiveWriterTasksPerQuery > 0) {
-      UcxShuffleCoordinator.pipelinedProducerLaunchCap(
-        groupId,
-        maxActiveWriterTasksPerQuery)
-    }
+  override def admitPipelinedShuffleGroup(groupAttemptId: String): Unit = {
+    coordinator.admitPipelinedShuffleGroup(groupAttemptId)
   }
 
-  override def admitPipelinedShuffleGroup(groupId: String): Unit = {
-    coordinator.admitPipelinedShuffleGroup(groupId)
+  override def completePipelinedShuffleGroup(groupAttemptId: String): Unit = {
+    coordinator.completePipelinedShuffleGroup(groupAttemptId)
   }
 
-  override def completePipelinedShuffleGroup(groupId: String): Unit = {
-    coordinator.completePipelinedShuffleGroup(groupId)
-  }
-
-  override def abortPipelinedShuffleGroup(groupId: String, reason: String): Unit = {
-    coordinator.abortPipelinedShuffleGroup(groupId, reason)
-  }
-
-  override def completePipelinedQuery(queryExecutionId: Long): Unit = {
-    coordinator.completePipelinedQuery(queryExecutionId)
-  }
-
-  override def abortPipelinedQuery(queryExecutionId: Long, reason: String): Unit = {
-    coordinator.abortPipelinedQuery(queryExecutionId, reason)
+  override def abortPipelinedShuffleGroup(groupAttemptId: String, reason: String): Unit = {
+    coordinator.abortPipelinedShuffleGroup(groupAttemptId, reason)
   }
 
   override def shuffleBlockResolver: ShuffleBlockResolver = {
@@ -196,18 +171,6 @@ private[spark] object UcxColumnarShuffleManager {
     "spark.gluten.ucx.shuffle.writer.readersReadyPollMs"
   val WriterMaxActiveTasksPerShuffleConf: String =
     "spark.gluten.ucx.shuffle.writer.maxActiveTasksPerShuffle"
-  val WriterMaxActiveTasksPerGroupConf: String =
-    "spark.gluten.ucx.shuffle.writer.maxActiveTasksPerGroup"
-  val WriterMaxActiveTasksPerQueryConf: String =
-    "spark.gluten.ucx.shuffle.query.maxActiveWriters"
-  val WriterMinFrontierTasksPerQueryConf: String =
-    "spark.gluten.ucx.shuffle.query.minFrontierWriters"
-  val QueryMaxQueuedBytesConf: String =
-    "spark.gluten.ucx.shuffle.query.maxQueuedBytes"
-  val QueryResumeQueuedBytesConf: String =
-    "spark.gluten.ucx.shuffle.query.resumeQueuedBytes"
-  val QueryBackpressuredLaunchWritersConf: String =
-    "spark.gluten.ucx.shuffle.query.backpressuredLaunchWriters"
   val WriterCreditWaitMsConf: String =
     "spark.gluten.ucx.shuffle.writer.creditWaitMs"
   val WriterCreditPollMsConf: String =
@@ -252,6 +215,7 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
   @volatile private var writerCreditAcquired = false
   @volatile private var writerFinishedMarked = false
   @volatile private var nativeWriterMetricsReported = false
+  @volatile private var nativeWriterFinalDrainStateReported = false
   @volatile private var nativeWriterNoMoreDataPoller: Thread = _
   @volatile private var nativeWriterNoMoreDataPollerStopRequested = false
   @volatile private var stopped = false
@@ -349,7 +313,7 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
       reportNativeWriterMetrics(endpoint)
       reportFinalNativeWriterNoMoreDataIfReady(endpoint)
       // The native producer can remain detached after the Spark task returns while UCX drains
-      // its output queue. Keep its telemetry alive so query-level admission sees that drain.
+      // its output queue. Keep its telemetry alive until the transport reports that drain.
       if (!nativeExchangeCompleted) {
         stopNativeWriterNoMoreDataPoller()
       }
@@ -452,13 +416,8 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
             s"ucxMapId=$ucxMapId sparkMapId=$mapId attemptId=$attemptId " +
             s"stage=${context.stageId()}.${context.stageAttemptNumber()} " +
             s"elapsedMs=$elapsedMs " +
-            s"groupId=${credit.groupId} queryId=${credit.queryId} " +
-            s"queryState=${credit.queryState} " +
-            s"shuffleActive=${credit.activeShuffleWriters}/${credit.maxShuffleWriters} " +
-            s"queryActive=${credit.activeGroupWriters}/${credit.maxGroupWriters} " +
-            s"queryQueuedBytes=${credit.queryQueuedBytes} " +
-            s"queryBlockedWriters=${credit.queryBlockedWriters} " +
-            s"queryBackpressured=${credit.queryBackpressured}")
+            s"groupId=${credit.groupId} " +
+            s"shuffleActive=${credit.activeShuffleWriters}/${credit.maxShuffleWriters}")
       } finally {
         tracker.ucxWriterCreditWaitNanos += System.nanoTime() - waitStartNs
       }
@@ -488,9 +447,7 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
   }
 
   private def writerCreditEnabled: Boolean = {
-    conf.getInt(UcxColumnarShuffleManager.WriterMaxActiveTasksPerShuffleConf, 0) > 0 ||
-    conf.getInt(UcxColumnarShuffleManager.WriterMaxActiveTasksPerGroupConf, 0) > 0 ||
-    conf.getInt(UcxColumnarShuffleManager.WriterMaxActiveTasksPerQueryConf, 0) > 0
+    conf.getInt(UcxColumnarShuffleManager.WriterMaxActiveTasksPerShuffleConf, 0) > 0
   }
 
   private def markWriterFinishedIfNeeded(reason: String): Unit = synchronized {
@@ -544,6 +501,13 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
       if (response.writerCreditReleased) {
         writerCreditAcquired = false
       }
+      if (
+        response.accepted &&
+        (noMoreData || runtimeStats.noMoreData) &&
+        runtimeStats.finished
+      ) {
+        nativeWriterFinalDrainStateReported = true
+      }
       response
     }
 
@@ -581,6 +545,9 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
                   .map(_.noMoreData)
                   .getOrElse(nativeBridge.writerNoMoreData(endpoint.nativeTaskId))
               val elapsedMs = (System.nanoTime() - startNs) / 1000000L
+              if (noMoreData && nativeWriterFinalDrainStateReported) {
+                return
+              }
               if (noMoreData && !observedNoMoreData) {
                 val response = reportNativeWriterState(endpoint, noMoreData = true, stats)
                 observedNoMoreData = true
@@ -593,11 +560,9 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
                     s"finished=${stats.map(_.finished)} " +
                     s"blocked=${stats.map(_.blocked)} " +
                     s"accepted=${response.accepted} groupId=${response.groupId} " +
-                    s"queryId=${response.queryId} queryState=${response.queryState} " +
+                    s"groupState=${response.groupState} " +
                     s"writerFinishedMarked=${response.writerFinishedMarked} " +
                     s"writerCreditReleased=${response.writerCreditReleased} " +
-                    s"queryQueuedBytes=${response.queryQueuedBytes} " +
-                    s"queryBlockedWriters=${response.queryBlockedWriters} " +
                     s"reason=${response.reason}")
                 if (!response.accepted || stats.exists(_.finished)) {
                   return
@@ -633,20 +598,19 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
                     s"sparkMapId=$mapId attemptId=$attemptId " +
                     s"nativeTaskId=${endpoint.nativeTaskId} elapsedMs=$elapsedMs " +
                     s"accepted=${response.accepted} groupId=${response.groupId} " +
-                    s"queryId=${response.queryId} queryState=${response.queryState} " +
-                    s"queryQueuedBytes=${response.queryQueuedBytes} reason=${response.reason}")
+                    s"groupState=${response.groupState} reason=${response.reason}")
                 return
               } else if (elapsedMs >= nextStateReportMs &&
                   (stateReportMs > 0 || observedNoMoreData)) {
                 val response = reportNativeWriterState(endpoint, noMoreData = false, stats)
                 if (!response.accepted) {
                   logWarning(
-                    s"Native UCX shuffle writer state rejected by query coordinator " +
+                    s"Native UCX shuffle writer state rejected by transport coordinator " +
                       s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
                       s"sparkMapId=$mapId attemptId=$attemptId " +
                       s"nativeTaskId=${endpoint.nativeTaskId} " +
-                      s"groupId=${response.groupId} queryId=${response.queryId} " +
-                      s"queryState=${response.queryState} reason=${response.reason}")
+                      s"groupId=${response.groupId} groupState=${response.groupState} " +
+                      s"reason=${response.reason}")
                   return
                 }
                 if (observedNoMoreData && stats.exists(_.finished)) {
@@ -655,8 +619,7 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
                       s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId " +
                       s"sparkMapId=$mapId attemptId=$attemptId " +
                       s"nativeTaskId=${endpoint.nativeTaskId} elapsedMs=$elapsedMs " +
-                      s"queuedBytes=${stats.map(_.queuedBytes)} " +
-                      s"queryQueuedBytes=${response.queryQueuedBytes}")
+                      s"queuedBytes=${stats.map(_.queuedBytes)}")
                   return
                 }
                 nextStateReportMs = elapsedMs +
@@ -718,12 +681,9 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
             s"queuedBytes=${stats.map(_.queuedBytes)} " +
             s"finished=${stats.map(_.finished)} " +
             s"blocked=${stats.map(_.blocked)} " +
-            s"groupId=${response.groupId} queryId=${response.queryId} " +
-            s"queryState=${response.queryState} " +
+            s"groupId=${response.groupId} groupState=${response.groupState} " +
             s"writerFinishedMarked=${response.writerFinishedMarked} " +
             s"writerCreditReleased=${response.writerCreditReleased} " +
-            s"queryQueuedBytes=${response.queryQueuedBytes} " +
-            s"queryBlockedWriters=${response.queryBlockedWriters} " +
             s"reason=${response.reason}")
       }
     } catch {
@@ -1200,10 +1160,10 @@ private[spark] class UcxColumnarShuffleReader[K, C](
             timestampMs = System.currentTimeMillis()))
       if (!response.accepted) {
         logWarning(
-          s"UCX native reader state rejected by query coordinator " +
+          s"UCX native reader state rejected by transport coordinator " +
             s"shuffleId=${handle.shuffleId} reduce=${endpoint.reducePartitionId} " +
             s"taskAttemptId=${endpoint.taskAttemptId} groupId=${response.groupId} " +
-            s"queryId=${response.queryId} queryState=${response.queryState} " +
+            s"groupState=${response.groupState} " +
             s"reason=${response.reason}")
       }
     } catch {

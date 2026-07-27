@@ -62,27 +62,13 @@ private[spark] case class UcxShuffleReaderCoverageResponse(
 
 private[spark] case class UcxShuffleReaderCoverage(registeredReaders: Int, expectedReaders: Int)
 
-private[spark] case class UcxPipelinedQueryRuntimeSummary(
-    queryId: String,
-    activeWriterCredits: Int,
-    nativeWriterStates: Int,
-    finishedWriters: Int,
-    expectedWriters: Int,
-    queuedBytes: Long,
-    blockedWriters: Int,
-    registeredReaders: Int,
-    finishedReaders: Int,
-    expectedReaders: Int,
-    backpressured: Boolean)
-
 private[spark] case class UcxPipelinedShuffleStateResponse(
     shuffleId: Int,
     groupId: Option[String],
     groupState: String,
     readersReady: Boolean,
     readerCoverage: Map[Int, UcxShuffleReaderCoverage],
-    abortedReason: Option[String],
-    querySummary: Option[UcxPipelinedQueryRuntimeSummary] = None)
+    abortedReason: Option[String])
 
 private[spark] case class UcxShuffleWriterCreditResponse(
     granted: Boolean,
@@ -90,14 +76,7 @@ private[spark] case class UcxShuffleWriterCreditResponse(
     groupId: Option[String],
     activeShuffleWriters: Int,
     maxShuffleWriters: Int,
-    activeGroupWriters: Int,
-    maxGroupWriters: Int,
-    reason: Option[String],
-    queryId: Option[String] = None,
-    queryState: Option[String] = None,
-    queryQueuedBytes: Long = 0L,
-    queryBlockedWriters: Int = 0,
-    queryBackpressured: Boolean = false)
+    reason: Option[String])
 
 private[spark] case class UcxNativeWriterState(
     shuffleId: Int,
@@ -119,12 +98,9 @@ private[spark] case class UcxNativeWriterStateResponse(
     accepted: Boolean,
     shuffleId: Int,
     groupId: Option[String],
-    queryId: Option[String],
-    queryState: String,
+    groupState: String,
     writerFinishedMarked: Boolean,
     writerCreditReleased: Boolean,
-    queryQueuedBytes: Long,
-    queryBlockedWriters: Int,
     reason: Option[String])
 
 private[spark] case class UcxNativeReaderState(
@@ -143,8 +119,7 @@ private[spark] case class UcxNativeReaderStateResponse(
     accepted: Boolean,
     shuffleId: Int,
     groupId: Option[String],
-    queryId: Option[String],
-    queryState: String,
+    groupState: String,
     reason: Option[String])
 
 sealed private[spark] trait UcxShuffleCoordinatorMessage
@@ -209,12 +184,6 @@ private[spark] case class CompleteUcxPipelinedShuffleGroup(groupId: String)
   extends UcxShuffleCoordinatorMessage
 
 private[spark] case class AbortUcxPipelinedShuffleGroup(groupId: String, reason: String)
-  extends UcxShuffleCoordinatorMessage
-
-private[spark] case class CompleteUcxPipelinedQuery(queryExecutionId: Long)
-  extends UcxShuffleCoordinatorMessage
-
-private[spark] case class AbortUcxPipelinedQuery(queryExecutionId: Long, reason: String)
   extends UcxShuffleCoordinatorMessage
 
 private[spark] case object StopUcxShuffleCoordinator extends UcxShuffleCoordinatorMessage
@@ -317,17 +286,6 @@ private[spark] case class AbortUcxPipelinedShuffleGroupMasterMessage(
     context: RpcCallContext)
   extends UcxShuffleCoordinatorMasterMessage
 
-private[spark] case class CompleteUcxPipelinedQueryMasterMessage(
-    queryExecutionId: Long,
-    context: RpcCallContext)
-  extends UcxShuffleCoordinatorMasterMessage
-
-private[spark] case class AbortUcxPipelinedQueryMasterMessage(
-    queryExecutionId: Long,
-    reason: String,
-    context: RpcCallContext)
-  extends UcxShuffleCoordinatorMasterMessage
-
 private[spark] case class UcxShuffleInfo(numMaps: Int, numReduces: Int)
 
 private[spark] object UcxPipelinedShuffleGroupState {
@@ -344,9 +302,8 @@ private[spark] case class UcxPipelinedShuffleGeneration(
     writerStageId: Int,
     writerStageAttempt: Int)
 
-private[spark] class UcxPipelinedQueryState(
-    val queryKey: String,
-    val queryExecutionId: Option[Long]) {
+private[spark] class UcxPipelinedTransportGroupState(
+    val groupAttemptId: String) {
 
   @volatile var state: String = UcxPipelinedShuffleGroupState.Registered
   @volatile var abortedReason: Option[String] = None
@@ -355,25 +312,21 @@ private[spark] class UcxPipelinedQueryState(
     new ConcurrentHashMap[String, PipelinedShuffleGroupMetadata]()
   private val stateByGroup = new ConcurrentHashMap[String, String]()
   private val shuffleIdSet = ConcurrentHashMap.newKeySet[Int]()
-  @volatile private var currentShuffleDepths = Map.empty[Int, Int]
 
-  val activeWriterCredits = new ConcurrentHashMap[String, java.lang.Long]()
   val nativeWriterStates = new ConcurrentHashMap[String, UcxNativeWriterState]()
   val nativeReaderStates = new ConcurrentHashMap[String, UcxNativeReaderState]()
-  @volatile var backpressured: Boolean = false
-  @volatile var producerLaunchPaused: Boolean = false
 
   def registerGroup(group: PipelinedShuffleGroupMetadata, shuffleIds: Seq[Int]): Unit =
     synchronized {
-      val previous = Option(metadataByGroup.put(group.groupId, group))
+      val groupAttemptId = group.groupAttemptId
+      val previous = Option(metadataByGroup.put(groupAttemptId, group))
       if (previous.forall(groupGeneration(_) != groupGeneration(group))) {
-        stateByGroup.put(group.groupId, UcxPipelinedShuffleGroupState.Registered)
+        stateByGroup.put(groupAttemptId, UcxPipelinedShuffleGroupState.Registered)
       }
       shuffleIdSet.clear()
       metadataByGroup.values().asScala
         .flatMap(_.stages.flatMap(_.shuffleId))
         .foreach(shuffleIdSet.add)
-      currentShuffleDepths = computeShuffleDepths()
     }
 
   def admitGroup(groupId: String): Unit = {
@@ -399,7 +352,13 @@ private[spark] class UcxPipelinedQueryState(
   }
 
   def completeGroup(groupId: String): Unit = {
+    stateByGroup.put(groupId, UcxPipelinedShuffleGroupState.Draining)
+    state = UcxPipelinedShuffleGroupState.Draining
+  }
+
+  def finishGroup(groupId: String): Unit = {
     stateByGroup.put(groupId, UcxPipelinedShuffleGroupState.Finished)
+    state = UcxPipelinedShuffleGroupState.Finished
   }
 
   def abortAllGroups(): Unit = {
@@ -448,22 +407,7 @@ private[spark] class UcxPipelinedQueryState(
 
   def shuffleIds: Set[Int] = shuffleIdSet.asScala.toSet
 
-  def activeShuffleIds: Set[Int] =
-    shuffleIds.filter { shuffleId =>
-      groupIdsForShuffle(shuffleId).exists { groupId =>
-        val currentState = groupState(groupId)
-        currentState != UcxPipelinedShuffleGroupState.Finished &&
-        currentState != UcxPipelinedShuffleGroupState.Aborted
-      }
-    }
-
   def groupId: String = groupIds.toSeq.sorted.mkString("[", ",", "]")
-
-  def queryId: String = queryKey
-
-  def shuffleDepths: Map[Int, Int] = currentShuffleDepths
-
-  def shuffleDepth(shuffleId: Int): Int = currentShuffleDepths.getOrElse(shuffleId, 0)
 
   private def groupGeneration(
       group: PipelinedShuffleGroupMetadata): Seq[(Int, Int, Option[Int], Seq[Int])] = {
@@ -481,40 +425,6 @@ private[spark] class UcxPipelinedQueryState(
       }
   }
 
-  private def computeShuffleDepths(): Map[Int, Int] = {
-    val stagesByShuffleId =
-      metadataByGroup.values().asScala
-        .flatMap(_.stages)
-        .flatMap(stage => stage.shuffleId.map(_ -> stage))
-        .toMap
-    val memo = scala.collection.mutable.HashMap[Int, Int]()
-
-    def depthOf(shuffleId: Int, visiting: Set[Int]): Int = {
-      memo.getOrElseUpdate(
-        shuffleId, {
-          if (visiting.contains(shuffleId)) {
-            0
-          } else {
-            stagesByShuffleId.get(shuffleId) match {
-              case Some(stage) =>
-                val parentDepths =
-                  stage.pipelinedParentShuffleIds
-                    .filter(stagesByShuffleId.contains)
-                    .map(parent => depthOf(parent, visiting + shuffleId))
-                if (parentDepths.isEmpty) {
-                  0
-                } else {
-                  parentDepths.max + 1
-                }
-              case None =>
-                0
-            }
-          }
-        })
-    }
-
-    shuffleIds.map(shuffleId => shuffleId -> depthOf(shuffleId, Set.empty)).toMap
-  }
 }
 
 abstract private[spark] class UcxShuffleCoordinator(conf: SparkConf) extends Logging {
@@ -583,7 +493,6 @@ abstract private[spark] class UcxShuffleCoordinator(conf: SparkConf) extends Log
           s"groupId=${state.groupId} state=${state.groupState} " +
           s"currentShuffleCoverage=${state.readerCoverage.get(shuffleId)} " +
           s"groupCoverage=${state.readerCoverage} " +
-          s"querySummary=${state.querySummary} " +
           s"requireGroupReadersReady=$requireGroupReadersReady"
       if (stateForLog != lastLoggedState) {
         logInfo(s"Waiting for UCX pipelined shuffle readers shuffleId=$shuffleId $stateForLog")
@@ -675,12 +584,7 @@ abstract private[spark] class UcxShuffleCoordinator(conf: SparkConf) extends Log
       }
       val stateForLog =
         s"groupId=${credit.groupId} " +
-          s"queryId=${credit.queryId} queryState=${credit.queryState} " +
-          s"shuffleActive=${credit.activeShuffleWriters}/${credit.maxShuffleWriters} " +
-          s"queryActive=${credit.activeGroupWriters}/${credit.maxGroupWriters} " +
-          s"queryQueuedBytes=${credit.queryQueuedBytes} " +
-          s"queryBlockedWriters=${credit.queryBlockedWriters} " +
-          s"queryBackpressured=${credit.queryBackpressured}"
+          s"shuffleActive=${credit.activeShuffleWriters}/${credit.maxShuffleWriters}"
       if (stateForLog != lastLoggedState) {
         logInfo(
           s"Waiting for UCX shuffle writer credit shuffleId=$shuffleId " +
@@ -707,21 +611,15 @@ abstract private[spark] class UcxShuffleCoordinator(conf: SparkConf) extends Log
 
   def reportNativeReaderState(state: UcxNativeReaderState): UcxNativeReaderStateResponse
 
-  def pipelinedProducerLaunchCap(groupId: String, configuredCap: Int): Int = configuredCap
-
   def abortShuffle(shuffleId: Int, reason: String): Boolean
 
   def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit
 
-  def admitPipelinedShuffleGroup(groupId: String): Boolean
+  def admitPipelinedShuffleGroup(groupAttemptId: String): Boolean
 
-  def completePipelinedShuffleGroup(groupId: String): Boolean
+  def completePipelinedShuffleGroup(groupAttemptId: String): Boolean
 
-  def abortPipelinedShuffleGroup(groupId: String, reason: String): Boolean
-
-  def completePipelinedQuery(queryExecutionId: Long): Boolean
-
-  def abortPipelinedQuery(queryExecutionId: Long, reason: String): Boolean
+  def abortPipelinedShuffleGroup(groupAttemptId: String, reason: String): Boolean
 
   def unregisterShuffle(shuffleId: Int): Unit = {}
 
@@ -739,12 +637,13 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
   private val finishedAttempts =
     new ConcurrentHashMap[Int, ConcurrentHashMap[Long, java.lang.Long]]()
   private val abortedShuffles = new ConcurrentHashMap[Int, String]()
-  private val pipelinedQueries = new ConcurrentHashMap[String, UcxPipelinedQueryState]()
-  private val abortedPipelinedQueries = new ConcurrentHashMap[String, String]()
-  private val groupIdToPipelinedQueryKey = new ConcurrentHashMap[String, String]()
+  private val pipelinedGroups =
+    new ConcurrentHashMap[String, UcxPipelinedTransportGroupState]()
+  private val abortedPipelinedGroups = new ConcurrentHashMap[String, String]()
   private val shuffleIdToPipelinedGroupId = new ConcurrentHashMap[Int, String]()
   private val shuffleGenerationById =
     new ConcurrentHashMap[Int, UcxPipelinedShuffleGeneration]()
+  private val pendingShuffleUnregistrations = ConcurrentHashMap.newKeySet[Int]()
   private val writerCreditsByShuffle =
     new ConcurrentHashMap[Int, ConcurrentHashMap[Long, java.lang.Long]]()
   private val writerCreditLock = new Object()
@@ -752,28 +651,6 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
 
   private val maxActiveWriterTasksPerShuffle =
     math.max(0, conf.getInt(UcxColumnarShuffleManager.WriterMaxActiveTasksPerShuffleConf, 0))
-  private val maxActiveWriterTasksPerQuery =
-    math.max(
-      0,
-      conf.getInt(
-        UcxColumnarShuffleManager.WriterMaxActiveTasksPerQueryConf,
-        conf.getInt(UcxColumnarShuffleManager.WriterMaxActiveTasksPerGroupConf, 0)))
-  private val minFrontierWriterTasksPerQuery =
-    math.max(
-      0,
-      conf.getInt(UcxColumnarShuffleManager.WriterMinFrontierTasksPerQueryConf, 0))
-  private val maxQueuedBytesPerQuery =
-    math.max(0L, conf.getLong(UcxColumnarShuffleManager.QueryMaxQueuedBytesConf, 0L))
-  private val resumeQueuedBytesPerQuery =
-    math.max(
-      0L,
-      conf.getLong(
-        UcxColumnarShuffleManager.QueryResumeQueuedBytesConf,
-        if (maxQueuedBytesPerQuery > 0) maxQueuedBytesPerQuery / 2 else 0L))
-  private val backpressuredLaunchWriters =
-    math.max(
-      0,
-      conf.getInt(UcxColumnarShuffleManager.QueryBackpressuredLaunchWritersConf, 0))
 
   private val coordinatorMessages = new LinkedBlockingQueue[UcxShuffleCoordinatorMasterMessage]
 
@@ -789,6 +666,7 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
 
   override def registerShuffle(shuffleId: Int, numMaps: Int, numReduces: Int): Unit = {
     logInfo(s"Registering UCX shuffle shuffleId=$shuffleId numMaps=$numMaps numReduces=$numReduces")
+    pendingShuffleUnregistrations.remove(shuffleId)
     val existing = shuffleInfos.putIfAbsent(shuffleId, UcxShuffleInfo(numMaps, numReduces))
     if (existing != null && existing != UcxShuffleInfo(numMaps, numReduces)) {
       throw new IllegalArgumentException(
@@ -844,13 +722,13 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
             }
         }
     }
-    queryForShuffle(shuffleId).foreach {
-      query =>
+    transportGroupForShuffle(shuffleId).foreach {
+      transportGroup =>
         val key = writerCreditKey(shuffleId, mapId)
-        Option(query.nativeWriterStates.get(key)).foreach {
+        Option(transportGroup.nativeWriterStates.get(key)).foreach {
           previous =>
             if (previous.attemptId != endpoint.attemptId) {
-              query.nativeWriterStates.remove(key, previous)
+              transportGroup.nativeWriterStates.remove(key, previous)
             }
         }
     }
@@ -904,13 +782,13 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
           s"currentAttempt=${current.taskAttemptId}")
       return false
     }
-    queryForShuffle(shuffleId).foreach {
-      query =>
+    transportGroupForShuffle(shuffleId).foreach {
+      transportGroup =>
         val key = readerStateKey(shuffleId, reducePartitionId)
-        Option(query.nativeReaderStates.get(key)).foreach {
+        Option(transportGroup.nativeReaderStates.get(key)).foreach {
           previous =>
             if (previous.taskAttemptId != endpoint.taskAttemptId) {
-              query.nativeReaderStates.remove(key, previous)
+              transportGroup.nativeReaderStates.remove(key, previous)
             }
         }
     }
@@ -971,27 +849,26 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
           groupState = UcxPipelinedShuffleGroupState.NoGroup,
           readersReady = shuffleAbort.isEmpty,
           readerCoverage = readerCoverageForShuffles(Seq(shuffleId)),
-          abortedReason = shuffleAbort,
-          querySummary = None
+          abortedReason = shuffleAbort
         )
       case Some(id) =>
-        val query = queryForGroup(id)
+        val transportGroup = transportGroupForAttempt(id)
         val groupState =
-          query.map(_.groupState(id)).getOrElse {
-            Option(abortedPipelinedQueries.get(id))
+          transportGroup.map(_.groupState(id)).getOrElse {
+            Option(abortedPipelinedGroups.get(id))
               .map(_ => UcxPipelinedShuffleGroupState.Aborted)
               .getOrElse(UcxPipelinedShuffleGroupState.Registered)
           }
         val shuffleIds =
-          query
+          transportGroup
             .flatMap(_.groupMetadata(id))
             .map(pipelinedShuffleIds)
             .getOrElse(shuffleIdsForGroup(id))
         val groupAbort =
           shuffleIds.iterator.flatMap(s => Option(abortedShuffles.get(s))).toSeq.headOption
         val abortedReason =
-          shuffleAbort.orElse(query.flatMap(_.abortedReason)).orElse(
-            Option(abortedPipelinedQueries.get(id))).orElse(groupAbort)
+          shuffleAbort.orElse(transportGroup.flatMap(_.abortedReason)).orElse(
+            Option(abortedPipelinedGroups.get(id))).orElse(groupAbort)
         UcxPipelinedShuffleStateResponse(
           shuffleId = shuffleId,
           groupId = Some(id),
@@ -999,8 +876,7 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
           readersReady =
             abortedReason.isEmpty && readersReadyState(groupState),
           readerCoverage = readerCoverageForShuffles(shuffleIds),
-          abortedReason = abortedReason,
-          querySummary = query.map(queryRuntimeSummary)
+          abortedReason = abortedReason
         )
     }
   }
@@ -1033,15 +909,11 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
       stageId: Int,
       stageAttemptNumber: Int): UcxShuffleWriterCreditResponse = {
     val groupId = groupIdForShuffle(shuffleId)
-    val query = queryForShuffle(shuffleId)
-    val queryCreditEnabled = query.isDefined && maxActiveWriterTasksPerQuery > 0
-    val shuffleCreditEnabled = query.isEmpty && maxActiveWriterTasksPerShuffle > 0
-    if (!queryCreditEnabled && !shuffleCreditEnabled) {
+    if (maxActiveWriterTasksPerShuffle <= 0) {
       return writerCreditResponse(
         granted = true,
         shuffleId = shuffleId,
         groupId = groupId,
-        query = query,
         reason = None)
     }
     val inactiveReason =
@@ -1052,132 +924,36 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
         granted = false,
         shuffleId = shuffleId,
         groupId = groupId,
-        query = query,
         reason = inactiveReason)
     }
 
     writerCreditLock.synchronized {
-      query match {
-        case Some(queryState) =>
-          val queryCreditKey = writerCreditKey(shuffleId, mapId)
-          val existing =
-            Option(queryState.activeWriterCredits.get(queryCreditKey)).map(_.longValue())
-          if (existing.contains(attemptId)) {
-            return writerCreditResponse(
-              granted = true,
-              shuffleId = shuffleId,
-              groupId = groupId,
-              query = query,
-              reason = None)
-          }
-
-          val decision = queryWriterCreditDecision(queryState, shuffleId)
-          if (decision.granted) {
-            queryState.activeWriterCredits.put(queryCreditKey, attemptId)
-            val postFrontierDepth = queryFrontierDepth(queryState)
-            val postAdmissionActive = activeAdmissionWriterCount(queryState, postFrontierDepth)
-            logInfo(
-              s"Granted UCX query writer credit queryId=${queryState.queryId} " +
-                s"groupId=${queryState.groupId} shuffleId=$shuffleId mapId=$mapId " +
-                s"attemptId=$attemptId " +
-                s"queryActive=$postAdmissionActive/$maxActiveWriterTasksPerQuery " +
-                s"queryTotalActive=${queryState.activeWriterCredits.size()} " +
-                s"shuffleActive=${decision.activeShuffleWriters}/" +
-                s"${decision.shuffleFairShare} " +
-                s"activeFrontier=${decision.activeFrontierWriters}/" +
-                s"${decision.frontierReserve} " +
-                s"writerDepth=${decision.writerDepth} " +
-                s"frontierDepth=${decision.frontierDepth} " +
-                s"frontierReserve=${decision.frontierReserve} " +
-                s"downstreamDrainBypassesQueryCap=" +
-                s"${decision.downstreamDrainBypassesQueryCap} " +
-                s"frontierProgressBypassesQueryCap=" +
-                s"${decision.frontierProgressBypassesQueryCap} " +
-                s"holdingFrontierForDrain=${decision.holdingFrontierForDrain} " +
-                s"underfilledShuffles=${decision.underfilledShuffles} " +
-                s"belowFairShuffles=${decision.belowFairShuffles} " +
-                s"queuedBytes=${decision.queuedBytes} " +
-                s"blockedWriters=${decision.blockedWriters} " +
-                s"backpressured=${decision.backpressured}")
-            writerCreditResponse(
-              granted = true,
-              shuffleId = shuffleId,
-              groupId = groupId,
-              query = query,
-              reason = None)
-          } else {
-            if (decision.shouldLogBlocked) {
-              logInfo(
-                s"Deferring UCX query writer credit queryId=${queryState.queryId} " +
-                  s"groupId=${queryState.groupId} shuffleId=$shuffleId mapId=$mapId " +
-                  s"attemptId=$attemptId " +
-                  s"queryActive=${decision.activeWriters}/$maxActiveWriterTasksPerQuery " +
-                  s"queryTotalActive=${decision.totalActiveWriters} " +
-                  s"shuffleActive=${decision.activeShuffleWriters}/" +
-                  s"${decision.shuffleFairShare} " +
-                  s"activeFrontier=${decision.activeFrontierWriters}/" +
-                  s"${decision.frontierReserve} " +
-                  s"writerDepth=${decision.writerDepth} " +
-                  s"frontierDepth=${decision.frontierDepth} " +
-                  s"frontierReserve=${decision.frontierReserve} " +
-                  s"downstreamDrainBypassesQueryCap=" +
-                  s"${decision.downstreamDrainBypassesQueryCap} " +
-                  s"frontierProgressBypassesQueryCap=" +
-                  s"${decision.frontierProgressBypassesQueryCap} " +
-                  s"holdingFrontierForDrain=${decision.holdingFrontierForDrain} " +
-                  s"underfilledShuffles=${decision.underfilledShuffles} " +
-                  s"belowFairShuffles=${decision.belowFairShuffles} " +
-                  s"queuedBytes=${decision.queuedBytes} " +
-                  s"blockedWriters=${decision.blockedWriters} " +
-                  s"backpressured=${decision.backpressured}")
-            }
-            writerCreditResponse(
-              granted = false,
-              shuffleId = shuffleId,
-              groupId = groupId,
-              query = query,
-              reason = None)
-          }
-
-        case None =>
-          val shuffleCredits =
-            writerCreditsByShuffle.computeIfAbsent(
-              shuffleId,
-              _ => new ConcurrentHashMap[Long, java.lang.Long]())
-          val existing = Option(shuffleCredits.get(mapId)).map(_.longValue())
-          if (existing.contains(attemptId)) {
-            return writerCreditResponse(
-              granted = true,
-              shuffleId = shuffleId,
-              groupId = groupId,
-              query = query,
-              reason = None)
-          }
-
-          val shuffleAllowed =
-            maxActiveWriterTasksPerShuffle <= 0 ||
-              shuffleCredits.size() < maxActiveWriterTasksPerShuffle
-          if (shuffleAllowed) {
-            shuffleCredits.put(mapId, attemptId)
-            logInfo(
-              s"Granted UCX shuffle writer credit shuffleId=$shuffleId mapId=$mapId " +
-                s"attemptId=$attemptId " +
-                s"shuffleActive=${shuffleCredits.size()}/$maxActiveWriterTasksPerShuffle")
-            writerCreditResponse(
-              granted = true,
-              shuffleId = shuffleId,
-              groupId = groupId,
-              query = query,
-              reason = None)
-          } else {
-            writerCreditResponse(
-              granted = false,
-              shuffleId = shuffleId,
-              groupId = groupId,
-              query = query,
-              reason = None)
-          }
+      val shuffleCredits =
+        writerCreditsByShuffle.computeIfAbsent(
+          shuffleId,
+          _ => new ConcurrentHashMap[Long, java.lang.Long]())
+      val existing = Option(shuffleCredits.get(mapId)).map(_.longValue())
+      if (existing.contains(attemptId)) {
+        return writerCreditResponse(
+          granted = true,
+          shuffleId = shuffleId,
+          groupId = groupId,
+          reason = None)
       }
+
+      val granted = shuffleCredits.size() < maxActiveWriterTasksPerShuffle
+      if (granted) {
+        shuffleCredits.put(mapId, attemptId)
+        logInfo(
+          s"Granted UCX shuffle writer credit shuffleId=$shuffleId mapId=$mapId " +
+            s"attemptId=$attemptId " +
+            s"shuffleActive=${shuffleCredits.size()}/$maxActiveWriterTasksPerShuffle")
+      }
+      writerCreditResponse(
+        granted = granted,
+        shuffleId = shuffleId,
+        groupId = groupId,
+        reason = None)
     }
   }
 
@@ -1189,14 +965,14 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
   override def reportNativeWriterState(
       state: UcxNativeWriterState): UcxNativeWriterStateResponse = {
     val groupId = groupIdForShuffle(state.shuffleId)
-    val query = queryForShuffle(state.shuffleId)
+    val transportGroup = transportGroupForShuffle(state.shuffleId)
     val inactiveReason =
       writerCreditInactiveReason(state.shuffleId).orElse(
         writerAttemptInactiveReason(state.shuffleId, state.mapId, state.attemptId))
     if (inactiveReason.isEmpty) {
-      query.foreach {
-        queryState =>
-          queryState.nativeWriterStates.put(writerCreditKey(state.shuffleId, state.mapId), state)
+      transportGroup.foreach {
+        group =>
+          group.nativeWriterStates.put(writerCreditKey(state.shuffleId, state.mapId), state)
       }
     }
     val writerDone = state.noMoreData || state.finished
@@ -1205,62 +981,24 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
         markWriterFinished(state.shuffleId, state.mapId, state.attemptId)
     val writerCreditReleased =
       writerDone && releaseWriterCreditInternal(state.shuffleId, state.mapId, state.attemptId)
-    query.foreach {
-      queryState =>
-        writerCreditLock.synchronized {
-          updateQueryBackpressure(queryState, queryQueuedBytes(queryState))
-        }
-        maybeAdvanceQueryState(queryState)
-    }
-    UcxNativeWriterStateResponse(
+    val response = UcxNativeWriterStateResponse(
       accepted = inactiveReason.isEmpty,
       shuffleId = state.shuffleId,
       groupId = groupId,
-      queryId = query.map(_.queryId),
-      queryState = query.map(_.state).getOrElse(UcxPipelinedShuffleGroupState.NoGroup),
+      groupState = transportGroup.map(_.state).getOrElse(UcxPipelinedShuffleGroupState.NoGroup),
       writerFinishedMarked = writerFinishedMarked,
       writerCreditReleased = writerCreditReleased,
-      queryQueuedBytes = query.map(queryQueuedBytes).getOrElse(0L),
-      queryBlockedWriters = query.map(queryBlockedWriters).getOrElse(0),
       reason = inactiveReason)
-  }
-
-  override def pipelinedProducerLaunchCap(groupId: String, configuredCap: Int): Int = {
-    val effectiveCap = math.max(0, configuredCap)
-    writerCreditLock.synchronized {
-      queryForGroup(groupId).map {
-        query =>
-          val queuedBytes = queryQueuedBytes(query)
-          val backpressured = updateQueryBackpressure(query, queuedBytes)
-          val activeAdmissionWriters =
-            activeAdmissionWriterCount(query, queryFrontierDepth(query))
-          val backpressuredCap = math.min(effectiveCap, backpressuredLaunchWriters)
-          val throttleLaunch = backpressured && backpressuredCap < effectiveCap
-          if (query.producerLaunchPaused != throttleLaunch) {
-            query.producerLaunchPaused = throttleLaunch
-            if (throttleLaunch) {
-              logInfo(
-                s"Throttled UCX pipelined pure-producer launch queryId=${query.queryId} " +
-                  s"groupId=$groupId queuedBytes=$queuedBytes " +
-                  s"activeAdmissionWriters=$activeAdmissionWriters " +
-                  s"backpressuredCap=$backpressuredCap configuredCap=$effectiveCap")
-            } else {
-              logInfo(
-                s"Resumed UCX pipelined pure-producer launch queryId=${query.queryId} " +
-                  s"groupId=$groupId queuedBytes=$queuedBytes " +
-                  s"activeAdmissionWriters=$activeAdmissionWriters " +
-                  s"configuredCap=$effectiveCap")
-            }
-          }
-          if (backpressured) backpressuredCap else effectiveCap
-      }.getOrElse(effectiveCap)
+    if (inactiveReason.isEmpty && state.finished) {
+      transportGroup.foreach(maybeFinishDrainingTransportGroup)
     }
+    response
   }
 
   override def reportNativeReaderState(
       state: UcxNativeReaderState): UcxNativeReaderStateResponse = {
     val groupId = groupIdForShuffle(state.shuffleId)
-    val query = queryForShuffle(state.shuffleId)
+    val transportGroup = transportGroupForShuffle(state.shuffleId)
     val inactiveReason =
       readerStateInactiveReason(state.shuffleId).orElse(
         readerAttemptInactiveReason(
@@ -1269,9 +1007,9 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
           state.taskAttemptId,
           state.nativeReaderId))
     if (inactiveReason.isEmpty) {
-      query.foreach {
-        queryState =>
-          queryState.nativeReaderStates.put(
+      transportGroup.foreach {
+        group =>
+          group.nativeReaderStates.put(
             readerStateKey(state.shuffleId, state.reducePartitionId),
             state)
       }
@@ -1281,38 +1019,29 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
             s"reduce=${state.reducePartitionId} taskAttemptId=${state.taskAttemptId} " +
             s"noMoreSplits=${state.noMoreSplits} finished=${state.finished} " +
             s"seenMaps=${state.seenMaps}/${state.expectedMaps} " +
-            s"completedMaps=${state.completedMaps}/${state.expectedMaps}")
+          s"completedMaps=${state.completedMaps}/${state.expectedMaps}")
       }
-      query.foreach(maybeAdvanceQueryState)
     }
     UcxNativeReaderStateResponse(
       accepted = inactiveReason.isEmpty,
       shuffleId = state.shuffleId,
       groupId = groupId,
-      queryId = query.map(_.queryId),
-      queryState = query.map(_.state).getOrElse(UcxPipelinedShuffleGroupState.NoGroup),
+      groupState = transportGroup.map(_.state).getOrElse(UcxPipelinedShuffleGroupState.NoGroup),
       reason = inactiveReason)
   }
 
   private def releaseWriterCreditInternal(shuffleId: Int, mapId: Long, attemptId: Long): Boolean = {
     writerCreditLock.synchronized {
-      val removedFromShuffle =
+      val removed =
         Option(writerCreditsByShuffle.get(shuffleId)).exists {
           credits => removeCreditIfSameAttempt(credits, mapId, attemptId)
         }
-      val queryCreditKey = writerCreditKey(shuffleId, mapId)
-      var removedFromQuery = false
-      queryForShuffle(shuffleId).foreach {
-        query =>
-          removedFromQuery =
-            removeCreditIfSameAttempt(query.activeWriterCredits, queryCreditKey, attemptId)
-      }
-      if (removedFromShuffle || removedFromQuery) {
+      if (removed) {
         logInfo(
           s"Released UCX shuffle writer credit shuffleId=$shuffleId " +
             s"mapId=$mapId attemptId=$attemptId")
       }
-      removedFromShuffle || removedFromQuery
+      removed
     }
   }
 
@@ -1326,11 +1055,11 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
 
   override def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {
     pipelinedRegistrationLock.synchronized {
+      val groupAttemptId = group.groupAttemptId
       val shuffleIds = pipelinedShuffleIds(group)
-      val queryKey = pipelinedQueryKey(group)
-      val created = new UcxPipelinedQueryState(queryKey, group.queryExecutionId)
-      val existing = pipelinedQueries.putIfAbsent(queryKey, created)
-      val query = Option(existing).getOrElse(created)
+      val created = new UcxPipelinedTransportGroupState(groupAttemptId)
+      val existing = pipelinedGroups.putIfAbsent(groupAttemptId, created)
+      val transportGroup = Option(existing).getOrElse(created)
 
       writerGenerations(group).foreach {
         case (shuffleId, generation) =>
@@ -1342,156 +1071,180 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
                   s"Reset UCX shuffle runtime for new writer generation shuffleId=$shuffleId " +
                     s"previous=${previous.writerStageId}.${previous.writerStageAttempt} " +
                     s"current=${generation.writerStageId}.${generation.writerStageAttempt} " +
-                    s"queryId=${query.queryId} groupId=${group.groupId}")
+                    s"groupAttemptId=$groupAttemptId")
               }
           }
           shuffleGenerationById.put(shuffleId, generation)
       }
 
-      query.registerGroup(group, shuffleIds)
-      groupIdToPipelinedQueryKey.put(group.groupId, queryKey)
-      shuffleIds.foreach(shuffleIdToPipelinedGroupId.put(_, group.groupId))
-      Option(abortedPipelinedQueries.get(group.groupId)).foreach {
+      transportGroup.registerGroup(group, shuffleIds)
+      val replacedGroups = shuffleIds.flatMap {
+        shuffleId =>
+          Option(shuffleIdToPipelinedGroupId.put(shuffleId, groupAttemptId))
+            .filter(_ != groupAttemptId)
+      }.distinct
+      replacedGroups.foreach(cleanupDetachedPipelinedGroup)
+      Option(abortedPipelinedGroups.get(groupAttemptId)).foreach {
         reason =>
-          query.state = UcxPipelinedShuffleGroupState.Aborted
-          query.abortedReason = Some(reason)
+          transportGroup.state = UcxPipelinedShuffleGroupState.Aborted
+          transportGroup.abortedReason = Some(reason)
       }
       logInfo(
-        s"Registered UCX pipelined query queryId=${query.queryId} groupId=${group.groupId} " +
-          s"jobId=${group.jobId} queryExecutionId=${group.queryExecutionId} " +
+        s"Registered UCX pipelined transport group logicalGroupId=${group.groupId} " +
+          s"groupAttemptId=$groupAttemptId " +
           s"stages=${group.stages.map(_.stageId)} shuffles=$shuffleIds " +
-          s"queryGroups=${query.groupIds.toSeq.sorted} " +
-          s"shuffleDepths=${query.shuffleDepths.toSeq.sortBy(_._1)} " +
-          s"state=${query.state}")
-      if (query.state == UcxPipelinedShuffleGroupState.Aborted) {
-        abortPipelinedShuffleGroup(group.groupId, "query was already aborted before registration")
+          s"state=${transportGroup.state}")
+      if (transportGroup.state == UcxPipelinedShuffleGroupState.Aborted) {
+        abortPipelinedShuffleGroup(
+          groupAttemptId,
+          "group attempt was already aborted before registration")
       }
     }
   }
 
-  override def admitPipelinedShuffleGroup(groupId: String): Boolean = {
-    val query = queryForGroup(groupId).getOrElse {
-      val queryState = new UcxPipelinedQueryState(groupId, None)
-      queryState.registerGroup(
-        PipelinedShuffleGroupMetadata(groupId, -1, None, Seq.empty),
-        shuffleIdsForGroup(groupId))
-      pipelinedQueries.putIfAbsent(groupId, queryState)
-      groupIdToPipelinedQueryKey.putIfAbsent(groupId, groupId)
-      Option(pipelinedQueries.get(groupId)).getOrElse(queryState)
-    }
-    if (query.state == UcxPipelinedShuffleGroupState.Aborted) {
+  override def admitPipelinedShuffleGroup(groupAttemptId: String): Boolean = {
+    val transportGroup = transportGroupForAttempt(groupAttemptId).getOrElse {
+      logWarning(
+        s"Rejected UCX pipelined transport admission for unknown " +
+          s"groupAttemptId=$groupAttemptId")
       return false
     }
-    query.admitGroup(groupId)
-    logInfo(s"Admitted UCX pipelined query queryId=${query.queryId} groupId=$groupId")
-    query
-      .groupMetadata(groupId)
+    if (transportGroup.state == UcxPipelinedShuffleGroupState.Aborted) {
+      return false
+    }
+    transportGroup.admitGroup(groupAttemptId)
+    logInfo(
+      s"Admitted UCX pipelined transport group groupAttemptId=$groupAttemptId")
+    transportGroup
+      .groupMetadata(groupAttemptId)
       .map(pipelinedShuffleIds)
-      .getOrElse(shuffleIdsForGroup(groupId))
+      .getOrElse(shuffleIdsForGroup(groupAttemptId))
       .foreach(maybeMarkReadersReady)
     true
   }
 
-  override def completePipelinedShuffleGroup(groupId: String): Boolean = {
-    queryForGroup(groupId) match {
-      case Some(query) if query.queryExecutionId.isDefined =>
-        query.completeGroup(groupId)
-        query
-          .groupMetadata(groupId)
-          .map(pipelinedShuffleIds)
-          .getOrElse(shuffleIdsForGroup(groupId))
-          .filterNot(query.activeShuffleIds.contains)
-          .foreach(clearWriterCreditsForShuffle)
-        maybeMarkQueryDraining(query)
+  override def completePipelinedShuffleGroup(groupAttemptId: String): Boolean = {
+    transportGroupForAttempt(groupAttemptId) match {
+      case Some(transportGroup) =>
+        transportGroup.completeGroup(groupAttemptId)
+        val shuffleIds =
+          transportGroup
+            .groupMetadata(groupAttemptId)
+            .map(pipelinedShuffleIds)
+            .getOrElse(shuffleIdsForGroup(groupAttemptId))
         logInfo(
-          s"Completed UCX pipelined group queryId=${query.queryId} groupId=$groupId; " +
-            s"retaining query control state until SQL execution completion")
-      case Some(query) =>
-        query.completeGroup(groupId)
-        cleanupPipelinedQuery(query)
+          s"Spark completed UCX pipelined transport group groupAttemptId=$groupAttemptId " +
+            s"shuffles=$shuffleIds; waiting for detached native writers to drain")
+        maybeFinishDrainingTransportGroup(transportGroup)
       case None =>
-        cleanupLegacyPipelinedGroup(groupId)
+        cleanupLegacyPipelinedGroup(groupAttemptId)
     }
     true
   }
 
-  override def abortPipelinedShuffleGroup(groupId: String, reason: String): Boolean = {
-    abortedPipelinedQueries.put(groupId, reason)
-    val query = queryForGroup(groupId)
-    val shuffleIds = query.map(_.shuffleIds.toSeq).getOrElse(shuffleIdsForGroup(groupId))
-    query.foreach { queryState =>
-      queryState.state = UcxPipelinedShuffleGroupState.Aborted
-      queryState.abortedReason = Some(reason)
-      queryState.abortAllGroups()
-      queryState.groupIds.foreach(abortedPipelinedQueries.put(_, reason))
+  override def abortPipelinedShuffleGroup(
+      groupAttemptId: String,
+      reason: String): Boolean = {
+    abortedPipelinedGroups.put(groupAttemptId, reason)
+    val transportGroup = transportGroupForAttempt(groupAttemptId)
+    val shuffleIds =
+      transportGroup.map(_.shuffleIds.toSeq).getOrElse(shuffleIdsForGroup(groupAttemptId))
+    transportGroup.foreach { group =>
+      group.state = UcxPipelinedShuffleGroupState.Aborted
+      group.abortedReason = Some(reason)
+      group.abortAllGroups()
     }
     shuffleIds.foreach {
       shuffleId =>
         abortShuffleInternal(
           shuffleId,
-          s"pipelined query ${query.map(_.queryId).getOrElse(groupId)} aborted: $reason")
+          s"pipelined group $groupAttemptId aborted: $reason")
     }
     logWarning(
-      s"Aborted UCX pipelined query queryId=${query.map(_.queryId)} groupId=$groupId " +
+      s"Aborted UCX pipelined transport group groupAttemptId=$groupAttemptId " +
         s"shuffles=$shuffleIds reason=$reason")
     true
   }
 
-  override def completePipelinedQuery(queryExecutionId: Long): Boolean = {
-    val queryKey = pipelinedQueryKey(queryExecutionId)
-    Option(pipelinedQueries.get(queryKey)).foreach {
-      query =>
-        if (query.state != UcxPipelinedShuffleGroupState.Aborted) {
-          query.state = UcxPipelinedShuffleGroupState.Finished
-          logInfo(
-            s"Completed UCX pipelined SQL query queryId=${query.queryId} " +
-              s"groups=${query.groupIds.toSeq.sorted} ${queryRuntimeSummary(query)}")
-          cleanupPipelinedQuery(query)
-        }
+  private def cleanupDetachedPipelinedGroup(groupAttemptId: String): Unit = {
+    if (!shuffleIdToPipelinedGroupId.containsValue(groupAttemptId)) {
+      Option(pipelinedGroups.remove(groupAttemptId)).foreach {
+        group =>
+          group.nativeWriterStates.clear()
+          group.nativeReaderStates.clear()
+      }
+      abortedPipelinedGroups.remove(groupAttemptId)
     }
-    true
-  }
-
-  override def abortPipelinedQuery(queryExecutionId: Long, reason: String): Boolean = {
-    val queryKey = pipelinedQueryKey(queryExecutionId)
-    Option(pipelinedQueries.get(queryKey)).foreach {
-      query =>
-        query.groupIds.headOption match {
-          case Some(groupId) => abortPipelinedShuffleGroup(groupId, reason)
-          case None =>
-            query.state = UcxPipelinedShuffleGroupState.Aborted
-            query.abortedReason = Some(reason)
-        }
-    }
-    true
   }
 
   private def cleanupLegacyPipelinedGroup(groupId: String): Unit = {
     val shuffleIds = shuffleIdsForGroup(groupId)
     shuffleIds.foreach(clearPipelinedShuffleState)
-    abortedPipelinedQueries.remove(groupId)
-    groupIdToPipelinedQueryKey.remove(groupId)
+    abortedPipelinedGroups.remove(groupId)
     logInfo(s"Completed legacy UCX pipelined group groupId=$groupId shuffles=$shuffleIds")
   }
 
-  private def cleanupPipelinedQuery(query: UcxPipelinedQueryState): Unit = {
-    val shuffleIds = query.shuffleIds.toSeq
-    query.activeWriterCredits.clear()
-    query.nativeWriterStates.clear()
-    query.nativeReaderStates.clear()
+  private def cleanupPipelinedTransportGroup(
+      transportGroup: UcxPipelinedTransportGroupState): Unit = {
+    val shuffleIds = transportGroup.shuffleIds.toSeq
+    transportGroup.nativeWriterStates.clear()
+    transportGroup.nativeReaderStates.clear()
     shuffleIds.foreach(clearPipelinedShuffleState)
-    query.groupIds.foreach {
+    transportGroup.groupIds.foreach {
       groupId =>
-        abortedPipelinedQueries.remove(groupId)
-        groupIdToPipelinedQueryKey.remove(groupId, query.queryKey)
+        abortedPipelinedGroups.remove(groupId)
     }
-    pipelinedQueries.remove(query.queryKey, query)
+    pipelinedGroups.remove(transportGroup.groupAttemptId, transportGroup)
     logInfo(
-      s"Cleaned UCX pipelined query queryId=${query.queryId} " +
-        s"groups=${query.groupIds.toSeq.sorted} shuffles=$shuffleIds")
+      s"Cleaned UCX pipelined transport group " +
+        s"groupAttemptId=${transportGroup.groupAttemptId} shuffles=$shuffleIds")
+  }
+
+  private def maybeFinishDrainingTransportGroup(
+      transportGroup: UcxPipelinedTransportGroupState): Unit = {
+    pipelinedRegistrationLock.synchronized {
+      if (
+        transportGroup.state != UcxPipelinedShuffleGroupState.Draining ||
+        !allNativeWritersDrained(transportGroup)
+      ) {
+        return
+      }
+
+      transportGroup.groupIds.foreach(transportGroup.finishGroup)
+      val shuffleIds = transportGroup.shuffleIds.toSeq
+      shuffleIds.foreach(resetPipelinedShuffleRuntime)
+      logInfo(
+        s"Finished draining UCX pipelined transport group " +
+          s"groupAttemptId=${transportGroup.groupAttemptId} shuffles=$shuffleIds")
+
+      if (shuffleIds.forall(pendingShuffleUnregistrations.contains)) {
+        cleanupPipelinedTransportGroup(transportGroup)
+      }
+    }
+  }
+
+  private def allNativeWritersDrained(
+      transportGroup: UcxPipelinedTransportGroupState): Boolean = {
+    transportGroup.shuffleIds.forall {
+      shuffleId =>
+        Option(endpoints.get(shuffleId)).forall {
+          registered =>
+            registered.asScala.forall {
+              case (mapId, endpoint) =>
+                Option(
+                  transportGroup.nativeWriterStates.get(writerCreditKey(shuffleId, mapId)))
+                  .exists(
+                    state =>
+                      state.attemptId == endpoint.attemptId &&
+                        state.noMoreData &&
+                        state.finished)
+            }
+        }
+    }
   }
 
   private def clearPipelinedShuffleState(shuffleId: Int): Unit = {
+    pendingShuffleUnregistrations.remove(shuffleId)
     shuffleInfos.remove(shuffleId)
     endpoints.remove(shuffleId)
     readerEndpoints.remove(shuffleId)
@@ -1524,6 +1277,15 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
   }
 
   override def unregisterShuffle(shuffleId: Int): Unit = {
+    val activeGroup = transportGroupForShuffle(shuffleId)
+    if (activeGroup.exists(_.state == UcxPipelinedShuffleGroupState.Draining)) {
+      pendingShuffleUnregistrations.add(shuffleId)
+      logInfo(
+        s"Deferred UCX shuffle unregistration until native drain shuffleId=$shuffleId " +
+          s"groupAttemptId=${activeGroup.get.groupAttemptId}")
+      return
+    }
+
     shuffleInfos.remove(shuffleId)
     endpoints.remove(shuffleId)
     readerEndpoints.remove(shuffleId)
@@ -1531,16 +1293,17 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
     abortedShuffles.remove(shuffleId)
     clearWriterCreditsForShuffle(shuffleId)
     clearNativeStatesForShuffle(shuffleId)
+    pendingShuffleUnregistrations.remove(shuffleId)
     val groupId = shuffleIdToPipelinedGroupId.remove(shuffleId)
     shuffleGenerationById.remove(shuffleId)
     if (groupId != null && !shuffleIdToPipelinedGroupId.containsValue(groupId)) {
-      queryForGroup(groupId).foreach {
-        query =>
+      transportGroupForAttempt(groupId).foreach {
+        transportGroup =>
           if (
-            query.state == UcxPipelinedShuffleGroupState.Aborted ||
-            query.state == UcxPipelinedShuffleGroupState.Finished
+            transportGroup.state == UcxPipelinedShuffleGroupState.Aborted ||
+            transportGroup.state == UcxPipelinedShuffleGroupState.Finished
           ) {
-            cleanupPipelinedQuery(query)
+            cleanupPipelinedTransportGroup(transportGroup)
           }
       }
     }
@@ -1548,8 +1311,9 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
   }
 
   private def isPipelinedGroupAborted(shuffleId: Int): Boolean = {
-    queryForShuffle(shuffleId).exists(_.state == UcxPipelinedShuffleGroupState.Aborted) ||
-    groupIdForShuffle(shuffleId).exists(abortedPipelinedQueries.containsKey)
+    transportGroupForShuffle(shuffleId)
+      .exists(_.state == UcxPipelinedShuffleGroupState.Aborted) ||
+    groupIdForShuffle(shuffleId).exists(abortedPipelinedGroups.containsKey)
   }
 
   private def pipelinedShuffleIds(group: PipelinedShuffleGroupMetadata): Seq[Int] = {
@@ -1567,14 +1331,6 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
     }
   }
 
-  private def pipelinedQueryKey(group: PipelinedShuffleGroupMetadata): String = {
-    group.queryExecutionId.map(pipelinedQueryKey).getOrElse(group.groupId)
-  }
-
-  private def pipelinedQueryKey(queryExecutionId: Long): String = {
-    s"queryExecution-$queryExecutionId"
-  }
-
   private def shuffleIdsForGroup(groupId: String): Seq[Int] = {
     shuffleIdToPipelinedGroupId.asScala.collect {
       case (shuffleId, mappedGroupId) if mappedGroupId == groupId => shuffleId
@@ -1582,16 +1338,19 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
   }
 
   private def maybeMarkReadersReady(shuffleId: Int): Unit = {
-    val query = queryForShuffle(shuffleId).orNull
+    val transportGroup = transportGroupForShuffle(shuffleId).orNull
     val groupId = groupIdForShuffle(shuffleId).orNull
     if (
-      query == null || groupId == null ||
-      query.groupState(groupId) != UcxPipelinedShuffleGroupState.Admitted
+      transportGroup == null || groupId == null ||
+      transportGroup.groupState(groupId) != UcxPipelinedShuffleGroupState.Admitted
     ) {
       return
     }
     val shuffleIds =
-      query.groupMetadata(groupId).map(pipelinedShuffleIds).getOrElse(shuffleIdsForGroup(groupId))
+      transportGroup
+        .groupMetadata(groupId)
+        .map(pipelinedShuffleIds)
+        .getOrElse(shuffleIdsForGroup(groupId))
     val allReadersReady = shuffleIds.nonEmpty && shuffleIds.forall {
       id =>
         val info = shuffleInfos.get(id)
@@ -1599,9 +1358,9 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
         info != null && readers != null && readers.size >= info.numReduces
     }
     if (allReadersReady) {
-      query.markGroupReadersReady(groupId)
+      transportGroup.markGroupReadersReady(groupId)
       logInfo(
-        s"UCX pipelined query queryId=${query.queryId} groupId=$groupId " +
+        s"UCX pipelined transport group groupAttemptId=$groupId " +
           s"reached READERS_READY " +
           s"readerCoverage=${readerCoverageSummary(shuffleIds)}")
     }
@@ -1611,99 +1370,6 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
     state == UcxPipelinedShuffleGroupState.ReadersReady ||
     state == UcxPipelinedShuffleGroupState.Draining ||
     state == UcxPipelinedShuffleGroupState.Finished
-  }
-
-  private def maybeMarkQueryDraining(query: UcxPipelinedQueryState): Unit = {
-    if (
-      query.state == UcxPipelinedShuffleGroupState.Aborted ||
-      query.state == UcxPipelinedShuffleGroupState.Finished
-    ) {
-      return
-    }
-    val activeShuffleIds = query.activeShuffleIds
-    val allWritersFinished = query.shuffleIds.nonEmpty &&
-      (activeShuffleIds.isEmpty || activeShuffleIds.forall {
-      shuffleId => shuffleFullyFinished(shuffleId)
-    })
-    if (allWritersFinished && query.state != UcxPipelinedShuffleGroupState.Draining) {
-      query.state = UcxPipelinedShuffleGroupState.Draining
-      logInfo(
-        s"UCX pipelined query queryId=${query.queryId} groupId=${query.groupId} " +
-          s"entered DRAINING activeCredits=${query.activeWriterCredits.size()} " +
-          s"nativeWriters=${query.nativeWriterStates.size()} " +
-          s"shuffles=${query.shuffleIds.toSeq.sorted}")
-    }
-  }
-
-  private def maybeAdvanceQueryState(query: UcxPipelinedQueryState): Unit = {
-    if (
-      query.state == UcxPipelinedShuffleGroupState.Aborted ||
-      query.state == UcxPipelinedShuffleGroupState.Finished
-    ) {
-      return
-    }
-    maybeMarkQueryDraining(query)
-  }
-
-  private def queryRuntimeSummary(
-      query: UcxPipelinedQueryState): UcxPipelinedQueryRuntimeSummary = {
-    UcxPipelinedQueryRuntimeSummary(
-      queryId = query.queryId,
-      activeWriterCredits = query.activeWriterCredits.size(),
-      nativeWriterStates = query.nativeWriterStates.size(),
-      finishedWriters = finishedWriterCount(query),
-      expectedWriters = expectedWriterCount(query),
-      queuedBytes = queryQueuedBytes(query),
-      blockedWriters = queryBlockedWriters(query),
-      registeredReaders = registeredReaderCount(query),
-      finishedReaders = finishedReaderCount(query),
-      expectedReaders = expectedReaderCount(query),
-      backpressured = query.backpressured)
-  }
-
-  private def expectedWriterCount(query: UcxPipelinedQueryState): Int = {
-    query.shuffleIds.toSeq
-      .flatMap(shuffleId => Option(shuffleInfos.get(shuffleId)))
-      .map(_.numMaps)
-      .sum
-  }
-
-  private def finishedWriterCount(query: UcxPipelinedQueryState): Int = {
-    query.shuffleIds.toSeq.map {
-      shuffleId => Option(finishedAttempts.get(shuffleId)).map(_.size()).getOrElse(0)
-    }.sum
-  }
-
-  private def expectedReaderCount(query: UcxPipelinedQueryState): Int = {
-    query.shuffleIds.toSeq
-      .flatMap(shuffleId => Option(shuffleInfos.get(shuffleId)))
-      .map(_.numReduces)
-      .sum
-  }
-
-  private def registeredReaderCount(query: UcxPipelinedQueryState): Int = {
-    query.shuffleIds.toSeq.map {
-      shuffleId => Option(readerEndpoints.get(shuffleId)).map(_.size()).getOrElse(0)
-    }.sum
-  }
-
-  private def finishedReaderCount(query: UcxPipelinedQueryState): Int = {
-    query.nativeReaderStates.asScala.values.count(_.finished)
-  }
-
-  private def queryQueuedBytes(query: UcxPipelinedQueryState): Long = {
-    val activeShuffleIds = query.activeShuffleIds
-    query.nativeWriterStates.asScala.values
-      .filter(state => activeShuffleIds.contains(state.shuffleId))
-      .map(state => math.max(0L, state.queuedBytes))
-      .sum
-  }
-
-  private def queryBlockedWriters(query: UcxPipelinedQueryState): Int = {
-    val activeShuffleIds = query.activeShuffleIds
-    query.nativeWriterStates.asScala.values.count {
-      state => activeShuffleIds.contains(state.shuffleId) && state.blocked
-    }
   }
 
   private def readerCoverageSummary(shuffleIds: Seq[Int]): String = {
@@ -1727,282 +1393,25 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
     }.toMap
   }
 
-  private case class QueryWriterCreditDecision(
-      granted: Boolean,
-      activeWriters: Int,
-      totalActiveWriters: Int,
-      activeShuffleWriters: Int,
-      activeFrontierWriters: Int,
-      writerDepth: Int,
-      frontierDepth: Option[Int],
-      frontierReserve: Int,
-      shuffleFairShare: Int,
-      underfilledShuffles: Seq[Int],
-      belowFairShuffles: Seq[Int],
-      downstreamDrainBypassesQueryCap: Boolean,
-      frontierProgressBypassesQueryCap: Boolean,
-      holdingFrontierForDrain: Boolean,
-      queuedBytes: Long,
-      blockedWriters: Int,
-      backpressured: Boolean,
-      shouldLogBlocked: Boolean = false)
-
-  private def queryWriterCreditDecision(
-      query: UcxPipelinedQueryState,
-      shuffleId: Int): QueryWriterCreditDecision = {
-    val writerDepth = query.shuffleDepth(shuffleId)
-    val frontierDepth = queryFrontierDepth(query)
-    val totalActiveWriters = query.activeWriterCredits.size()
-    val activeWriters = activeAdmissionWriterCount(query, frontierDepth)
-    val frontierReserve =
-      frontierDepth.map(depth => queryFrontierWriterReserve(query, depth)).getOrElse(0)
-    val unfinishedShuffles =
-      query.activeShuffleIds.toSeq.filterNot(shuffleFullyFinished).sorted
-    val admissionControlledShuffles =
-      frontierDepth
-        .map(depth => unfinishedShuffles.filter(id => query.shuffleDepth(id) == depth))
-        .getOrElse(unfinishedShuffles)
-    val activeByShuffle = activeWriterCountsByShuffle(query)
-    val activeShuffleWriters = activeByShuffle.getOrElse(shuffleId, 0)
-    val activeFrontierWriters =
-      frontierDepth
-        .map {
-          depth =>
-            activeByShuffle.iterator
-              .filter { case (activeShuffleId, _) =>
-                query.shuffleDepth(activeShuffleId) == depth
-              }
-              .map(_._2)
-              .sum
-        }
-        .getOrElse(0)
-    val shuffleFairShare =
-      if (maxActiveWriterTasksPerQuery > 0 && admissionControlledShuffles.nonEmpty) {
-        math.max(1, maxActiveWriterTasksPerQuery / admissionControlledShuffles.size)
-      } else {
-        0
-      }
-    val underfilledShuffles =
-      if (maxActiveWriterTasksPerQuery >= admissionControlledShuffles.size) {
-        admissionControlledShuffles.filter(id => activeByShuffle.getOrElse(id, 0) == 0)
-      } else {
-        Seq.empty[Int]
-      }
-    val belowFairShuffles =
-      if (shuffleFairShare > 0) {
-        admissionControlledShuffles.filter(
-          id => activeByShuffle.getOrElse(id, 0) < shuffleFairShare)
-      } else {
-        Seq.empty[Int]
-      }
-    val queuedBytes = queryQueuedBytes(query)
-    val blockedWriters = queryBlockedWriters(query)
-    val backpressured = updateQueryBackpressure(query, queuedBytes)
-
-    // Start the full downstream drain chain before releasing bulk producers. A writer below the
-    // frontier is also a reader of an upstream exchange. Blocking any deeper level can leave most
-    // exchange partitions undrained and turn streaming execution into a stage fence.
-    val downstreamDrain =
-      frontierDepth.exists(depth => writerDepth > depth)
-    val hasUnfinishedDirectDownstream =
-      frontierDepth.exists { depth =>
-        unfinishedShuffles.exists(id => query.shuffleDepth(id) == depth + 1)
-      }
-    val downstreamDrainBypassesQueryCap = downstreamDrain
-    val frontierProgressBypassesQueryCap =
-      frontierDepth.contains(writerDepth) &&
-        activeFrontierWriters < frontierReserve
-    val holdingFrontierForDrain =
-      backpressured &&
-        frontierDepth.contains(writerDepth) &&
-        hasUnfinishedDirectDownstream &&
-        activeFrontierWriters >= frontierReserve
-    val waitingForOtherUnderfilledShuffle =
-      !downstreamDrain &&
-        underfilledShuffles.exists(_ != shuffleId) &&
-        !underfilledShuffles.contains(shuffleId)
-    val waitingForOtherBelowFairShuffle =
-      !downstreamDrain &&
-        shuffleFairShare > 0 &&
-        activeShuffleWriters >= shuffleFairShare &&
-        belowFairShuffles.exists(_ != shuffleId)
-    val depthAllowed =
-      if (backpressured) {
-        frontierDepth.forall(depth => writerDepth >= depth)
-      } else {
-        true
-      }
-    val granted =
-      if (maxActiveWriterTasksPerQuery <= 0) {
-        true
-      } else if (
-        activeWriters >= maxActiveWriterTasksPerQuery &&
-        !downstreamDrainBypassesQueryCap &&
-        !frontierProgressBypassesQueryCap
-      ) {
-        false
-      } else if (holdingFrontierForDrain) {
-        false
-      } else if (!depthAllowed) {
-        false
-      } else if (waitingForOtherUnderfilledShuffle) {
-        false
-      } else if (waitingForOtherBelowFairShuffle) {
-        false
-      } else {
-        true
-      }
-
-    QueryWriterCreditDecision(
-      granted = granted,
-      activeWriters = activeWriters,
-      totalActiveWriters = totalActiveWriters,
-      activeShuffleWriters = activeShuffleWriters,
-      activeFrontierWriters = activeFrontierWriters,
-      writerDepth = writerDepth,
-      frontierDepth = frontierDepth,
-      frontierReserve = frontierReserve,
-      shuffleFairShare = shuffleFairShare,
-      underfilledShuffles = underfilledShuffles,
-      belowFairShuffles = belowFairShuffles,
-      downstreamDrainBypassesQueryCap = downstreamDrainBypassesQueryCap,
-      frontierProgressBypassesQueryCap = frontierProgressBypassesQueryCap,
-      holdingFrontierForDrain = holdingFrontierForDrain,
-      queuedBytes = queuedBytes,
-      blockedWriters = blockedWriters,
-      backpressured = backpressured)
-  }
-
-  private def updateQueryBackpressure(query: UcxPipelinedQueryState, queuedBytes: Long): Boolean = {
-    if (maxQueuedBytesPerQuery <= 0) {
-      query.backpressured = false
-      return false
-    }
-    if (query.backpressured) {
-      if (queuedBytes <= resumeQueuedBytesPerQuery) {
-        query.backpressured = false
-        logInfo(
-          s"UCX pipelined query queryId=${query.queryId} groupId=${query.groupId} " +
-            s"left backpressure queuedBytes=$queuedBytes " +
-            s"resumeQueuedBytes=$resumeQueuedBytesPerQuery")
-      }
-    } else if (queuedBytes >= maxQueuedBytesPerQuery) {
-      query.backpressured = true
-      logInfo(
-        s"UCX pipelined query queryId=${query.queryId} groupId=${query.groupId} " +
-          s"entered backpressure queuedBytes=$queuedBytes " +
-          s"maxQueuedBytes=$maxQueuedBytesPerQuery")
-    }
-    query.backpressured
-  }
-
-  private def queryFrontierDepth(query: UcxPipelinedQueryState): Option[Int] = {
-    val unfinishedDepths =
-      query.activeShuffleIds.toSeq
-        .filterNot(shuffleFullyFinished)
-        .map(query.shuffleDepth)
-    if (unfinishedDepths.isEmpty) {
-      None
-    } else {
-      Some(unfinishedDepths.min)
-    }
-  }
-
-  private def queryFrontierWriterReserve(
-      query: UcxPipelinedQueryState,
-      frontierDepth: Int): Int = {
-    if (maxActiveWriterTasksPerQuery <= 0) {
-      return 0
-    }
-    // Writer credit is currently acquired after Spark launches the task. Shrinking the frontier
-    // below the query cap can therefore consume every executor slot with credit waiters while
-    // downstream tasks wait for those producers. Keep the full admission window until the
-    // coordinator can pause native producers without occupying Spark task slots. Explicit
-    // configuration remains available for scheduler-integrated experiments.
-    val computedReserve = maxActiveWriterTasksPerQuery
-    val reserve =
-      if (minFrontierWriterTasksPerQuery > 0) {
-        minFrontierWriterTasksPerQuery
-      } else {
-        computedReserve
-      }
-    math.min(maxActiveWriterTasksPerQuery, reserve)
-  }
-
-  private def activeWriterCountsByShuffle(query: UcxPipelinedQueryState): Map[Int, Int] = {
-    query.activeWriterCredits
-      .keySet()
-      .asScala
-      .iterator
-      .flatMap {
-        key =>
-          val delimiter = key.indexOf(':')
-          if (delimiter <= 0) {
-            None
-          } else {
-            try {
-              Some(key.substring(0, delimiter).toInt)
-            } catch {
-              case _: NumberFormatException => None
-            }
-          }
-      }
-      .toSeq
-      .groupBy(identity)
-      .view
-      .mapValues(_.size)
-      .toMap
-  }
-
-  private def activeAdmissionWriterCount(
-      query: UcxPipelinedQueryState,
-      frontierDepth: Option[Int]): Int = {
-    frontierDepth match {
-      case Some(frontier) =>
-        activeWriterCountsByShuffle(query).iterator
-          .filterNot { case (shuffleId, _) =>
-            isDownstreamDrainShuffle(query, shuffleId, frontier)
-          }
-          .map(_._2)
-          .sum
-      case None =>
-        query.activeWriterCredits.size()
-    }
-  }
-
-  private def isDownstreamDrainShuffle(
-      query: UcxPipelinedQueryState,
-      shuffleId: Int,
-      frontierDepth: Int): Boolean = {
-    query.shuffleDepth(shuffleId) > frontierDepth &&
-      query.activeShuffleIds.exists { candidate =>
-        query.shuffleDepth(candidate) == frontierDepth && !shuffleFullyFinished(candidate)
-      }
-  }
-
-  private def shuffleFullyFinished(shuffleId: Int): Boolean = {
-    val info = shuffleInfos.get(shuffleId)
-    val finished = finishedAttempts.get(shuffleId)
-    info != null && finished != null && finished.size >= info.numMaps
-  }
-
   private def writerStageInactiveReason(
       shuffleId: Int,
       stageId: Int,
       stageAttemptNumber: Int): Option[String] = {
-    queryForShuffle(shuffleId).flatMap {
-      query =>
-        query.writerStage(shuffleId) match {
+    transportGroupForShuffle(shuffleId).flatMap {
+      transportGroup =>
+        transportGroup.writerStage(shuffleId) match {
           case Some(stage)
               if stage.stageId == stageId && stage.attemptId == stageAttemptNumber =>
             None
           case Some(stage) =>
             Some(
               s"writer stage=$stageId.$stageAttemptNumber does not match current " +
-                s"stage=${stage.stageId}.${stage.attemptId} for groupId=${query.groupId}")
+                s"stage=${stage.stageId}.${stage.attemptId} " +
+                s"for groupId=${transportGroup.groupId}")
           case None =>
             Some(
-              s"shuffleId=$shuffleId has no writer stage in current groupId=${query.groupId}")
+              s"shuffleId=$shuffleId has no writer stage in current " +
+                s"groupId=${transportGroup.groupId}")
         }
     }
   }
@@ -2011,9 +1420,9 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
       shuffleId: Int,
       stageId: Int,
       stageAttemptNumber: Int): Option[String] = {
-    queryForShuffle(shuffleId).flatMap {
-      query =>
-        query.readerStage(stageId) match {
+    transportGroupForShuffle(shuffleId).flatMap {
+      transportGroup =>
+        transportGroup.readerStage(stageId) match {
           case Some(stage)
               if stage.attemptId == stageAttemptNumber &&
                 stage.pipelinedParentShuffleIds.contains(shuffleId) =>
@@ -2021,15 +1430,16 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
           case Some(stage) if stage.attemptId != stageAttemptNumber =>
             Some(
               s"reader stage=$stageId.$stageAttemptNumber does not match current " +
-                s"stage=${stage.stageId}.${stage.attemptId} for groupId=${query.groupId}")
+                s"stage=${stage.stageId}.${stage.attemptId} " +
+                s"for groupId=${transportGroup.groupId}")
           case Some(_) =>
             Some(
               s"reader stage=$stageId.$stageAttemptNumber does not consume shuffleId=$shuffleId " +
-                s"in current groupId=${query.groupId}")
+                s"in current groupId=${transportGroup.groupId}")
           case None =>
             Some(
               s"reader stage=$stageId.$stageAttemptNumber is not in current " +
-                s"groupId=${query.groupId}")
+                s"groupId=${transportGroup.groupId}")
         }
     }
   }
@@ -2082,15 +1492,15 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
       Some(s"shuffleId=$shuffleId is not registered")
     } else {
       Option(abortedShuffles.get(shuffleId)).orElse {
-        queryForShuffle(shuffleId)
+        transportGroupForShuffle(shuffleId)
           .flatMap {
-            query =>
-              query.abortedReason.orElse {
-                query.state match {
+            transportGroup =>
+              transportGroup.abortedReason.orElse {
+                transportGroup.state match {
                   case UcxPipelinedShuffleGroupState.Aborted =>
-                    Some(s"pipelined query ${query.groupId} is aborted")
+                    Some(s"pipelined transport group ${transportGroup.groupId} is aborted")
                   case UcxPipelinedShuffleGroupState.Finished =>
-                    Some(s"pipelined query ${query.groupId} is finished")
+                    Some(s"pipelined transport group ${transportGroup.groupId} is finished")
                   case _ =>
                     None
                 }
@@ -2098,7 +1508,7 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
           }
           .orElse {
             groupIdForShuffle(shuffleId).flatMap {
-              id => Option(abortedPipelinedQueries.get(id))
+              id => Option(abortedPipelinedGroups.get(id))
             }
           }
       }
@@ -2110,12 +1520,12 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
       Some(s"shuffleId=$shuffleId is not registered")
     } else {
       Option(abortedShuffles.get(shuffleId)).orElse {
-        queryForShuffle(shuffleId)
+        transportGroupForShuffle(shuffleId)
           .flatMap {
-            query =>
-              query.abortedReason.orElse {
-                if (query.state == UcxPipelinedShuffleGroupState.Aborted) {
-                  Some(s"pipelined query ${query.groupId} is aborted")
+            transportGroup =>
+              transportGroup.abortedReason.orElse {
+                if (transportGroup.state == UcxPipelinedShuffleGroupState.Aborted) {
+                  Some(s"pipelined transport group ${transportGroup.groupId} is aborted")
                 } else {
                   None
                 }
@@ -2123,7 +1533,7 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
           }
           .orElse {
             groupIdForShuffle(shuffleId).flatMap {
-              id => Option(abortedPipelinedQueries.get(id))
+              id => Option(abortedPipelinedGroups.get(id))
             }
           }
       }
@@ -2134,46 +1544,30 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
       granted: Boolean,
       shuffleId: Int,
       groupId: Option[String],
-      query: Option[UcxPipelinedQueryState],
       reason: Option[String]): UcxShuffleWriterCreditResponse = {
     val shuffleActive =
-      query
-        .map(activeWriterCountsByShuffle(_).getOrElse(shuffleId, 0))
-        .getOrElse(Option(writerCreditsByShuffle.get(shuffleId)).map(_.size()).getOrElse(0))
-    val queryActive =
-      query
-        .map { queryState =>
-          activeAdmissionWriterCount(queryState, queryFrontierDepth(queryState))
-        }
-        .getOrElse(0)
+      Option(writerCreditsByShuffle.get(shuffleId)).map(_.size()).getOrElse(0)
     UcxShuffleWriterCreditResponse(
       granted = granted,
       shuffleId = shuffleId,
       groupId = groupId,
       activeShuffleWriters = shuffleActive,
       maxShuffleWriters = maxActiveWriterTasksPerShuffle,
-      activeGroupWriters = queryActive,
-      maxGroupWriters = maxActiveWriterTasksPerQuery,
-      reason = reason,
-      queryId = query.map(_.queryId),
-      queryState = query.map(_.state),
-      queryQueuedBytes = query.map(queryQueuedBytes).getOrElse(0L),
-      queryBlockedWriters = query.map(queryBlockedWriters).getOrElse(0),
-      queryBackpressured = query.exists(_.backpressured)
-    )
+      reason = reason)
   }
 
   private def groupIdForShuffle(shuffleId: Int): Option[String] = {
     Option(shuffleIdToPipelinedGroupId.get(shuffleId))
   }
 
-  private def queryForGroup(groupId: String): Option[UcxPipelinedQueryState] = {
-    Option(groupIdToPipelinedQueryKey.get(groupId))
-      .flatMap(queryKey => Option(pipelinedQueries.get(queryKey)))
+  private def transportGroupForAttempt(
+      groupId: String): Option[UcxPipelinedTransportGroupState] = {
+    Option(pipelinedGroups.get(groupId))
   }
 
-  private def queryForShuffle(shuffleId: Int): Option[UcxPipelinedQueryState] = {
-    groupIdForShuffle(shuffleId).flatMap(queryForGroup)
+  private def transportGroupForShuffle(
+      shuffleId: Int): Option[UcxPipelinedTransportGroupState] = {
+    groupIdForShuffle(shuffleId).flatMap(transportGroupForAttempt)
   }
 
   private def writerCreditKey(shuffleId: Int, mapId: Long): String = {
@@ -2200,32 +1594,23 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
   private def clearWriterCreditsForShuffle(shuffleId: Int): Unit = {
     writerCreditLock.synchronized {
       writerCreditsByShuffle.remove(shuffleId)
-      val prefix = s"$shuffleId:"
-      pipelinedQueries.asScala.values.foreach {
-        query =>
-          query.activeWriterCredits
-            .keySet()
-            .asScala
-            .filter(_.startsWith(prefix))
-            .foreach(key => query.activeWriterCredits.remove(key))
-      }
     }
   }
 
   private def clearNativeStatesForShuffle(shuffleId: Int): Unit = {
     val prefix = s"$shuffleId:"
-    pipelinedQueries.asScala.values.foreach {
-      query =>
-        query.nativeWriterStates
+    pipelinedGroups.asScala.values.foreach {
+      transportGroup =>
+        transportGroup.nativeWriterStates
           .keySet()
           .asScala
           .filter(_.startsWith(prefix))
-          .foreach(key => query.nativeWriterStates.remove(key))
-        query.nativeReaderStates
+          .foreach(key => transportGroup.nativeWriterStates.remove(key))
+        transportGroup.nativeReaderStates
           .keySet()
           .asScala
           .filter(_.startsWith(prefix))
-          .foreach(key => query.nativeReaderStates.remove(key))
+          .foreach(key => transportGroup.nativeReaderStates.remove(key))
     }
   }
 
@@ -2314,10 +1699,6 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
                 context.reply(completePipelinedShuffleGroup(groupId))
               case AbortUcxPipelinedShuffleGroupMasterMessage(groupId, reason, context) =>
                 context.reply(abortPipelinedShuffleGroup(groupId, reason))
-              case CompleteUcxPipelinedQueryMasterMessage(queryExecutionId, context) =>
-                context.reply(completePipelinedQuery(queryExecutionId))
-              case AbortUcxPipelinedQueryMasterMessage(queryExecutionId, reason, context) =>
-                context.reply(abortPipelinedQuery(queryExecutionId, reason))
             }
           } catch {
             case NonFatal(e) => logError(s"Error in UCX shuffle coordinator message loop", e)
@@ -2409,25 +1790,20 @@ private[spark] class UcxShuffleCoordinatorWorker(conf: SparkConf)
     sendCoordinator(RegisterUcxPipelinedShuffleGroup(group))
   }
 
-  override def admitPipelinedShuffleGroup(groupId: String): Boolean = {
-    askCoordinator[Boolean](AdmitUcxPipelinedShuffleGroup(groupId))
+  override def admitPipelinedShuffleGroup(groupAttemptId: String): Boolean = {
+    askCoordinator[Boolean](AdmitUcxPipelinedShuffleGroup(groupAttemptId))
   }
 
-  override def completePipelinedShuffleGroup(groupId: String): Boolean = {
-    askCoordinator[Boolean](CompleteUcxPipelinedShuffleGroup(groupId))
+  override def completePipelinedShuffleGroup(groupAttemptId: String): Boolean = {
+    askCoordinator[Boolean](CompleteUcxPipelinedShuffleGroup(groupAttemptId))
   }
 
-  override def abortPipelinedShuffleGroup(groupId: String, reason: String): Boolean = {
-    askCoordinator[Boolean](AbortUcxPipelinedShuffleGroup(groupId, reason))
+  override def abortPipelinedShuffleGroup(
+      groupAttemptId: String,
+      reason: String): Boolean = {
+    askCoordinator[Boolean](AbortUcxPipelinedShuffleGroup(groupAttemptId, reason))
   }
 
-  override def completePipelinedQuery(queryExecutionId: Long): Boolean = {
-    askCoordinator[Boolean](CompleteUcxPipelinedQuery(queryExecutionId))
-  }
-
-  override def abortPipelinedQuery(queryExecutionId: Long, reason: String): Boolean = {
-    askCoordinator[Boolean](AbortUcxPipelinedQuery(queryExecutionId, reason))
-  }
 }
 
 private[spark] class UcxShuffleCoordinatorEndpoint(
@@ -2501,12 +1877,6 @@ private[spark] class UcxShuffleCoordinatorEndpoint(
     case AbortUcxPipelinedShuffleGroup(groupId, reason) =>
       coordinator.post(AbortUcxPipelinedShuffleGroupMasterMessage(groupId, reason, context))
 
-    case CompleteUcxPipelinedQuery(queryExecutionId) =>
-      coordinator.post(CompleteUcxPipelinedQueryMasterMessage(queryExecutionId, context))
-
-    case AbortUcxPipelinedQuery(queryExecutionId, reason) =>
-      coordinator.post(AbortUcxPipelinedQueryMasterMessage(queryExecutionId, reason, context))
-
     case StopUcxShuffleCoordinator =>
       logInfo(log"UCX shuffle coordinator endpoint stopped.")
       stop()
@@ -2518,12 +1888,6 @@ private[spark] object UcxShuffleCoordinator extends Logging {
   val EndpointName: String = "UcxShuffleCoordinator"
 
   @volatile private var coordinator: Option[UcxShuffleCoordinator] = None
-
-  def pipelinedProducerLaunchCap(groupId: String, configuredCap: Int): Int = {
-    coordinator
-      .map(_.pipelinedProducerLaunchCap(groupId, configuredCap))
-      .getOrElse(math.max(0, configuredCap))
-  }
 
   def getOrCreate(conf: SparkConf, isDriver: Boolean): UcxShuffleCoordinator = synchronized {
     coordinator.getOrElse {

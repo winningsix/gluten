@@ -443,10 +443,10 @@ object NativeUcxShuffleExecution extends Logging {
           timestampMs = System.currentTimeMillis()))
     if (!response.accepted) {
       logWarning(
-        s"Native UCX reader state rejected by query coordinator " +
+        s"Native UCX reader state rejected by transport coordinator " +
           s"shuffleId=${spec.shuffleId} reduce=${spec.reducePartitionId} " +
           s"taskAttemptId=${spec.taskAttemptId} groupId=${response.groupId} " +
-          s"queryId=${response.queryId} queryState=${response.queryState} " +
+          s"groupState=${response.groupState} " +
           s"reason=${response.reason}")
     }
   }
