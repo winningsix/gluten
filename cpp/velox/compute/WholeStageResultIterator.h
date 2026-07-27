@@ -152,6 +152,7 @@ class WholeStageResultIterator : public SplitAwareColumnarBatchIterator {
   std::shared_ptr<facebook::velox::exec::Task> task_;
   std::shared_ptr<const facebook::velox::core::PlanNode> veloxPlan_;
   std::shared_ptr<WholeStageParallelResultQueue> parallelResultQueue_ = nullptr;
+  uint32_t parallelTaskMaxDrivers_ = 1;
   bool requiresParallelExecution_ = false;
   bool parallelTaskProducesOutput_ = false;
   bool parallelTaskStarted_ = false;

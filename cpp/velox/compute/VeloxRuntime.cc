@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <sstream>
 
 #include "VeloxBackend.h"
 #include "compute/ResultIterator.h"
@@ -57,6 +58,7 @@ DECLARE_bool(velox_memory_pool_capacity_transfer_across_tasks);
 #endif
 
 #ifdef GLUTEN_ENABLE_GPU
+#include "cudf/GpuLock.h"
 #include "operators/serializer/VeloxGpuColumnarBatchSerializer.h"
 #endif
 
@@ -75,6 +77,8 @@ const std::string kNativeUcxWritePartitioning =
     "spark.gluten.ucx.shuffle.native.write.partitioning";
 const std::string kNativeUcxWriteDropFirstColumn =
     "spark.gluten.ucx.shuffle.native.write.dropFirstColumn";
+const std::string kNativeUcxWritePartitionKeyIndices =
+    "spark.gluten.ucx.shuffle.native.write.partitionKeyIndices";
 
 bool boolConf(
     const std::unordered_map<std::string, std::string>& conf,
@@ -106,6 +110,23 @@ std::string stringConf(
   return it == conf.end() ? defaultValue : it->second;
 }
 
+std::vector<column_index_t> indexListConf(
+    const std::unordered_map<std::string, std::string>& conf,
+    const std::string& key) {
+  std::vector<column_index_t> indices;
+  const auto value = stringConf(conf, key);
+  if (value.empty()) {
+    return indices;
+  }
+  std::stringstream values(value);
+  std::string token;
+  while (std::getline(values, token, ',')) {
+    VELOX_CHECK(!token.empty(), "Empty native UCX partition-key index");
+    indices.push_back(static_cast<column_index_t>(std::stoi(token)));
+  }
+  return indices;
+}
+
 RowTypePtr dropFirstField(const RowTypePtr& inputType) {
   VELOX_CHECK_GT(
       inputType->size(),
@@ -130,12 +151,15 @@ core::PlanNodePtr wrapNativeUcxPartitionedOutput(
   VELOX_CHECK_GT(numPartitions, 0, "Native UCX shuffle needs partitions > 0");
   const auto partitioning = stringConf(conf, kNativeUcxWritePartitioning, "");
   const auto dropFirstColumn = boolConf(conf, kNativeUcxWriteDropFirstColumn);
+  const auto partitionKeyIndices =
+      indexListConf(conf, kNativeUcxWritePartitionKeyIndices);
   const auto inputType = source->outputType();
   const auto outputType = dropFirstColumn ? dropFirstField(inputType) : inputType;
   const auto outputNodeId = std::string{"ucx_partitioned_output"};
   LOG(INFO) << "Creating native UCX PartitionedOutput partitioning="
             << partitioning << " partitions=" << numPartitions
             << " dropFirstColumn=" << dropFirstColumn
+            << " partitionKeyCount=" << partitionKeyIndices.size()
             << " inputType=" << inputType->toString()
             << " outputType=" << outputType->toString();
   if (numPartitions == 1 || partitioning == "single") {
@@ -165,12 +189,21 @@ core::PlanNodePtr wrapNativeUcxPartitionedOutput(
         inputType->size(),
         0,
         "Native UCX hash/range shuffle requires a partition id/hash column");
-    keys.push_back(std::make_shared<core::FieldAccessTypedExpr>(
-        inputType->childAt(0),
-        inputType->nameOf(0)));
+    const auto keyIndices = partitionKeyIndices.empty()
+        ? std::vector<column_index_t>{0}
+        : partitionKeyIndices;
+    for (const auto keyIndex : keyIndices) {
+      VELOX_CHECK_GE(keyIndex, 0, "Native UCX partition-key index is negative");
+      VELOX_CHECK_LT(
+          keyIndex,
+          inputType->size(),
+          "Native UCX partition-key index is outside the input schema");
+      keys.push_back(std::make_shared<core::FieldAccessTypedExpr>(
+          inputType->childAt(keyIndex),
+          inputType->nameOf(keyIndex)));
+    }
     funcSpec = std::make_shared<velox::exec::HashPartitionFunctionSpec>(
-        inputType,
-        std::vector<column_index_t>{0});
+        inputType, keyIndices);
   }
 
   return std::make_shared<core::PartitionedOutputNode>(
@@ -206,6 +239,20 @@ VeloxRuntime::VeloxRuntime(
   FLAGS_velox_memory_use_hugepages = veloxCfg_->get<bool>(kMemoryUseHugePages, FLAGS_velox_memory_use_hugepages);
   FLAGS_velox_memory_pool_capacity_transfer_across_tasks = veloxCfg_->get<bool>(
       kMemoryPoolCapacityTransferAcrossTasks, FLAGS_velox_memory_pool_capacity_transfer_across_tasks);
+#ifdef GLUTEN_ENABLE_GPU
+  gpuLockEnableScope_ = veloxCfg_->get<bool>(kCudfGpuLockEnabled, false);
+  if (gpuLockEnableScope_) {
+    acquireGpuLockEnableScope();
+  }
+#endif
+}
+
+VeloxRuntime::~VeloxRuntime() {
+#ifdef GLUTEN_ENABLE_GPU
+  if (gpuLockEnableScope_) {
+    releaseGpuLockEnableScope();
+  }
+#endif
 }
 
 void VeloxRuntime::parsePlan(const uint8_t* data, int32_t size) {

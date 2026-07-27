@@ -164,13 +164,27 @@ object ExecUtil {
         .create()
     }
 
+    val exposesAllChildColumns =
+      Option(projectOutputAttributes).forall(_.size == childOutputAttributes.size)
     val nativePartitioning: NativePartitioning = newPartitioning match {
       case SinglePartition =>
         new NativePartitioning(GlutenShuffleUtils.SinglePartitioningShortName, 1)
       case RoundRobinPartitioning(n) =>
         new NativePartitioning(GlutenShuffleUtils.RoundRobinPartitioningShortName, n)
       case HashPartitioning(exprs, n) =>
-        new NativePartitioning(GlutenShuffleUtils.HashPartitioningShortName, n)
+        val keyIndices = if (exposesAllChildColumns) {
+          exprs.map(expr => childOutputAttributes.indexWhere(_.semanticEquals(expr)))
+        } else {
+          Seq.empty
+        }
+        if (keyIndices.nonEmpty && keyIndices.forall(_ >= 0)) {
+          new NativePartitioning(
+            GlutenShuffleUtils.HashPartitioningShortName,
+            n,
+            keyIndices.toArray)
+        } else {
+          new NativePartitioning(GlutenShuffleUtils.HashPartitioningShortName, n)
+        }
       case ReplicatedPartitioning(n) =>
         new NativePartitioning(GlutenShuffleUtils.BroadcastPartitioningShortName, n)
       // range partitioning fall back to row-based partition id computation

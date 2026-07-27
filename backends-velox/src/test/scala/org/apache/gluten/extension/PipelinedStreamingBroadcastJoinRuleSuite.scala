@@ -22,7 +22,7 @@ import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.AttributeReference
 import org.apache.spark.sql.catalyst.optimizer.BuildRight
-import org.apache.spark.sql.catalyst.plans.Inner
+import org.apache.spark.sql.catalyst.plans.{Inner, LeftAnti}
 import org.apache.spark.sql.catalyst.plans.physical.{IdentityBroadcastMode, SinglePartition}
 import org.apache.spark.sql.execution.{CoalesceExec, ColumnarBroadcastExchangeExec, ColumnarShuffleExchangeExec, LocalTableScanExec}
 import org.apache.spark.sql.execution.exchange.{ENSURE_REQUIREMENTS, ReusedExchangeExec}
@@ -63,6 +63,39 @@ class PipelinedStreamingBroadcastJoinRuleSuite extends QueryTest with SharedSpar
       assert(exchange.child eq build)
       assert(rewritten.left eq probe)
       assert(rewritten.outputPartitioning == probe.outputPartitioning)
+      assert(rewritten.output.map(_.exprId) == original.output.map(_.exprId))
+    }
+  }
+
+  test("null-aware anti broadcast join preserves null-aware semantics with replicated build") {
+    withSQLConf(
+      "spark.sql.shuffle.pipelined.enabled" -> "true",
+      "spark.gluten.sql.columnar.pipelined.streamingBroadcast.enabled" -> "true") {
+      val probeKey = AttributeReference("probe_key", LongType, nullable = true)()
+      val buildKey = AttributeReference("build_key", LongType, nullable = true)()
+      val probe = CoalesceExec(
+        4,
+        LocalTableScanExec(Seq(probeKey), Seq.empty[InternalRow], None))
+      val build = LocalTableScanExec(Seq(buildKey), Seq.empty[InternalRow], None)
+      val original = BroadcastHashJoinExecTransformer(
+        Seq(probeKey),
+        Seq(buildKey),
+        LeftAnti,
+        BuildRight,
+        condition = None,
+        probe,
+        ColumnarBroadcastExchangeExec(
+          HashedRelationBroadcastMode(Seq(buildKey), isNullAware = true),
+          build),
+        isNullAwareAntiJoin = true)
+
+      val rewritten = PipelinedStreamingBroadcastJoinRule()(original)
+        .asInstanceOf[ShuffledHashJoinExecTransformer]
+      val exchange = rewritten.right.asInstanceOf[ColumnarShuffleExchangeExec]
+
+      assert(exchange.outputPartitioning == ReplicatedPartitioning(4))
+      assert(rewritten.isNullAwareAntiJoin)
+      assert(rewritten.genJoinParametersInternal() == (0, 1, ""))
       assert(rewritten.output.map(_.exprId) == original.output.map(_.exprId))
     }
   }
@@ -197,6 +230,54 @@ class PipelinedStreamingBroadcastJoinRuleSuite extends QueryTest with SharedSpar
       assert(!(firstNested eq secondNested))
       assert(firstNested.outputPartitioning == SinglePartition)
       assert(secondNested.outputPartitioning == SinglePartition)
+    }
+  }
+
+  test("nested broadcast chain inherits consumer count from rewritten inner join") {
+    withSQLConf(
+      "spark.sql.shuffle.pipelined.enabled" -> "true",
+      "spark.gluten.sql.columnar.pipelined.streamingBroadcast.enabled" -> "true") {
+      val probeKey = AttributeReference("probe_key", LongType, nullable = false)()
+      val firstBuildKey = AttributeReference("first_build_key", LongType, nullable = false)()
+      val secondBuildKey = AttributeReference("second_build_key", LongType, nullable = false)()
+      val probe = CoalesceExec(
+        4,
+        LocalTableScanExec(Seq(probeKey), Seq.empty[InternalRow], None))
+
+      def broadcast(key: AttributeReference): ColumnarBroadcastExchangeExec =
+        ColumnarBroadcastExchangeExec(
+          HashedRelationBroadcastMode(Seq(key)),
+          LocalTableScanExec(Seq(key), Seq.empty[InternalRow], None))
+
+      val inner = BroadcastHashJoinExecTransformer(
+        Seq(probeKey),
+        Seq(firstBuildKey),
+        Inner,
+        BuildRight,
+        condition = None,
+        probe,
+        broadcast(firstBuildKey),
+        isNullAwareAntiJoin = false)
+      val outer = BroadcastHashJoinExecTransformer(
+        Seq(probeKey),
+        Seq(secondBuildKey),
+        Inner,
+        BuildRight,
+        condition = None,
+        inner,
+        broadcast(secondBuildKey),
+        isNullAwareAntiJoin = false)
+
+      val rewrittenOuter = PipelinedStreamingBroadcastJoinRule()(outer)
+        .asInstanceOf[ShuffledHashJoinExecTransformer]
+      val rewrittenInner = rewrittenOuter.left.asInstanceOf[ShuffledHashJoinExecTransformer]
+      val outerExchange =
+        rewrittenOuter.right.asInstanceOf[ColumnarShuffleExchangeExec]
+      val innerExchange =
+        rewrittenInner.right.asInstanceOf[ColumnarShuffleExchangeExec]
+
+      assert(innerExchange.outputPartitioning == ReplicatedPartitioning(4))
+      assert(outerExchange.outputPartitioning == ReplicatedPartitioning(4))
     }
   }
 }

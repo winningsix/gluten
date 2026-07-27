@@ -32,7 +32,7 @@ import org.apache.spark.api.python.{ColumnarArrowEvalPythonExec, PullOutArrowEva
 import org.apache.spark.memory.SparkMemoryUtil
 import org.apache.spark.rdd.RDD
 import org.apache.spark.serializer.Serializer
-import org.apache.spark.shuffle.{GenShuffleReaderParameters, GenShuffleWriterParameters, GlutenShuffleReaderWrapper, GlutenShuffleWriterWrapper}
+import org.apache.spark.shuffle.{GenShuffleReaderParameters, GenShuffleWriterParameters, GlutenShuffleReaderWrapper, GlutenShuffleWriterWrapper, NativeUcxShuffleExecution}
 import org.apache.spark.shuffle.utils.ShuffleUtil
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
@@ -379,26 +379,42 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
 
     val newShuffle = shuffle.outputPartitioning match {
       case HashPartitioning(exprs, _) =>
-        val hashExpr = if (exprs.isEmpty) {
-          // In Spark, a hash expression with empty input is not resolvable and an
-          // `WRONG_NUM_ARGS.WITHOUT_SUGGESTION` error will be reported when validating the project
-          // transformer. So we directly return the seed here, which is the intended hashed value
-          // for empty input given Spark's murmur3 hash logic.
-          Literal(new Murmur3Hash(Nil).seed, IntegerType)
+        val nativeUcxRawHash =
+          SQLConf.get
+            .getConfString(NativeUcxShuffleExecution.EnabledConf, "false")
+            .toBoolean &&
+            SQLConf.get
+              .getConfString(NativeUcxShuffleExecution.RawHashEnabledConf, "false")
+              .toBoolean &&
+            exprs.nonEmpty &&
+            exprs.forall(expr => child.output.exists(_.semanticEquals(expr)))
+        if (nativeUcxRawHash) {
+          // Native UCX can hash-partition the actual key columns inside the cuDF sink. Keep
+          // Spark's logical HashPartitioning on the exchange, but avoid materializing a
+          // hash_partition_key column in a separate GPU Project.
+          ColumnarShuffleExchangeExec(shuffle, child, child.output)
         } else {
-          new Murmur3Hash(exprs)
-        }
-        val projectList = Seq(Alias(hashExpr, "hash_partition_key")()) ++ child.output
-        val projectTransformer = ProjectExecTransformer(projectList, child)
-        val validationResult = projectTransformer.doValidate()
-        if (validationResult.ok()) {
-          ColumnarShuffleExchangeExec(
-            shuffle,
-            projectTransformer,
-            projectTransformer.output.drop(1))
-        } else {
-          FallbackTags.add(shuffle, validationResult)
-          shuffle.withNewChildren(child :: Nil)
+          val hashExpr = if (exprs.isEmpty) {
+            // In Spark, a hash expression with empty input is not resolvable and an
+            // `WRONG_NUM_ARGS.WITHOUT_SUGGESTION` error will be reported when validating the
+            // project transformer. So we directly return the seed here, which is the intended
+            // hashed value for empty input given Spark's murmur3 hash logic.
+            Literal(new Murmur3Hash(Nil).seed, IntegerType)
+          } else {
+            new Murmur3Hash(exprs)
+          }
+          val projectList = Seq(Alias(hashExpr, "hash_partition_key")()) ++ child.output
+          val projectTransformer = ProjectExecTransformer(projectList, child)
+          val validationResult = projectTransformer.doValidate()
+          if (validationResult.ok()) {
+            ColumnarShuffleExchangeExec(
+              shuffle,
+              projectTransformer,
+              projectTransformer.output.drop(1))
+          } else {
+            FallbackTags.add(shuffle, validationResult)
+            shuffle.withNewChildren(child :: Nil)
+          }
         }
       case RoundRobinPartitioning(num) if SQLConf.get.sortBeforeRepartition && num > 1 =>
         // scalastyle:off line.size.limit

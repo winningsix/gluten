@@ -100,4 +100,25 @@ class PartitionsUtilSuite extends AnyFunSuite {
     assert(result.size === 0)
   }
 
+  test("coalesce file partitions to an exact executor count") {
+    val files = (1 to 12).map(i => makePartitionedFile(s"f$i", i * 10L))
+    val initialPartitions = makeFilePartitions(files, 6)
+
+    val result = PartitionsUtil.coalesceFilePartitions(initialPartitions, 4, 0.0)
+
+    assert(result.size === 4)
+    assert(result.flatMap(_.files).map(_.filePath).toSet === files.map(_.filePath).toSet)
+    assert(result.flatMap(_.files).map(_.length).sum === files.map(_.length).sum)
+    assert(result.forall(_.files.nonEmpty))
+  }
+
+  test("file partition coalescing does not expand an already smaller scan") {
+    val files = (1 to 3).map(i => makePartitionedFile(s"f$i", i * 10L))
+    val initialPartitions = makeFilePartitions(files, 3)
+
+    val result = PartitionsUtil.coalesceFilePartitions(initialPartitions, 4, 0.0)
+
+    assert(result eq initialPartitions)
+  }
+
 }

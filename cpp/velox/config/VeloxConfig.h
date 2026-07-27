@@ -194,6 +194,15 @@ const std::string kCudfMemoryResourceDefault =
 const std::string kCudfMemoryPercent = "spark.gluten.sql.columnar.backend.velox.cudf.memoryPercent";
 const std::string kCudfMemoryPercentDefault = "50";
 
+const std::string kCudfFilteredJoinCacheEnabled =
+    "spark.gluten.sql.columnar.backend.velox.cudf.filteredJoinCache.enabled";
+
+const std::string kCudfPartialGroupbyMaxConcurrent =
+    "spark.gluten.sql.columnar.backend.velox.cudf.partialGroupby.maxConcurrent";
+
+const std::string kCudfGpuLockEnabled =
+    "spark.gluten.sql.columnar.backend.velox.cudf.gpuLock.enabled";
+
 const std::string kCudfTimestampUnit = "spark.gluten.sql.columnar.backend.velox.cudf.timestampUnit";
 const std::string kCudfTimestampUnitDefault = "us";
 

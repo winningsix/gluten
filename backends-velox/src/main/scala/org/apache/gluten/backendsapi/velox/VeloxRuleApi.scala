@@ -105,6 +105,11 @@ object VeloxRuleApi {
     // Merge paired EXISTS / NOT EXISTS min/max summaries over the same relation into one
     // conditional aggregate (for example TPC-H Q21).
     injector.injectOptimizerRule(MergeExistenceJoinSummaries.apply)
+    // Reuse a grouped aggregate when an uncorrelated scalar subquery independently recomputes the
+    // same groups only to take max(value) (for example TPC-H Q15). Besides removing a duplicate
+    // fact scan, this guarantees that floating-point equality compares values derived from the
+    // same aggregate result.
+    injector.injectOptimizerRule(ReuseGroupedAggregateForScalarMax.apply)
     if (BackendsApiManager.getSettings.supportAppendDataExec()) {
       injector.injectPlannerStrategy(SparkShimLoader.getSparkShims.getRewriteCreateTableAsSelect(_))
     }

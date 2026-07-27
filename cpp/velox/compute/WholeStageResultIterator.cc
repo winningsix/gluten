@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <deque>
 #include <limits>
@@ -87,7 +88,10 @@ const std::string kGpuComputeNanos = "gpuComputeNanos";
 // others
 const std::string kHiveDefaultPartition = "__HIVE_DEFAULT_PARTITION__";
 constexpr uint64_t kParallelResultQueueMaxBytes = 64UL << 20;
-constexpr uint32_t kParallelTaskMaxDrivers = 1;
+constexpr uint32_t kParallelTaskMaxDriversDefault = 1;
+constexpr uint32_t kParallelTaskMaxDriversLimit = 8;
+const std::string kParallelTaskMaxDrivers =
+    "spark.gluten.ucx.shuffle.native.maxDriversPerTask";
 
 bool planRequiresParallelExecution(
     const std::shared_ptr<const velox::core::PlanNode>& planNode) {
@@ -175,6 +179,20 @@ int64_t detachedUcxTaskTimeoutMs() {
   return 300000;
 }
 
+int64_t detachedUcxTaskReaperIntervalMs() {
+  if (const char* value =
+          std::getenv("GLUTEN_UCX_SHUFFLE_DETACHED_TASK_REAPER_INTERVAL_MS")) {
+    try {
+      return std::max<int64_t>(1, std::stoll(value));
+    } catch (...) {
+      LOG(WARNING)
+          << "Invalid GLUTEN_UCX_SHUFFLE_DETACHED_TASK_REAPER_INTERVAL_MS="
+          << value << ", using default 10";
+    }
+  }
+  return 10;
+}
+
 class DetachedUcxProducerTaskRegistry {
  public:
   void retain(
@@ -205,6 +223,7 @@ class DetachedUcxProducerTaskRegistry {
       std::lock_guard<std::mutex> l(mutex_);
       tasks_[taskId] = std::move(entry);
     }
+    reaperCv_.notify_one();
     LOG(WARNING) << "[UCX-DETACH] retained root partitioned output task"
                  << " taskId=" << taskId << " reason=" << reason
                  << " queueStats=" << describeUcxOutputQueue(logTask);
@@ -230,9 +249,17 @@ class DetachedUcxProducerTaskRegistry {
   }
 
   void reaperLoop() {
+    const auto interval =
+        std::chrono::milliseconds(detachedUcxTaskReaperIntervalMs());
+    LOG(INFO) << "[UCX-DETACH] task reaper started intervalMs="
+              << interval.count();
     while (true) {
-      std::this_thread::sleep_for(std::chrono::seconds(1));
+      {
+        std::unique_lock<std::mutex> l(mutex_);
+        reaperCv_.wait(l, [this]() { return !tasks_.empty(); });
+      }
       reapOnce();
+      std::this_thread::sleep_for(interval);
     }
   }
 
@@ -270,12 +297,12 @@ class DetachedUcxProducerTaskRegistry {
       if (future.valid() && future.isReady()) {
         return true;
       }
-      auto queueMgr =
-          facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
-      auto stats = queueMgr->stats(taskId);
-      if (stats.has_value()) {
-        return stats->finished;
-      }
+      // A drained UCX output queue only means that all downstream readers have
+      // consumed the producer's output.  The Velox task can still be running
+      // its final driver/Task bookkeeping.  Treating queue drain as task
+      // completion makes releaseFinished() cancel a healthy producer and can
+      // stall every subsequent GPU pipeline behind requestCancel().wait().
+      // Keep the task alive until Velox itself reports completion.
       return !entry.task->isRunning();
     } catch (const std::exception& e) {
       LOG(WARNING) << "[UCX-DETACH] failed to inspect detached task"
@@ -290,11 +317,6 @@ class DetachedUcxProducerTaskRegistry {
       auto future = entry.task->taskCompletionFuture();
       if (future.valid() && future.isReady()) {
         future.wait();
-      } else if (entry.task->isRunning()) {
-        auto cancelFuture = entry.task->requestCancel();
-        if (cancelFuture.valid()) {
-          cancelFuture.wait();
-        }
       } else if (future.valid()) {
         future.wait();
       }
@@ -350,6 +372,7 @@ class DetachedUcxProducerTaskRegistry {
   }
 
   std::mutex mutex_;
+  std::condition_variable reaperCv_;
   std::unordered_map<std::string, DetachedTask> tasks_;
   std::atomic<bool> reaperStarted_{false};
 };
@@ -530,8 +553,13 @@ WholeStageResultIterator::WholeStageResultIterator(
   parallelTaskProducesOutput_ =
       requiresParallelExecution_ && !planRootIsPartitionedOutput(veloxPlan_);
   if (requiresParallelExecution_) {
+    parallelTaskMaxDrivers_ = std::clamp(
+        veloxCfg_->get<uint32_t>(
+            kParallelTaskMaxDrivers, kParallelTaskMaxDriversDefault),
+        kParallelTaskMaxDriversDefault,
+        kParallelTaskMaxDriversLimit);
     taskExecutor_ = std::make_shared<folly::CPUThreadPoolExecutor>(
-        kParallelTaskMaxDrivers);
+        parallelTaskMaxDrivers_);
     if (parallelTaskProducesOutput_) {
       parallelResultQueue_ =
           std::make_shared<WholeStageParallelResultQueue>(
@@ -881,9 +909,9 @@ void WholeStageResultIterator::startParallelTaskIfNeeded() {
   parallelTaskStarted_ = true;
   try {
     LOG(INFO) << "[WS-ITER] starting parallel task taskId=" << task_->taskId()
-              << " requestedDrivers=" << kParallelTaskMaxDrivers
+              << " requestedDrivers=" << parallelTaskMaxDrivers_
               << " producesOutput=" << parallelTaskProducesOutput_;
-    task_->start(kParallelTaskMaxDrivers);
+    task_->start(parallelTaskMaxDrivers_);
     LOG(INFO) << "[WS-ITER] started parallel task taskId=" << task_->taskId()
               << " numOutputDrivers=" << task_->numOutputDrivers()
               << " numTotalDrivers=" << task_->numTotalDrivers()
@@ -1240,15 +1268,15 @@ void WholeStageResultIterator::collectMetrics() {
     return;
   }
 
-  LOG(WARNING) << "collectMetrics() called, task state="
-               << static_cast<int>(task_->state());
+  VLOG(1) << "collectMetrics() called, task state="
+          << static_cast<int>(task_->state());
 
-  LOG(WARNING) << "[TIMING] " << taskInfo_
-               << " totalNextNanos=" << totalNextNanos_
-               << " veloxNextNanos=" << totalVeloxNextNanos_
-               << " wrapperNanos="
-               << (totalNextNanos_ - totalVeloxNextNanos_)
-               << " nextCalls=" << nextCallCount_;
+  VLOG(1) << "[TIMING] " << taskInfo_
+          << " totalNextNanos=" << totalNextNanos_
+          << " veloxNextNanos=" << totalVeloxNextNanos_
+          << " wrapperNanos="
+          << (totalNextNanos_ - totalVeloxNextNanos_)
+          << " nextCalls=" << nextCallCount_;
 
   const auto& taskStats = task_->taskStats();
   if (taskStats.executionStartTimeMs == 0) {
@@ -1377,11 +1405,11 @@ void WholeStageResultIterator::collectMetrics() {
           runtimeMetric("sum", second->customStats, kGpuComputeNanos);
       metrics_->get(Metrics::kGpuComputeTime)[metricIndex] = gpuVal;
       if (gpuVal > 0 || second->customStats.count(kGpuComputeNanos)) {
-        LOG(WARNING) << "collectMetrics opType="
-                     << entry.first
-                     << " gpuComputeNanos=" << gpuVal
-                     << " present="
-                     << second->customStats.count(kGpuComputeNanos);
+        VLOG(1) << "collectMetrics opType="
+                << entry.first
+                << " gpuComputeNanos=" << gpuVal
+                << " present="
+                << second->customStats.count(kGpuComputeNanos);
       }
 
       metricIndex += 1;
@@ -1425,6 +1453,16 @@ int64_t WholeStageResultIterator::runtimeMetric(
 
 std::unordered_map<std::string, std::string> WholeStageResultIterator::getQueryContextConf() {
   std::unordered_map<std::string, std::string> configs = {};
+  configs["spark.gluten.ucx.shuffle.native.read.replicatedStreams"] =
+      veloxCfg_->get<std::string>(
+          "spark.gluten.ucx.shuffle.native.read.replicatedStreams", "");
+  configs["spark.gluten.ucx.shuffle.replicatedHashCache.enabled"] =
+      veloxCfg_->get<std::string>(
+          "spark.gluten.ucx.shuffle.replicatedHashCache.enabled", "false");
+  configs[kCudfFilteredJoinCacheEnabled] =
+      veloxCfg_->get<std::string>(kCudfFilteredJoinCacheEnabled, "false");
+  configs[kCudfPartialGroupbyMaxConcurrent] =
+      veloxCfg_->get<std::string>(kCudfPartialGroupbyMaxConcurrent, "0");
   // Find batch size from Spark confs. If found, set the preferred and max batch size.
   configs[velox::core::QueryConfig::kPreferredOutputBatchRows] =
       std::to_string(veloxCfg_->get<uint32_t>(kSparkBatchSize, 4096));

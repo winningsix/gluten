@@ -378,16 +378,45 @@ class VeloxIteratorApi extends IteratorApi with Logging {
       inputIterators: Seq[Iterator[ColumnarBatch]],
       base: Map[String, String]): Map[String, String] = {
     val readerStreams = nativeUcxReaderStreams(inputIterators).map(_._1)
+    val replicatedReaderStreams = nativeUcxReaderStreams(inputIterators).collect {
+      case (streamIdx, spec) if spec.replicated => streamIdx
+    }
     val writerConf =
       NativeUcxShuffleExecution.currentWriterContext
         .map(NativeUcxShuffleExecution.writerExtraConf)
         .getOrElse(Map.empty)
-    val readerConf = NativeUcxShuffleExecution.readerExtraConf(readerStreams)
-    val merged = base ++ writerConf ++ readerConf
+    val readerConf =
+      NativeUcxShuffleExecution.readerExtraConf(readerStreams, replicatedReaderStreams)
+    val replicatedHashCacheEnabled =
+      replicatedReaderStreams.nonEmpty &&
+        VeloxConfig.get.cudfReplicatedHashCacheEnabled
+    val replicatedHashCacheConf =
+      if (replicatedReaderStreams.nonEmpty) {
+        Map(
+          VeloxConfig.CUDF_REPLICATED_HASH_CACHE_ENABLED.key ->
+            replicatedHashCacheEnabled.toString)
+      } else {
+        Map.empty[String, String]
+      }
+    val filteredJoinCacheConf =
+      Map(
+        VeloxConfig.CUDF_FILTERED_JOIN_CACHE_ENABLED.key ->
+          VeloxConfig.get.cudfFilteredJoinCacheEnabled.toString)
+    val partialGroupbyAdmissionConf =
+      Map(
+        VeloxConfig.CUDF_PARTIAL_GROUPBY_MAX_CONCURRENT.key ->
+          VeloxConfig.get.cudfPartialGroupbyMaxConcurrent.toString)
+    val merged =
+      base ++ writerConf ++ readerConf ++ replicatedHashCacheConf ++ filteredJoinCacheConf ++
+        partialGroupbyAdmissionConf
     if (writerConf.nonEmpty || readerConf.nonEmpty) {
       logInfo(
         s"Velox native UCX shuffle conf writer=${writerConf.nonEmpty} " +
           s"readerStreams=${readerStreams.sorted.mkString("[", ",", "]")} " +
+          s"replicatedReaderStreams=${replicatedReaderStreams.sorted.mkString("[", ",", "]")} " +
+          s"replicatedHashCacheEnabled=$replicatedHashCacheEnabled " +
+          s"filteredJoinCacheEnabled=${VeloxConfig.get.cudfFilteredJoinCacheEnabled} " +
+          s"partialGroupbyMaxConcurrent=${VeloxConfig.get.cudfPartialGroupbyMaxConcurrent} " +
           s"inputIterators=${nativeUcxInputSummary(inputIterators)}")
     }
     merged

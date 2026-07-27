@@ -311,6 +311,8 @@ class GlutenConfig(conf: SQLConf) extends GlutenCoreConfig(conf) {
 
   def smallFileThreshold: Double = getConf(SMALL_FILE_THRESHOLD)
 
+  def fileScanMaxPartitions: Int = getConf(FILE_SCAN_MAX_PARTITIONS)
+
   def expressionBlacklist: Set[String] = {
     val blacklistSet = getConf(EXPRESSION_BLACK_LIST)
       .map(_.toLowerCase(Locale.ROOT).split(",").map(_.trim()).filter(_.nonEmpty).toSet)
@@ -1659,4 +1661,16 @@ object GlutenConfig extends ConfigRegistry {
           "total size of small files is below this threshold.")
       .doubleConf
       .createWithDefault(0.5)
+
+  val FILE_SCAN_MAX_PARTITIONS =
+    buildConf("spark.gluten.sql.columnar.fileScan.maxPartitions")
+      .experimental()
+      .doc(
+        "Maximum number of non-bucketed native file-scan partitions after Spark file splitting. " +
+          "When positive, Gluten rebalances existing PartitionedFile splits into at most this " +
+          "many FilePartitions. Set it to the number of long-lived GPU executors to avoid " +
+          "replicated joins fanning out once per Spark scan task. Zero disables the limit.")
+      .intConf
+      .checkValue(_ >= 0, "File scan max partitions must be non-negative.")
+      .createWithDefault(0)
 }

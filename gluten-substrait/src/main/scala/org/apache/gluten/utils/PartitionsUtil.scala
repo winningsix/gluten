@@ -160,8 +160,35 @@ object PartitionsUtil {
   def regeneratePartition(
       inputPartitions: Seq[FilePartition],
       smallFileThreshold: Double): Seq[FilePartition] = {
+    rebalanceFilePartitions(inputPartitions, inputPartitions.size, smallFileThreshold)
+  }
 
-    val partitions = Array.fill(inputPartitions.size)(mutable.ArrayBuffer.empty[PartitionedFile])
+  /**
+   * Coalesce existing Spark file splits without changing the splits themselves. Unlike Spark's
+   * maxPartitionNum rescaling, this produces exactly maxPartitions when the input has at least that
+   * many non-empty FilePartitions, which is useful when one long-lived executor owns each GPU.
+   */
+  def coalesceFilePartitions(
+      inputPartitions: Seq[FilePartition],
+      maxPartitions: Int,
+      smallFileThreshold: Double): Seq[FilePartition] = {
+    require(maxPartitions > 0, "maxPartitions must be positive")
+    if (inputPartitions.size <= maxPartitions) {
+      inputPartitions
+    } else {
+      rebalanceFilePartitions(inputPartitions, maxPartitions, smallFileThreshold)
+    }
+  }
+
+  private def rebalanceFilePartitions(
+      inputPartitions: Seq[FilePartition],
+      numPartitions: Int,
+      smallFileThreshold: Double): Seq[FilePartition] = {
+    if (inputPartitions.isEmpty || numPartitions == 0) {
+      return Seq.empty
+    }
+
+    val partitions = Array.fill(numPartitions)(mutable.ArrayBuffer.empty[PartitionedFile])
 
     def addToBucket(
         heap: mutable.PriorityQueue[(Long, Int, Int)],
@@ -175,7 +202,7 @@ object PartitionsUtil {
     def initializeHeap(
         ordering: Ordering[(Long, Int, Int)]): mutable.PriorityQueue[(Long, Int, Int)] = {
       val heap = mutable.PriorityQueue.empty[(Long, Int, Int)](ordering)
-      inputPartitions.indices.foreach(i => heap.enqueue((0L, 0, i)))
+      partitions.indices.foreach(i => heap.enqueue((0L, 0, i)))
       heap
     }
 

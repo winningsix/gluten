@@ -17,6 +17,7 @@
 
 #include "GpuLock.h"
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <condition_variable>
 #include <cstdlib>
@@ -45,6 +46,7 @@ struct GpuLockState {
   std::condition_variable cv;
   int maxConcurrent{1};
   int activeCount{0};
+  std::atomic<int> enabledScopes{0};
 };
 
 GpuLockState& getState() {
@@ -52,7 +54,7 @@ GpuLockState& getState() {
   return state;
 }
 
-bool gpuLockEnabled() {
+bool gpuLockEnabledByEnvironment() {
   static const bool enabled = [] {
     const auto* value = std::getenv("GLUTEN_GPULOCK_ENABLED");
     if (value == nullptr) {
@@ -68,6 +70,11 @@ bool gpuLockEnabled() {
         normalized != "false" && normalized != "off" && normalized != "no";
   }();
   return enabled;
+}
+
+bool gpuLockEnabled() {
+  return gpuLockEnabledByEnvironment() ||
+      getState().enabledScopes.load(std::memory_order_relaxed) > 0;
 }
 
 thread_local int tLocalRefCount = 0;
@@ -91,6 +98,29 @@ int getMaxConcurrentGpuTasks() {
   auto& s = getState();
   std::unique_lock<std::mutex> lock(s.mutex);
   return s.maxConcurrent;
+}
+
+void acquireGpuLockEnableScope() {
+  auto& s = getState();
+  const auto previous =
+      s.enabledScopes.fetch_add(1, std::memory_order_acq_rel);
+  if (previous == 0 && !gpuLockEnabledByEnvironment()) {
+    LOG(INFO) << "GPU concurrency semaphore enabled by query-scoped runtime";
+  }
+}
+
+void releaseGpuLockEnableScope() {
+  auto& s = getState();
+  const auto previous =
+      s.enabledScopes.fetch_sub(1, std::memory_order_acq_rel);
+  if (previous <= 0) {
+    s.enabledScopes.store(0, std::memory_order_release);
+    LOG(ERROR) << "Unbalanced query-scoped GPU concurrency semaphore release";
+    return;
+  }
+  if (previous == 1 && !gpuLockEnabledByEnvironment()) {
+    LOG(INFO) << "GPU concurrency semaphore disabled after query-scoped runtime";
+  }
 }
 
 void lockGpu() {
@@ -131,7 +161,10 @@ void lockGpu() {
 }
 
 void unlockGpu() {
-  if (!gpuLockEnabled()) {
+  // A dynamic query scope can end while an unrelated task is finishing a
+  // guard that it acquired during the overlap. Always release an acquired
+  // permit even if the semaphore is no longer enabled for new calls.
+  if (tLocalRefCount <= 0 && !gpuLockEnabled()) {
 #if GLUTEN_GPULOCK_TRACE
     std::cerr << "GPU_LOCK [unlockGpu-bypass] tid="
               << std::this_thread::get_id() << std::endl;

@@ -17,10 +17,11 @@
 package org.apache.gluten.execution
 
 import org.apache.gluten.backendsapi.BackendsApiManager
+import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.metrics.MetricsUpdater
 import org.apache.gluten.sql.shims.SparkShimLoader
 import org.apache.gluten.substrait.rel.LocalFilesNode.ReadFileFormat
-import org.apache.gluten.utils.FileIndexUtil
+import org.apache.gluten.utils.{FileIndexUtil, PartitionsUtil}
 
 import org.apache.spark.Partition
 import org.apache.spark.sql.catalyst.TableIdentifier
@@ -29,7 +30,7 @@ import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.util.truncatedString
 import org.apache.spark.sql.connector.read.streaming.SparkDataStream
 import org.apache.spark.sql.execution.FileSourceScanExecShim
-import org.apache.spark.sql.execution.datasources.HadoopFsRelation
+import org.apache.spark.sql.execution.datasources.{FilePartition, HadoopFsRelation}
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.util.SparkVersionUtil
@@ -124,7 +125,7 @@ abstract class FileSourceScanExecTransformerBase(
   override def getMetadataColumns(): Seq[AttributeReference] = metadataColumns
 
   @transient private lazy val plannedPartitions: Seq[Partition] = {
-    if (SparkVersionUtil.gteSpark40) {
+    val sparkPlannedPartitions = if (SparkVersionUtil.gteSpark40) {
       getPartitionsSeq()
     } else {
       BackendsApiManager.getTransformerApiInstance
@@ -139,6 +140,22 @@ abstract class FileSourceScanExecTransformerBase(
           disableBucketedScan,
           filterExprs()
         )
+    }
+    val maxPartitions = GlutenConfig.get.fileScanMaxPartitions
+    if (!bucketedScan && maxPartitions > 0 && sparkPlannedPartitions.size > maxPartitions) {
+      val filePartitions = sparkPlannedPartitions.collect { case partition: FilePartition =>
+        partition
+      }
+      if (filePartitions.size == sparkPlannedPartitions.size) {
+        PartitionsUtil.coalesceFilePartitions(
+          filePartitions,
+          maxPartitions,
+          GlutenConfig.get.smallFileThreshold)
+      } else {
+        sparkPlannedPartitions
+      }
+    } else {
+      sparkPlannedPartitions
     }
   }
 

@@ -29,6 +29,14 @@ void setMaxConcurrentGpuTasks(int n);
 /// Get the current max concurrent GPU tasks setting.
 int getMaxConcurrentGpuTasks();
 
+/// Enable the GPU semaphore while at least one query-scoped runtime needs it.
+/// The process-wide environment switch remains supported; scoped users add a
+/// safe dynamic override without changing unrelated sequential queries.
+void acquireGpuLockEnableScope();
+
+/// Release one query-scoped GPU semaphore user.
+void releaseGpuLockEnableScope();
+
 /// Acquire GPU access. Blocks if the concurrency limit is reached.
 /// Reentrant: multiple calls from the same thread are ref-counted.
 void lockGpu();

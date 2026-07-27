@@ -89,6 +89,14 @@ class VeloxConfig(conf: SQLConf) extends GlutenConfig(conf) {
 
   def cudfBatchSizeInBytes: Long = getConf(CUDF_BATCH_SIZE_IN_BYTES)
 
+  def cudfFilteredJoinCacheEnabled: Boolean = getConf(CUDF_FILTERED_JOIN_CACHE_ENABLED)
+
+  def cudfReplicatedHashCacheEnabled: Boolean = getConf(CUDF_REPLICATED_HASH_CACHE_ENABLED)
+
+  def cudfPartialGroupbyMaxConcurrent: Int = getConf(CUDF_PARTIAL_GROUPBY_MAX_CONCURRENT)
+
+  def cudfGpuLockEnabled: Boolean = getConf(CUDF_GPU_LOCK_ENABLED)
+
   def cudfConcurrentGpuTasks: Option[Int] = getConf(CUDF_CONCURRENT_GPU_TASKS)
 
   def cudfGpuMemorySize: Option[Long] = getConf(CUDF_GPU_MEMORY_SIZE)
@@ -699,6 +707,40 @@ object VeloxConfig extends ConfigRegistry {
       .doc("The initial percent of GPU memory to allocate for memory resource for one thread.")
       .intConf
       .createWithDefault(50)
+
+  val CUDF_FILTERED_JOIN_CACHE_ENABLED =
+    buildConf("spark.gluten.sql.columnar.backend.velox.cudf.filteredJoinCache.enabled")
+      .doc(
+        "Build reusable cuDF filtered-join state once on the hash-join build side for " +
+          "no-filter semi and anti joins, instead of rebuilding it for every probe batch.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val CUDF_REPLICATED_HASH_CACHE_ENABLED =
+    buildConf("spark.gluten.ucx.shuffle.replicatedHashCache.enabled")
+      .doc(
+        "Reuse a replicated cuDF hash-build state between native shuffle tasks in the same " +
+          "executor and Spark stage. This is a query-scoped configuration.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val CUDF_PARTIAL_GROUPBY_MAX_CONCURRENT =
+    buildConf("spark.gluten.sql.columnar.backend.velox.cudf.partialGroupby.maxConcurrent")
+      .doc(
+        "Maximum number of cuDF partial-groupby calls that may execute concurrently in one " +
+          "executor. A value of 0 disables this query-scoped admission limit.")
+      .intConf
+      .checkValue(_ >= 0, "must be non-negative")
+      .createWithDefault(0)
+
+  val CUDF_GPU_LOCK_ENABLED =
+    buildConf("spark.gluten.sql.columnar.backend.velox.cudf.gpuLock.enabled")
+      .doc(
+        "Enable the native GPU-operation admission semaphore for runtimes created by this " +
+          "query. Concurrent scoped runtimes share the executor-wide semaphore; unrelated " +
+          "queries retain the process default.")
+      .booleanConf
+      .createWithDefault(false)
 
   val CUDF_GROUPBY_STREAMING_MAX_DISTINCT_KEYS =
     buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.groupbyStreamingMaxDistinctKeys")

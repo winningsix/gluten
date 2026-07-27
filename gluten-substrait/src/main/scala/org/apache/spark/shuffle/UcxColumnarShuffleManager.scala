@@ -328,7 +328,13 @@ private[spark] class UcxColumnarShuffleWriter[K, V](
         startPartitionId = GlutenShuffleUtils.getStartPartitionId(
           columnarDependency.nativePartitioning,
           context.partitionId()),
-        dropFirstColumn = partitioning == GlutenShuffleUtils.HashPartitioningShortName
+        dropFirstColumn =
+          partitioning == GlutenShuffleUtils.HashPartitioningShortName &&
+            columnarDependency.nativePartitioning.getKeyIndices == null,
+        partitionKeyIndices =
+          Option(columnarDependency.nativePartitioning.getKeyIndices)
+            .map(_.toSeq)
+            .getOrElse(Seq.empty)
       )
       logInfo(
         s"Driving Velox native UCX shuffle producer shuffleId=${handle.shuffleId} " +
@@ -1162,7 +1168,10 @@ private[spark] class UcxColumnarShuffleReader[K, C](
       expectedMaps = expectedMaps,
       initialEndpoints = initialEndpoints,
       taskAttemptId = context.taskAttemptId(),
-      nativeReaderId = readerEndpoint.nativeReaderId
+      nativeReaderId = readerEndpoint.nativeReaderId,
+      replicated =
+        columnarDependency.nativePartitioning.getShortName ==
+          GlutenShuffleUtils.BroadcastPartitioningShortName
     )
     NativeUcxShuffleExecution.captureReadSpec(spec)
     new NativeUcxShuffleReadProductIterator[K, C](spec)

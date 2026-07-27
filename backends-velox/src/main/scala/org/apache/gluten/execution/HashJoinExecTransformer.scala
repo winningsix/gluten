@@ -35,7 +35,8 @@ case class ShuffledHashJoinExecTransformer(
     condition: Option[Expression],
     left: SparkPlan,
     right: SparkPlan,
-    isSkewJoin: Boolean)
+    isSkewJoin: Boolean,
+    isNullAwareAntiJoin: Boolean = false)
   extends ShuffledHashJoinExecTransformerBase(
     leftKeys,
     rightKeys,
@@ -46,9 +47,17 @@ case class ShuffledHashJoinExecTransformer(
     right,
     isSkewJoin) {
 
+  require(
+    !isNullAwareAntiJoin || buildPlan.outputPartitioning.isInstanceOf[ReplicatedPartitioning],
+    "A null-aware shuffled hash join requires the complete build side in every consumer")
+
   override def outputPartitioning: Partitioning = buildPlan.outputPartitioning match {
     case _: ReplicatedPartitioning => streamedPlan.outputPartitioning
     case _ => super.outputPartitioning
+  }
+
+  override def genJoinParametersInternal(): (Int, Int, String) = {
+    (0, if (isNullAwareAntiJoin) 1 else 0, "")
   }
 
   override protected lazy val substraitJoinType: JoinRel.JoinType = joinType match {

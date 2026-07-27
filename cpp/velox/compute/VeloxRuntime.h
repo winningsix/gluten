@@ -38,6 +38,8 @@ class VeloxRuntime final : public Runtime {
       VeloxMemoryManager* vmm,
       const std::unordered_map<std::string, std::string>& confMap);
 
+  ~VeloxRuntime() override;
+
   void setSparkTaskInfo(SparkTaskInfo taskInfo) override {
     static std::atomic<uint32_t> vtId{0};
     taskInfo.vId = vtId++;
@@ -119,6 +121,7 @@ class VeloxRuntime final : public Runtime {
   std::shared_ptr<const facebook::velox::core::PlanNode> veloxPlan_;
   std::shared_ptr<facebook::velox::config::ConfigBase> veloxCfg_;
   bool debugModeEnabled_{false};
+  bool gpuLockEnableScope_{false};
 
   std::unordered_map<int32_t, std::shared_ptr<VeloxColumnarBatch>> emptySchemaBatchLoopUp_;
 };

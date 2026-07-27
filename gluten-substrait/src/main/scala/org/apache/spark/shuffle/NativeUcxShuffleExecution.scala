@@ -35,7 +35,8 @@ case class NativeUcxShuffleWriterContext(
     numPartitions: Int,
     partitioning: String,
     startPartitionId: Int,
-    dropFirstColumn: Boolean)
+    dropFirstColumn: Boolean,
+    partitionKeyIndices: Seq[Int])
 
 case class NativeUcxShuffleReadSpec(
     shuffleId: Int,
@@ -45,7 +46,8 @@ case class NativeUcxShuffleReadSpec(
     expectedMaps: Int,
     initialEndpoints: Seq[UcxShuffleEndpoint],
     taskAttemptId: Long = -1L,
-    nativeReaderId: String = "")
+    nativeReaderId: String = "",
+    replicated: Boolean = false)
 
 trait NativeUcxShuffleReadMetadata {
   def nativeUcxShuffleReadSpec: NativeUcxShuffleReadSpec
@@ -98,14 +100,19 @@ class NativeUcxShuffleReadMetadataIterator[T](
 
 object NativeUcxShuffleExecution extends Logging {
   val EnabledConf: String = "spark.gluten.ucx.shuffle.nativeExchange.enabled"
+  val RawHashEnabledConf: String = "spark.gluten.ucx.shuffle.native.rawHash.enabled"
   val WriteEnabledConf: String = "spark.gluten.ucx.shuffle.native.write.enabled"
   val ReadStreamIndicesConf: String = "spark.gluten.ucx.shuffle.native.read.streams"
+  val ReplicatedReadStreamIndicesConf: String =
+    "spark.gluten.ucx.shuffle.native.read.replicatedStreams"
   val NativeTaskIdConf: String = "spark.gluten.ucx.shuffle.native.taskId"
   val WriteNumPartitionsConf: String = "spark.gluten.ucx.shuffle.native.write.numPartitions"
   val WritePartitioningConf: String = "spark.gluten.ucx.shuffle.native.write.partitioning"
   val WriteStartPartitionIdConf: String =
     "spark.gluten.ucx.shuffle.native.write.startPartitionId"
   val WriteDropFirstColumnConf: String = "spark.gluten.ucx.shuffle.native.write.dropFirstColumn"
+  val WritePartitionKeyIndicesConf: String =
+    "spark.gluten.ucx.shuffle.native.write.partitionKeyIndices"
 
   private val MaxReadSpecUnwrapDepth = 8
 
@@ -252,7 +259,13 @@ object NativeUcxShuffleExecution extends Logging {
           startPartitionId = GlutenShuffleUtils.getStartPartitionId(
             columnarDependency.nativePartitioning,
             context.partitionId()),
-          dropFirstColumn = partitioning == GlutenShuffleUtils.HashPartitioningShortName
+          dropFirstColumn =
+            partitioning == GlutenShuffleUtils.HashPartitioningShortName &&
+              columnarDependency.nativePartitioning.getKeyIndices == null,
+          partitionKeyIndices =
+            Option(columnarDependency.nativePartitioning.getKeyIndices)
+              .map(_.toSeq)
+              .getOrElse(Seq.empty)
         )
         logInfo(
           s"Installing native UCX shuffle writer context before map iterator creation " +
@@ -288,15 +301,21 @@ object NativeUcxShuffleExecution extends Logging {
       WriteNumPartitionsConf -> context.numPartitions.toString,
       WritePartitioningConf -> context.partitioning,
       WriteStartPartitionIdConf -> context.startPartitionId.toString,
-      WriteDropFirstColumnConf -> context.dropFirstColumn.toString
+      WriteDropFirstColumnConf -> context.dropFirstColumn.toString,
+      WritePartitionKeyIndicesConf -> context.partitionKeyIndices.mkString(",")
     )
   }
 
-  def readerExtraConf(streamIndices: Seq[Int]): Map[String, String] = {
+  def readerExtraConf(
+      streamIndices: Seq[Int],
+      replicatedStreamIndices: Seq[Int]): Map[String, String] = {
     if (streamIndices.isEmpty) {
       Map.empty
     } else {
-      Map(ReadStreamIndicesConf -> streamIndices.sorted.mkString(","))
+      Map(
+        ReadStreamIndicesConf -> streamIndices.sorted.mkString(","),
+        ReplicatedReadStreamIndicesConf -> replicatedStreamIndices.sorted.mkString(",")
+      )
     }
   }
 

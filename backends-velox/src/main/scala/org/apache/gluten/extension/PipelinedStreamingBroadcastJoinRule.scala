@@ -16,12 +16,13 @@
  */
 package org.apache.gluten.extension
 
-import org.apache.gluten.execution.{BroadcastHashJoinExecTransformer, FileSourceScanExecTransformerBase, ReplicatedPartitioning, ShuffledHashJoinExecTransformer, VeloxBroadcastNestedLoopJoinExecTransformer, VeloxReplicatedNestedLoopJoinExecTransformer}
+import org.apache.gluten.execution.{BroadcastHashJoinExecTransformer, FileSourceScanExecTransformerBase, ReplicatedPartitioning, ShuffledHashJoinExecTransformer, ShuffledHashJoinExecTransformerBase, VeloxBroadcastNestedLoopJoinExecTransformer, VeloxReplicatedNestedLoopJoinExecTransformer}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarShuffleExchangeExec, SparkPlan}
 import org.apache.spark.sql.execution.exchange.{ENSURE_REQUIREMENTS, ReusedExchangeExec}
 import org.apache.spark.sql.internal.SQLConf
@@ -37,7 +38,13 @@ import org.apache.spark.sql.internal.SQLConf
 case class PipelinedStreamingBroadcastJoinRule() extends Rule[SparkPlan] with Logging {
   private val enabledKey =
     "spark.gluten.sql.columnar.pipelined.streamingBroadcast.enabled"
+  private val nestedLoopEnabledKey =
+    "spark.gluten.sql.columnar.pipelined.streamingBroadcast.nestedLoop.enabled"
+  private val nestedLoopMaxBuildScansKey =
+    "spark.gluten.sql.columnar.pipelined.streamingBroadcast.nestedLoop.maxBuildScans"
   private val pipelinedShuffleKey = "spark.sql.shuffle.pipelined.enabled"
+  private val consumerCountTag =
+    TreeNodeTag[Int]("org.apache.gluten.pipelinedStreamingBroadcast.consumerCount")
 
   override def apply(plan: SparkPlan): SparkPlan = {
     if (!confBoolean(enabledKey, defaultValue = false) ||
@@ -46,9 +53,10 @@ case class PipelinedStreamingBroadcastJoinRule() extends Rule[SparkPlan] with Lo
     }
 
     val rewritten = plan.transformUp {
-      case join: BroadcastHashJoinExecTransformer if !join.isNullAwareAntiJoin =>
+      case join: BroadcastHashJoinExecTransformer =>
         rewrite(join).getOrElse(join)
-      case join: VeloxBroadcastNestedLoopJoinExecTransformer =>
+      case join: VeloxBroadcastNestedLoopJoinExecTransformer
+          if confBoolean(nestedLoopEnabledKey, defaultValue = true) =>
         rewriteNestedLoop(join).getOrElse(join)
     }
     // A UCX destination queue is destructive and has one sequence space. Until the transport
@@ -81,7 +89,7 @@ case class PipelinedStreamingBroadcastJoinRule() extends Rule[SparkPlan] with Lo
         logInfo(
           s"PipelinedStreamingBroadcastJoinRule: rewriting join ${join.id} to streaming UCX " +
             s"broadcast with $numConsumers consumers buildSide=${join.buildSide}")
-        ShuffledHashJoinExecTransformer(
+        val rewritten = ShuffledHashJoinExecTransformer(
           join.leftKeys,
           join.rightKeys,
           join.joinType,
@@ -89,7 +97,10 @@ case class PipelinedStreamingBroadcastJoinRule() extends Rule[SparkPlan] with Lo
           join.condition,
           newLeft,
           newRight,
-          isSkewJoin = false)
+          isSkewJoin = false,
+          isNullAwareAntiJoin = join.isNullAwareAntiJoin)
+        rewritten.setTagValue(consumerCountTag, numConsumers)
+        rewritten
     }
   }
 
@@ -98,6 +109,18 @@ case class PipelinedStreamingBroadcastJoinRule() extends Rule[SparkPlan] with Lo
     val (buildPlan, streamedPlan) = join.joinBuildSide match {
       case BuildLeft => (join.left, join.right)
       case BuildRight => (join.right, join.left)
+    }
+    val buildScanCount = buildPlan.collect {
+      case _: FileSourceScanExecTransformerBase => 1
+    }.sum
+    val maxBuildScans =
+      SQLConf.get.getConfString(nestedLoopMaxBuildScansKey, "1").toInt
+    if (buildScanCount > maxBuildScans) {
+      logInfo(
+        s"PipelinedStreamingBroadcastJoinRule: keeping Spark nested-loop broadcast for join " +
+          s"${join.id}; build contains $buildScanCount file scans, exceeding native streaming " +
+          s"limit $maxBuildScans")
+      return None
     }
     val numConsumers = resolveNumConsumers(streamedPlan, join.id)
     if (numConsumers <= 0) {
@@ -117,12 +140,14 @@ case class PipelinedStreamingBroadcastJoinRule() extends Rule[SparkPlan] with Lo
           s"PipelinedStreamingBroadcastJoinRule: rewriting nested-loop join ${join.id} to " +
             s"streaming UCX broadcast with $numConsumers consumers " +
             s"buildSide=${join.joinBuildSide}")
-        VeloxReplicatedNestedLoopJoinExecTransformer(
+        val rewritten = VeloxReplicatedNestedLoopJoinExecTransformer(
           left = newLeft,
           right = newRight,
           buildSide = join.joinBuildSide,
           joinType = join.joinType,
           condition = join.condition)
+        rewritten.setTagValue(consumerCountTag, numConsumers)
+        rewritten
     }
   }
 
@@ -130,6 +155,57 @@ case class PipelinedStreamingBroadcastJoinRule() extends Rule[SparkPlan] with Lo
     val planned = streamedPlan.outputPartitioning.numPartitions
     if (planned > 0) {
       return planned
+    }
+
+    // transformUp rewrites an inner broadcast join before its parent. Tag each rewritten node with
+    // the exact task count used for its replicated build. Tree depth is not a safe proxy for
+    // execution order: projects, exchanges, and build-side branches can make an old 1-consumer
+    // dimension join appear closer than the 12-consumer join that actually feeds this parent. The
+    // most recently constructed tagged node has the largest SparkPlan id and is the enclosing
+    // rewritten join whose output becomes this join's streamed input.
+    val nearestJoinConsumerCount = streamedPlan
+      .collect {
+        case node if node.getTagValue(consumerCountTag).exists(_ > 0) =>
+          (node.id, node.getTagValue(consumerCountTag).get)
+      }
+      .sortBy(_._1)
+      .lastOption
+      .map(_._2)
+
+    // Tags are the primary source during this transform. Retain a structural fallback for plans
+    // that already contained a replicated shuffled join before this rule ran.
+    val existingJoinConsumerCount = streamedPlan
+      .collect {
+        case nestedJoin: ShuffledHashJoinExecTransformerBase =>
+          val counts = replicatedConsumerCounts(nestedJoin.buildPlan)
+          if (counts.size == 1) Some((nestedJoin.id, counts.head)) else None
+      }
+      .flatten
+      .sortBy(_._1)
+      .lastOption
+      .map(_._2)
+
+    nearestJoinConsumerCount.orElse(existingJoinConsumerCount).foreach {
+      resolved =>
+        logInfo(
+          s"PipelinedStreamingBroadcastJoinRule: resolved join $joinId consumer count " +
+            s"from the nearest nested join: $resolved " +
+            s"(output partitioning reported $planned)")
+        return resolved
+    }
+
+    // A non-join wrapper can hide the rewritten node in unusual plans. As a secondary structural
+    // fallback, accept a single replicated count across the subtree.
+    val subtreeReplicatedCounts = replicatedConsumerCounts(streamedPlan)
+
+    subtreeReplicatedCounts match {
+      case Seq(resolved) =>
+        logInfo(
+          s"PipelinedStreamingBroadcastJoinRule: resolved join $joinId consumer count " +
+            s"from a nested replicated exchange: $resolved " +
+            s"(output partitioning reported $planned)")
+        return resolved
+      case _ =>
     }
 
     val scanPartitionCounts = streamedPlan.collect {
@@ -150,6 +226,12 @@ case class PipelinedStreamingBroadcastJoinRule() extends Rule[SparkPlan] with Lo
         planned
     }
   }
+
+  private def replicatedConsumerCounts(plan: SparkPlan): Seq[Int] =
+    plan.collect {
+      case exchange: ColumnarShuffleExchangeExec if isReplicated(exchange) =>
+        exchange.outputPartitioning.numPartitions
+    }.filter(_ > 0).distinct
 
   private def replaceBroadcastBoundary(
       buildPlan: SparkPlan,
