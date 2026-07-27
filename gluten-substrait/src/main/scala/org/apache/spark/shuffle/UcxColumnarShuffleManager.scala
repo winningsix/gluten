@@ -91,6 +91,22 @@ class UcxColumnarShuffleManager(conf: SparkConf, isDriver: Boolean)
     }
   }
 
+  override def wrapShuffleMapTaskInput(
+      handle: ShuffleHandle,
+      mapId: Long,
+      context: TaskContext)(
+      createInput: => Iterator[_]): Iterator[_] = {
+    handle match {
+      case ucx: UcxColumnarShuffleHandle[_, _, _] =>
+        NativeUcxShuffleExecution.wrapShuffleMapTaskInput(
+          ucx, mapId, context)(createInput)
+      case other =>
+        throw new SparkException(
+          s"${UcxColumnarShuffleManager.ClassName} received non-UCX shuffle handle " +
+            s"${other.getClass.getName} for map input shuffleId=${other.shuffleId}")
+    }
+  }
+
   override def getReader[K, C](
       handle: ShuffleHandle,
       startMapIndex: Int,
