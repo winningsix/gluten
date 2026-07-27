@@ -328,8 +328,7 @@ const std::string kCudfGpuTargetBatchRowsDefault = "1000000";
 
 const std::string kCudfGpuTargetBatchBytes = "spark.gluten.sql.columnar.backend.velox.cudf.gpuTargetBatchBytes";
 const std::string kCudfGpuTargetBatchBytesDefault = "2147483648"; // 2 GiB
-const std::string kCudfGpuSemaphoreEnabled =
-    "spark.gluten.sql.columnar.backend.velox.cudf.gpuSemaphore.enabled";
+const std::string kCudfGpuSemaphoreEnabled = "spark.gluten.sql.columnar.backend.velox.cudf.gpuSemaphore.enabled";
 const bool kCudfGpuSemaphoreEnabledDefault = false;
 const std::string kCudfIcebergMultiFileTargetBytes =
     "spark.gluten.sql.columnar.backend.velox.cudf.iceberg.multi_file.target_bytes";
