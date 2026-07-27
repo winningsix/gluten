@@ -22,12 +22,8 @@
 #include <thread>
 #include <glog/logging.h>
 
-// MPP livelock diagnosis: GpuLock is bypassed entirely. lockGpu/unlockGpu
-// early-return with no futex/cv wait so we can prove the lock is a symptom,
-// not the root cause of the MppNativeQueryExec hang on Q1.
-// Symbols are kept exported so other TUs that reference them still link.
-// Stderr markers are compiled out to keep executor logs quiet; flip
-// GLUTEN_GPULOCK_TRACE to 1 to re-enable.
+// Fine-grained GPU locking remains bypassed for MPP execution. BSP task
+// admission uses the shared concurrency state below.
 #ifndef GLUTEN_GPULOCK_TRACE
 #define GLUTEN_GPULOCK_TRACE 0
 #endif
@@ -48,6 +44,8 @@ GpuLockState& getState() {
   return state;
 }
 
+thread_local int taskLockRefCount = 0;
+
 } // namespace
 
 void setMaxConcurrentGpuTasks(int n) {
@@ -55,8 +53,7 @@ void setMaxConcurrentGpuTasks(int n) {
   std::unique_lock<std::mutex> lock(s.mutex);
   int prev = s.maxConcurrent;
   s.maxConcurrent = std::max(1, n);
-  LOG(INFO) << "GPU concurrency (bypassed): " << prev << " -> "
-            << s.maxConcurrent;
+  LOG(INFO) << "GPU task concurrency: " << prev << " -> " << s.maxConcurrent;
   if (s.maxConcurrent > prev) {
     s.cv.notify_all();
   }
@@ -82,6 +79,34 @@ void unlockGpu() {
   std::cerr << "GPU_LOCK [unlockGpu-bypass] tid="
             << std::this_thread::get_id() << std::endl;
 #endif
+}
+
+void lockGpuTask() {
+  if (taskLockRefCount > 0) {
+    ++taskLockRefCount;
+    return;
+  }
+  auto& state = getState();
+  std::unique_lock<std::mutex> lock(state.mutex);
+  state.cv.wait(
+      lock, [&] { return state.activeCount < state.maxConcurrent; });
+  ++state.activeCount;
+  taskLockRefCount = 1;
+}
+
+void unlockGpuTask() {
+  if (taskLockRefCount <= 0) {
+    return;
+  }
+  if (--taskLockRefCount > 0) {
+    return;
+  }
+  auto& state = getState();
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    --state.activeCount;
+  }
+  state.cv.notify_one();
 }
 
 } // namespace gluten

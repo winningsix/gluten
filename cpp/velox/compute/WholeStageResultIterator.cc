@@ -16,6 +16,7 @@
  */
 #include "WholeStageResultIterator.h"
 #include <chrono>
+#include <optional>
 #include "VeloxBackend.h"
 #include "VeloxPlanConverter.h"
 #include "VeloxRuntime.h"
@@ -88,6 +89,11 @@ WholeStageResultIterator::WholeStageResultIterator(
       veloxCfg_(veloxCfg),
 #ifdef GLUTEN_ENABLE_GPU
       enableCudf_(veloxCfg_->get<bool>(kCudfEnabled, kCudfEnabledDefault)),
+      enableGpuTaskAdmission_(
+          enableCudf_ &&
+          veloxCfg_->get<bool>(
+              kCudfGpuSemaphoreEnabled,
+              kCudfGpuSemaphoreEnabledDefault)),
 #endif
       taskInfo_(taskInfo),
       veloxPlan_(planNode),
@@ -393,16 +399,15 @@ std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
   }
   velox::RowVectorPtr vector;
 
-  // GPU locking is NOT applied at this level. The pipeline (task_->next())
-  // contains both GPU work (cuDF operators, D2H) and CPU work (Parquet I/O,
-  // operator scheduling). Serializing the entire pipeline with maxConcurrent=1
-  // blocks multi-task CPU parallelism and causes 12-21% regression.
-  //
-  // Instead, each GPU-touching component manages its own lock:
-  //   - CudfHiveDataSource: GpuGuard around scan/H2D
-  //   - VeloxGpuColumnarBatchSerializer: GpuLockGuard around deserialize H2D
-  //   - GpuBufferBatchResizer / CudfVectorStream: GpuLockGuard around H2D
-  // cuDF operators are stream-safe (per-op streams) and RMM is thread-safe.
+#ifdef GLUTEN_ENABLE_GPU
+  std::optional<GpuTaskLockGuard> gpuTaskGuard;
+  if (enableGpuTaskAdmission_) {
+    gpuTaskGuard.emplace();
+  }
+#endif
+
+  // The task-level admission guard is independent of the fine-grained MPP
+  // lock, which remains bypassed.
 
   while (true) {
     auto future = velox::ContinueFuture::makeEmpty();
@@ -911,8 +916,10 @@ std::unordered_map<std::string, std::string> WholeStageResultIterator::getQueryC
 #ifdef GLUTEN_ENABLE_GPU
     configs[velox::cudf_velox::CudfConfig::kCudfEnabled] =
         std::to_string(veloxCfg_->get<bool>(kCudfEnabled, false));
-    // IBM baseline removed kCudfSkipOutputToVelox. Output-to-Velox is
-    // unconditional now; gluten consumers always materialize to RowVector.
+    configs[velox::cudf_velox::CudfConfig::kCudfSkipOutputToVelox] =
+        std::to_string(veloxCfg_->get<bool>(
+            kCudfSkipOutputToVelox,
+            kCudfSkipOutputToVeloxDefault));
 #endif
 
     const auto setIfExists = [&](const std::string& glutenKey, const std::string& veloxKey) {
