@@ -1197,19 +1197,34 @@ const core::WindowNode::Frame SubstraitToVeloxPlanConverter::createWindowFrame(
 detail::WindowInputOrdering detail::selectWindowInputOrdering(
     const core::PlanNodePtr& input,
     bool preserveSortedInput) {
+  const auto hasOrderByInput = [](const core::PlanNodePtr& node) {
+    auto current = node;
+    while (current) {
+      if (std::dynamic_pointer_cast<const core::OrderByNode>(current)) {
+        return true;
+      }
+      if (!std::dynamic_pointer_cast<const core::ProjectNode>(current) ||
+          current->sources().size() != 1) {
+        return false;
+      }
+      current = current->sources().front();
+    }
+    return false;
+  };
+
+  if (preserveSortedInput) {
+    VELOX_CHECK(
+        hasOrderByInput(input),
+        "Window inputsSorted contract requires an OrderBy input, optionally through Projects.");
+    return {input, true};
+  }
+
   if (auto orderBy =
           std::dynamic_pointer_cast<const core::OrderByNode>(input)) {
-    if (preserveSortedInput) {
-      return {input, true};
-    }
-
     VELOX_CHECK_EQ(orderBy->sources().size(), 1);
     return {orderBy->sources().front(), false};
   }
 
-  VELOX_CHECK(
-      !preserveSortedInput,
-      "Window inputsSorted contract requires an immediate OrderBy input.");
   return {input, false};
 }
 

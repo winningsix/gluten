@@ -16,9 +16,9 @@
  */
 package org.apache.gluten.execution
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, CurrentRow, Expression, Literal, RangeFrame, Rank, RowFrame, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedFollowing, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, AttributeSet, CurrentRow, Expression, Literal, NamedExpression, RangeFrame, Rank, RowFrame, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedFollowing, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Count, Sum}
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.{ProjectExec, SparkPlan}
 import org.apache.spark.sql.types.{ByteType, DoubleType, IntegerType, LongType, ShortType}
 
 private[execution] object MppWindowInputOrdering {
@@ -27,31 +27,130 @@ private[execution] object MppWindowInputOrdering {
   private case object FullPartitionCount extends WindowKind
   private case object RunningRangeSum extends WindowKind
 
-  private[execution] case class OrderingStats(markedWindows: Int)
+  private[execution] case class OrderingStats(
+      candidateWindows: Int,
+      verifiedSortWindows: Int,
+      supportedShapeWindows: Int,
+      markedWindows: Int)
 
   def apply(plan: SparkPlan): (SparkPlan, OrderingStats) = {
+    var candidateWindows = 0
+    var verifiedSortWindows = 0
+    var supportedShapeWindows = 0
     var markedWindows = 0
     plan.foreach {
-      case window: WindowExecTransformer
-          if hasCompleteLocalSort(window) && hasSupportedWindowShape(window) =>
-        if (!WindowExecTransformer.inputsSorted(window)) {
-          WindowExecTransformer.markInputsSorted(window)
-          markedWindows += 1
+      case window: WindowExecTransformer =>
+        candidateWindows += 1
+        val hasSort = hasCompleteLocalSort(window)
+        val hasShape = hasSupportedWindowShape(window)
+        if (hasSort) {
+          verifiedSortWindows += 1
+        }
+        if (hasShape) {
+          supportedShapeWindows += 1
+        }
+        if (hasSort && hasShape) {
+          if (!WindowExecTransformer.inputsSorted(window)) {
+            WindowExecTransformer.markInputsSorted(window)
+            markedWindows += 1
+          }
         }
       case _ =>
     }
-    plan -> OrderingStats(markedWindows)
+    plan -> OrderingStats(
+      candidateWindows,
+      verifiedSortWindows,
+      supportedShapeWindows,
+      markedWindows)
   }
 
   private def hasCompleteLocalSort(window: WindowExecTransformer): Boolean = {
-    window.partitionSpec.nonEmpty && (window.child match {
-      case sort: SortExecTransformer if !sort.global =>
-        val requiredOrdering =
-          window.partitionSpec.map(SortOrder(_, Ascending)) ++ window.orderSpec
-        sort.sortOrder.length == requiredOrdering.length &&
-        SortOrder.orderingSatisfies(sort.sortOrder, requiredOrdering)
-      case _ => false
-    })
+    def find(child: SparkPlan, partitionSpec: Seq[Expression], orderSpec: Seq[SortOrder]): Boolean =
+      child match {
+        case sort: SortExecTransformer if !sort.global =>
+          hasRequiredOrdering(sort, partitionSpec, orderSpec)
+        case project: ProjectExecTransformer if project.projectList.forall(_.deterministic) =>
+          rewriteOrderingThroughProject(partitionSpec, orderSpec, project.projectList).exists {
+            case (childPartitionSpec, childOrderSpec) =>
+              find(project.child, childPartitionSpec, childOrderSpec)
+          }
+        case project: ProjectExec if project.projectList.forall(_.deterministic) =>
+          rewriteOrderingThroughProject(partitionSpec, orderSpec, project.projectList).exists {
+            case (childPartitionSpec, childOrderSpec) =>
+              find(project.child, childPartitionSpec, childOrderSpec)
+          }
+        case _ => false
+      }
+
+    window.partitionSpec.nonEmpty &&
+    find(window.child, window.partitionSpec, window.orderSpec)
+  }
+
+  private[execution] def hasRequiredOrdering(
+      sort: SortExecTransformer,
+      partitionSpec: Seq[Expression],
+      orderSpec: Seq[SortOrder]): Boolean = {
+    val requiredOrdering = partitionSpec.map(SortOrder(_, Ascending)) ++ orderSpec
+    sort.sortOrder.length == requiredOrdering.length &&
+    (SortOrder.orderingSatisfies(sort.sortOrder, requiredOrdering) ||
+      sort.sortOrder.zip(requiredOrdering).forall {
+        case (actual, required) =>
+          actual.direction == required.direction &&
+          actual.nullOrdering == required.nullOrdering &&
+          resolveProjectLineage(actual.child, sort.child)
+            .semanticEquals(resolveProjectLineage(required.child, sort.child))
+      })
+  }
+
+  private def resolveProjectLineage(expression: Expression, plan: SparkPlan): Expression = {
+    plan match {
+      case project: ProjectExecTransformer if project.projectList.forall(_.deterministic) =>
+        rewriteExpressionsThroughProject(Seq(expression), project.projectList)
+          .map(_.head)
+          .map(resolveProjectLineage(_, project.child))
+          .getOrElse(expression)
+      case project: ProjectExec if project.projectList.forall(_.deterministic) =>
+        rewriteExpressionsThroughProject(Seq(expression), project.projectList)
+          .map(_.head)
+          .map(resolveProjectLineage(_, project.child))
+          .getOrElse(expression)
+      case _ => expression
+    }
+  }
+
+  private[execution] def rewriteOrderingThroughProject(
+      partitionSpec: Seq[Expression],
+      orderSpec: Seq[SortOrder],
+      projectList: Seq[NamedExpression]): Option[(Seq[Expression], Seq[SortOrder])] = {
+    rewriteExpressionsThroughProject(partitionSpec ++ orderSpec, projectList).map {
+      rewritten =>
+        val (partitions, orders) = rewritten.splitAt(partitionSpec.size)
+        partitions -> orders.map(_.asInstanceOf[SortOrder])
+    }
+  }
+
+  private def rewriteExpressionsThroughProject(
+      expressions: Seq[Expression],
+      projectList: Seq[NamedExpression]): Option[Seq[Expression]] = {
+    val projectOutput = AttributeSet(projectList.map(_.toAttribute))
+    val references = expressions.foldLeft(AttributeSet.empty)(_ ++ _.references)
+    if (!references.subsetOf(projectOutput)) {
+      return None
+    }
+
+    val replacements = projectList.map {
+      case alias: Alias => alias.exprId -> alias.child
+      case attribute: Attribute => attribute.exprId -> attribute
+      case expression => expression.exprId -> expression
+    }.toMap
+    def rewrite(expression: Expression): Expression = {
+      expression.transform {
+        case attribute: Attribute if replacements.contains(attribute.exprId) =>
+          replacements(attribute.exprId)
+      }
+    }
+
+    Some(expressions.map(rewrite))
   }
 
   private def hasSupportedWindowShape(window: WindowExecTransformer): Boolean = {
@@ -61,8 +160,7 @@ private[execution] object MppWindowInputOrdering {
 
   private def classify(expression: Expression, window: WindowExecTransformer): Option[WindowKind] =
     expression match {
-      case Alias(WindowExpression(function, spec: WindowSpecDefinition), _)
-          if matchesPhysicalWindow(spec, window) =>
+      case Alias(WindowExpression(function, spec: WindowSpecDefinition), _) =>
         function match {
           case _: RowNumber | _: Rank
               if window.orderSpec.nonEmpty &&
@@ -91,13 +189,6 @@ private[execution] object MppWindowInputOrdering {
       case _ => None
     }
 
-  private def matchesPhysicalWindow(
-      spec: WindowSpecDefinition,
-      window: WindowExecTransformer): Boolean = {
-    sameExpressions(spec.partitionSpec, window.partitionSpec) &&
-    sameSortOrders(spec.orderSpec, window.orderSpec)
-  }
-
   private def hasFrame(
       spec: WindowSpecDefinition,
       lower: Expression,
@@ -119,15 +210,4 @@ private[execution] object MppWindowInputOrdering {
       dataType == LongType ||
       dataType == DoubleType
 
-  private def sameExpressions(left: Seq[Expression], right: Seq[Expression]): Boolean = {
-    left.length == right.length && left.zip(right).forall {
-      case (leftExpression, rightExpression) => leftExpression.semanticEquals(rightExpression)
-    }
-  }
-
-  private def sameSortOrders(left: Seq[SortOrder], right: Seq[SortOrder]): Boolean = {
-    left.length == right.length && left.zip(right).forall {
-      case (leftOrder, rightOrder) => leftOrder.semanticEquals(rightOrder)
-    }
-  }
 }

@@ -303,6 +303,16 @@ TEST(SubstraitWindowOrderingContractTest, followsPhysicalPlanMarker) {
   EXPECT_EQ(marked.input, orderBy);
   EXPECT_TRUE(marked.inputsSorted);
 
+  auto project = std::make_shared<core::ProjectNode>(
+      "project",
+      std::vector<std::string>{"k", "o"},
+      std::vector<core::TypedExprPtr>{partitionKey, orderKey},
+      orderBy);
+  const auto markedThroughProject =
+      detail::selectWindowInputOrdering(project, true);
+  EXPECT_EQ(markedThroughProject.input, project);
+  EXPECT_TRUE(markedThroughProject.inputsSorted);
+
   const auto unmarked =
       detail::selectWindowInputOrdering(orderBy, false);
   EXPECT_EQ(unmarked.input, nullptr);
