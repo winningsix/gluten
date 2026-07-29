@@ -1,8 +1,8 @@
 // Diagnostic-only CUDA allocation tracer.
 //
 // Build:
-//   g++ -std=c++17 -O2 -g -shared -fPIC -o libcuda_alloc_trace.so \
-//     cuda_alloc_trace.cpp -ldl -pthread
+//   g++ -std=c++17 -O2 -g -shared -fPIC -o libcuda_alloc_trace.so
+//   cuda_alloc_trace.cpp -ldl -pthread
 // Enable only for a focused executor run through LD_PRELOAD.
 
 #include <dlfcn.h>
@@ -23,6 +23,8 @@ namespace {
 
 using CudaError = int;
 using CudaStream = void *;
+using CuDevicePtr = std::uint64_t;
+using CuMemoryPool = void *;
 
 std::mutex allocationMutex;
 struct Allocation {
@@ -44,6 +46,7 @@ std::atomic<uint64_t> currentBytes{0};
 std::atomic<uint64_t> peakBytes{0};
 std::atomic<uint64_t> totalBytes{0};
 std::atomic<uint64_t> allocationCount{0};
+std::atomic<uint64_t> allocationFailureCount{0};
 std::atomic<uint64_t> freeCount{0};
 std::atomic<uint64_t> freeFailureCount{0};
 std::atomic<uint64_t> reportedPeakGiB{0};
@@ -102,7 +105,32 @@ void printStack() {
 
 void recordAllocation(const char *api, void *pointer, std::size_t bytes,
                       CudaError status) {
-  if (status != 0 || pointer == nullptr || bytes == 0) {
+  if (status != 0) {
+    const auto failures = allocationFailureCount.fetch_add(1) + 1;
+    if (failures <= 32) {
+      uint32_t context = 0;
+      std::string contextName{"unattributed"};
+      {
+        std::lock_guard<std::mutex> lock(allocationMutex);
+        context = contextStack.empty() ? 0 : contextStack.back();
+        if (context < contexts.size()) {
+          contextName = contexts[context].name;
+        }
+      }
+      dprintf(
+          STDERR_FILENO,
+          "CUDA_ALLOC_TRACE event=allocationFailure api=%s pid=%d bytes=%zu "
+          "status=%d currentBytes=%llu peakBytes=%llu failures=%llu "
+          "triggerContext=%s\n",
+          api, static_cast<int>(getpid()), bytes, status,
+          static_cast<unsigned long long>(currentBytes.load()),
+          static_cast<unsigned long long>(peakBytes.load()),
+          static_cast<unsigned long long>(failures), contextName.c_str());
+      printTopContexts();
+    }
+    return;
+  }
+  if (pointer == nullptr || bytes == 0) {
     return;
   }
 
@@ -196,6 +224,11 @@ void recordFree(const char *api, void *pointer, CudaError status) {
 }
 
 } // namespace
+
+__attribute__((constructor)) static void cudaAllocTraceLoaded() {
+  dprintf(STDERR_FILENO, "CUDA_ALLOC_TRACE event=loaded pid=%d\n",
+          static_cast<int>(getpid()));
+}
 
 extern "C" void cuda_alloc_trace_push_context(const char *name) {
   if (name == nullptr || name[0] == '\0') {
@@ -297,6 +330,97 @@ extern "C" CudaError cudaFreeAsync(void *pointer, CudaStream stream) {
   insideHook = true;
   const auto status = real(pointer, stream);
   recordFree("cudaFreeAsync", pointer, status);
+  insideHook = false;
+  return status;
+}
+
+extern "C" CudaError cuMemAllocAsync(CuDevicePtr *pointer, std::size_t bytes,
+                                     CudaStream stream) {
+  using Function = CudaError (*)(CuDevicePtr *, std::size_t, CudaStream);
+  static auto real = loadNext<Function>("cuMemAllocAsync");
+  if (real == nullptr) {
+    return 999;
+  }
+  if (insideHook) {
+    return real(pointer, bytes, stream);
+  }
+  insideHook = true;
+  const auto status = real(pointer, bytes, stream);
+  recordAllocation("cuMemAllocAsync",
+                   status == 0 ? reinterpret_cast<void *>(*pointer) : nullptr,
+                   bytes, status);
+  insideHook = false;
+  return status;
+}
+
+extern "C" CudaError cuMemAllocFromPoolAsync(CuDevicePtr *pointer,
+                                             std::size_t bytes,
+                                             CuMemoryPool pool,
+                                             CudaStream stream) {
+  using Function =
+      CudaError (*)(CuDevicePtr *, std::size_t, CuMemoryPool, CudaStream);
+  static auto real = loadNext<Function>("cuMemAllocFromPoolAsync");
+  if (real == nullptr) {
+    return 999;
+  }
+  if (insideHook) {
+    return real(pointer, bytes, pool, stream);
+  }
+  insideHook = true;
+  const auto status = real(pointer, bytes, pool, stream);
+  recordAllocation("cuMemAllocFromPoolAsync",
+                   status == 0 ? reinterpret_cast<void *>(*pointer) : nullptr,
+                   bytes, status);
+  insideHook = false;
+  return status;
+}
+
+extern "C" CudaError cuMemFreeAsync(CuDevicePtr pointer, CudaStream stream) {
+  using Function = CudaError (*)(CuDevicePtr, CudaStream);
+  static auto real = loadNext<Function>("cuMemFreeAsync");
+  if (real == nullptr) {
+    return 999;
+  }
+  if (insideHook) {
+    return real(pointer, stream);
+  }
+  insideHook = true;
+  const auto status = real(pointer, stream);
+  recordFree("cuMemFreeAsync", reinterpret_cast<void *>(pointer), status);
+  insideHook = false;
+  return status;
+}
+
+extern "C" CudaError cuMemAlloc_v2(CuDevicePtr *pointer, std::size_t bytes) {
+  using Function = CudaError (*)(CuDevicePtr *, std::size_t);
+  static auto real = loadNext<Function>("cuMemAlloc_v2");
+  if (real == nullptr) {
+    return 999;
+  }
+  if (insideHook) {
+    return real(pointer, bytes);
+  }
+  insideHook = true;
+  const auto status = real(pointer, bytes);
+  recordAllocation("cuMemAlloc_v2",
+                   status == 0 ? reinterpret_cast<void *>(*pointer) : nullptr,
+                   bytes, status);
+  insideHook = false;
+  return status;
+}
+
+extern "C" CudaError cuMemFree_v2(CuDevicePtr pointer) {
+  using Function = CudaError (*)(CuDevicePtr);
+  static auto real = loadNext<Function>("cuMemFree_v2");
+  if (real == nullptr) {
+    return 999;
+  }
+  if (insideHook) {
+    return real(pointer);
+  }
+  insideHook = true;
+  const auto status = real(pointer);
+  recordFree("cuMemFree_v2", reinterpret_cast<void *>(pointer), status);
   insideHook = false;
   return status;
 }

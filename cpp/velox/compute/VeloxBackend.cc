@@ -37,6 +37,8 @@
 #include "ucs/debug/debug.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
+#include "velox/experimental/cudf/connectors/hive/ExecutorReadBroker.h"
+#include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
@@ -581,6 +583,12 @@ void VeloxBackend::tearDown() {
     // Destruct IOThreadPoolExecutor will join all threads.
     // On threads exit, thread local variables can be constructed with referencing global variables.
     // So, we need to destruct IOThreadPoolExecutor and stop the threads before global variables get destructed.
+#ifdef GLUTEN_ENABLE_GPU
+    facebook::velox::cudf_velox::connector::hive::ExecutorSplitPrefetch::erase(
+        ioExecutor_.get());
+    facebook::velox::cudf_velox::connector::hive::ExecutorReadBroker::erase(
+        ioExecutor_.get());
+#endif
     ioExecutor_.reset();
     globalMemoryManager_.reset();
 

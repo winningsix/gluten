@@ -245,6 +245,20 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorSessionC
             true)
         ? "true"
         : "false";
+    configs["cudf.hive.selective_preload_enabled"] =
+        conf->get<bool>(
+            kCudfHiveSelectivePreloadEnabled,
+            kCudfHiveSelectivePreloadEnabledDefault)
+        ? "true"
+        : "false";
+    configs["cudf.hive.prefetch_max_inflight_bytes"] = std::to_string(
+        conf->get<uint64_t>(
+            kCudfHivePrefetchMaxInFlightBytes,
+            kCudfHivePrefetchMaxInFlightBytesDefault));
+    configs["cudf.hive.prefetch_threads"] = std::to_string(
+        conf->get<uint32_t>(
+            kCudfHivePrefetchThreads,
+            kCudfHivePrefetchThreadsDefault));
   }
   configs[facebook::velox::connector::hive::HiveConfig::kMaxPartitionsPerWritersSession] =
       conf->get<std::string>(kMaxPartitions, "10000");

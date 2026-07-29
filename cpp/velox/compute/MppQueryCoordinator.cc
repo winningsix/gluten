@@ -61,6 +61,7 @@
 #ifdef GLUTEN_ENABLE_GPU
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
+#include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
@@ -381,6 +382,13 @@ MppQueryCoordinator::~MppQueryCoordinator() {
     nvtx3::scoped_range_in<GlutenMppDomain> r{"coordinator::~destructor:fragmentTasks.clear"};
     fragmentTasks_.clear();
   }
+#ifdef GLUTEN_ENABLE_GPU
+  // All split readers are gone after fragmentTasks_.clear(). Release the
+  // query-scoped prefetch queue and join its scheduler workers now instead
+  // of accumulating one 16-thread scheduler per query until executor exit.
+  cudf_velox::connector::hive::ExecutorSplitPrefetch::eraseQuery(
+      executor_, queryCtx_->queryId());
+#endif
   if (spillDiskOpts_.has_value()) {
     std::error_code error;
     std::filesystem::remove_all(spillDiskOpts_->spillDirPath, error);
@@ -1246,6 +1254,46 @@ void MppQueryCoordinator::start() {
               j < scanInfo->properties.size() ? scanInfo->properties[j] : std::nullopt,
               /*dataSequenceNumber=*/0,
               std::move(coalescedFiles));
+#ifdef GLUTEN_ENABLE_GPU
+          const auto prefetchPrimaryPath =
+              cleanedCudfPath(scanInfo->paths[j]);
+          if (connectorId == kCudfIcebergConnectorId &&
+              queryCtx_->executor() != nullptr &&
+              prefetchPrimaryPath.starts_with("s3://")) {
+            const auto icebergConnectorSplit =
+                std::dynamic_pointer_cast<
+                    connector::hive::iceberg::HiveIcebergSplit>(
+                    connectorSplit);
+            VELOX_CHECK_NOT_NULL(icebergConnectorSplit);
+            std::vector<
+                cudf_velox::connector::hive::SplitPrefetchFile>
+                prefetchFiles;
+            std::optional<uint64_t> primaryFileSize;
+            if (icebergConnectorSplit->properties.has_value() &&
+                icebergConnectorSplit->properties->fileSize.has_value()) {
+              primaryFileSize = static_cast<uint64_t>(
+                  *icebergConnectorSplit->properties->fileSize);
+            }
+            if (primaryFileSize.has_value()) {
+              prefetchFiles.reserve(
+                  1 + icebergConnectorSplit->coalescedFiles.size());
+              prefetchFiles.push_back(
+                  {prefetchPrimaryPath,
+                   *primaryFileSize});
+              for (const auto& file :
+                   icebergConnectorSplit->coalescedFiles) {
+                prefetchFiles.push_back(
+                    {cleanedCudfPath(file.filePath), file.length});
+              }
+              cudf_velox::connector::hive::ExecutorSplitPrefetch::
+                  registerSplit(
+                      queryCtx_->executor(),
+                      queryCtx_->queryId(),
+                      prefetchPrimaryPath,
+                      std::move(prefetchFiles));
+            }
+          }
+#endif
         } else
 #ifdef GLUTEN_ENABLE_GPU
             if (connectorId == kCudfHiveConnectorId && scanInfo->canUseCudfConnector()) {
@@ -2286,7 +2334,6 @@ void MppQueryCoordinator::logOperatorMetrics() const {
           row["numMemoryAllocations"] = static_cast<int64_t>(opStats.memoryStats.numMemoryAllocations);
           row["spilledBytes"] = static_cast<int64_t>(opStats.spilledBytes);
           row["spilledRows"] = static_cast<int64_t>(opStats.spilledRows);
-
           LOG(WARNING) << "[MPP_OPERATOR_METRICS] " << folly::toJson(row);
           ++emitted;
         }

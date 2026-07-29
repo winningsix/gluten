@@ -733,8 +733,19 @@ if(ENABLE_GPU)
     message(
       STATUS "Using legacy shared KvikIO library: ${_gluten_kvikio_shared}")
   else()
-    message(
-      STATUS "Using KvikIO absorbed by shared cuDF: ${_gluten_cudf_location}")
+    find_library(
+      _gluten_kvikio_system
+      NAMES kvikio
+      PATHS /usr/local/lib64 /usr/local/lib
+      NO_DEFAULT_PATH)
+    if(_gluten_kvikio_system)
+      list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_kvikio_system}")
+      message(STATUS "Using system shared KvikIO library: "
+                     "${_gluten_kvikio_system}")
+    else()
+      message(
+        STATUS "Using KvikIO absorbed by shared cuDF: ${_gluten_cudf_location}")
+    endif()
   endif()
 
   set(GLUTEN_CUDART_LIBRARY /usr/local/cuda/lib64/libcudart.so)

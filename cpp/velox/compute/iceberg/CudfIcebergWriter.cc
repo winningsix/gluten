@@ -43,6 +43,8 @@
 #include "velox/connectors/hive/storage_adapters/s3fs/S3WriteFile.h"
 #endif
 
+#include "velox/experimental/cudf/CudfNoDefaults.h"
+
 using facebook::velox::RowTypePtr;
 using facebook::velox::TypeKind;
 using facebook::velox::TypePtr;
@@ -406,10 +408,29 @@ struct CudfIcebergWriter::Impl {
   void write(const facebook::velox::RowVectorPtr& input) {
     VELOX_USER_CHECK(!closed, "Cannot write after the libcudf Iceberg writer is closed");
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
-    VELOX_USER_CHECK_NOT_NULL(
-        cudfInput,
-        "Iceberg GPU writer requires a CudfVector; the MPP root materialized data on CPU");
-    const auto table = cudfInput->getTableView();
+    std::unique_ptr<cudf::table> convertedInput;
+    const auto table = [&]() -> cudf::table_view {
+      if (cudfInput) {
+        // MPP operators may use a different stream. The synchronization keeps
+        // the input device buffers ready before this writer consumes them.
+        cudfInput->stream().synchronize();
+        return cudfInput->getTableView();
+      }
+
+      // A V2 write can retain a Spark/BSP boundary above an otherwise native
+      // plan (for example an unsupported nested left-anti join). Preserve the
+      // GPU writer in that case by uploading the CPU RowVector. Fully GPU MPP
+      // output continues to use the zero-copy CudfVector path above.
+      convertedInput =
+          facebook::velox::cudf_velox::with_arrow::toCudfTable(
+              input,
+              input->pool(),
+              stream,
+              facebook::velox::cudf_velox::get_temp_mr());
+      VELOX_USER_CHECK_NOT_NULL(
+          convertedInput, "Failed to upload Iceberg write input to libcudf");
+      return convertedInput->view();
+    }();
     VELOX_USER_CHECK_EQ(
         table.num_columns(), rowType->size(), "Iceberg GPU write schema column count mismatch");
     VELOX_USER_CHECK_EQ(
@@ -422,10 +443,6 @@ struct CudfIcebergWriter::Impl {
           rowType->nameOf(i));
     }
 
-    // MPP operators may use a different stream. The synchronization keeps the
-    // input device buffers alive and ready before the chunked writer consumes them.
-    cudfInput->stream().synchronize();
-
     if (partitionChannels.empty()) {
       // Keep one batch in flight so the MPP root can produce the next device
       // batch while libcudf compresses this one.  The next call reaches this
@@ -433,10 +450,15 @@ struct CudfIcebergWriter::Impl {
       // releasing the previous input buffers and queueing another write.
       stream.synchronize();
       inFlightInput.reset();
+      inFlightConvertedInput.reset();
       auto& file = openFile("", folly::dynamic::array, table);
       file.writer->write(table);
       file.rows += table.num_rows();
-      inFlightInput = input;
+      if (cudfInput) {
+        inFlightInput = input;
+      } else {
+        inFlightConvertedInput = std::move(convertedInput);
+      }
       return;
     }
 
@@ -480,6 +502,7 @@ struct CudfIcebergWriter::Impl {
       file->writer.reset();
       stream.synchronize();
       inFlightInput.reset();
+      inFlightConvertedInput.reset();
       file->sink->close();
       file->bytes = file->sink->bytes_written();
       file->closed = true;
@@ -531,6 +554,7 @@ struct CudfIcebergWriter::Impl {
           file->writer->close();
           stream.synchronize();
           inFlightInput.reset();
+          inFlightConvertedInput.reset();
         } catch (const std::exception& error) {
           LOG(WARNING) << "Failed to close aborted libcudf Iceberg file "
                        << file->path << ": " << error.what();
@@ -569,6 +593,7 @@ struct CudfIcebergWriter::Impl {
   std::vector<TypePtr> partitionTypes;
   rmm::cuda_stream_view stream;
   facebook::velox::RowVectorPtr inFlightInput;
+  std::unique_ptr<cudf::table> inFlightConvertedInput;
   std::unordered_map<std::string, std::unique_ptr<OpenFile>> files;
   uint64_t totalBytes{0};
   bool closed{false};

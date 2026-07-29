@@ -339,6 +339,14 @@ const std::string kCudfIcebergMultiFileMaxFileBytes =
 const uint64_t kCudfIcebergMultiFileMaxFileBytesDefault = 64UL << 20;
 const std::string kCudfHiveUseExperimentalReader =
     "spark.gluten.sql.columnar.backend.velox.cudf.hive.use_experimental_reader";
+const std::string kCudfHiveSelectivePreloadEnabled =
+    "spark.gluten.sql.columnar.backend.velox.cudf.hive.selectivePreloadEnabled";
+const bool kCudfHiveSelectivePreloadEnabledDefault = false;
+const std::string kCudfHivePrefetchMaxInFlightBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.hive.prefetchMaxInFlightBytes";
+const uint64_t kCudfHivePrefetchMaxInFlightBytesDefault = 4ULL << 30;
+const std::string kCudfHivePrefetchThreads = "spark.gluten.sql.columnar.backend.velox.cudf.hive.prefetchThreads";
+const uint32_t kCudfHivePrefetchThreadsDefault = 128;
 
 // Target bytes for UCX partitioned-output accumulation and chunking. When it
 // is not set explicitly, MPP uses kCudfGpuTargetBatchBytes so byte-aware UCX
