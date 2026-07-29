@@ -163,7 +163,7 @@ pipeline {
                                                 $class: 'GitSCM',
                                                 branches: [[name: env.GLUTEN_SOURCE_REF]],
                                                 userRemoteConfigs: [[
-                                                    credentialsId: 'github-token',
+                                                    credentialsId: 'nvauto-bot_github',
                                                     url: githubHelper.getCloneUrl(),
                                                     refspec: '+refs/pull/*/merge:' +
                                                         'refs/remotes/origin/pr/*'
