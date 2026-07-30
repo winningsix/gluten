@@ -1,0 +1,281 @@
+#!/usr/local/env groovy
+
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+@Library('blossom-lib') _
+@Library('blossom-github-lib@master')
+import ipp.blossom.*
+
+def githubHelper
+def skipped = false
+
+pipeline {
+    agent {
+        kubernetes {
+            label "gluten-premerge-init-${BUILD_TAG}"
+            cloud "${common.CLOUD_NAME}"
+            yaml pod.getCPUYAML('alpine')
+        }
+    }
+
+    options {
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '30', daysToKeepStr: '90'))
+        skipDefaultCheckout true
+        timeout(time: 3, unit: 'HOURS')
+    }
+
+    parameters {
+        string(name: 'REF', defaultValue: 'dev',
+            description: 'Gluten ref for manual runs; ignored when GITHUB_DATA is set.')
+        string(name: 'GITHUB_DATA', defaultValue: '',
+            description: 'GitHub event JSON from Blossom CI. Leave empty for manual runs.')
+
+        string(name: 'COLT_REPO_URL',
+            defaultValue: 'https://gitlab-master.nvidia.com/alfxu/colt.git',
+            description: 'Colt repository URL.')
+        string(name: 'COLT_REF', defaultValue: 'main',
+            description: 'Pinned Colt branch or tag.')
+        string(name: 'VELOX_REPO_URL',
+            defaultValue: 'https://github.com/HighPerfDataAccelerator/velox.git',
+            description: 'Baseline Velox repository required by the Colt source model.')
+        string(name: 'VELOX_REF', defaultValue: 'dev',
+            description: 'Velox baseline ref. Gluten premerge uses dev by default.')
+
+        string(name: 'PREBUILD_IMAGE',
+            defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/gluten-builder:latest",
+            description: 'cuDF-pinned Colt prebuild image. A matching image is required.')
+        string(name: 'GPU_TYPE', defaultValue: 'RESERVED_POOL',
+            description: 'Blossom lockable GPU pool label. One GPU is allocated to DinD.')
+        string(name: 'COLT_RUNNER_IMAGE',
+            defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/" +
+                'gluten-colt-runner:docker25-v3',
+            description: 'Gluten Colt runner image with Docker, Git, Bash, Python, and gh.')
+        string(name: 'COLT_PARALLEL', defaultValue: '4',
+            description: 'Colt build/test parallelism.')
+        string(name: 'COLT_MEM_LIMIT', defaultValue: '20G',
+            description: 'Child-container memory limit; keep below the DinD sidecar limit.')
+    }
+
+    stages {
+        stage('Initialize') {
+            environment {
+                GITHUB_TOKEN = credentials('github-token')
+            }
+            steps {
+                script {
+                    def requestedRef = params.REF.trim()
+                    if (params.GITHUB_DATA.trim()) {
+                        githubHelper = GithubHelper.getInstance(
+                            "${GITHUB_TOKEN}", params.GITHUB_DATA)
+                        currentBuild.description = githubHelper.getBuildDescription()
+
+                        def title = githubHelper.getIssue().title.toLowerCase()
+                        if (title ==~ /.*\[skip ci\].*/) {
+                            githubHelper.updateCommitStatus(
+                                env.BUILD_URL, 'Skipped', GitHubCommitState.SUCCESS)
+                            currentBuild.result = 'SUCCESS'
+                            skipped = true
+                            return
+                        }
+
+                        def mergedSha = githubHelper.getMergedSHA()?.trim()
+                        if (!mergedSha) {
+                            error('GitHub event did not resolve to a merged PR SHA')
+                        }
+                        env.GLUTEN_SOURCE_REF = mergedSha
+                        githubHelper.updateCommitStatus(
+                            env.BUILD_URL, 'Running', GitHubCommitState.PENDING)
+                    } else {
+                        if (!requestedRef) {
+                            error('REF is required for a manual premerge run')
+                        }
+                        env.GLUTEN_SOURCE_REF = requestedRef
+                        currentBuild.description = "manual @ ${requestedRef.take(20)}"
+                    }
+
+                    if (!env.GLUTEN_SOURCE_REF?.trim()) {
+                        error('Unable to determine the Gluten source ref')
+                    }
+                    echo "Gluten ref: ${env.GLUTEN_SOURCE_REF}"
+                }
+            }
+        }
+
+        stage('Colt Gluten verification') {
+            when {
+                beforeAgent true
+                expression { !skipped }
+            }
+            options {
+                lock(label: "${params.GPU_TYPE}", quantity: 1, variable: 'GPU_RESOURCE')
+            }
+            agent {
+                kubernetes {
+                    label "gluten-premerge-${BUILD_TAG}"
+                    cloud "${common.CLOUD_NAME}"
+                    // Only the DinD sidecar needs the GPU because Colt launches its
+                    // build and source-test containers through that Docker daemon.
+                    yaml pod.getGPUDockerYAML(
+                        "${params.COLT_RUNNER_IMAGE}",
+                        "${env.GPU_RESOURCE}",
+                        '8',
+                        '30Gi',
+                        true,
+                        '0')
+                }
+            }
+            environment {
+                COLT_ROOT = "${WORKSPACE}/colt"
+                GLUTEN_SOURCE_DIR = "${WORKSPACE}/gluten-source"
+                COLT_WORKSPACE = "${WORKSPACE}/colt-workspace"
+                COLT_RUN_DIR = "${WORKSPACE}/colt-results/verify"
+            }
+            stages {
+                stage('Checkout') {
+                    steps {
+                        container('gpu') {
+                            script {
+                                deleteDir()
+
+                                // Blossom CI supplies only GITHUB_DATA. Event builds
+                                // fetch the merged PR SHA directly; manual runs keep
+                                // using the job SCM configured from params.REF.
+                                dir(env.GLUTEN_SOURCE_DIR) {
+                                    if (githubHelper != null) {
+                                        checkout(
+                                            changelog: false,
+                                            poll: false,
+                                            scm: [
+                                                $class: 'GitSCM',
+                                                branches: [[name: env.GLUTEN_SOURCE_REF]],
+                                                userRemoteConfigs: [[
+                                                    credentialsId: 'nvauto-bot_github',
+                                                    url: githubHelper.getCloneUrl(),
+                                                    refspec: '+refs/pull/*/merge:' +
+                                                        'refs/remotes/origin/pr/*'
+                                                ]]
+                                            ])
+                                    } else {
+                                        checkout scm
+                                    }
+                                    env.GLUTEN_SHA = sh(
+                                        script: 'git rev-parse HEAD',
+                                        returnStdout: true).trim()
+                                }
+                                dir(env.COLT_ROOT) {
+                                    // Jenkins runs SCM checkout in the JNLP container. Store the
+                                    // skip-smudge filters in this repository so its old Git LFS
+                                    // client leaves Colt's unused LFS objects as pointers.
+                                    sh '''
+                                        git init .
+                                        git config filter.lfs.smudge \
+                                          'git-lfs smudge --skip -- %f'
+                                        git config filter.lfs.process \
+                                          'git-lfs filter-process --skip'
+                                    '''
+                                    common.checkoutSourceCode(
+                                        this,
+                                        params.COLT_REPO_URL.trim(),
+                                        params.COLT_REF.trim())
+                                    // The runner image does not need Git LFS. Remove the temporary
+                                    // filters before Colt inspects its own repository status.
+                                    sh '''
+                                        git config --unset-all filter.lfs.smudge || true
+                                        git config --unset-all filter.lfs.process || true
+                                        git config filter.lfs.required false
+                                    '''
+                                }
+                                if (env.GLUTEN_SOURCE_REF ==~ /[0-9a-fA-F]{40}/ &&
+                                        !env.GLUTEN_SHA.equalsIgnoreCase(env.GLUTEN_SOURCE_REF)) {
+                                    error(
+                                        "Job SCM did not check out the requested Gluten SHA: " +
+                                            "${env.GLUTEN_SHA} != ${env.GLUTEN_SOURCE_REF}")
+                                }
+                                echo "Resolved Gluten SHA: ${env.GLUTEN_SHA}"
+                            }
+                        }
+                    }
+                }
+
+                stage('Verify Spark source suites') {
+                    steps {
+                        container('gpu') {
+                            script {
+                                DockerUtils.loginDockerRepo(this)
+                                def prebuildImage = params.PREBUILD_IMAGE.trim()
+                                if (!prebuildImage) {
+                                    error('PREBUILD_IMAGE is required')
+                                }
+                                sh """
+                                    set -eu
+                                    docker pull '${prebuildImage}'
+                                    PYTHONUNBUFFERED=1 '${env.COLT_ROOT}/colt' workflow verify \
+                                      --mode=run \
+                                      --scope=gluten \
+                                      --tier=spark-source \
+                                      --worktree-mode=snapshot \
+                                      --build-mode=clean \
+                                      --gluten-repo='${env.GLUTEN_SOURCE_DIR}' \
+                                      --gluten-sha='${env.GLUTEN_SHA}' \
+                                      --velox-repo='${params.VELOX_REPO_URL.trim()}' \
+                                      --velox-ref='${params.VELOX_REF.trim()}' \
+                                      --prebuild-image='${prebuildImage}' \
+                                      --require-prebuild-match \
+                                      --cuda-arch=75 \
+                                      --workspace='${env.COLT_WORKSPACE}' \
+                                      --run-dir='${env.COLT_RUN_DIR}' \
+                                      --result-file='${env.COLT_RUN_DIR}/result.json' \
+                                      --backend=docker \
+                                      --parallel='${params.COLT_PARALLEL.trim()}' \
+                                      --mem-limit='${params.COLT_MEM_LIMIT.trim()}'
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                always {
+                    container('gpu') {
+                        archiveArtifacts(
+                            artifacts: 'colt-results/**',
+                            allowEmptyArchive: true)
+                        junit(
+                            testResults: 'colt-results/verify/junit.xml',
+                            allowEmptyResults: true)
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                if (githubHelper != null && !skipped) {
+                    if (currentBuild.currentResult == 'SUCCESS') {
+                        githubHelper.updateCommitStatus(
+                            env.BUILD_URL, 'Success', GitHubCommitState.SUCCESS)
+                    } else if (currentBuild.currentResult != 'ABORTED') {
+                        githubHelper.updateCommitStatus(
+                            env.BUILD_URL, 'Fail', GitHubCommitState.FAILURE)
+                    }
+                }
+            }
+        }
+    }
+}
