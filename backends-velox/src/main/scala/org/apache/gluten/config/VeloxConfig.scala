@@ -786,8 +786,7 @@ object VeloxConfig extends ConfigRegistry {
       .createWithDefault(0L)
 
   val CUDF_HIVE_SELECTIVE_PRELOAD_ENABLED =
-    buildStaticConf(
-      "spark.gluten.sql.columnar.backend.velox.cudf.hive.selectivePreloadEnabled")
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.hive.selectivePreloadEnabled")
       .doc(
         "Preload complete Parquet files into executor-shared pinned host buffers " +
           "before cuDF applies the final column projection.")
@@ -795,19 +794,15 @@ object VeloxConfig extends ConfigRegistry {
       .createWithDefault(false)
 
   val CUDF_HIVE_PREFETCH_MAX_INFLIGHT_BYTES =
-    buildStaticConf(
-      "spark.gluten.sql.columnar.backend.velox.cudf.hive.prefetchMaxInFlightBytes")
-      .doc(
-        "Maximum Parquet range bytes admitted concurrently by the executor-wide " +
-          "selective prefetch broker.")
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.hive.prefetchMaxInFlightBytes")
+      .doc("Maximum Parquet range bytes admitted concurrently by the executor-wide " +
+        "selective prefetch broker.")
       .bytesConf(ByteUnit.BYTE)
       .createWithDefault(4L * 1024 * 1024 * 1024)
 
   val CUDF_HIVE_PREFETCH_THREADS =
-    buildStaticConf(
-      "spark.gluten.sql.columnar.backend.velox.cudf.hive.prefetchThreads")
-      .doc(
-        "Number of CPU range-read workers in the executor-wide selective prefetch broker.")
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.hive.prefetchThreads")
+      .doc("Number of CPU range-read workers in the executor-wide selective prefetch broker.")
       .intConf
       .checkValue(_ > 0, "Prefetch thread count must be positive")
       .createWithDefault(128)
