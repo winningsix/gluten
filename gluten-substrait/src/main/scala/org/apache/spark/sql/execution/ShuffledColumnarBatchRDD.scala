@@ -94,9 +94,10 @@ class ShuffledColumnarBatchRDD(
     // `SQLShuffleReadMetricsReporter` will update its own metrics for SQL exchange operator,
     // as well as the `tempMetrics` for basic shuffle metrics.
     val sqlMetricsReporter = new SQLColumnarShuffleReadMetricsReporter(tempMetrics, metrics)
+    val shuffleManager = SparkEnv.get.shuffleManagerFor(dependency)
     val reader = split.asInstanceOf[ShuffledColumnarBatchRDDPartition].spec match {
       case CoalescedPartitionSpec(startReducerIndex, endReducerIndex, _) =>
-        SparkEnv.get.shuffleManager.getReader(
+        shuffleManager.getReader(
           dependency.shuffleHandle,
           startReducerIndex,
           endReducerIndex,
@@ -104,7 +105,7 @@ class ShuffledColumnarBatchRDD(
           sqlMetricsReporter)
 
       case PartialReducerPartitionSpec(reducerIndex, startMapIndex, endMapIndex, _) =>
-        SparkEnv.get.shuffleManager.getReader(
+        shuffleManager.getReader(
           dependency.shuffleHandle,
           startMapIndex,
           endMapIndex,
@@ -114,7 +115,7 @@ class ShuffledColumnarBatchRDD(
           sqlMetricsReporter)
 
       case PartialMapperPartitionSpec(mapIndex, startReducerIndex, endReducerIndex) =>
-        SparkEnv.get.shuffleManager.getReader(
+        shuffleManager.getReader(
           dependency.shuffleHandle,
           mapIndex,
           mapIndex + 1,
@@ -124,7 +125,7 @@ class ShuffledColumnarBatchRDD(
           sqlMetricsReporter)
 
       case CoalescedMapperPartitionSpec(startMapIndex, endMapIndex, numReducers) =>
-        SparkEnv.get.shuffleManager.getReader(
+        shuffleManager.getReader(
           dependency.shuffleHandle,
           startMapIndex,
           endMapIndex,
