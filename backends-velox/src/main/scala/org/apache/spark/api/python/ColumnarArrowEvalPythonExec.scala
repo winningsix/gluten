@@ -26,6 +26,7 @@ import org.apache.gluten.utils.{ArrowUtil, PullOutProjectHelper}
 import org.apache.gluten.vectorized.ArrowWritableColumnVector
 
 import org.apache.spark.{ContextAwareIterator, SparkEnv, TaskContext}
+import org.apache.spark.api.python.PythonWorkerHandle
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.execution.{ProjectExec, SparkPlan}
@@ -265,11 +266,11 @@ class ColumnarArrowPythonRunner(
       startTime: Long,
       env: SparkEnv,
       worker: PythonWorker,
-      pid: scala.Option[scala.Int],
+      handle: Option[PythonWorkerHandle],
       releasedOrClosed: AtomicBoolean,
       context: TaskContext): Iterator[ColumnarBatch] = {
 
-    new ReaderIterator(stream, writer, startTime, env, worker, pid, releasedOrClosed, context) {
+    new ReaderIterator(stream, writer, startTime, env, worker, handle, releasedOrClosed, context) {
       private val allocator = ArrowBufferAllocators.contextInstance()
 
       private var reader: ArrowStreamReader = _
