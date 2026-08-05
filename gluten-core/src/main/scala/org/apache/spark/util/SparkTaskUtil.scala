@@ -55,13 +55,22 @@ object SparkTaskUtil {
     val metricsSystem =
       MetricsSystem.createMetricsSystem("GLUTEN_UNSAFE", conf).asInstanceOf[Object]
     val taskMetrics = TaskMetrics.empty.asInstanceOf[Object]
-    val cpus = 1.asInstanceOf[Object] // Added in Spark 3.3.
     val resources = Map.empty.asInstanceOf[Object]
 
     val ctor = {
       val ctors = classOf[TaskContextImpl].getDeclaredConstructors
       assert(ctors.size == 1)
       ctors.head
+    }
+    // Added in Spark 3.3; changed from Int to BigDecimal in Spark 4.3.
+    val cpus = {
+      val parameterTypes = ctor.getParameterTypes
+      if (parameterTypes.length > 10 &&
+          parameterTypes.apply(10) == classOf[scala.math.BigDecimal]) {
+        BigDecimal(1).asInstanceOf[Object]
+      } else {
+        1.asInstanceOf[Object]
+      }
     }
 
     if (SparkVersionUtil.lteSpark32) {
