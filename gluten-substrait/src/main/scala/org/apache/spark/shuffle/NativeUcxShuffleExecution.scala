@@ -16,15 +16,19 @@
  */
 package org.apache.spark.shuffle
 
-import org.apache.spark.{ShuffleDependency, SparkConf, SparkEnv, SparkException, TaskContext}
+import org.apache.gluten.vectorized.NativePartitioning
+
+import org.apache.spark.{Partition, SparkConf, SparkEnv, SparkException, TaskContext}
 import org.apache.spark.internal.Logging
+import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import java.lang.reflect.Modifier
 import java.util.IdentityHashMap
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 
 import scala.collection.mutable
+import scala.reflect.ClassTag
 import scala.util.control.NonFatal
 
 case class NativeUcxShuffleWriterContext(
@@ -51,6 +55,55 @@ case class NativeUcxShuffleReadSpec(
 
 trait NativeUcxShuffleReadMetadata {
   def nativeUcxShuffleReadSpec: NativeUcxShuffleReadSpec
+}
+
+private[spark] class NativeUcxShuffleWriterContextRDD[K: ClassTag, V: ClassTag](
+    parent: RDD[_ <: Product2[K, V]],
+    shuffleId: AtomicInteger,
+    nativePartitioning: NativePartitioning,
+    numPartitions: Int)
+  extends RDD[Product2[K, V]](parent) {
+
+  override protected def getPartitions: Array[Partition] =
+    firstParent[Product2[K, V]].partitions
+
+  override val partitioner = parent.partitioner
+
+  override def compute(split: Partition, context: TaskContext): Iterator[Product2[K, V]] = {
+    val currentShuffleId = shuffleId.get()
+    if (currentShuffleId < 0) {
+      throw SparkException.internalError("Native UCX shuffle id was not initialized")
+    }
+    val partitioning = nativePartitioning.getShortName
+    val writerContext = NativeUcxShuffleWriterContext(
+      shuffleId = currentShuffleId,
+      mapId = context.partitionId().toLong,
+      attemptId = context.taskAttemptId(),
+      nativeTaskId = NativeUcxShuffleExecution.writerTaskId(
+        currentShuffleId,
+        context.partitionId().toLong,
+        context.taskAttemptId()),
+      numPartitions = numPartitions,
+      partitioning = partitioning,
+      startPartitionId = GlutenShuffleUtils.getStartPartitionId(
+        nativePartitioning,
+        context.partitionId()),
+      dropFirstColumn =
+        partitioning == GlutenShuffleUtils.HashPartitioningShortName &&
+          nativePartitioning.getKeyIndices == null,
+      partitionKeyIndices =
+        Option(nativePartitioning.getKeyIndices).map(_.toSeq).getOrElse(Seq.empty))
+    val input = NativeUcxShuffleExecution.withWriterContext(writerContext) {
+      firstParent[Product2[K, V]].iterator(split, context)
+    }
+    new Iterator[Product2[K, V]] {
+      override def hasNext: Boolean =
+        NativeUcxShuffleExecution.withWriterContext(writerContext)(input.hasNext)
+
+      override def next(): Product2[K, V] =
+        NativeUcxShuffleExecution.withWriterContext(writerContext)(input.next())
+    }
+  }
 }
 
 class NativeUcxShuffleReadProductIterator[K, C](val spec: NativeUcxShuffleReadSpec)
@@ -214,83 +267,6 @@ object NativeUcxShuffleExecution extends Logging {
       } else {
         writerContext.set(previous)
       }
-    }
-  }
-
-  private def nativeUcxShuffleHandle(
-      handle: ShuffleHandle): Option[UcxColumnarShuffleHandle[_, _, _]] = {
-    handle match {
-      case ucx: UcxColumnarShuffleHandle[_, _, _] =>
-        Some(ucx)
-      case incremental: IncrementalShuffleHandle =>
-        incremental.delegate match {
-          case ucx: UcxColumnarShuffleHandle[_, _, _] => Some(ucx)
-          case _ => None
-        }
-      case _ =>
-        None
-    }
-  }
-
-  def withShuffleMapTaskWriterContext(
-      dep: ShuffleDependency[_, _, _],
-      mapId: Long,
-      context: TaskContext,
-      body: Function0[Iterator[_]]): Iterator[_] = {
-    val conf = SparkEnv.get.conf
-    if (!enabled(conf)) {
-      return body()
-    }
-
-    nativeUcxShuffleHandle(dep.shuffleHandle) match {
-      case Some(handle) =>
-        val columnarDependency =
-          handle.dependency.asInstanceOf[ColumnarShuffleDependencyLike]
-        val partitioning = columnarDependency.nativePartitioning.getShortName
-        val ucxMapId = context.partitionId().toLong
-        val attemptId = context.taskAttemptId()
-        val writerContext = NativeUcxShuffleWriterContext(
-          shuffleId = handle.shuffleId,
-          mapId = ucxMapId,
-          attemptId = attemptId,
-          nativeTaskId = writerTaskId(handle.shuffleId, ucxMapId, attemptId),
-          numPartitions = handle.dependency.partitioner.numPartitions,
-          partitioning = partitioning,
-          startPartitionId = GlutenShuffleUtils.getStartPartitionId(
-            columnarDependency.nativePartitioning,
-            context.partitionId()),
-          dropFirstColumn =
-            partitioning == GlutenShuffleUtils.HashPartitioningShortName &&
-              columnarDependency.nativePartitioning.getKeyIndices == null,
-          partitionKeyIndices =
-            Option(columnarDependency.nativePartitioning.getKeyIndices)
-              .map(_.toSeq)
-              .getOrElse(Seq.empty)
-        )
-        logInfo(
-          s"Installing native UCX shuffle writer context before map iterator creation " +
-            s"shuffleId=${handle.shuffleId} ucxMapId=$ucxMapId sparkMapId=$mapId " +
-            s"attemptId=$attemptId " +
-            s"nativeTaskId=${writerContext.nativeTaskId} " +
-            s"partitions=${writerContext.numPartitions} " +
-            s"partitioning=$partitioning " +
-            s"handleClass=${dep.shuffleHandle.getClass.getName}")
-        val inputIterator = withWriterContext(writerContext) {
-          body()
-        }
-        new Iterator[Any] {
-          override def hasNext: Boolean =
-            withWriterContext(writerContext) {
-              inputIterator.hasNext
-            }
-
-          override def next(): Any =
-            withWriterContext(writerContext) {
-              inputIterator.next()
-            }
-        }
-      case _ =>
-        body()
     }
   }
 

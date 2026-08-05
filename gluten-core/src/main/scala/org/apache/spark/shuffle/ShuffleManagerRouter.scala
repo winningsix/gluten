@@ -24,7 +24,7 @@ import org.apache.spark.storage.{BlockId, ShuffleBlockBatchId, ShuffleBlockId, S
 
 /** The internal shuffle manager instance used by GlutenShuffleManager. */
 private class ShuffleManagerRouter(lookup: ShuffleManagerLookup)
-  extends ShuffleManager
+  extends BlockingShuffleManager
   with Logging {
   import ShuffleManagerRouter._
   private val cache = new Cache()
@@ -61,7 +61,7 @@ private class ShuffleManagerRouter(lookup: ShuffleManagerLookup)
   }
 
   override def unregisterShuffle(shuffleId: Int): Boolean = {
-    cache.remove(shuffleId).unregisterShuffle(shuffleId)
+    cache.remove(shuffleId).exists(_.unregisterShuffle(shuffleId))
   }
 
   override def shuffleBlockResolver: ShuffleBlockResolver = resolver
@@ -117,10 +117,17 @@ private object ShuffleManagerRouter {
       manager
     }
 
-    def remove(shuffleId: Int): ShuffleManager = {
-      val manager = cache.remove(shuffleId)
-      assert(manager != null, s"Shuffle manager not registered for shuffle id: $shuffleId")
-      manager
+    def remove(shuffleId: Int): Option[ShuffleManager] = {
+      Option(cache.remove(shuffleId))
+    }
+
+    def blockResolver(shuffleId: Int): ShuffleBlockResolver = {
+      get(shuffleId) match {
+        case blocking: BlockingShuffleManager => blocking.shuffleBlockResolver
+        case other =>
+          throw new IllegalStateException(
+            s"Shuffle manager ${other.getClass.getName} for shuffle $shuffleId is not blocking")
+      }
     }
 
     def size(): Int = {
@@ -143,21 +150,21 @@ private object ShuffleManagerRouter {
           throw new IllegalArgumentException(
             "GlutenShuffleManager: Unsupported shuffle block id: " + blockId)
       }
-      cache.get(shuffleId).shuffleBlockResolver.getBlockData(blockId, dirs)
+      cache.blockResolver(shuffleId).getBlockData(blockId, dirs)
     }
 
     override def getMergedBlockData(
         blockId: ShuffleMergedBlockId,
         dirs: Option[Array[String]]): Seq[ManagedBuffer] = {
       val shuffleId = blockId.shuffleId
-      cache.get(shuffleId).shuffleBlockResolver.getMergedBlockData(blockId, dirs)
+      cache.blockResolver(shuffleId).getMergedBlockData(blockId, dirs)
     }
 
     override def getMergedBlockMeta(
         blockId: ShuffleMergedBlockId,
         dirs: Option[Array[String]]): MergedBlockMeta = {
       val shuffleId = blockId.shuffleId
-      cache.get(shuffleId).shuffleBlockResolver.getMergedBlockMeta(blockId, dirs)
+      cache.blockResolver(shuffleId).getMergedBlockMeta(blockId, dirs)
     }
 
     override def stop(): Unit = {

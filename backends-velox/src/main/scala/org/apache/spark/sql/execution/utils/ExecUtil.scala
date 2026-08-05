@@ -16,6 +16,8 @@
  */
 package org.apache.spark.sql.execution.utils
 
+import java.util.concurrent.atomic.AtomicInteger
+
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.columnarbatch.{ColumnarBatches, VeloxColumnarBatches}
 import org.apache.gluten.config.ShuffleWriterType
@@ -28,7 +30,7 @@ import org.apache.gluten.vectorized.{ArrowWritableColumnVector, NativeColumnarTo
 import org.apache.spark.{Partitioner, RangePartitioner, ShuffleDependency}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.serializer.Serializer
-import org.apache.spark.shuffle.{ColumnarShuffleDependency, GlutenShuffleUtils, PipelinedColumnarShuffleDependency, UcxColumnarShuffleManager}
+import org.apache.spark.shuffle.{ColumnarShuffleDependency, GlutenShuffleUtils, NativeUcxShuffleWriterContextRDD, PipelinedColumnarShuffleDependency, UcxColumnarShuffleManager}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, BoundReference, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.expressions.codegen.LazilyGeneratedOrdering
@@ -244,16 +246,25 @@ object ExecUtil {
               s"spark.shuffle.manager.incremental=${UcxColumnarShuffleManager.ClassName}, " +
               s"but got $incrementalManager")
         }
-        new PipelinedColumnarShuffleDependency[Int, ColumnarBatch, ColumnarBatch](
+        val shuffleId = new AtomicInteger(-1)
+        val nativeWriterInput = new NativeUcxShuffleWriterContextRDD[Int, ColumnarBatch](
           rddWithDummyKey,
-          new PartitionIdPassThrough(newPartitioning.numPartitions),
-          serializer,
-          shuffleWriterProcessor = ShuffleExchangeExec.createShuffleWriteProcessor(writeMetrics),
-          nativePartitioning = nativePartitioning,
-          metrics = metrics,
-          shuffleWriterType = shuffleWriterType,
-          outputSchema = outputSchema
-        )
+          shuffleId,
+          nativePartitioning,
+          newPartitioning.numPartitions)
+        val pipelinedDependency =
+          new PipelinedColumnarShuffleDependency[Int, ColumnarBatch, ColumnarBatch](
+            nativeWriterInput,
+            new PartitionIdPassThrough(newPartitioning.numPartitions),
+            serializer,
+            shuffleWriterProcessor = ShuffleExchangeExec.createShuffleWriteProcessor(writeMetrics),
+            nativePartitioning = nativePartitioning,
+            metrics = metrics,
+            shuffleWriterType = shuffleWriterType,
+            outputSchema = outputSchema
+          )
+        shuffleId.set(pipelinedDependency.shuffleId)
+        pipelinedDependency
       } else {
         new ColumnarShuffleDependency[Int, ColumnarBatch, ColumnarBatch](
           rddWithDummyKey,

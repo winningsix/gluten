@@ -33,7 +33,7 @@ import java.util.concurrent.ConcurrentHashMap
 import scala.collection.JavaConverters._
 
 class ColumnarShuffleManager(conf: SparkConf)
-  extends ShuffleManager
+  extends BlockingShuffleManager
   with SupportsColumnarShuffle
   with Logging {
 

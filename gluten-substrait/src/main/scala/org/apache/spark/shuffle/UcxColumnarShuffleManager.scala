@@ -22,6 +22,7 @@ import org.apache.gluten.shuffle.SupportsColumnarShuffle
 import org.apache.spark.{ShuffleDependency, SparkConf, SparkEnv, SparkException, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler.MapStatus
+import org.apache.spark.shuffle.streaming.StreamingShuffleManager
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.Utils
 
@@ -30,8 +31,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
 import scala.util.control.NonFatal
 
 class UcxColumnarShuffleManager(conf: SparkConf, isDriver: Boolean)
-  extends ShuffleManager
-  with PipelinedShuffleControlPlane
+  extends StreamingShuffleManager
   with SupportsColumnarShuffle
   with Logging {
 
@@ -39,13 +39,6 @@ class UcxColumnarShuffleManager(conf: SparkConf, isDriver: Boolean)
     UcxShuffleCoordinator.getOrCreate(conf, isDriver)
   private lazy val nativeBridge: UcxShuffleNativeBridge =
     UcxShuffleNativeBridge.getOrCreate(conf)
-  private val maxActiveWriterTasksPerQuery =
-    math.max(
-      0,
-      conf.getInt(
-        UcxColumnarShuffleManager.WriterMaxActiveTasksPerQueryConf,
-        conf.getInt(UcxColumnarShuffleManager.WriterMaxActiveTasksPerGroupConf, 0)))
-
   logInfo(
     s"Using ${UcxColumnarShuffleManager.ClassName} " +
       s"(isDriver=$isDriver, dataPlane=${UcxColumnarShuffleManager.DataPlaneStatus})")
@@ -129,50 +122,10 @@ class UcxColumnarShuffleManager(conf: SparkConf, isDriver: Boolean)
     true
   }
 
-  override def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {
-    coordinator.registerPipelinedShuffleGroup(group)
-  }
-
-  override def requiresAllPipelinedShuffleReadersResident(
-      group: PipelinedShuffleGroupMetadata): Boolean = true
-
-  override def maxConcurrentPipelinedShuffleProducers(groupId: String): Option[Int] = {
-    Option.when(isDriver && maxActiveWriterTasksPerQuery > 0) {
-      UcxShuffleCoordinator.pipelinedProducerLaunchCap(
-        groupId,
-        maxActiveWriterTasksPerQuery)
-    }
-  }
-
-  override def admitPipelinedShuffleGroup(groupId: String): Unit = {
-    coordinator.admitPipelinedShuffleGroup(groupId)
-  }
-
-  override def completePipelinedShuffleGroup(groupId: String): Unit = {
-    coordinator.completePipelinedShuffleGroup(groupId)
-  }
-
-  override def abortPipelinedShuffleGroup(groupId: String, reason: String): Unit = {
-    coordinator.abortPipelinedShuffleGroup(groupId, reason)
-  }
-
-  override def completePipelinedQuery(queryExecutionId: Long): Unit = {
-    coordinator.completePipelinedQuery(queryExecutionId)
-  }
-
-  override def abortPipelinedQuery(queryExecutionId: Long, reason: String): Unit = {
-    coordinator.abortPipelinedQuery(queryExecutionId, reason)
-  }
-
-  override def shuffleBlockResolver: ShuffleBlockResolver = {
-    throw new UnsupportedOperationException(
-      s"${UcxColumnarShuffleManager.ClassName} is incremental and does not expose " +
-        "Spark shuffle blocks")
-  }
-
   override def stop(): Unit = {
     UcxShuffleCoordinator.stop()
     UcxShuffleNativeBridge.stop()
+    super.stop()
   }
 }
 

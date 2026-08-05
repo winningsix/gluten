@@ -40,6 +40,19 @@ case class UcxShuffleEndpoint(
     deviceId: Int,
     epoch: Long)
 
+private[spark] case class UcxPipelinedShuffleStageMetadata(
+    stageId: Int,
+    attemptId: Int,
+    numTasks: Int,
+    shuffleId: Option[Int],
+    pipelinedParentShuffleIds: Seq[Int] = Seq.empty)
+
+private[spark] case class UcxPipelinedShuffleGroupMetadata(
+    groupId: String,
+    jobId: Int,
+    queryExecutionId: Option[Long],
+    stages: Seq[UcxPipelinedShuffleStageMetadata])
+
 private[spark] case class UcxShuffleReaderEndpoint(
     executorId: String,
     host: String,
@@ -199,7 +212,7 @@ private[spark] case class ReportUcxNativeReaderState(state: UcxNativeReaderState
 private[spark] case class AbortUcxShuffle(shuffleId: Int, reason: String)
   extends UcxShuffleCoordinatorMessage
 
-private[spark] case class RegisterUcxPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata)
+private[spark] case class RegisterUcxPipelinedShuffleGroup(group: UcxPipelinedShuffleGroupMetadata)
   extends UcxShuffleCoordinatorMessage
 
 private[spark] case class AdmitUcxPipelinedShuffleGroup(groupId: String)
@@ -297,7 +310,7 @@ private[spark] case class AbortUcxShuffleMasterMessage(
   extends UcxShuffleCoordinatorMasterMessage
 
 private[spark] case class RegisterUcxPipelinedShuffleGroupMasterMessage(
-    group: PipelinedShuffleGroupMetadata,
+    group: UcxPipelinedShuffleGroupMetadata,
     context: RpcCallContext)
   extends UcxShuffleCoordinatorMasterMessage
 
@@ -352,7 +365,7 @@ private[spark] class UcxPipelinedQueryState(
   @volatile var abortedReason: Option[String] = None
 
   private val metadataByGroup =
-    new ConcurrentHashMap[String, PipelinedShuffleGroupMetadata]()
+    new ConcurrentHashMap[String, UcxPipelinedShuffleGroupMetadata]()
   private val stateByGroup = new ConcurrentHashMap[String, String]()
   private val shuffleIdSet = ConcurrentHashMap.newKeySet[Int]()
   @volatile private var currentShuffleDepths = Map.empty[Int, Int]
@@ -363,7 +376,7 @@ private[spark] class UcxPipelinedQueryState(
   @volatile var backpressured: Boolean = false
   @volatile var producerLaunchPaused: Boolean = false
 
-  def registerGroup(group: PipelinedShuffleGroupMetadata, shuffleIds: Seq[Int]): Unit =
+  def registerGroup(group: UcxPipelinedShuffleGroupMetadata, shuffleIds: Seq[Int]): Unit =
     synchronized {
       val previous = Option(metadataByGroup.put(group.groupId, group))
       if (previous.forall(groupGeneration(_) != groupGeneration(group))) {
@@ -420,7 +433,7 @@ private[spark] class UcxPipelinedQueryState(
   def groupState(groupId: String): String =
     Option(stateByGroup.get(groupId)).getOrElse(UcxPipelinedShuffleGroupState.Registered)
 
-  def groupMetadata(groupId: String): Option[PipelinedShuffleGroupMetadata] =
+  def groupMetadata(groupId: String): Option[UcxPipelinedShuffleGroupMetadata] =
     Option(metadataByGroup.get(groupId))
 
   def groupIdsForShuffle(shuffleId: Int): Set[String] =
@@ -430,7 +443,7 @@ private[spark] class UcxPipelinedQueryState(
         groupId
     }.toSet
 
-  def writerStage(shuffleId: Int): Option[PipelinedShuffleStageMetadata] =
+  def writerStage(shuffleId: Int): Option[UcxPipelinedShuffleStageMetadata] =
     metadataByGroup.values().asScala
       .flatMap(_.stages)
       .filter(_.shuffleId.contains(shuffleId))
@@ -438,7 +451,7 @@ private[spark] class UcxPipelinedQueryState(
       .sortBy(stage => (stage.stageId, stage.attemptId))
       .lastOption
 
-  def readerStage(stageId: Int): Option[PipelinedShuffleStageMetadata] =
+  def readerStage(stageId: Int): Option[UcxPipelinedShuffleStageMetadata] =
     metadataByGroup.values().asScala
       .flatMap(_.stages)
       .filter(_.stageId == stageId)
@@ -466,7 +479,7 @@ private[spark] class UcxPipelinedQueryState(
   def shuffleDepth(shuffleId: Int): Int = currentShuffleDepths.getOrElse(shuffleId, 0)
 
   private def groupGeneration(
-      group: PipelinedShuffleGroupMetadata): Seq[(Int, Int, Option[Int], Seq[Int])] = {
+      group: UcxPipelinedShuffleGroupMetadata): Seq[(Int, Int, Option[Int], Seq[Int])] = {
     group.stages
       .map {
         stage =>
@@ -711,7 +724,7 @@ abstract private[spark] class UcxShuffleCoordinator(conf: SparkConf) extends Log
 
   def abortShuffle(shuffleId: Int, reason: String): Boolean
 
-  def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit
+  def registerPipelinedShuffleGroup(group: UcxPipelinedShuffleGroupMetadata): Unit
 
   def admitPipelinedShuffleGroup(groupId: String): Boolean
 
@@ -965,12 +978,20 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
     val groupId = Option(shuffleIdToPipelinedGroupId.get(shuffleId))
     groupId match {
       case None =>
+        val coverage = readerCoverageForShuffles(Seq(shuffleId))
+        val readersReady = coverage.get(shuffleId).exists {
+          current =>
+            current.expectedReaders > 0 &&
+              current.registeredReaders >= current.expectedReaders
+        }
         UcxPipelinedShuffleStateResponse(
           shuffleId = shuffleId,
           groupId = None,
-          groupState = UcxPipelinedShuffleGroupState.NoGroup,
-          readersReady = shuffleAbort.isEmpty,
-          readerCoverage = readerCoverageForShuffles(Seq(shuffleId)),
+          groupState =
+            if (readersReady) UcxPipelinedShuffleGroupState.ReadersReady
+            else UcxPipelinedShuffleGroupState.NoGroup,
+          readersReady = shuffleAbort.isEmpty && readersReady,
+          readerCoverage = coverage,
           abortedReason = shuffleAbort,
           querySummary = None
         )
@@ -1324,7 +1345,7 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
     abortShuffleInternal(shuffleId, reason)
   }
 
-  override def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {
+  override def registerPipelinedShuffleGroup(group: UcxPipelinedShuffleGroupMetadata): Unit = {
     pipelinedRegistrationLock.synchronized {
       val shuffleIds = pipelinedShuffleIds(group)
       val queryKey = pipelinedQueryKey(group)
@@ -1373,7 +1394,7 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
     val query = queryForGroup(groupId).getOrElse {
       val queryState = new UcxPipelinedQueryState(groupId, None)
       queryState.registerGroup(
-        PipelinedShuffleGroupMetadata(groupId, -1, None, Seq.empty),
+        UcxPipelinedShuffleGroupMetadata(groupId, -1, None, Seq.empty),
         shuffleIdsForGroup(groupId))
       pipelinedQueries.putIfAbsent(groupId, queryState)
       groupIdToPipelinedQueryKey.putIfAbsent(groupId, groupId)
@@ -1552,12 +1573,12 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
     groupIdForShuffle(shuffleId).exists(abortedPipelinedQueries.containsKey)
   }
 
-  private def pipelinedShuffleIds(group: PipelinedShuffleGroupMetadata): Seq[Int] = {
+  private def pipelinedShuffleIds(group: UcxPipelinedShuffleGroupMetadata): Seq[Int] = {
     group.stages.flatMap(_.shuffleId).distinct
   }
 
   private def writerGenerations(
-      group: PipelinedShuffleGroupMetadata): Seq[(Int, UcxPipelinedShuffleGeneration)] = {
+      group: UcxPipelinedShuffleGroupMetadata): Seq[(Int, UcxPipelinedShuffleGeneration)] = {
     group.stages.flatMap {
       stage =>
         stage.shuffleId.map {
@@ -1567,7 +1588,7 @@ private[spark] class UcxShuffleCoordinatorMaster(conf: SparkConf)
     }
   }
 
-  private def pipelinedQueryKey(group: PipelinedShuffleGroupMetadata): String = {
+  private def pipelinedQueryKey(group: UcxPipelinedShuffleGroupMetadata): String = {
     group.queryExecutionId.map(pipelinedQueryKey).getOrElse(group.groupId)
   }
 
@@ -2405,7 +2426,7 @@ private[spark] class UcxShuffleCoordinatorWorker(conf: SparkConf)
     askCoordinator[Boolean](AbortUcxShuffle(shuffleId, reason))
   }
 
-  override def registerPipelinedShuffleGroup(group: PipelinedShuffleGroupMetadata): Unit = {
+  override def registerPipelinedShuffleGroup(group: UcxPipelinedShuffleGroupMetadata): Unit = {
     sendCoordinator(RegisterUcxPipelinedShuffleGroup(group))
   }
 

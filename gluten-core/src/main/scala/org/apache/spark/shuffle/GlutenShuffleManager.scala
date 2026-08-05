@@ -31,7 +31,7 @@ import org.apache.spark.annotation.Experimental
  * base)instead.
  */
 @Experimental
-class GlutenShuffleManager(conf: SparkConf, isDriver: Boolean) extends ShuffleManager {
+class GlutenShuffleManager(conf: SparkConf, isDriver: Boolean) extends BlockingShuffleManager {
   private val routerBuilder = ShuffleManagerRegistry.get().newRouterBuilder(conf, isDriver)
 
   override def registerShuffle[K, V, C](

@@ -190,7 +190,7 @@ object GlutenShuffleManagerSuite {
   private val counter1 = new InvocationCounter
   private val counter2 = new InvocationCounter
 
-  class ShuffleManager1(conf: SparkConf) extends ShuffleManager {
+  class ShuffleManager1(conf: SparkConf) extends BlockingShuffleManager {
     private val delegate = new SortShuffleManager(conf)
     private val counter = counter1
     override def registerShuffle[K, V, C](
@@ -244,7 +244,7 @@ object GlutenShuffleManagerSuite {
     }
   }
 
-  class ShuffleManager2(conf: SparkConf, isDriver: Boolean) extends ShuffleManager {
+  class ShuffleManager2(conf: SparkConf, isDriver: Boolean) extends BlockingShuffleManager {
     private val delegate = new SortShuffleManager(conf)
     private val counter = counter2
     override def registerShuffle[K, V, C](

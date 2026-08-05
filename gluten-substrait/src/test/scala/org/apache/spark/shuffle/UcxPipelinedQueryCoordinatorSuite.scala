@@ -18,33 +18,39 @@
 package org.apache.spark.shuffle
 
 import org.apache.spark.SparkConf
+import org.apache.spark.shuffle.streaming.StreamingShuffleManager
 
 import org.scalatest.funsuite.AnyFunSuite
 
 class UcxPipelinedQueryCoordinatorSuite extends AnyFunSuite {
 
-  test("expose query writer cap as driver-side pre-launch producer admission") {
-    val queryConf = new SparkConf(false)
-      .set(UcxColumnarShuffleManager.WriterMaxActiveTasksPerQueryConf, "17")
-    val groupFallbackConf = new SparkConf(false)
-      .set(UcxColumnarShuffleManager.WriterMaxActiveTasksPerGroupConf, "9")
-
-    assert(
-      new UcxColumnarShuffleManager(queryConf, isDriver = true)
-        .maxConcurrentPipelinedShuffleProducers("group-a")
-        .contains(17))
-    assert(
-      new UcxColumnarShuffleManager(groupFallbackConf, isDriver = true)
-        .maxConcurrentPipelinedShuffleProducers("group-a")
-        .contains(9))
-    assert(
-      new UcxColumnarShuffleManager(queryConf, isDriver = false)
-        .maxConcurrentPipelinedShuffleProducers("group-a")
-        .isEmpty)
+  test("use the community streaming shuffle manager contract") {
     assert(
       new UcxColumnarShuffleManager(new SparkConf(false), isDriver = true)
-        .maxConcurrentPipelinedShuffleProducers("group-a")
-        .isEmpty)
+        .isInstanceOf[StreamingShuffleManager])
+  }
+
+  test("discover full reader residency without Spark group callbacks") {
+    val coordinator = new UcxShuffleCoordinatorMaster(
+      new SparkConf(false)
+        .set("spark.gluten.ucx.shuffle.coordinator.threads", "1"))
+
+    try {
+      coordinator.registerShuffle(shuffleId = 5, numMaps = 1, numReduces = 2)
+      assert(!coordinator.getPipelinedShuffleState(5).readersReady)
+
+      assert(coordinator.registerReader(5, 0, readerEndpoint(5, 100L, 10, 0)))
+      assert(!coordinator.getPipelinedShuffleState(5).readersReady)
+
+      assert(coordinator.registerReader(5, 1, readerEndpoint(5, 101L, 10, 1)))
+      val ready = coordinator.getPipelinedShuffleState(5)
+      assert(ready.readersReady)
+      assert(ready.groupState == UcxPipelinedShuffleGroupState.ReadersReady)
+      assert(
+        ready.readerCoverage.get(5).contains(UcxShuffleReaderCoverage(2, 2)))
+    } finally {
+      coordinator.stop()
+    }
   }
 
   test("coordinate all pipelined shuffle groups in one SQL execution") {
@@ -425,12 +431,13 @@ class UcxPipelinedQueryCoordinatorSuite extends AnyFunSuite {
   private def readerEndpoint(
       shuffleId: Int,
       attemptId: Long,
-      stageId: Int): UcxShuffleReaderEndpoint = {
+      stageId: Int,
+      reducePartitionId: Int = 0): UcxShuffleReaderEndpoint = {
     UcxShuffleReaderEndpoint(
       executorId = "executor-1",
       host = "localhost",
       shuffleId = shuffleId,
-      reducePartitionId = 0,
+      reducePartitionId = reducePartitionId,
       taskAttemptId = attemptId,
       stageId = stageId,
       stageAttemptNumber = 0,
@@ -444,18 +451,18 @@ class UcxPipelinedQueryCoordinatorSuite extends AnyFunSuite {
       queryExecutionId: Long,
       shuffleId: Int,
       writerStageId: Int,
-      readerStageId: Int): PipelinedShuffleGroupMetadata = {
-    PipelinedShuffleGroupMetadata(
+      readerStageId: Int): UcxPipelinedShuffleGroupMetadata = {
+    UcxPipelinedShuffleGroupMetadata(
       groupId = groupId,
       jobId = jobId,
       queryExecutionId = Some(queryExecutionId),
       stages = Seq(
-        PipelinedShuffleStageMetadata(
+        UcxPipelinedShuffleStageMetadata(
           stageId = writerStageId,
           attemptId = 0,
           numTasks = 2,
           shuffleId = Some(shuffleId)),
-        PipelinedShuffleStageMetadata(
+        UcxPipelinedShuffleStageMetadata(
           stageId = readerStageId,
           attemptId = 0,
           numTasks = 2,
@@ -463,30 +470,30 @@ class UcxPipelinedQueryCoordinatorSuite extends AnyFunSuite {
           pipelinedParentShuffleIds = Seq(shuffleId))))
   }
 
-  private def chainedGroup(): PipelinedShuffleGroupMetadata = {
-    PipelinedShuffleGroupMetadata(
+  private def chainedGroup(): UcxPipelinedShuffleGroupMetadata = {
+    UcxPipelinedShuffleGroupMetadata(
       groupId = "group-chain",
       jobId = 6,
       queryExecutionId = Some(168L),
       stages = Seq(
-        PipelinedShuffleStageMetadata(
+        UcxPipelinedShuffleStageMetadata(
           stageId = 10,
           attemptId = 0,
           numTasks = 2,
           shuffleId = Some(10)),
-        PipelinedShuffleStageMetadata(
+        UcxPipelinedShuffleStageMetadata(
           stageId = 20,
           attemptId = 0,
           numTasks = 2,
           shuffleId = Some(20),
           pipelinedParentShuffleIds = Seq(10)),
-        PipelinedShuffleStageMetadata(
+        UcxPipelinedShuffleStageMetadata(
           stageId = 30,
           attemptId = 0,
           numTasks = 2,
           shuffleId = Some(30),
           pipelinedParentShuffleIds = Seq(20)),
-        PipelinedShuffleStageMetadata(
+        UcxPipelinedShuffleStageMetadata(
           stageId = 40,
           attemptId = 0,
           numTasks = 2,
@@ -494,24 +501,24 @@ class UcxPipelinedQueryCoordinatorSuite extends AnyFunSuite {
           pipelinedParentShuffleIds = Seq(30))))
   }
 
-  private def wideFrontierGroup(): PipelinedShuffleGroupMetadata = {
-    PipelinedShuffleGroupMetadata(
+  private def wideFrontierGroup(): UcxPipelinedShuffleGroupMetadata = {
+    UcxPipelinedShuffleGroupMetadata(
       groupId = "group-wide-frontier",
       jobId = 7,
       queryExecutionId = Some(210L),
       stages = Seq(
-        PipelinedShuffleStageMetadata(
+        UcxPipelinedShuffleStageMetadata(
           stageId = 10,
           attemptId = 0,
           numTasks = 9,
           shuffleId = Some(10)),
-        PipelinedShuffleStageMetadata(
+        UcxPipelinedShuffleStageMetadata(
           stageId = 20,
           attemptId = 0,
           numTasks = 2,
           shuffleId = Some(20),
           pipelinedParentShuffleIds = Seq(10)),
-        PipelinedShuffleStageMetadata(
+        UcxPipelinedShuffleStageMetadata(
           stageId = 30,
           attemptId = 0,
           numTasks = 2,
