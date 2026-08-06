@@ -506,6 +506,7 @@ case class MppNativeQueryExec(
   private val MPP_SINGLE_TASK_MODE_KEY =
     "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode"
   private val CANDIDATE_FIRST_EXISTENCE_ATTR_PREFIX = "_gluten_candidate_first_exists_"
+  private val RESTRICTED_CANDIDATE_KEY_ATTR_PREFIX = "_gluten_restricted_candidate_key_"
 
   private type FragmentExtractionResult =
     (
@@ -1554,8 +1555,10 @@ case class MppNativeQueryExec(
       planMppExchangePartitions(singleDriverExchanges)
         .sortBy(_.id)
         .toSeq
+    val joinAdjustedFragments =
+      tuneMultiInputJoinConsumerParallelism(rangePlanningFragments, sortedExchanges)
     val adjustedFragments =
-      tunePostJoinFinalAggSplitParallelism(rangePlanningFragments, sortedExchanges)
+      tunePostJoinFinalAggSplitParallelism(joinAdjustedFragments, sortedExchanges)
     val frozenBroadcasts = broadcastsByConsumer.iterator.map {
       case (consumerId, buf) => consumerId -> buf.toSeq
     }.toMap
@@ -3368,6 +3371,19 @@ case class MppNativeQueryExec(
       case BuildRight => (rightBytes, leftBytes)
       case BuildLeft => (leftBytes, rightBytes)
     }
+    // A late logical reduction can intentionally broadcast distinct correlation keys selected by
+    // an optimizer-proven candidate chain. Leaf scan bytes describe the work used to produce that
+    // state, not the materialized build size. Preserve this narrowly marked build;
+    // otherwise the generic fact-table guard turns it back into a full fact x fact shuffle.
+    if (
+      buildBytes > cap &&
+      join.buildPlan.output.exists(_.name.startsWith(RESTRICTED_CANDIDATE_KEY_ATTR_PREFIX))
+    ) {
+      logInfo(
+        s"MppNativeQueryExec: preserving optimizer-proven reduced candidate BROADCAST build " +
+          s"despite sourceScanBytes=$buildBytes")
+      return None
+    }
     // Only act when the BROADCAST/build side is the LARGER side carrying a large
     // fact-table scan (the fact wrongly chosen as build). When the build is the
     // smaller side -- e.g. the upstream MppFactProbeBroadcastHint correctly
@@ -3524,8 +3540,8 @@ case class MppNativeQueryExec(
    * CBO statistics below a write command can describe the pre-filter logical join rather than the
    * physical producer and select the multi-terabyte fact input as BuildLeft (Q11). Use real leaf
    * scan bytes only for an unambiguous dimension-vs-fact shape: the chosen side must expose at most
-   * four columns and scan at least eight times fewer bytes. Unlike broadcast selection, this is a
-   * partitioned hash build, so the dimension does not need to fit the broadcast threshold.
+   * four columns and scan materially fewer bytes. Unlike broadcast selection, this is a partitioned
+   * hash build, so the dimension does not need to fit the broadcast threshold.
    */
   private def dominantRealScanBuildSide(
       join: ShuffledHashJoinExecTransformer): Option[BuildSideChoice] = {
@@ -3535,19 +3551,25 @@ case class MppNativeQueryExec(
     }
     val leftBytes = realScanBytes(join.left)
     val rightBytes = realScanBytes(join.right)
+    val dominanceRatio =
+      positiveIntConf("spark.gluten.mpp.realScanBuildSideDominanceRatio").getOrElse(2)
     if (leftBytes > 0 && rightBytes > 0) {
-      if (join.left.output.size <= 4 && leftBytes * 8 <= rightBytes) {
+      if (join.left.output.size <= 4 && leftBytes * dominanceRatio <= rightBytes) {
         Some(
           BuildSideChoice(
             BuildLeft,
             s"real leaf-scan bytes selected dominant smaller side " +
-              s"(leftScanBytes=$leftBytes, rightScanBytes=$rightBytes)"))
-      } else if (join.right.output.size <= 4 && rightBytes * 8 <= leftBytes) {
+              s"(leftScanBytes=$leftBytes, rightScanBytes=$rightBytes, " +
+              s"dominanceRatio=$dominanceRatio)"
+          ))
+      } else if (join.right.output.size <= 4 && rightBytes * dominanceRatio <= leftBytes) {
         Some(
           BuildSideChoice(
             BuildRight,
             s"real leaf-scan bytes selected dominant smaller side " +
-              s"(leftScanBytes=$leftBytes, rightScanBytes=$rightBytes)"))
+              s"(leftScanBytes=$leftBytes, rightScanBytes=$rightBytes, " +
+              s"dominanceRatio=$dominanceRatio)"
+          ))
       } else {
         None
       }
@@ -4706,9 +4728,14 @@ case class MppNativeQueryExec(
       fragments: Seq[NativeFragment],
       exchanges: Seq[ExchangeSpec]): Seq[NativeFragment] = {
     val fragmentById = fragments.map(fragment => fragment.id -> fragment).toMap
+    // This late topology pass must not bypass the public hard cap.  In
+    // particular, four concurrent FINAL group-by drivers can exhaust a 32GB
+    // GPU even when maxDriversPerFragment=1 was explicitly requested.
+    val maxDrivers = positiveIntConf("spark.gluten.mpp.maxDriversPerFragment")
+      .getOrElse(Int.MaxValue)
     val tunedConsumers = exchanges.collect {
       case spec if isPostJoinFinalAggSplitExchange(spec, fragmentById) =>
-        spec.consumerFragmentId -> math.max(1, spec.numPartitions)
+        spec.consumerFragmentId -> math.min(maxDrivers, math.max(1, spec.numPartitions))
     }.toMap
 
     fragments.map {
@@ -4721,6 +4748,26 @@ case class MppNativeQueryExec(
             fragment.copy(parallelism = tunedParallelism)
           case _ =>
             fragment
+        }
+    }
+  }
+
+  private def tuneMultiInputJoinConsumerParallelism(
+      fragments: Seq[NativeFragment],
+      exchanges: Seq[ExchangeSpec]): Seq[NativeFragment] = {
+    val requested = positiveIntConf("spark.gluten.mpp.joinDriversPerFragment")
+      .orElse(positiveIntConf("spark.gluten.mpp.maxDriversPerFragment"))
+      .getOrElse(2)
+    val inboundCounts = exchanges.groupBy(_.consumerFragmentId).view.mapValues(_.size).toMap
+    fragments.map {
+      fragment =>
+        if (inboundCounts.getOrElse(fragment.id, 0) >= 2 && fragment.parallelism < requested) {
+          logInfo(
+            s"MppNativeQueryExec: raising multi-input join consumer fragment F${fragment.id} " +
+              s"drivers from ${fragment.parallelism} to $requested")
+          fragment.copy(parallelism = requested)
+        } else {
+          fragment
         }
     }
   }
@@ -4896,9 +4943,8 @@ case class MppNativeQueryExec(
         case wst: WholeStageTransformer =>
           collect(wst.child)
         case join: HashJoinLikeExecTransformer =>
-          // HashJoinLikeExecTransformer emits Substrait inputs in streamed/build order, which may
-          // differ from Spark's left/right child order when the build side is switched. Keep MPP
-          // exchange specs in the same order so native ValueStream replacement cannot swap inputs.
+          // HashJoinLikeExecTransformer serializes the streamed input before the build input.
+          // Preserve that order so iterator:N and exchange consumer slots stay aligned.
           collect(join.streamedPlan)
           collect(join.buildPlan)
         case marker: MppReplicatedJoinBuildInput =>
@@ -5263,6 +5309,20 @@ case class MppNativeQueryExec(
       case _ =>
         SQLConf.get.getConfString("spark.sql.shuffle.partitions", "200").toInt
     }
+    val cores = SQLConf.get.getConfString("spark.executor.cores", "16").toInt
+    val joinDriverOverride = positiveIntConf("spark.gluten.mpp.joinDriversPerFragment")
+      .filter(
+        _ =>
+          plan.find {
+            case _: HashJoinLikeExecTransformer => true
+            case _ => false
+          }.isDefined)
+    if (joinDriverOverride.isDefined) {
+      // A downstream SINGLE gather describes the fragment's network output, not the amount of
+      // local join work. Do not clamp join drivers to raw=1 in that shape: Velox hash-join drivers
+      // share the build bridge and can consume the partitioned probe concurrently.
+      return math.min(math.max(cores, 1), joinDriverOverride.get)
+    }
     val scanDriverOverride = positiveIntConf("spark.gluten.mpp.scanDriversPerFragment")
       .filter(
         _ =>
@@ -5271,9 +5331,14 @@ case class MppNativeQueryExec(
             case _ => false
           }.isDefined)
     if (scanDriverOverride.isDefined) {
-      return math.min(raw, scanDriverOverride.get)
+      val ignoreOutputPartitioning =
+        booleanConf("spark.gluten.mpp.scanDriversIgnoreOutputPartitioning", defaultValue = false)
+      return if (ignoreOutputPartitioning) {
+        math.min(math.max(cores, 1), scanDriverOverride.get)
+      } else {
+        math.min(raw, scanDriverOverride.get)
+      }
     }
-    val cores = SQLConf.get.getConfString("spark.executor.cores", "16").toInt
     val coreCapped = math.min(raw, math.max(cores, 1))
     positiveIntConf("spark.gluten.mpp.maxDriversPerFragment") match {
       case Some(maxDrivers) =>

@@ -73,6 +73,10 @@ object VeloxRuleApi {
     injector.injectPreCBORule(MergeSelfCorrelatedExistenceState.apply)
     injector.injectOptimizerRule(RewriteExistenceJoinRhsDedup.apply)
     injector.injectPreCBORule(RewriteExistenceJoinRhsDedup.apply)
+    // If a branch already computed one SUM per key from a fact source, reuse that summary when
+    // the parent joins the same source on the same key only to SUM the same value again.
+    injector.injectOptimizerRule(EliminateRedundantSelfAggregateJoin.apply)
+    injector.injectPreCBORule(EliminateRedundantSelfAggregateJoin.apply)
     injector.injectOptimizerRule(spark => PruneRedundantLeftSemiFilters(spark))
     injector.injectOptimizerRule(SelectiveDimensionJoinReorder.apply)
     // Reassociate selective fact-to-fact joins before wide dimensions. The rule also

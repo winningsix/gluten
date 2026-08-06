@@ -17,7 +17,7 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.backendsapi.BackendsApiManager
-import org.apache.gluten.execution.{BasicScanExecTransformer, ColumnarToColumnarExec, ColumnarToRowExecBase, FilterExecTransformer, FilterExecTransformerBase, MppNativeQueryExec, MppPreparedChildExec, ProjectExecTransformer, TransformSupport}
+import org.apache.gluten.execution.{BasicScanExecTransformer, ColumnarToColumnarExec, ColumnarToRowExecBase, FileSourceScanExecTransformer, FilterExecTransformer, FilterExecTransformerBase, MppNativeQueryExec, MppPreparedChildExec, ProjectExecTransformer, TransformSupport}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression, NamedExpression}
@@ -158,16 +158,38 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
     val rewrittenExprIds = rewrittenSubqueries.map(_.exprId).toSet
     if (rewrittenExprIds.isEmpty) return child
 
+    def containsRewrittenScalar(filter: Expression): Boolean = {
+      filter.exists {
+        case sq: ScalarSubquery => rewrittenExprIds.contains(sq.exprId)
+        case _ => false
+      }
+    }
+
     child.transformUp {
+      // FileSourceScanExecTransformer keeps Spark's original dataFilters in scanFilters even
+      // after PushDownFilterToScan adds a second pushDownFilters copy. Removing only the latter
+      // therefore leaves a stale ScalarSubquery executable on the scan (Q22), and Spark
+      // materializes the four peer-local AVG rows as an invalid multi-row scalar. Strip the
+      // rewritten predicate from both copies; the enclosing rewritten Filter still evaluates the
+      // exact predicate against the native scalar-broadcast attribute.
+      case scan: FileSourceScanExecTransformer =>
+        val retainedDataFilters = scan.dataFilters.filterNot(containsRewrittenScalar)
+        val retainedPushDownFilters =
+          scan.pushDownFilters.map(_.filterNot(containsRewrittenScalar))
+        if (
+          retainedDataFilters.size == scan.dataFilters.size &&
+          retainedPushDownFilters == scan.pushDownFilters
+        ) {
+          scan
+        } else {
+          logDebug(
+            "RewriteUncorrelatedScalarSubquery: removed stale scalar predicate from " +
+              "FileSourceScan dataFilters/pushDownFilters")
+          scan.copy(dataFilters = retainedDataFilters, pushDownFilters = retainedPushDownFilters)
+        }
       case scan: BasicScanExecTransformer if scan.pushDownFilters.nonEmpty =>
         val original = scan.pushDownFilters.get
-        val retained = original.filterNot {
-          filter =>
-            filter.exists {
-              case sq: ScalarSubquery => rewrittenExprIds.contains(sq.exprId)
-              case _ => false
-            }
-        }
+        val retained = original.filterNot(containsRewrittenScalar)
         if (retained.size == original.size) {
           scan
         } else {

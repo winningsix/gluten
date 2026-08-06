@@ -19,6 +19,29 @@
 #include "jni/JniCommon.h"
 #include "velox/common/io/IoStatistics.h"
 
+#include <cstring>
+#include <limits>
+#include <vector>
+
+extern "C" JNIEXPORT void JNICALL Java_com_nvidia_sparkmpp_CrtS3RangeReader_copyDirect(
+    JNIEnv* env,
+    jclass,
+    jlong destinationAddress,
+    jobject source,
+    jint sourceOffset,
+    jint length);
+
+extern "C" JNIEXPORT void JNICALL Java_com_nvidia_sparkmpp_CrtS3RangeReader_copyArray(
+    JNIEnv* env,
+    jclass,
+    jlong destinationAddress,
+    jbyteArray source,
+    jint sourceOffset,
+    jint length);
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_nvidia_sparkmpp_CrtS3RangeReader_wrapDirect(JNIEnv* env, jclass, jlong destinationAddress, jlong length);
+
 namespace {
 constexpr std::string_view kJniFsScheme("jni:");
 constexpr std::string_view kJolFsScheme("jol:");
@@ -28,6 +51,7 @@ JavaVM* vm;
 jclass jniFileSystemClass;
 jclass jniReadFileClass;
 jclass jniWriteFileClass;
+jclass crtS3RangeReaderClass;
 
 jmethodID jniGetFileSystem;
 jmethodID jniIsCapableForNewFile;
@@ -51,6 +75,8 @@ jmethodID jniWriteFileAppend;
 jmethodID jniWriteFileFlush;
 jmethodID jniWriteFileClose;
 jmethodID jniWriteFileSize;
+jmethodID crtS3ObjectSize;
+jmethodID crtS3ReadRanges;
 
 jstring createJString(JNIEnv* env, const std::string_view& path) {
   return env->NewStringUTF(std::string(path).c_str());
@@ -445,9 +471,39 @@ void gluten::initVeloxJniFileSystem(JNIEnv* env) {
   jniWriteFileFlush = getMethodIdOrError(env, jniWriteFileClass, "flush", "()V");
   jniWriteFileClose = getMethodIdOrError(env, jniWriteFileClass, "close", "()V");
   jniWriteFileSize = getMethodIdOrError(env, jniWriteFileClass, "size", "()J");
+
+  // This class is supplied only by runtimes that enable the Java AWS CRT
+  // bridge. Keep it optional: the native C++ S3 CRT path does not need it.
+  crtS3RangeReaderClass = createGlobalClassReference(env, "Lcom/nvidia/sparkmpp/CrtS3RangeReader;");
+  if (crtS3RangeReaderClass != nullptr) {
+    JNINativeMethod nativeMethods[] = {
+        {const_cast<char*>("copyDirect"),
+         const_cast<char*>("(JLjava/nio/ByteBuffer;II)V"),
+         reinterpret_cast<void*>(Java_com_nvidia_sparkmpp_CrtS3RangeReader_copyDirect)},
+        {const_cast<char*>("copyArray"),
+         const_cast<char*>("(J[BII)V"),
+         reinterpret_cast<void*>(Java_com_nvidia_sparkmpp_CrtS3RangeReader_copyArray)},
+        {const_cast<char*>("wrapDirect"),
+         const_cast<char*>("(JJ)Ljava/nio/ByteBuffer;"),
+         reinterpret_cast<void*>(Java_com_nvidia_sparkmpp_CrtS3RangeReader_wrapDirect)}};
+    const auto registerResult =
+        env->RegisterNatives(crtS3RangeReaderClass, nativeMethods, sizeof(nativeMethods) / sizeof(nativeMethods[0]));
+    if (registerResult != JNI_OK) {
+      checkException(env);
+    }
+    GLUTEN_CHECK(registerResult == JNI_OK, "Failed to register AWS CRT S3 range bridge native methods");
+    crtS3ObjectSize = getStaticMethodIdOrError(env, crtS3RangeReaderClass, "objectSize", "(Ljava/lang/String;)J");
+    crtS3ReadRanges =
+        getStaticMethodIdOrError(env, crtS3RangeReaderClass, "readRanges", "(Ljava/lang/String;J[J[J[J)J");
+    LOG(INFO) << "AWS CRT S3 range bridge is available";
+  }
 }
 
 void gluten::finalizeVeloxJniFileSystem(JNIEnv* env) {
+  if (crtS3RangeReaderClass != nullptr) {
+    env->DeleteGlobalRef(crtS3RangeReaderClass);
+    crtS3RangeReaderClass = nullptr;
+  }
   env->DeleteGlobalRef(jniWriteFileClass);
   env->DeleteGlobalRef(jniReadFileClass);
   env->DeleteGlobalRef(jniFileSystemClass);
@@ -480,4 +536,123 @@ void gluten::registerJolFileSystem(uint64_t maxFileSize) {
   };
 
   facebook::velox::filesystems::registerFileSystem(JolSchemeMatcher, fileSystemGenerator);
+}
+
+extern "C" bool glutenCrtS3RangeReaderAvailable() {
+  return crtS3RangeReaderClass != nullptr;
+}
+
+extern "C" uint64_t glutenCrtS3ObjectSize(const char* uri) {
+  GLUTEN_CHECK(crtS3RangeReaderClass != nullptr, "AWS CRT S3 range bridge is not available");
+  JNIEnv* env = nullptr;
+  attachCurrentThreadAsDaemonOrThrow(vm, &env);
+  auto jUri = env->NewStringUTF(uri);
+  checkException(env);
+  const auto size = env->CallStaticLongMethod(crtS3RangeReaderClass, crtS3ObjectSize, jUri);
+  env->DeleteLocalRef(jUri);
+  checkException(env);
+  GLUTEN_CHECK(size >= 0, "AWS CRT S3 object size is negative");
+  return static_cast<uint64_t>(size);
+}
+
+extern "C" uint64_t glutenCrtS3ReadRanges(
+    const char* uri,
+    uint8_t* destination,
+    const uint64_t* offsets,
+    const uint64_t* lengths,
+    const uint64_t* destinationOffsets,
+    size_t count) {
+  GLUTEN_CHECK(crtS3RangeReaderClass != nullptr, "AWS CRT S3 range bridge is not available");
+  GLUTEN_CHECK(count <= static_cast<size_t>(std::numeric_limits<jsize>::max()), "Too many AWS CRT S3 ranges");
+
+  JNIEnv* env = nullptr;
+  attachCurrentThreadAsDaemonOrThrow(vm, &env);
+  const auto jCount = static_cast<jsize>(count);
+  auto jUri = env->NewStringUTF(uri);
+  auto jOffsets = env->NewLongArray(jCount);
+  auto jLengths = env->NewLongArray(jCount);
+  auto jDestinationOffsets = env->NewLongArray(jCount);
+  checkException(env);
+
+  std::vector<jlong> signedOffsets(count);
+  std::vector<jlong> signedLengths(count);
+  std::vector<jlong> signedDestinationOffsets(count);
+  for (size_t index = 0; index < count; ++index) {
+    GLUTEN_CHECK(
+        offsets[index] <= static_cast<uint64_t>(std::numeric_limits<jlong>::max()),
+        "AWS CRT S3 range offset exceeds jlong");
+    GLUTEN_CHECK(
+        lengths[index] <= static_cast<uint64_t>(std::numeric_limits<jlong>::max()),
+        "AWS CRT S3 range length exceeds jlong");
+    GLUTEN_CHECK(
+        destinationOffsets[index] <= static_cast<uint64_t>(std::numeric_limits<jlong>::max()),
+        "AWS CRT S3 destination offset exceeds jlong");
+    signedOffsets[index] = static_cast<jlong>(offsets[index]);
+    signedLengths[index] = static_cast<jlong>(lengths[index]);
+    signedDestinationOffsets[index] = static_cast<jlong>(destinationOffsets[index]);
+  }
+  env->SetLongArrayRegion(jOffsets, 0, jCount, signedOffsets.data());
+  env->SetLongArrayRegion(jLengths, 0, jCount, signedLengths.data());
+  env->SetLongArrayRegion(jDestinationOffsets, 0, jCount, signedDestinationOffsets.data());
+  checkException(env);
+
+  const auto bytes = env->CallStaticLongMethod(
+      crtS3RangeReaderClass,
+      crtS3ReadRanges,
+      jUri,
+      reinterpret_cast<jlong>(destination),
+      jOffsets,
+      jLengths,
+      jDestinationOffsets);
+  env->DeleteLocalRef(jDestinationOffsets);
+  env->DeleteLocalRef(jLengths);
+  env->DeleteLocalRef(jOffsets);
+  env->DeleteLocalRef(jUri);
+  checkException(env);
+  GLUTEN_CHECK(bytes >= 0, "AWS CRT S3 read byte count is negative");
+  return static_cast<uint64_t>(bytes);
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_nvidia_sparkmpp_CrtS3RangeReader_copyDirect(
+    JNIEnv* env,
+    jclass,
+    jlong destinationAddress,
+    jobject source,
+    jint sourceOffset,
+    jint length) {
+  auto* sourceAddress = static_cast<uint8_t*>(env->GetDirectBufferAddress(source));
+  const auto capacity = env->GetDirectBufferCapacity(source);
+  if (sourceAddress == nullptr || sourceOffset < 0 || length < 0 ||
+      static_cast<jlong>(sourceOffset) + length > capacity) {
+    jclass errorClass = env->FindClass("java/lang/IllegalArgumentException");
+    env->ThrowNew(errorClass, "Invalid direct CRT response buffer");
+    return;
+  }
+  std::memcpy(reinterpret_cast<void*>(destinationAddress), sourceAddress + sourceOffset, static_cast<size_t>(length));
+}
+
+extern "C" JNIEXPORT void JNICALL Java_com_nvidia_sparkmpp_CrtS3RangeReader_copyArray(
+    JNIEnv* env,
+    jclass,
+    jlong destinationAddress,
+    jbyteArray source,
+    jint sourceOffset,
+    jint length) {
+  const auto arrayLength = env->GetArrayLength(source);
+  if (sourceOffset < 0 || length < 0 || static_cast<jlong>(sourceOffset) + length > arrayLength) {
+    jclass errorClass = env->FindClass("java/lang/IllegalArgumentException");
+    env->ThrowNew(errorClass, "Invalid heap CRT response buffer");
+    return;
+  }
+  env->GetByteArrayRegion(source, sourceOffset, length, reinterpret_cast<jbyte*>(destinationAddress));
+}
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_nvidia_sparkmpp_CrtS3RangeReader_wrapDirect(JNIEnv* env, jclass, jlong destinationAddress, jlong length) {
+  if (destinationAddress == 0 || length < 0 || length > std::numeric_limits<jint>::max()) {
+    jclass errorClass = env->FindClass("java/lang/IllegalArgumentException");
+    env->ThrowNew(errorClass, "Invalid direct CRT destination buffer");
+    return nullptr;
+  }
+  return env->NewDirectByteBuffer(reinterpret_cast<void*>(destinationAddress), length);
 }

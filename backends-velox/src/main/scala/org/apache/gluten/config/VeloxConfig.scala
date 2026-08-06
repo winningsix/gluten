@@ -123,6 +123,24 @@ object VeloxConfig extends ConfigRegistry {
       .bytesConf(ByteUnit.BYTE)
       .createWithDefaultString("1GB")
 
+  val COLUMNAR_VELOX_CACHE_LARGEST_SIZE_CLASS_PAGES =
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.cacheLargestSizeClassPages")
+      .doc("Largest MmapAllocator size class for the Velox memory cache, in 4 KiB pages. " +
+        "Must be a power of two between 256 and 2048.")
+      .intConf
+      .checkValue(
+        value => value >= 256 && value <= 2048 && (value & (value - 1)) == 0,
+        "must be a power of two between 256 and 2048")
+      .createWithDefault(256)
+
+  val COLUMNAR_VELOX_CACHE_CONTIGUOUS_ENTRIES =
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.cacheContiguousEntries")
+      .doc(
+        "Allocate each non-tiny Velox cache entry as one contiguous region. " +
+          "This can reduce direct cache-to-device copy submissions.")
+      .booleanConf
+      .createWithDefault(false)
+
   val COLUMNAR_VELOX_MEM_INIT_CAPACITY =
     buildConf("spark.gluten.sql.columnar.backend.velox.memInitCapacity")
       .doc("The initial memory capacity to reserve for a newly created Velox query memory pool.")
@@ -220,6 +238,14 @@ object VeloxConfig extends ConfigRegistry {
       .doc("The split preload per task")
       .intConf
       .createWithDefault(2)
+
+  val COLUMNAR_VELOX_SPLIT_PRELOAD_PER_TASK =
+    buildConf("spark.gluten.sql.columnar.backend.velox.SplitPreloadPerTask")
+      .doc("Task-wide split preload window. A positive value decouples split preparation " +
+        "from the number of scan drivers; zero preserves the per-driver behavior.")
+      .intConf
+      .checkValue(_ >= 0, "Task-wide split preload window must be non-negative")
+      .createWithDefault(0)
 
   val COLUMNAR_VELOX_GLOG_VERBOSE_LEVEL =
     buildConf("spark.gluten.sql.columnar.backend.velox.glogVerboseLevel")
@@ -694,7 +720,7 @@ object VeloxConfig extends ConfigRegistry {
       .createWithDefault(50)
 
   val CUDF_GROUPBY_STREAMING_MAX_DISTINCT_KEYS =
-    buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.groupbyStreamingMaxDistinctKeys")
+    buildConf("spark.gluten.sql.columnar.backend.velox.cudf.groupbyStreamingMaxDistinctKeys")
       .doc(
         "Maximum distinct keys retained by cuDF FINAL streaming groupby. " +
           "Set to 0 to keep the all-GPU levelled aggregation path. A positive value also " +
@@ -705,6 +731,32 @@ object VeloxConfig extends ConfigRegistry {
         value => value >= 0 && value <= Integer.MAX_VALUE,
         "must be between 0 and 2147483647")
       .createWithDefault(0)
+
+  val CUDF_PARTIAL_STREAMING_GROUPBY =
+    buildConf("spark.gluten.sql.columnar.backend.velox.cudf.partialStreamingGroupby")
+      .doc(
+        "Emit independently reduced PARTIAL groupby batches without retaining and " +
+          "compacting them across input batches. This is a query-scoped setting.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val CUDF_PARTIAL_STREAMING_MAX_DISTINCT_KEYS =
+    buildConf("spark.gluten.sql.columnar.backend.velox.cudf.partialStreamingMaxDistinctKeys")
+      .doc("Maximum distinct keys retained while partial streaming feeds a FINAL or SINGLE " +
+        "streaming groupby. Zero inherits cudf.groupbyStreamingMaxDistinctKeys.")
+      .intConf
+      .checkValue(
+        value => value >= 0 && value <= Integer.MAX_VALUE,
+        "must be between 0 and 2147483647")
+      .createWithDefault(0)
+
+  val CUDF_PARTIAL_IDENTITY_AGGREGATION =
+    buildConf("spark.gluten.sql.columnar.backend.velox.cudf.partialIdentityAggregation")
+      .doc(
+        "Allow supported high-cardinality PARTIAL aggregates to emit one legal " +
+          "intermediate state per input row, avoiding a low-reduction local hash table.")
+      .booleanConf
+      .createWithDefault(false)
 
   val CUDF_ORDER_BY_SORTED_RUN_BYTES =
     buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.orderBySortedRunBytes")
@@ -806,6 +858,15 @@ object VeloxConfig extends ConfigRegistry {
       .intConf
       .checkValue(_ > 0, "Prefetch thread count must be positive")
       .createWithDefault(128)
+
+  val CUDF_HIVE_EXECUTOR_SPLIT_PREFETCH_CONCURRENCY =
+    buildStaticConf(
+      "spark.gluten.sql.columnar.backend.velox.cudf.hive.executorSplitPrefetchConcurrency")
+      .doc("Executor-wide number of complete Parquet splits prepared concurrently. " +
+        "Zero preserves the existing min(16, prefetchThreads) behavior.")
+      .intConf
+      .checkValue(_ >= 0, "Executor split prefetch concurrency must be non-negative")
+      .createWithDefault(0)
 
   val CUDF_CONCURRENT_GPU_TASKS =
     buildConf("spark.gluten.sql.columnar.backend.velox.cudf.concurrentGpuTasks")

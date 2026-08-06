@@ -14,8 +14,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <cstdlib>
+#include <algorithm>
 #include <csignal>
+#include <cstdlib>
 #include <filesystem>
 
 #include "VeloxBackend.h"
@@ -30,6 +31,9 @@
 #include "utils/qat/QatCodec.h"
 #endif
 #ifdef GLUTEN_ENABLE_GPU
+#include <cuda_runtime_api.h>
+
+#include "compute/PinnedCacheAllocator.h"
 #include "cudf/CheckOverflowInTableInsertCudf.h"
 #include "cudf/GpuMemoryTracker.h"
 #include "operators/plannodes/CudfVectorStream.h"
@@ -37,6 +41,7 @@
 #include "ucs/debug/debug.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
+#include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorReadBroker.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
@@ -49,6 +54,7 @@
 #include "jni/JniFileSystem.h"
 #include "memory/GlutenBufferedInputBuilder.h"
 #include "operators/functions/SparkExprToSubfieldFilterParser.h"
+#include "operators/plannodes/RowVectorStream.h"
 #include "shuffle/ArrowShuffleDictionaryWriter.h"
 #include "udf/UdfLoader.h"
 #include "utils/Exception.h"
@@ -57,7 +63,6 @@
 #include "velox/connectors/hive/BufferedInputBuilder.h"
 #include "velox/connectors/hive/HiveConnector.h"
 #include "velox/connectors/hive/HiveDataSource.h"
-#include "operators/plannodes/RowVectorStream.h"
 #include "velox/connectors/hive/storage_adapters/abfs/RegisterAbfsFileSystem.h" // @manual
 #include "velox/connectors/hive/storage_adapters/gcs/RegisterGcsFileSystem.h" // @manual
 #include "velox/connectors/hive/storage_adapters/hdfs/HdfsFileSystem.h"
@@ -203,17 +208,13 @@ void VeloxBackend::init(
 
 #ifdef GLUTEN_ENABLE_GPU
   if (backendConf_->get<bool>(kCudfEnabled, kCudfEnabledDefault)) {
-    const auto mppEnabled = backendConf_->get<bool>(
-        "spark.gluten.mpp.enabled", false);
-    const auto& orderBySortedRunBytesDefault = mppEnabled
-        ? kCudfOrderBySortedRunBytesMppDefault
-        : kCudfOrderBySortedRunBytesDefault;
-    const auto& orderByOutputChunkBytesDefault = mppEnabled
-        ? kCudfOrderByOutputChunkBytesMppDefault
-        : kCudfOrderByOutputChunkBytesDefault;
-    const auto& orderByMaxOutputRowsDefault = mppEnabled
-        ? kCudfOrderByMaxOutputRowsMppDefault
-        : kCudfOrderByMaxOutputRowsDefault;
+    const auto mppEnabled = backendConf_->get<bool>("spark.gluten.mpp.enabled", false);
+    const auto& orderBySortedRunBytesDefault =
+        mppEnabled ? kCudfOrderBySortedRunBytesMppDefault : kCudfOrderBySortedRunBytesDefault;
+    const auto& orderByOutputChunkBytesDefault =
+        mppEnabled ? kCudfOrderByOutputChunkBytesMppDefault : kCudfOrderByOutputChunkBytesDefault;
+    const auto& orderByMaxOutputRowsDefault =
+        mppEnabled ? kCudfOrderByMaxOutputRowsMppDefault : kCudfOrderByMaxOutputRowsDefault;
     std::unordered_map<std::string, std::string> options = {
         {velox::cudf_velox::CudfConfig::kCudfEnabled, "true"},
         {velox::cudf_velox::CudfConfig::kCudfDebugEnabled, backendConf_->get(kDebugCudf, kDebugCudfDefault)},
@@ -251,13 +252,11 @@ void VeloxBackend::init(
         // kUcxExchange), so disabling it does not trigger CPU/Presto-serde
         // fallback. Overridable to "true" to restore the legacy poll bypass.
         {velox::cudf_velox::CudfConfig::kUcxIntraNodeExchange,
-         backendConf_->get<std::string>(
-             "spark.gluten.sql.columnar.backend.velox.cudf.intra_node_exchange",
-             "false")},
+         backendConf_->get<std::string>("spark.gluten.sql.columnar.backend.velox.cudf.intra_node_exchange", "false")},
         {velox::cudf_velox::CudfConfig::kUcxxErrorHandling,
-         backendConf_->get<std::string>(
-             "spark.gluten.sql.columnar.backend.velox.cudf.ucxx_error_handling",
-             "true")},
+         backendConf_->get<std::string>("spark.gluten.sql.columnar.backend.velox.cudf.ucxx_error_handling", "true")},
+        {velox::cudf_velox::CudfConfig::kUcxxBlockingPolling,
+         backendConf_->get<std::string>("spark.gluten.sql.columnar.backend.velox.cudf.ucxx_blocking_polling", "false")},
         // Tell cuDF expression evaluator to register the Spark function set
         // (might_contain, hash_with_seed, xxhash64_with_seed, ...) instead of
         // the Presto default. Without this, registerSparkFunctions() never
@@ -283,48 +282,36 @@ void VeloxBackend::init(
         {velox::cudf_velox::CudfConfig::kCudfConcatOptimizationEnabled,
          backendConf_->get(kCudfConcatOptimizationEnabled, kCudfConcatOptimizationEnabledDefault)},
         {velox::cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys,
-         backendConf_->get(
-             kCudfGroupbyStreamingMaxDistinctKeys,
-             kCudfGroupbyStreamingMaxDistinctKeysDefault)},
+         backendConf_->get(kCudfGroupbyStreamingMaxDistinctKeys, kCudfGroupbyStreamingMaxDistinctKeysDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfPartialIdentityAggregation,
+         backendConf_->get(kCudfPartialIdentityAggregation, kCudfPartialIdentityAggregationDefault)},
         {velox::cudf_velox::CudfConfig::kCudfExchangeConcatOptimizationEnabled,
-         backendConf_->get(
-             kCudfExchangeConcatOptimizationEnabled,
-             kCudfExchangeConcatOptimizationEnabledDefault)},
+         backendConf_->get(kCudfExchangeConcatOptimizationEnabled, kCudfExchangeConcatOptimizationEnabledDefault)},
         {velox::cudf_velox::CudfConfig::kCudfBatchSizeMinThreshold,
          backendConf_->get(kCudfBatchSizeMinThreshold, kCudfBatchSizeMinThresholdDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfBatchSizeMaxThreshold,
+         backendConf_->get(kCudfBatchSizeMaxThreshold, kCudfBatchSizeMaxThresholdDefault)},
         {velox::cudf_velox::CudfConfig::kCudfBatchSizeMinThresholdBytes,
-         backendConf_->get(
-             kCudfBatchSizeMinThresholdBytes,
-             kCudfBatchSizeMinThresholdBytesDefault)},
+         backendConf_->get(kCudfBatchSizeMinThresholdBytes, kCudfBatchSizeMinThresholdBytesDefault)},
         {velox::cudf_velox::CudfConfig::kCudfExchangeBatchSizeMinThreshold,
-         backendConf_->get(
-             kCudfExchangeBatchSizeMinThreshold,
-             kCudfExchangeBatchSizeMinThresholdDefault)},
+         backendConf_->get(kCudfExchangeBatchSizeMinThreshold, kCudfExchangeBatchSizeMinThresholdDefault)},
         // Bound post-exchange concat independently from aggregation concat.
         // Wide exchange inputs can exhaust the device before reaching the row
         // target. Keep the default large enough to avoid excessive UCX batches.
         {velox::cudf_velox::CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
-         backendConf_->get(
-             kCudfExchangeBatchSizeMinThresholdBytes,
-             kCudfExchangeBatchSizeMinThresholdBytesDefault)},
+         backendConf_->get(kCudfExchangeBatchSizeMinThresholdBytes, kCudfExchangeBatchSizeMinThresholdBytesDefault)},
         // Keep the new bounded external-sort implementation. MPP uses the
         // previously validated 3 GiB run/output bounds so 30 TB Q2/Q11 do not
         // spill or split already materialized local sorts into thousands of
         // batches; non-MPP execution retains the native conservative limits.
         {velox::cudf_velox::CudfConfig::kCudfOrderBySortedRunBytes,
-         backendConf_->get(
-             kCudfOrderBySortedRunBytes,
-             orderBySortedRunBytesDefault)},
+         backendConf_->get(kCudfOrderBySortedRunBytes, orderBySortedRunBytesDefault)},
         {velox::cudf_velox::CudfConfig::kCudfOrderByMergeFanIn,
          backendConf_->get(kCudfOrderByMergeFanIn, kCudfOrderByMergeFanInDefault)},
         {velox::cudf_velox::CudfConfig::kCudfOrderByOutputChunkBytes,
-         backendConf_->get(
-             kCudfOrderByOutputChunkBytes,
-             orderByOutputChunkBytesDefault)},
+         backendConf_->get(kCudfOrderByOutputChunkBytes, orderByOutputChunkBytesDefault)},
         {velox::cudf_velox::CudfConfig::kCudfOrderByMaxOutputRows,
-         backendConf_->get(
-             kCudfOrderByMaxOutputRows,
-             orderByMaxOutputRowsDefault)},
+         backendConf_->get(kCudfOrderByMaxOutputRows, orderByMaxOutputRowsDefault)},
         // Forward the ucx-exchange VLOG level so CudfConfig.exchangeLogLevel is
         // populated BEFORE the once-per-process Communicator starts here at
         // backend init (Communicator::start reads it and calls
@@ -334,13 +321,11 @@ void VeloxBackend::init(
         // VLOG lines are not filtered out of stderr.
         {velox::cudf_velox::CudfConfig::kUcxExchangeLogLevel,
          backendConf_->get<std::string>(
-             "spark.gluten.sql.columnar.backend.velox.cudf.exchange_log_level",
-             std::string("0"))}};
+             "spark.gluten.sql.columnar.backend.velox.cudf.exchange_log_level", std::string("0"))}};
     auto& cudfConfig = velox::cudf_velox::CudfConfig::getInstance();
     cudfConfig.initialize(std::move(options));
     velox::cudf_velox::registerCudf();
-    registerCheckOverflowInTableInsertCudfFunction(
-        cudfConfig.functionNamePrefix);
+    registerCheckOverflowInTableInsertCudfFunction(cudfConfig.functionNamePrefix);
     velox::exec::Operator::registerOperator(std::make_unique<CudfVectorStreamOperatorTranslator>());
 
     // Initialize the UCX Communicator once per process. Required so that
@@ -355,14 +340,12 @@ void VeloxBackend::init(
     ucxCommunicator_ = velox::ucx_exchange::Communicator::initAndGet(
         /*port=*/0, /*coordinatorURL=*/"", &commReady);
     if (ucxCommunicator_) {
-      ucxCommunicatorThread_ =
-          std::thread([comm = ucxCommunicator_]() { comm->run(); });
+      ucxCommunicatorThread_ = std::thread([comm = ucxCommunicator_]() { comm->run(); });
       std::move(commReady).wait();
       // WARNING (not INFO) so it survives the default kGlogSeverityLevel=1
       // filter; this single line is the canonical proof that the per-process
       // Communicator started, and we want it in every run log.
-      LOG(WARNING) << "VeloxBackend: UCX Communicator running on port "
-                   << ucxCommunicator_->getListenerPort()
+      LOG(WARNING) << "VeloxBackend: UCX Communicator running on port " << ucxCommunicator_->getListenerPort()
                    << " (intra-node-bypass enabled)";
     } else {
       LOG(WARNING) << "VeloxBackend: UCX Communicator init returned null "
@@ -478,15 +461,120 @@ void VeloxBackend::initCache() {
 
     velox::memory::MmapAllocator::Options options;
     options.capacity = memCacheSize;
+    const auto largestSizeClassPages =
+        backendConf_->get<uint64_t>(kVeloxCacheLargestSizeClassPages, kVeloxCacheLargestSizeClassPagesDefault);
+    VELOX_USER_CHECK_GE(largestSizeClassPages, 256, "{} must be at least 256 pages", kVeloxCacheLargestSizeClassPages);
+    VELOX_USER_CHECK_LE(largestSizeClassPages, 2048, "{} must be at most 2048 pages", kVeloxCacheLargestSizeClassPages);
+    VELOX_USER_CHECK_EQ(
+        largestSizeClassPages & (largestSizeClassPages - 1),
+        0,
+        "{} must be a power of two",
+        kVeloxCacheLargestSizeClassPages);
+    options.largestSizeClass = static_cast<int32_t>(largestSizeClassPages);
+
+    const auto* nativePinnedValue = std::getenv("GLUTEN_VELOX_CACHE_NATIVE_PINNED");
+    const bool nativePinned = nativePinnedValue != nullptr &&
+        (std::string_view(nativePinnedValue) == "1" || std::string_view(nativePinnedValue) == "true");
+#ifdef GLUTEN_ENABLE_GPU
+    if (nativePinned) {
+      cacheAllocator_ = std::make_shared<PinnedCacheAllocator>(options);
+    } else {
+      cacheAllocator_ = std::make_shared<velox::memory::MmapAllocator>(options);
+    }
+#else
+    VELOX_USER_CHECK(!nativePinned, "GLUTEN_VELOX_CACHE_NATIVE_PINNED requires a GPU build");
     cacheAllocator_ = std::make_shared<velox::memory::MmapAllocator>(options);
+#endif
+
+    LOG(INFO) << "AsyncDataCache allocator: " << cacheAllocator_->toString()
+              << ", largest size class: " << cacheAllocator_->largestSizeClass() << " pages";
+    velox::cache::AsyncDataCache::Options cacheOptions;
+    cacheOptions.forceContiguousEntries =
+        backendConf_->get<bool>(kVeloxCacheContiguousEntries, kVeloxCacheContiguousEntriesDefault);
+
+#ifdef GLUTEN_ENABLE_GPU
+    auto* mmapCacheAllocator = dynamic_cast<velox::memory::MmapAllocator*>(cacheAllocator_.get());
+    const auto cachePinnedBytes = backendConf_->get<uint64_t>(kVeloxCachePinnedBytes, kVeloxCachePinnedBytesDefault);
+    const auto cachePinnedPrewarmBytes =
+        backendConf_->get<uint64_t>(kVeloxCachePinnedPrewarmBytes, kVeloxCachePinnedPrewarmBytesDefault);
+    auto cachePageRegistration = velox::cudf_velox::connector::hive::makeBoundedCachePageRegistration(cachePinnedBytes);
+    cacheOptions.registerBackingRuns = cachePageRegistration.registerBackingRuns;
+
+    if (nativePinned) {
+      VELOX_USER_CHECK(
+          cacheOptions.forceContiguousEntries, "GLUTEN_VELOX_CACHE_NATIVE_PINNED requires contiguous cache entries");
+      // cudaHostAlloc already supplies the registration lifetime. A marker
+      // tells the direct-H2D path that this cache entry is safe to retain until
+      // the CUDA stream completes.
+      cacheOptions.registerBackingBytes = [](void*, uint64_t) {
+        static const auto marker = std::make_shared<uint8_t>(0);
+        return std::static_pointer_cast<void>(marker);
+      };
+    } else if (
+        mmapCacheAllocator != nullptr && cacheOptions.forceContiguousEntries &&
+        cachePageRegistration.registerPersistentBackingRange) {
+      cacheOptions.registerBackingBytes = [registerRange = cachePageRegistration.registerPersistentBackingRange,
+                                           allocator = mmapCacheAllocator](void* address, uint64_t logicalBytes) {
+        auto pages = velox::memory::AllocationTraits::numPages(logicalBytes);
+        if (pages <= allocator->largestSizeClass()) {
+          const auto& sizeClasses = allocator->sizeClasses();
+          const auto it = std::lower_bound(sizeClasses.begin(), sizeClasses.end(), pages);
+          VELOX_CHECK(it != sizeClasses.end());
+          pages = *it;
+        }
+        return registerRange(*allocator, address, velox::memory::AllocationTraits::pageBytes(pages));
+      };
+      cachePinnedPersistentLifetime_ = cachePageRegistration.persistentLifetime;
+    } else if (mmapCacheAllocator != nullptr && cachePageRegistration.registerBackingRange) {
+      cacheOptions.registerBackingBytes = [registerRange = cachePageRegistration.registerBackingRange,
+                                           allocator = mmapCacheAllocator](void* address, uint64_t logicalBytes) {
+        auto pages = velox::memory::AllocationTraits::numPages(logicalBytes);
+        if (pages <= allocator->largestSizeClass()) {
+          const auto& sizeClasses = allocator->sizeClasses();
+          const auto it = std::lower_bound(sizeClasses.begin(), sizeClasses.end(), pages);
+          VELOX_CHECK(it != sizeClasses.end());
+          pages = *it;
+        }
+        return registerRange(address, velox::memory::AllocationTraits::pageBytes(pages));
+      };
+    }
+
+    LOG(INFO) << "AsyncDataCache contiguous entries: " << cacheOptions.forceContiguousEntries
+              << ", CUDA registration limit: " << cachePinnedBytes;
+    if (cachePinnedPrewarmBytes > 0) {
+      if (mmapCacheAllocator == nullptr || cachePinnedPrewarmBytes > cachePinnedBytes ||
+          cachePinnedPrewarmBytes > memCacheSize || !cachePageRegistration.prewarmLargestSizeClass) {
+        LOG(WARNING) << "AsyncDataCache pinned prewarm disabled by invalid bounds: "
+                     << "prewarmBytes=" << cachePinnedPrewarmBytes << " registrationLimitBytes=" << cachePinnedBytes
+                     << " memCacheSize=" << memCacheSize;
+      } else {
+        int deviceCount = 0;
+        const auto cudaStatus = cudaGetDeviceCount(&deviceCount);
+        if (cudaStatus != cudaSuccess || deviceCount == 0) {
+          LOG(INFO) << "AsyncDataCache pinned prewarm skipped: no executor "
+                       "GPU; cudaStatus="
+                    << cudaGetErrorString(cudaStatus) << " deviceCount=" << deviceCount;
+          cudaGetLastError();
+        } else {
+          cachePinnedPrewarmLifetime_ =
+              cachePageRegistration.prewarmLargestSizeClass(*mmapCacheAllocator, cachePinnedPrewarmBytes);
+          if (!cachePinnedPrewarmLifetime_) {
+            LOG(WARNING) << "AsyncDataCache pinned prewarm failed; continuing "
+                            "with demand registration/pageable fallback";
+          }
+        }
+      }
+    }
+#endif
+
     if (ssdCacheSize == 0) {
       LOG(INFO) << "AsyncDataCache will do memory caching only as ssd cache size is 0";
       // TODO: this is not tracked by Spark.
-      asyncDataCache_ = velox::cache::AsyncDataCache::create(cacheAllocator_.get());
+      asyncDataCache_ = velox::cache::AsyncDataCache::create(cacheAllocator_.get(), nullptr, cacheOptions);
     } else {
       // TODO: this is not tracked by Spark.
       auto ssd = initSsdCache(ssdCacheSize);
-      asyncDataCache_ = velox::cache::AsyncDataCache::create(cacheAllocator_.get(), std::move(ssd));
+      asyncDataCache_ = velox::cache::AsyncDataCache::create(cacheAllocator_.get(), std::move(ssd), cacheOptions);
     }
 
     VELOX_CHECK_NOT_NULL(dynamic_cast<velox::cache::AsyncDataCache*>(asyncDataCache_.get()));
@@ -504,10 +592,10 @@ void VeloxBackend::initConnector(const std::shared_ptr<velox::config::ConfigBase
   }
   velox::connector::registerConnector(
       std::make_shared<velox::connector::hive::HiveConnector>(kHiveConnectorId, hiveConf, ioExecutor_.get()));
-  
+
   // Register value-stream connector for runtime iterator-based inputs
   velox::connector::registerConnector(std::make_shared<ValueStreamConnector>(kIteratorConnectorId, hiveConf));
-  
+
 #ifdef GLUTEN_ENABLE_GPU
   if (backendConf_->get<bool>(kCudfEnableTableScan, kCudfEnableTableScanDefault) &&
       backendConf_->get<bool>(kCudfEnabled, kCudfEnabledDefault)) {
@@ -584,10 +672,8 @@ void VeloxBackend::tearDown() {
     // On threads exit, thread local variables can be constructed with referencing global variables.
     // So, we need to destruct IOThreadPoolExecutor and stop the threads before global variables get destructed.
 #ifdef GLUTEN_ENABLE_GPU
-    facebook::velox::cudf_velox::connector::hive::ExecutorSplitPrefetch::erase(
-        ioExecutor_.get());
-    facebook::velox::cudf_velox::connector::hive::ExecutorReadBroker::erase(
-        ioExecutor_.get());
+    facebook::velox::cudf_velox::connector::hive::ExecutorSplitPrefetch::erase(ioExecutor_.get());
+    facebook::velox::cudf_velox::connector::hive::ExecutorReadBroker::erase(ioExecutor_.get());
 #endif
     ioExecutor_.reset();
     globalMemoryManager_.reset();
@@ -602,10 +688,11 @@ void VeloxBackend::tearDown() {
         }
       }
       asyncDataCache_->shutdown();
+      cachePinnedPersistentLifetime_.reset();
+      cachePinnedPrewarmLifetime_.reset();
     }
   } catch (const std::exception& e) {
-    LOG(ERROR) << "Ignoring terminal VeloxBackend teardown failure: "
-               << e.what();
+    LOG(ERROR) << "Ignoring terminal VeloxBackend teardown failure: " << e.what();
   } catch (...) {
     LOG(ERROR) << "Ignoring unknown terminal VeloxBackend teardown failure";
   }

@@ -25,6 +25,24 @@ class AllVeloxConfiguration extends AnyFunSuite {
     AllGlutenConfiguration.getCodeSourceLocation(this.getClass).split("backends-velox")(0)
   private val markdown = Paths.get(glutenHome, "docs", "velox-configuration.md").toAbsolutePath
 
+  test("Validate cache largest size class pages") {
+    val entry = VeloxConfig.COLUMNAR_VELOX_CACHE_LARGEST_SIZE_CLASS_PAGES
+    assert(entry.defaultValue.contains(256))
+    Seq(256, 512, 1024, 2048).foreach {
+      value => assert(entry.valueConverter(value.toString) == value)
+    }
+    Seq(128, 768, 4096).foreach {
+      value => assertThrows[IllegalArgumentException](entry.valueConverter(value.toString))
+    }
+  }
+
+  test("Validate contiguous cache entries") {
+    val entry = VeloxConfig.COLUMNAR_VELOX_CACHE_CONTIGUOUS_ENTRIES
+    assert(entry.defaultValue.contains(false))
+    assert(entry.valueConverter("true"))
+    assert(!entry.valueConverter("false"))
+  }
+
   test("Check velox backend configs") {
     val builder = MarkdownBuilder(getClass.getName)
 

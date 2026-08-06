@@ -959,7 +959,8 @@ void MppQueryCoordinator::start() {
             ? (spec.keyedFinalLocalRepartition
                    ? std::max(1, spec.numDrivers)
                    : (replicas == 1 &&
-                              spec.rightSemiProjectMultiDriverSafe
+                              (spec.rightSemiProjectMultiDriverSafe ||
+                               spec.innerJoinMultiDriverSafe)
                           ? std::min(2, std::max(1, spec.numDrivers))
                           : 1))
         : std::max(1, spec.numDrivers);
@@ -1002,6 +1003,8 @@ void MppQueryCoordinator::start() {
                    << spec.keyedFinalLocalRepartition
                    << " rightSemiProjectMultiDriverSafe="
                    << spec.rightSemiProjectMultiDriverSafe
+                   << " innerJoinMultiDriverSafe="
+                   << spec.innerJoinMultiDriverSafe
                    << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN)
                                   : std::string{});
     }

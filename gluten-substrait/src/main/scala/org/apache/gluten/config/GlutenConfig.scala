@@ -1478,14 +1478,19 @@ object GlutenConfig extends ConfigRegistry {
     buildConf("spark.gluten.sql.optimizer.candidateFirstExistence.mode")
       .doc(
         "Controls candidate-first rewriting of a strictly proven paired self-correlated " +
-          "EXISTS / NOT EXISTS shape. Valid values are 'off', 'auto', and 'force'. " +
+          "EXISTS / NOT EXISTS shape. Valid values are 'off', 'auto', 'force', " +
+          "'restricted', and 'restricted-rowid'. " +
           "Auto requires a safe inner-join chain and a minimum estimated cost improvement; " +
-          "force bypasses only the cost gate for validation.")
+          "force bypasses only the cost gate for validation. Restricted first derives distinct " +
+          "candidate correlation keys and uses them to limit one shared MIN/MAX state scan. " +
+          "Restricted-rowid instead carries row-identified candidates through that state scan, " +
+          "preserving duplicates while avoiding a second candidate scan.")
       .stringConf
       .transform(_.toLowerCase(Locale.ROOT))
       .checkValue(
-        mode => Set("off", "auto", "force").contains(mode),
-        "Valid values are 'off', 'auto', and 'force'.")
+        mode => Set("off", "auto", "force", "restricted", "restricted-rowid").contains(mode),
+        "Valid values are 'off', 'auto', 'force', 'restricted', and 'restricted-rowid'."
+      )
       .createWithDefault("auto")
 
   val CANDIDATE_FIRST_EXISTENCE_MIN_COST_IMPROVEMENT_RATIO =

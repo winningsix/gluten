@@ -245,16 +245,43 @@ std::unordered_map<std::string, std::string> buildMppQueryConfig(
   configs[kCudfHiveUseExperimentalReader] = std::to_string(
       veloxCfg->get<bool>(kCudfHiveUseExperimentalReader, false));
 
-  // Keep the UCX exchange byte bound independently configurable, but make the
-  // byte-aware path active by default by inheriting the GPU compute batch
-  // target. GLUTEN_UCX_PARTITIONED_OUTPUT_BATCH_BYTES remains a runtime
-  // override inside UcxPartitionedOutput.
+  // These groupby controls may be supplied by a query-scoped Spark SQLConf.
+  // MPP builds its own QueryCtx, so values merged into the runtime session
+  // config must be copied explicitly into QueryConfig for cuDF operators to
+  // observe the per-query override instead of the executor-global default.
+  configs[velox::cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys] =
+      veloxCfg->get<std::string>(
+          kCudfGroupbyStreamingMaxDistinctKeys,
+          kCudfGroupbyStreamingMaxDistinctKeysDefault);
+  configs[velox::cudf_velox::CudfConfig::kCudfPartialIdentityAggregation] =
+      veloxCfg->get<std::string>(
+          kCudfPartialIdentityAggregation,
+          kCudfPartialIdentityAggregationDefault);
+  LOG(INFO) << "MppJniWrapper: query-scoped cuDF groupby config "
+            << velox::cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys
+            << "="
+            << configs[velox::cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys]
+            << " "
+            << velox::cudf_velox::CudfConfig::kCudfPartialIdentityAggregation
+            << "="
+            << configs[velox::cudf_velox::CudfConfig::kCudfPartialIdentityAggregation];
+
+  // Keep the UCX exchange byte bound independently configurable. Partial
+  // identity can emit one state per input row, so its default is bounded at
+  // 64 MiB. Regular queries retain the historical GPU compute-batch default;
+  // applying the smaller window globally regresses exchange-heavy queries.
+  const auto partialIdentityAggregation = veloxCfg->get<bool>(
+      kCudfPartialIdentityAggregation,
+      false);
+  const auto partitionedOutputBatchBytesDefault = partialIdentityAggregation
+      ? kCudfPartitionedOutputBatchBytesPartialIdentityDefault
+      : veloxCfg->get<uint64_t>(
+            kCudfGpuTargetBatchBytes,
+            std::stoull(kCudfGpuTargetBatchBytesDefault));
   configs[velox::core::QueryConfig::kUcxPartitionedOutputBatchBytes] =
       std::to_string(veloxCfg->get<uint64_t>(
           kCudfPartitionedOutputBatchBytes,
-          veloxCfg->get<uint64_t>(
-              kCudfGpuTargetBatchBytes,
-              std::stoull(kCudfGpuTargetBatchBytesDefault))));
+          partitionedOutputBatchBytesDefault));
 #endif
 
   try {
@@ -340,6 +367,9 @@ std::unordered_map<std::string, std::string> buildMppQueryConfig(
         std::to_string(veloxCfg->get<uint64_t>(kHashProbeBloomFilterPushdownMaxSize, 0));
     configs[velox::core::QueryConfig::kMaxSplitPreloadPerDriver] =
         std::to_string(veloxCfg->get<int32_t>(kVeloxSplitPreloadPerDriver, 2));
+    configs[velox::core::QueryConfig::kMaxSplitPreloadPerTask] =
+        std::to_string(veloxCfg->get<int32_t>(
+            kVeloxSplitPreloadPerTask, kVeloxSplitPreloadPerTaskDefault));
 
     configs[velox::core::QueryConfig::kAbandonDedupHashMapMinRows] =
         std::to_string(veloxCfg->get<int32_t>(kAbandonDedupHashMapMinRows, 100000));
@@ -491,7 +521,10 @@ bool feedsKeyedFinalAggregation(
     const std::string& targetNodeId) {
   if (auto aggregation =
           std::dynamic_pointer_cast<const velox::core::AggregationNode>(node)) {
-    if (aggregation->step() == velox::core::AggregationNode::Step::kFinal &&
+    if ((aggregation->step() ==
+             velox::core::AggregationNode::Step::kFinal ||
+         aggregation->step() ==
+             velox::core::AggregationNode::Step::kSingle) &&
         !aggregation->groupingKeys().empty() &&
         unaryPathToValueStream(aggregation->sources().front(), targetNodeId)) {
       return true;
@@ -541,6 +574,8 @@ bool isRightSemiProjectMultiDriverSafePlan(
       std::dynamic_pointer_cast<const velox::core::FilterNode>(node) ==
           nullptr &&
       std::dynamic_pointer_cast<const velox::core::ExchangeNode>(node) ==
+          nullptr &&
+      std::dynamic_pointer_cast<const velox::core::TableScanNode>(node) ==
           nullptr) {
     return false;
   }
@@ -602,6 +637,40 @@ bool isRightSemiProjectMultiDriverSafePlan(
       shape.rightSemiProjectCount == 2 &&
       shape.partialAggregationCount == 1 &&
       hasNestedRightSemiProjectPartialShape(node);
+}
+
+bool isInnerJoinMultiDriverSafePlan(
+    const velox::core::PlanNodePtr& node,
+    int32_t& innerJoinCount) {
+  if (auto join =
+          std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node)) {
+    if (join->joinType() != velox::core::JoinType::kInner ||
+        join->isNullAware()) {
+      return false;
+    }
+    ++innerJoinCount;
+  } else if (
+      std::dynamic_pointer_cast<const velox::core::ProjectNode>(node) ==
+          nullptr &&
+      std::dynamic_pointer_cast<const velox::core::FilterNode>(node) ==
+          nullptr &&
+      std::dynamic_pointer_cast<const velox::core::ExchangeNode>(node) ==
+          nullptr) {
+    return false;
+  }
+  return std::all_of(
+      node->sources().begin(),
+      node->sources().end(),
+      [&](const auto& source) {
+        return isInnerJoinMultiDriverSafePlan(source, innerJoinCount);
+      });
+}
+
+bool isInnerJoinMultiDriverSafePlan(
+    const velox::core::PlanNodePtr& node) {
+  int32_t innerJoinCount = 0;
+  return isInnerJoinMultiDriverSafePlan(node, innerJoinCount) &&
+      innerJoinCount > 0;
 }
 
 bool hasValidHashKeys(
@@ -1143,6 +1212,117 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
       "node type in replaceValueStreamWithExchange().",
       node->name(),
       node->id());
+}
+
+bool containsHashJoin(const velox::core::PlanNodePtr& node) {
+  if (std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node) !=
+      nullptr) {
+    return true;
+  }
+  return std::any_of(
+      node->sources().begin(),
+      node->sources().end(),
+      [&](const auto& source) { return containsHashJoin(source); });
+}
+
+/// Protect a keyed FINAL aggregation whose input contains a hash join with a
+/// local hash exchange on the aggregation keys.  This creates a pipeline
+/// boundary after the join: multiple upstream probe drivers can run without
+/// allowing equal FINAL groups to be owned by different downstream drivers.
+velox::core::PlanNodePtr insertKeyedFinalLocalRepartitionAfterJoin(
+    const velox::core::PlanNodePtr& node,
+    bool& inserted) {
+  if (auto aggregation =
+          std::dynamic_pointer_cast<const velox::core::AggregationNode>(node)) {
+    if ((aggregation->step() ==
+             velox::core::AggregationNode::Step::kFinal ||
+         aggregation->step() ==
+             velox::core::AggregationNode::Step::kSingle) &&
+        !aggregation->groupingKeys().empty() &&
+        containsHashJoin(aggregation->sources().front())) {
+      const auto& source = aggregation->sources().front();
+      const auto& sourceType = source->outputType();
+      std::vector<velox::column_index_t> keyChannels;
+      keyChannels.reserve(aggregation->groupingKeys().size());
+      for (const auto& key : aggregation->groupingKeys()) {
+        velox::column_index_t channel = -1;
+        for (size_t i = 0; i < sourceType->size(); ++i) {
+          if (sourceType->nameOf(i) == key->name()) {
+            channel = static_cast<velox::column_index_t>(i);
+            break;
+          }
+        }
+        VELOX_CHECK_GE(
+            channel,
+            0,
+            "Keyed FINAL grouping key '{}' is absent from source schema {}",
+            key->name(),
+            sourceType->toString());
+        keyChannels.push_back(channel);
+      }
+      auto partitionSpec =
+          std::make_shared<velox::exec::HashPartitionFunctionSpec>(
+              sourceType, std::move(keyChannels));
+      auto localPartition = velox::core::LocalPartitionNode::Builder()
+                                .id(aggregation->id() + "_post_join_local_hash")
+                                .type(velox::core::LocalPartitionNode::Type::
+                                          kRepartition)
+                                .scaleWriter(false)
+                                .partitionFunctionSpec(partitionSpec)
+                                .sources({source})
+                                .build();
+      inserted = true;
+      LOG(WARNING)
+          << "MppJniWrapper: inserting keyed FINAL local HASH repartition "
+             "after join before aggregation "
+          << aggregation->id();
+      return velox::core::AggregationNode::Builder(*aggregation)
+          .source(std::move(localPartition))
+          .build();
+    }
+  }
+
+  if (node->sources().size() != 1) {
+    return node;
+  }
+  auto newSource =
+      insertKeyedFinalLocalRepartitionAfterJoin(node->sources().front(), inserted);
+  if (newSource.get() == node->sources().front().get()) {
+    return node;
+  }
+  if (auto project =
+          std::dynamic_pointer_cast<const velox::core::ProjectNode>(node)) {
+    return velox::core::ProjectNode::Builder(*project)
+        .source(std::move(newSource))
+        .build();
+  }
+  if (auto filter =
+          std::dynamic_pointer_cast<const velox::core::FilterNode>(node)) {
+    return velox::core::FilterNode::Builder(*filter)
+        .source(std::move(newSource))
+        .build();
+  }
+  if (auto topN =
+          std::dynamic_pointer_cast<const velox::core::TopNNode>(node)) {
+    return velox::core::TopNNode::Builder(*topN)
+        .source(std::move(newSource))
+        .build();
+  }
+  if (auto orderBy =
+          std::dynamic_pointer_cast<const velox::core::OrderByNode>(node)) {
+    return velox::core::OrderByNode::Builder(*orderBy)
+        .source(std::move(newSource))
+        .build();
+  }
+  if (auto limit =
+          std::dynamic_pointer_cast<const velox::core::LimitNode>(node)) {
+    return velox::core::LimitNode::Builder(*limit)
+        .source(std::move(newSource))
+        .build();
+  }
+  VELOX_FAIL(
+      "Unsupported unary node '{}' above keyed FINAL local repartition",
+      node->name());
 }
 
 bool schemaMatches(const velox::RowTypePtr& a, const velox::RowTypePtr& b) {
@@ -2125,6 +2305,12 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
                 << veloxPlanNode->toString(
                        /*detailed=*/true, /*recursive=*/true);
     }
+    if (!singleTaskMode && keyedFinalLocalDrivers > 1) {
+      bool insertedAfterJoin = false;
+      veloxPlanNode = insertKeyedFinalLocalRepartitionAfterJoin(
+          veloxPlanNode, insertedAfterJoin);
+      fragmentUsesKeyedFinalLocalRepartition |= insertedAfterJoin;
+    }
 
     // Capture the post-rewrite, pre-wrap plan for use by downstream consumer
     // fragments in single-task merge mode. This is what gets inlined via
@@ -2294,6 +2480,17 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
                    << " is a RIGHT_SEMI_PROJECT HASH-join shape that is "
                       "safe for intra-task multi-driver execution";
     }
+    const bool innerJoinMultiDriverSafe =
+        outboundExchange != nullptr && partitionType == "HASH" &&
+        hasValidHashKeys(
+            outboundExchange->partitionKeyIndices,
+            veloxPlanNode->outputType()) &&
+        isInnerJoinMultiDriverSafePlan(veloxPlanNode);
+    if (innerJoinMultiDriverSafe) {
+      LOG(WARNING) << "MppJniWrapper: fragment " << i
+                   << " is a pure INNER HASH-join shape that is safe for "
+                      "intra-task multi-driver execution";
+    }
 
     MppFragmentSpec fragSpec;
     // In single-task mode, merged producers are skipped (continue) above, so
@@ -2354,6 +2551,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
         fragmentUsesKeyedFinalLocalRepartition;
     fragSpec.rightSemiProjectMultiDriverSafe =
         rightSemiProjectMultiDriverSafe;
+    fragSpec.innerJoinMultiDriverSafe =
+        innerJoinMultiDriverSafe;
     fragSpec.scanInfos = std::move(fragScanInfos);
     fragSpec.scanNodeIds = std::move(fragScanNodeIds);
     // Determine connector IDs for scan nodes from the converted Velox plan.

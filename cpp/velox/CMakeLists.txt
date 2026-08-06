@@ -114,7 +114,7 @@ macro(find_re2)
 endmacro()
 
 macro(find_awssdk)
-  find_package(AWSSDK REQUIRED COMPONENTS s3;identity-management)
+  find_package(AWSSDK REQUIRED COMPONENTS s3;identity-management;s3-crt)
 endmacro()
 
 macro(find_gcssdk)
@@ -679,6 +679,12 @@ if(ENABLE_GPU)
       ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/iceberg/libvelox_cudf_iceberg_connector.a
       ${VELOX_BUILD_PATH}/velox/experimental/cudf/expression/libvelox_cudf_expression.a
       -Wl,--no-whole-archive)
+  # The cuDF connector archives above contain S3 callers. Repeat the static AWS
+  # SDK closure after those archives so one-pass GNU linking retains the
+  # corresponding S3/S3 CRT objects in libgluten.so itself.
+  if(ENABLE_S3)
+    target_link_libraries(velox PRIVATE ${AWSSDK_LIBRARIES})
+  endif()
   # Shared libs consumers need at link time (cudf::cudf, libcurl): PUBLIC.
   target_link_libraries(velox PUBLIC cudf::cudf velox_curl)
   # IBM baseline brings in apache thrift symbols transitively (Presto serde uses
@@ -752,11 +758,29 @@ if(ENABLE_GPU)
   if(EXISTS /usr/local/cuda/lib64/libcudart.so.13)
     set(GLUTEN_CUDART_LIBRARY /usr/local/cuda/lib64/libcudart.so.13)
   endif()
+
+  set(_gluten_ucxx_bundled "${VELOX_BUILD_PATH}/_deps/ucxx-build/libucxx.so")
+  if(EXISTS "${_gluten_ucxx_bundled}")
+    set(GLUTEN_UCXX_LIBRARY "${_gluten_ucxx_bundled}")
+  else()
+    find_library(
+      _gluten_ucxx_system
+      NAMES ucxx
+      PATHS /usr/local/lib64 /usr/local/lib
+      NO_DEFAULT_PATH)
+    set(GLUTEN_UCXX_LIBRARY "${_gluten_ucxx_system}")
+  endif()
+  if(NOT GLUTEN_UCXX_LIBRARY OR NOT EXISTS "${GLUTEN_UCXX_LIBRARY}")
+    message(
+      FATAL_ERROR
+        "GPU builds require either Velox's bundled UCXX artifact or an "
+        "installed libucxx.so")
+  endif()
+  message(STATUS "Using UCXX library: ${GLUTEN_UCXX_LIBRARY}")
+
   target_link_libraries(
-    velox
-    PUBLIC ${GLUTEN_EXPLICIT_RAPIDS_LIBRARIES}
-           ${VELOX_BUILD_PATH}/_deps/ucxx-build/libucxx.so
-           ${GLUTEN_CUDART_LIBRARY} ${GLUTEN_UCX_LIBRARIES})
+    velox PUBLIC ${GLUTEN_EXPLICIT_RAPIDS_LIBRARIES} ${GLUTEN_UCXX_LIBRARY}
+                 ${GLUTEN_CUDART_LIBRARY} ${GLUTEN_UCX_LIBRARIES})
 endif()
 
 # Keep these at the end of libgluten.so's link line. `facebook::velox` and the

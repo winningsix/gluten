@@ -21,10 +21,11 @@ import org.apache.gluten.config.GlutenConfig
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.analysis.MultiInstanceRelation
-import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, AttributeReference, AttributeSet, EqualTo, Exists, Expression, ExprId, If, Literal, NamedExpression, Not, PredicateHelper}
+import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, AttributeReference, AttributeSet, EqualTo, Exists, Expression, ExprId, If, Literal, MonotonicallyIncreasingID, NamedExpression, Not, PredicateHelper}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Max, Min}
+import org.apache.spark.sql.catalyst.optimizer.ColumnPruning
 import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, Inner, LeftAnti, LeftSemi}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, BROADCAST, Filter, Join, JoinHint, LeafNode, LogicalPlan, Project, SubqueryAlias}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, BROADCAST, Filter, HintInfo, Join, JoinHint, LeafNode, LogicalPlan, Project, SubqueryAlias}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.types.{BooleanType, DoubleType, FloatType}
 
@@ -72,6 +73,9 @@ case class MergeSelfCorrelatedExistenceState(spark: SparkSession)
   import MergeSelfCorrelatedExistenceState._
 
   private val glutenConfig = new GlutenConfig(spark.sessionState.conf)
+  private val candidateFirstPushDimensionChain = spark.sessionState.conf
+    .getConfString("spark.gluten.sql.optimizer.candidateFirstExistence.pushDimensionChain", "false")
+    .toBoolean
 
   private case class SourceView(
       plan: LogicalPlan,
@@ -158,6 +162,8 @@ case class MergeSelfCorrelatedExistenceState(spark: SparkSession)
     val candidateFirst = glutenConfig.candidateFirstExistenceMode match {
       case "force" => rewriteCandidateFirst(plan, requireCostGuard = false)
       case "auto" => rewriteCandidateFirst(plan, requireCostGuard = true)
+      case "restricted" => rewriteCandidateRestricted(plan)
+      case "restricted-rowid" => rewriteCandidateRestrictedRows(plan)
       case "off" => plan
     }
 
@@ -224,6 +230,39 @@ case class MergeSelfCorrelatedExistenceState(spark: SparkSession)
                     }
                 }
               }
+          }
+          .getOrElse(current)
+    }
+  }
+
+  private def rewriteCandidateRestricted(plan: LogicalPlan): LogicalPlan = {
+    plan.transformDown {
+      case current =>
+        extractCandidateContext(current)
+          .map {
+            context =>
+              logWarning(
+                "MergeSelfCorrelatedExistenceState: selected candidate-restricted shared-state " +
+                  s"shape absorbedInnerJoins=${context.absorbedJoins.size} " +
+                  s"sourceBytes=${context.proof.allView.source.stats.sizeInBytes}")
+              buildCandidateRestrictedState(context)
+          }
+          .getOrElse(current)
+    }
+  }
+
+  private def rewriteCandidateRestrictedRows(plan: LogicalPlan): LogicalPlan = {
+    plan.transformDown {
+      case current =>
+        extractCandidateContext(current)
+          .map {
+            context =>
+              logWarning(
+                "MergeSelfCorrelatedExistenceState: selected row-preserving " +
+                  "candidate-restricted shared-state shape " +
+                  s"absorbedInnerJoins=${context.absorbedJoins.size} " +
+                  s"sourceBytes=${context.proof.allView.source.stats.sizeInBytes}")
+              buildCandidateRestrictedRows(context)
           }
           .getOrElse(current)
     }
@@ -521,18 +560,30 @@ case class MergeSelfCorrelatedExistenceState(spark: SparkSession)
 
   private def buildCandidateFirst(context: CandidateContext): LogicalPlan = {
     val proof = context.proof
+    val candidate =
+      if (candidateFirstPushDimensionChain) {
+        val rewritten =
+          PushSelectiveDimensionChainBeforeFact(spark).rewriteProvenCandidate(context.candidate)
+        if (!rewritten.fastEquals(context.candidate)) {
+          logWarning(
+            "MergeSelfCorrelatedExistenceState: pushed selective dimension chain inside " +
+              "proven candidate")
+        }
+        rewritten
+      } else {
+        context.candidate
+      }
     val allExists = AttributeReference(
       s"${CandidateFirstExistenceAttributePrefix}all",
       BooleanType,
       nullable = false)()
     val allProbe = Join(
-      context.candidate,
+      candidate,
       proof.allRhs,
       ExistenceJoin(allExists),
       Some(proof.semiCondition),
       JoinHint.NONE)
-    val candidatesWithAllMatch =
-      Project(context.candidate.output, Filter(allExists, allProbe))
+    val candidatesWithAllMatch = Project(candidate.output, Filter(allExists, allProbe))
 
     val delayedExists = AttributeReference(
       s"${CandidateFirstExistenceAttributePrefix}delayed",
@@ -545,11 +596,205 @@ case class MergeSelfCorrelatedExistenceState(spark: SparkSession)
       Some(proof.antiCondition),
       JoinHint.NONE)
     val candidatesWithoutDelayedMatch =
-      Project(context.candidate.output, Filter(Not(delayedExists), delayedProbe))
+      Project(candidate.output, Filter(Not(delayedExists), delayedProbe))
 
     // Restore the exact output contract of the original surrounding inner-join context. Hidden
     // source attributes kept through intermediate Projects do not escape this boundary.
     Project(context.output, candidatesWithoutDelayedMatch)
+  }
+
+  /**
+   * Evaluate a proven paired EXISTS / NOT EXISTS pair with one source-state scan restricted to
+   * correlation keys that survived the selective candidate chain.
+   *
+   * Distinct candidate keys are a relational semijoin reduction, not a query-specific rewrite. The
+   * final LeftSemi join preserves every candidate row and therefore preserves bag semantics.
+   */
+  private def buildCandidateRestrictedState(context: CandidateContext): LogicalPlan = {
+    val proof = context.proof
+    val candidate =
+      if (candidateFirstPushDimensionChain) {
+        val rewritten =
+          PushSelectiveDimensionChainBeforeFact(spark).rewriteProvenCandidate(context.candidate)
+        if (!rewritten.fastEquals(context.candidate)) {
+          logWarning(
+            "MergeSelfCorrelatedExistenceState: pushed selective dimension chain inside " +
+              "candidate-restricted state")
+        }
+        rewritten
+      } else {
+        context.candidate
+      }
+    // The restriction-key aggregate and final semijoin both reference the selective candidate.
+    // Spark can represent that as a reused shuffle, but native MPP deliberately gives each
+    // consumer an independent producer because one PartitionedOutput cannot yet fan out safely.
+    // Repartitioning here therefore duplicated the whole candidate scan and also forced the
+    // unrestricted fact source through a sort-merge exchange. Keep both small state relations as
+    // broadcast builds instead: the full source remains a local streaming probe, and only rows
+    // whose keys survived the candidate chain enter the state aggregate.
+    val sharedCandidate = candidate
+    val candidateKeyAliases =
+      proof.semiKeys.leftEquality.zipWithIndex.map {
+        case (key, ordinal) =>
+          Alias(key, s"$RestrictedCandidateKeyAttributePrefix$ordinal")()
+      }
+    val candidateKeys =
+      Aggregate(
+        proof.semiKeys.leftEquality,
+        candidateKeyAliases,
+        Project(proof.semiKeys.leftEquality, sharedCandidate))
+
+    val stateInputReferences =
+      AttributeSet(proof.sourceKeys :+ proof.sourceValue) ++ proof.delayedPredicate.references
+    val narrowSource =
+      Project(
+        proof.allView.source.output.filter(stateInputReferences.contains),
+        proof.allView.source)
+    val restrictionConditions =
+      proof.sourceKeys.zip(candidateKeyAliases.map(_.toAttribute)).map {
+        case (sourceKey, candidateKey) => EqualTo(sourceKey, candidateKey): Expression
+      }
+    val restrictedSource =
+      Join(
+        narrowSource,
+        candidateKeys,
+        Inner,
+        Some(restrictionConditions.reduce(And)),
+        JoinHint(None, Some(HintInfo(strategy = Some(BROADCAST)))))
+
+    val allMin = Alias(
+      Min(proof.sourceValue).toAggregateExpression(),
+      s"_restricted_existence_all_min_${proof.sourceValue.name}")()
+    val allMax = Alias(
+      Max(proof.sourceValue).toAggregateExpression(),
+      s"_restricted_existence_all_max_${proof.sourceValue.name}")()
+    val delayedValue =
+      If(
+        proof.delayedPredicate,
+        proof.sourceValue,
+        Literal.create(null, proof.sourceValue.dataType))
+    val delayedMin = Alias(
+      Min(delayedValue).toAggregateExpression(),
+      s"_restricted_existence_delayed_min_${proof.sourceValue.name}")()
+    val delayedMax = Alias(
+      Max(delayedValue).toAggregateExpression(),
+      s"_restricted_existence_delayed_max_${proof.sourceValue.name}")()
+    val state =
+      Aggregate(
+        proof.sourceKeys,
+        proof.sourceKeys ++ Seq(allMin, allMax, delayedMin, delayedMax),
+        restrictedSource)
+    val eligibleState =
+      Filter(
+        And(
+          Not(EqualTo(allMin.toAttribute, allMax.toAttribute)),
+          EqualTo(delayedMin.toAttribute, delayedMax.toAttribute)),
+        state)
+    val eligibleJoinState =
+      Project(proof.sourceKeys ++ Seq(delayedMin.toAttribute), eligibleState)
+    val candidateConditions =
+      proof.semiKeys.leftEquality.zip(proof.sourceKeys).map {
+        case (candidateKey, sourceKey) => EqualTo(candidateKey, sourceKey): Expression
+      }
+    val valueCondition =
+      EqualTo(proof.semiKeys.leftNotEqual, delayedMin.toAttribute)
+    val matchedCandidates =
+      Join(
+        sharedCandidate,
+        eligibleJoinState,
+        LeftSemi,
+        Some((candidateConditions :+ valueCondition).reduce(And)),
+        JoinHint(None, Some(HintInfo(strategy = Some(BROADCAST))))
+      )
+    Project(context.output, matchedCandidates)
+  }
+
+  /**
+   * Restrict one state scan with the candidate rows themselves.
+   *
+   * A private monotonically-increasing row id keeps duplicate candidate rows distinct, so grouping
+   * the joined source state by that id preserves bag semantics. Carrying the exact surrounding
+   * output through the state aggregate then removes the second candidate scan required by
+   * [[buildCandidateRestrictedState]]. The id is internal and never escapes the final Project.
+   */
+  private def buildCandidateRestrictedRows(context: CandidateContext): LogicalPlan = {
+    val proof = context.proof
+    val candidate =
+      if (candidateFirstPushDimensionChain) {
+        val rewritten =
+          PushSelectiveDimensionChainBeforeFact(spark).rewriteProvenCandidate(context.candidate)
+        if (!rewritten.fastEquals(context.candidate)) {
+          logWarning(
+            "MergeSelfCorrelatedExistenceState: pushed selective dimension chain inside " +
+              "row-preserving candidate-restricted state")
+        }
+        rewritten
+      } else {
+        context.candidate
+      }
+
+    val candidateRowId =
+      Alias(MonotonicallyIncreasingID(), s"${RestrictedCandidateKeyAttributePrefix}row_id")()
+    val candidateWithRowId = Project(candidate.output :+ candidateRowId, candidate)
+    val requiredCandidateAttributes =
+      AttributeSet(context.output ++ proof.semiKeys.leftEquality :+ proof.semiKeys.leftNotEqual)
+    val carriedCandidateAttributes =
+      candidateWithRowId.output.filter(requiredCandidateAttributes.contains)
+
+    val stateInputReferences =
+      AttributeSet(proof.sourceKeys :+ proof.sourceValue) ++ proof.delayedPredicate.references
+    val narrowSource =
+      Project(
+        proof.allView.source.output.filter(stateInputReferences.contains),
+        proof.allView.source)
+    val restrictionConditions =
+      proof.sourceKeys.zip(proof.semiKeys.leftEquality).map {
+        case (sourceKey, candidateKey) => EqualTo(sourceKey, candidateKey): Expression
+      }
+    val restrictedSource =
+      Join(
+        narrowSource,
+        candidateWithRowId,
+        Inner,
+        Some(restrictionConditions.reduce(And)),
+        JoinHint(None, Some(HintInfo(strategy = Some(BROADCAST)))))
+
+    val allMin = Alias(
+      Min(proof.sourceValue).toAggregateExpression(),
+      s"_restricted_row_existence_all_min_${proof.sourceValue.name}")()
+    val allMax = Alias(
+      Max(proof.sourceValue).toAggregateExpression(),
+      s"_restricted_row_existence_all_max_${proof.sourceValue.name}")()
+    val delayedValue =
+      If(
+        proof.delayedPredicate,
+        proof.sourceValue,
+        Literal.create(null, proof.sourceValue.dataType))
+    val delayedMin = Alias(
+      Min(delayedValue).toAggregateExpression(),
+      s"_restricted_row_existence_delayed_min_${proof.sourceValue.name}")()
+    val delayedMax = Alias(
+      Max(delayedValue).toAggregateExpression(),
+      s"_restricted_row_existence_delayed_max_${proof.sourceValue.name}")()
+
+    val groupingAttributes = candidateRowId.toAttribute +: carriedCandidateAttributes
+    val state =
+      Aggregate(
+        groupingAttributes,
+        groupingAttributes ++ Seq(allMin, allMax, delayedMin, delayedMax),
+        restrictedSource)
+    val eligibleRows =
+      Filter(
+        And(
+          And(
+            Not(EqualTo(allMin.toAttribute, allMax.toAttribute)),
+            EqualTo(delayedMin.toAttribute, delayedMax.toAttribute)
+          ),
+          EqualTo(proof.semiKeys.leftNotEqual, delayedMin.toAttribute)
+        ),
+        state
+      )
+    Project(context.output, eligibleRows)
   }
 
   private def analyzePair(
@@ -940,9 +1185,35 @@ case class MergeSelfCorrelatedExistenceState(spark: SparkSession)
   }
 }
 
+/**
+ * Re-run Spark's ordinary column pruning after the late candidate-first rewrite.
+ *
+ * The paired-existence rule runs after Spark's normal ColumnPruning batch. Without this pass,
+ * candidate-first joins carry every attribute from the absorbed inner-join context through both
+ * existence exchanges even when the parent needs only the correlation keys and payload.
+ */
+case class PruneCandidateFirstExistenceColumns(spark: SparkSession) extends Rule[LogicalPlan] {
+  override def apply(plan: LogicalPlan): LogicalPlan = {
+    val hasCandidateFirstMarker = plan.exists {
+      node =>
+        node.expressions.exists {
+          _.exists {
+            case attribute: Attribute
+                if attribute.name.startsWith(
+                  MergeSelfCorrelatedExistenceState.CandidateFirstExistenceAttributePrefix) =>
+              true
+            case _ => false
+          }
+        }
+    }
+    if (hasCandidateFirstMarker) ColumnPruning(plan) else plan
+  }
+}
+
 object MergeSelfCorrelatedExistenceState {
 
   val CandidateFirstExistenceAttributePrefix: String = "_gluten_candidate_first_exists_"
+  val RestrictedCandidateKeyAttributePrefix: String = "_gluten_restricted_candidate_key_"
 
   /** Install one ordered pair of post-RewriteSubquery rules for this Spark session. */
   def registerPostSubqueryRules(spark: SparkSession): Unit = {
@@ -952,11 +1223,15 @@ object MergeSelfCorrelatedExistenceState {
       val firstExisting = current.indexWhere {
         case _: MergeSelfCorrelatedExistenceState => true
         case _: RewriteExistenceJoinRhsDedup => true
+        case _: PruneCandidateFirstExistenceColumns => true
+        case _: EliminateRedundantSelfAggregateJoin => true
         case _ => false
       }
       val retained = current.filterNot {
         case _: MergeSelfCorrelatedExistenceState => true
         case _: RewriteExistenceJoinRhsDedup => true
+        case _: PruneCandidateFirstExistenceColumns => true
+        case _: EliminateRedundantSelfAggregateJoin => true
         case _ => false
       }
       val insertion =
@@ -965,13 +1240,21 @@ object MergeSelfCorrelatedExistenceState {
           current.take(firstExisting).count {
             case _: MergeSelfCorrelatedExistenceState => false
             case _: RewriteExistenceJoinRhsDedup => false
+            case _: PruneCandidateFirstExistenceColumns => false
+            case _: EliminateRedundantSelfAggregateJoin => false
             case _ => true
           }
         }
       experimental.extraOptimizations = retained.patch(
         insertion,
-        Seq(MergeSelfCorrelatedExistenceState(spark), RewriteExistenceJoinRhsDedup(spark)),
-        0)
+        Seq(
+          MergeSelfCorrelatedExistenceState(spark),
+          RewriteExistenceJoinRhsDedup(spark),
+          PruneCandidateFirstExistenceColumns(spark),
+          EliminateRedundantSelfAggregateJoin(spark)
+        ),
+        0
+      )
     }
   }
 

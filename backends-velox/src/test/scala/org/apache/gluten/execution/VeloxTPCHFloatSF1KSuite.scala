@@ -18,7 +18,7 @@ package org.apache.gluten.execution
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, LeftAnti, LeftSemi}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Join, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Join}
 
 import org.scalatest.concurrent.TimeLimits
 import org.scalatest.time.{Seconds, Span}
@@ -282,20 +282,23 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
     // scalastyle:on println
   }
 
-  private def rhsDedupExistenceJoinCount(plan: LogicalPlan): Int = {
-    plan.collect {
-      case Join(_, _: Aggregate, LeftSemi | LeftAnti | _: ExistenceJoin, _, _) => true
-    }.size
-  }
-
-  private def assertQ21UsesGenericExistenceOptimization(
-      df: org.apache.spark.sql.DataFrame): Unit = {
+  private def assertQ21UsesMergedRestrictedRowState(df: org.apache.spark.sql.DataFrame): Unit = {
     val optimizedPlan = df.queryExecution.optimizedPlan
-    val dedupCount = rhsDedupExistenceJoinCount(optimizedPlan)
+    val restrictedRowStateCount = optimizedPlan.collect {
+      case aggregate: Aggregate
+          if aggregate.aggregateExpressions.exists(
+            _.name.startsWith("_restricted_row_existence_")) =>
+        aggregate
+    }.size
+    val remainingExistenceJoinCount = optimizedPlan.collect {
+      case Join(_, _, LeftSemi | LeftAnti | _: ExistenceJoin, _, _) => true
+    }.size
     assert(
-      dedupCount >= 2,
-      "Expected original Q21 SQL to use generic RHS dedup for EXISTS/NOT EXISTS. " +
-        s"Found $dedupCount optimized existence join(s) with aggregate RHS.\n" +
+      restrictedRowStateCount == 1 && remainingExistenceJoinCount == 0,
+      "Expected original Q21 SQL to merge EXISTS/NOT EXISTS into one restricted-row state " +
+        "aggregate without remaining existence joins. " +
+        s"Found $restrictedRowStateCount restricted-row aggregate(s) and " +
+        s"$remainingExistenceJoinCount remaining existence join(s).\n" +
         optimizedPlan.treeString
     )
   }
@@ -332,7 +335,7 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
             s"VeloxTPCHFloatSF1KSuite: Q$qid PRE-COLLECT optimizedPlan with stats:\n" +
               previewDf.queryExecution.stringWithStats)
           if (qid == 21) {
-            assertQ21UsesGenericExistenceOptimization(previewDf)
+            assertQ21UsesMergedRestrictedRowState(previewDf)
           }
           runTPCHQuery(qid, tpchQueries, queriesResults, compareResult = false, noFallBack = false)(
             df => dumpRows(qid, df))

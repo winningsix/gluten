@@ -61,8 +61,9 @@ struct MppFragmentSpec {
   /// today we override to 1/replica when replicated. TODO: scale with N/cores.
   int32_t numDrivers{1};
 
-  /// True when every remote HASH input that directly feeds a keyed FINAL
-  /// aggregation is protected by an intra-task LocalPartition(kRepartition).
+  /// True when a keyed FINAL aggregation is protected by an intra-task
+  /// LocalPartition(kRepartition), either directly above its remote HASH input
+  /// or between an upstream join and the FINAL aggregation.
   /// This makes it correct to run the consumer task with numDrivers > 1:
   /// equal group keys are assigned to exactly one local driver lane.
   bool keyedFinalLocalRepartition{false};
@@ -74,6 +75,11 @@ struct MppFragmentSpec {
   /// task, so a single owned task may use the Scala-supplied driver budget
   /// without creating duplicate final results.
   bool rightSemiProjectMultiDriverSafe{false};
+
+  /// True for a HASH consumer made only of exchange inputs, non-null-aware
+  /// INNER hash joins, projections and filters.  These operators do not
+  /// require singleton ownership, so multiple probe drivers are correct.
+  bool innerJoinMultiDriverSafe{false};
 
   /// Scan split information for table scan nodes in this fragment.
   /// Only populated for scan-containing (leaf) fragments.

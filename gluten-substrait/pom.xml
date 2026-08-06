@@ -126,6 +126,14 @@
       <type>test-jar</type>
       <scope>test</scope>
     </dependency>
+    <!-- Spark's provided dependencies exclude Arrow, but SharedSparkSession loads Spark SQL
+         classes whose public signatures reference ArrowType during ScalaTest discovery. -->
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-vector</artifactId>
+      <version>${arrow.version}</version>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.scalacheck</groupId>
       <artifactId>scalacheck_${scala.binary.version}</artifactId>

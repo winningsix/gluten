@@ -90,7 +90,11 @@ class VeloxBackend {
 
   std::unique_ptr<folly::IOThreadPoolExecutor> ssdCacheExecutor_;
   std::unique_ptr<folly::IOThreadPoolExecutor> ioExecutor_;
-  std::shared_ptr<facebook::velox::memory::MmapAllocator> cacheAllocator_;
+  std::shared_ptr<facebook::velox::memory::MemoryAllocator> cacheAllocator_;
+  // Declared after the allocator so external registration is released before
+  // the allocator can release its backing pages.
+  std::shared_ptr<void> cachePinnedPrewarmLifetime_;
+  std::shared_ptr<void> cachePinnedPersistentLifetime_;
 
   std::string cachePathPrefix_;
   std::string cacheFilePrefix_;

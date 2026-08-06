@@ -259,6 +259,10 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorSessionC
         conf->get<uint32_t>(
             kCudfHivePrefetchThreads,
             kCudfHivePrefetchThreadsDefault));
+    configs["cudf.hive.executor_split_prefetch_concurrency"] =
+        std::to_string(conf->get<uint32_t>(
+            kCudfHiveExecutorSplitPrefetchConcurrency,
+            kCudfHiveExecutorSplitPrefetchConcurrencyDefault));
   }
   configs[facebook::velox::connector::hive::HiveConfig::kMaxPartitionsPerWritersSession] =
       conf->get<std::string>(kMaxPartitions, "10000");

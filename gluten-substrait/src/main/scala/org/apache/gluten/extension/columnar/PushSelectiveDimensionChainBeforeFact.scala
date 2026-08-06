@@ -104,6 +104,17 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
     rewritePlan(plan, blockedByParentCluster = false)
   }
 
+  /**
+   * Apply the same guarded reorder to an already-proven candidate subtree.
+   *
+   * This entry point deliberately skips the session-wide enable flag: the paired-existence rule
+   * invokes it only after isolating the candidate from its correlated RHS branches. Enabling the
+   * global rule earlier can flatten that boundary before the proof runs.
+   */
+  private[columnar] def rewriteProvenCandidate(plan: LogicalPlan): LogicalPlan = {
+    if (plan.resolved) rewritePlan(plan, blockedByParentCluster = false) else plan
+  }
+
   private def rewritePlan(plan: LogicalPlan, blockedByParentCluster: Boolean): LogicalPlan = {
     val blockThisCluster = !blockedByParentCluster && hasCompetingSelectiveEntrances(plan)
     val current =

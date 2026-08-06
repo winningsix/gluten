@@ -71,6 +71,8 @@ const std::string kBloomFilterExpectedNumItems = "spark.gluten.sql.columnar.back
 const std::string kBloomFilterNumBits = "spark.gluten.sql.columnar.backend.velox.bloomFilter.numBits";
 const std::string kBloomFilterMaxNumBits = "spark.gluten.sql.columnar.backend.velox.bloomFilter.maxNumBits";
 const std::string kVeloxSplitPreloadPerDriver = "spark.gluten.sql.columnar.backend.velox.SplitPreloadPerDriver";
+const std::string kVeloxSplitPreloadPerTask = "spark.gluten.sql.columnar.backend.velox.SplitPreloadPerTask";
+const int32_t kVeloxSplitPreloadPerTaskDefault = 0;
 
 const std::string kHashProbeDynamicFilterPushdownEnabled =
     "spark.gluten.sql.columnar.backend.velox.hashProbe.dynamicFilterPushdown.enabled";
@@ -110,6 +112,15 @@ const std::string kExprMaxCompiledRegexes = "spark.gluten.sql.columnar.backend.v
 // memory cache
 const std::string kVeloxMemCacheSize = "spark.gluten.sql.columnar.backend.velox.memCacheSize";
 const uint64_t kVeloxMemCacheSizeDefault = 1073741824; // 1G
+const std::string kVeloxCacheLargestSizeClassPages =
+    "spark.gluten.sql.columnar.backend.velox.cacheLargestSizeClassPages";
+const uint64_t kVeloxCacheLargestSizeClassPagesDefault = 256;
+const std::string kVeloxCacheContiguousEntries = "spark.gluten.sql.columnar.backend.velox.cacheContiguousEntries";
+const bool kVeloxCacheContiguousEntriesDefault = false;
+const std::string kVeloxCachePinnedBytes = "spark.gluten.sql.columnar.backend.velox.cachePinnedBytes";
+const uint64_t kVeloxCachePinnedBytesDefault = 0;
+const std::string kVeloxCachePinnedPrewarmBytes = "spark.gluten.sql.columnar.backend.velox.cachePinnedPrewarmBytes";
+const uint64_t kVeloxCachePinnedPrewarmBytesDefault = 0;
 
 // ssd cache
 const std::string kVeloxSsdCacheSize = "spark.gluten.sql.columnar.backend.velox.ssdCacheSize";
@@ -280,6 +291,9 @@ const std::string kCudfExchangeConcatOptimizationEnabledDefault = "true";
 const std::string kCudfGroupbyStreamingMaxDistinctKeys =
     "spark.gluten.sql.columnar.backend.velox.cudf.groupbyStreamingMaxDistinctKeys";
 const std::string kCudfGroupbyStreamingMaxDistinctKeysDefault = "0";
+const std::string kCudfPartialIdentityAggregation =
+    "spark.gluten.sql.columnar.backend.velox.cudf.partialIdentityAggregation";
+const std::string kCudfPartialIdentityAggregationDefault = "false";
 
 const std::string kCudfOrderBySortedRunBytes = "spark.gluten.sql.columnar.backend.velox.cudf.orderBySortedRunBytes";
 const std::string kCudfOrderBySortedRunBytesDefault = "268435456";
@@ -302,6 +316,9 @@ const std::string kCudfOrderByMaxOutputRowsMppDefault = "2147483647";
 // final end-of-stream tail batch may be smaller.
 const std::string kCudfBatchSizeMinThreshold = "spark.gluten.sql.columnar.backend.velox.cudf.batch_size_min_threshold";
 const std::string kCudfBatchSizeMinThresholdDefault = "32000000";
+
+const std::string kCudfBatchSizeMaxThreshold = "spark.gluten.sql.columnar.backend.velox.cudf.batch_size_max_threshold";
+const std::string kCudfBatchSizeMaxThresholdDefault = "2147483647";
 
 // Exchange-specific concat target. It is kept separate so exchange and
 // aggregation can be tuned independently, but both default to 32M: otherwise
@@ -347,12 +364,17 @@ const std::string kCudfHivePrefetchMaxInFlightBytes =
 const uint64_t kCudfHivePrefetchMaxInFlightBytesDefault = 4ULL << 30;
 const std::string kCudfHivePrefetchThreads = "spark.gluten.sql.columnar.backend.velox.cudf.hive.prefetchThreads";
 const uint32_t kCudfHivePrefetchThreadsDefault = 128;
+const std::string kCudfHiveExecutorSplitPrefetchConcurrency =
+    "spark.gluten.sql.columnar.backend.velox.cudf.hive.executorSplitPrefetchConcurrency";
+const uint32_t kCudfHiveExecutorSplitPrefetchConcurrencyDefault = 0;
 
-// Target bytes for UCX partitioned-output accumulation and chunking. When it
-// is not set explicitly, MPP uses kCudfGpuTargetBatchBytes so byte-aware UCX
-// batching follows the configured GPU batch target by default.
+// Target bytes for UCX partitioned-output accumulation and chunking. The
+// high-cardinality partial-identity path uses a smaller default because each
+// window is split across destinations; regular queries retain the configured
+// GPU compute batch target unless this setting is explicit.
 const std::string kCudfPartitionedOutputBatchBytes =
     "spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_bytes";
+const uint64_t kCudfPartitionedOutputBatchBytesPartialIdentityDefault = 64UL << 20;
 
 // Pinned host memory pool size in bytes for fast HtoD/DtoH PCIe transfers.
 // Default "0" uses cudf's default (0.5% of device memory, capped at 64 MB).

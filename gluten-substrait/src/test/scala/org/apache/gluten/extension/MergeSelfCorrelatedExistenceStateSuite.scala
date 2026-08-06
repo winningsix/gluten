@@ -174,6 +174,13 @@ class MergeSelfCorrelatedExistenceStateSuite extends QueryTest with SharedSparkS
     }
   }
 
+  private def hasRestrictedCandidateRowId(plan: LogicalPlan): Boolean = {
+    plan.exists {
+      _.output.exists(
+        _.name.startsWith(MergeSelfCorrelatedExistenceState.RestrictedCandidateKeyAttributePrefix))
+    }
+  }
+
   test("canonical paired EXISTS and NOT EXISTS use one state aggregate and preserve answers") {
     createCanonicalView()
     val raw = rawOptimizedPlan(canonicalSql)
@@ -521,6 +528,21 @@ class MergeSelfCorrelatedExistenceStateSuite extends QueryTest with SharedSparkS
         candidateFirstExistenceJoins(optimized).size == 2,
         s"The first optimizer execution must see both candidate-first probes:\n" +
           optimized.treeString)
+
+      val restrictedRows = withConfigValues(
+        GlutenConfig.MERGE_PAIRED_EXISTENCE_STATE_ENABLED.key -> "true",
+        GlutenConfig.ENABLE_EXISTENCE_JOIN_RHS_DEDUP.key -> "true",
+        GlutenConfig.CANDIDATE_FIRST_EXISTENCE_MODE.key -> "restricted-rowid",
+        GlutenConfig.MERGE_PAIRED_EXISTENCE_STATE_MIN_SOURCE_BYTES.key -> "0",
+        SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> ConvertToLocalRelation.ruleName
+      ) {
+        spark.sessionState.optimizer.execute(analyzed)
+      }
+      assert(
+        hasRestrictedCandidateRowId(restrictedRows) && existenceJoinCount(restrictedRows) == 0,
+        "Production restricted-rowid ordering must consume the raw semi/anti pair:\n" +
+          restrictedRows.treeString
+      )
     } finally {
       experimental.extraOptimizations = original
     }

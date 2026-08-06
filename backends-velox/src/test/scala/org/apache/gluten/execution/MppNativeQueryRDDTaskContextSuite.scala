@@ -28,6 +28,30 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
 class MppNativeQueryRDDTaskContextSuite extends AnyFunSuite with SQLHelper {
 
+  test("query-scoped native settings are captured before RDD serialization") {
+    val capacityKey =
+      "spark.gluten.sql.columnar.backend.velox.cudf.groupbyStreamingMaxDistinctKeys"
+    val partialIdentityKey =
+      "spark.gluten.sql.columnar.backend.velox.cudf.partialIdentityAggregation"
+
+    withSQLConf(capacityKey -> "400000000", partialIdentityKey -> "true") {
+      assert(
+        MppNativeQueryRDD.queryScopedNativeConfSnapshot ==
+          Map(capacityKey -> "400000000", partialIdentityKey -> "true"))
+    }
+  }
+
+  test("SINGLE-gather root uses one native driver without shrinking producer fragments") {
+    val exchangeSpecs =
+      """[
+        | {"producerFragmentId": 0, "consumerFragmentId": 2, "exchangeType": "HASH"},
+        | {"producerFragmentId": 1, "consumerFragmentId": 2, "exchangeType": "HASH"},
+        | {"producerFragmentId": 2, "consumerFragmentId": 3, "exchangeType": "SINGLE"}
+        |]""".stripMargin
+    val actual = MppNativeQueryRDD.singleGatherRootDriverCounts(Array(4, 4, 4, 4), exchangeSpecs)
+    assert(actual.toSeq == Seq(4, 4, 4, 1))
+  }
+
   test("repeated MPP RDD executions in one Spark task receive distinct query IDs") {
     val context = mock(classOf[org.apache.spark.TaskContext])
     when(context.stageId()).thenReturn(23)

@@ -114,6 +114,13 @@ class MppNativeQueryRDD(
     s"replicated Cartesian max build bytes must be non-negative, found " +
       replicatedCartesianMaxBuildBytes)
 
+  // MppNativeQueryRDD instances are constructed on the driver. Capture query-scoped SQLConf here
+  // so the executor receives the values that were active for this query after RDD serialization.
+  private val serializedRuntimeExtraConf = MppNativeQueryRDD.queryScopedNativeConfSnapshot
+
+  private val runtimeNumDriversPerFragment =
+    MppNativeQueryRDD.singleGatherRootDriverCounts(numDriversPerFragment, exchangeSpecsJson)
+
   private val numSparkPartitions: Int =
     if (peerInfos.nonEmpty) peerInfos.length else math.max(1, sparkPartitionCount)
 
@@ -165,6 +172,7 @@ class MppNativeQueryRDD(
     // This launches ALL fragments concurrently (MPP all-stages-up)
     // and wires them together via OutputBufferManager streaming exchange.
     val runtimeExtraConf = new JHashMap[String, String]()
+    serializedRuntimeExtraConf.foreach { case (key, value) => runtimeExtraConf.put(key, value) }
     if (MppNativeQueryRDD.largeParquetScanChunksEnabled) {
       runtimeExtraConf.put(MppNativeQueryRDD.largeParquetScanChunksKey, "true")
     }
@@ -299,7 +307,7 @@ class MppNativeQueryRDD(
       spillRootPath =>
         jniWrapper.nativeCreateMppQuery(
           fragmentPlans,
-          numDriversPerFragment,
+          runtimeNumDriversPerFragment,
           exchangeSpecsJson.getBytes("UTF-8"),
           mppPeerSpecJson.getBytes("UTF-8"),
           localFragmentSplitInfos,
@@ -693,6 +701,34 @@ final private[execution] class MppSpillRootLease(val root: File, deleteRoot: Fil
 
 private[execution] object MppNativeQueryRDD extends Logging {
 
+  private val exchangeEndpointPattern =
+    ("""(?s)"producerFragmentId"\s*:\s*(-?\d+)\s*,\s*""" +
+      """"consumerFragmentId"\s*:\s*(-?\d+)\s*,\s*"exchangeType"\s*:\s*"([^"]+)""").r
+
+  private[execution] def singleGatherRootDriverCounts(
+      driverCounts: Array[Int],
+      exchangeSpecsJson: String): Array[Int] = {
+    val exchanges = exchangeEndpointPattern
+      .findAllMatchIn(Option(exchangeSpecsJson).getOrElse(""))
+      .map(m => (m.group(1).toInt, m.group(2).toInt, m.group(3)))
+      .toSeq
+    val producerIds = exchanges.iterator.map(_._1).toSet
+    val rootIds = exchanges.iterator.map(_._2).filterNot(producerIds.contains).toSet
+    val singleGatherRootIds = rootIds.filter {
+      rootId =>
+        val inbound = exchanges.filter(_._2 == rootId)
+        inbound.nonEmpty && inbound.forall(_._3 == "SINGLE")
+    }
+    val adjusted = driverCounts.clone()
+    singleGatherRootIds.foreach {
+      rootId =>
+        if (rootId >= 0 && rootId < adjusted.length) {
+          adjusted(rootId) = 1
+        }
+    }
+    adjusted
+  }
+
   final private case class InvocationKey(
       queryId: String,
       stageId: Int,
@@ -842,6 +878,20 @@ private[execution] object MppNativeQueryRDD extends Logging {
   val largeParquetScanChunksKey: String = "spark.gluten.mpp.largeParquetScanChunks"
 
   val runtimeTimingProbeKey: String = "spark.gluten.mpp.runtimeTimingProbe"
+
+  // Runtime resources are task-scoped and keyed by extraConf. Forward settings that may be
+  // changed with SET between benchmark queries instead of freezing their SparkConf startup value.
+  private[execution] val queryScopedNativeConf: Seq[(String, String)] = Seq(
+    "spark.gluten.sql.columnar.backend.velox.cudf.groupbyStreamingMaxDistinctKeys" -> "0",
+    "spark.gluten.sql.columnar.backend.velox.cudf.partialIdentityAggregation" -> "false"
+  )
+
+  private[execution] def queryScopedNativeConfSnapshot: Map[String, String] = {
+    val conf = SQLConf.get
+    queryScopedNativeConf.map {
+      case (key, defaultValue) => key -> conf.getConfString(key, defaultValue)
+    }.toMap
+  }
 
   def largeParquetScanChunksEnabled: Boolean =
     SQLConf.get.getConfString(largeParquetScanChunksKey, "false").toBoolean

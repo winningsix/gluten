@@ -873,6 +873,9 @@ std::unordered_map<std::string, std::string> WholeStageResultIterator::getQueryC
     // spark.gluten.sql.columnar.backend.velox.IOThreads is set to 0
     configs[velox::core::QueryConfig::kMaxSplitPreloadPerDriver] =
         std::to_string(veloxCfg_->get<int32_t>(kVeloxSplitPreloadPerDriver, 2));
+    configs[velox::core::QueryConfig::kMaxSplitPreloadPerTask] =
+        std::to_string(veloxCfg_->get<int32_t>(
+            kVeloxSplitPreloadPerTask, kVeloxSplitPreloadPerTaskDefault));
 
     // hashtable build optimizations
     configs[velox::core::QueryConfig::kAbandonDedupHashMapMinRows] =
