@@ -1413,6 +1413,20 @@
       </properties>
     </profile>
     <profile>
+      <id>emr-8.0</id>
+      <activation>
+        <activeByDefault>false</activeByDefault>
+      </activation>
+      <properties>
+        <spark.version>4.0.2</spark.version>
+        <hadoop.version>3.4.2</hadoop.version>
+        <emr.spark.distribution.version>4.0.2-amzn-0</emr.spark.distribution.version>
+        <emr.hadoop.distribution.version>3.4.2-amzn-1</emr.hadoop.distribution.version>
+        <ion-java.version>1.11.9</ion-java.version>
+        <ion-spark-data-source.version>1.0.0</ion-spark-data-source.version>
+      </properties>
+    </profile>
+    <profile>
       <id>arrow-netty</id>
       <activation>
         <activeByDefault>false</activeByDefault>

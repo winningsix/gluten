@@ -2337,6 +2337,40 @@ void MppQueryCoordinator::logOperatorMetrics() const {
           row["numMemoryAllocations"] = static_cast<int64_t>(opStats.memoryStats.numMemoryAllocations);
           row["spilledBytes"] = static_cast<int64_t>(opStats.spilledBytes);
           row["spilledRows"] = static_cast<int64_t>(opStats.spilledRows);
+          const bool includeExchangeRuntimeStats =
+              opStats.operatorType == "UcxExchange";
+          const bool includeTopNRuntimeStats =
+              opStats.operatorType == "CudfTopNRowNumber";
+          const bool includeHashJoinRuntimeStats =
+              opStats.operatorType == "CudfHashJoinBuild" ||
+              opStats.operatorType == "CudfHashJoinProbe";
+          if (opStats.operatorType == "TableScan" ||
+              includeExchangeRuntimeStats || includeTopNRuntimeStats ||
+              includeHashJoinRuntimeStats) {
+            folly::dynamic runtimeStats = folly::dynamic::object;
+            for (const auto& [name, metric] : opStats.runtimeStats) {
+              const bool includeScanMetric =
+                  opStats.operatorType == "TableScan" &&
+                  (name.starts_with("cudf") || name == "totalScanTime");
+              const bool includeExchangeMetric =
+                  includeExchangeRuntimeStats &&
+                  (name.starts_with("ucxExchangeSource.") ||
+                   name == "peakBytes" || name == "numReceivedPages" ||
+                   name == "averageReceivedPageBytes");
+              if (!includeScanMetric && !includeExchangeMetric &&
+                  !includeTopNRuntimeStats && !includeHashJoinRuntimeStats) {
+                continue;
+              }
+              folly::dynamic value = folly::dynamic::object;
+              value["sum"] = metric.sum;
+              value["count"] = static_cast<int64_t>(metric.count);
+              value["min"] = metric.min;
+              value["max"] = metric.max;
+              value["unit"] = static_cast<int64_t>(metric.unit);
+              runtimeStats[name] = std::move(value);
+            }
+            row["runtimeStats"] = std::move(runtimeStats);
+          }
           LOG(WARNING) << "[MPP_OPERATOR_METRICS] " << folly::toJson(row);
           ++emitted;
         }

@@ -339,6 +339,96 @@ object MppRangeBoundsGenerator extends Logging {
     Some(Result(encode(ordering, rows), rows.length))
   }
 
+  /**
+   * Build RANGE boundaries from an explicitly configured matrix of integral values. Rows are
+   * separated by semicolons, columns by commas, and `null` is accepted for trailing sentinels.
+   * Repeated full-key rows opt the native partitioner into safely striping only keys exactly equal
+   * to those repeats across their adjacent partition-id span.
+   */
+  def fromExplicitIntegralBounds(
+      ordering: Seq[SortOrder],
+      encodedBounds: String,
+      requestedPartitions: Int): Option[Result] = {
+    val raw = encodedBounds.trim
+    if (raw.isEmpty) {
+      return None
+    }
+    require(ordering.nonEmpty, "MPP RANGE explicit bounds require at least one SortOrder")
+    require(
+      requestedPartitions > 1,
+      s"MPP RANGE explicit bounds require at least two partitions: $requestedPartitions")
+    ordering.foreach {
+      order =>
+        require(
+          supportsIntegralInterval(order.dataType),
+          s"MPP RANGE explicit bounds require integral keys, found " +
+            order.dataType.catalogString)
+    }
+
+    val parsed = raw.split(";", -1).toSeq.map {
+      encodedRow =>
+        require(encodedRow.trim.nonEmpty, "MPP RANGE explicit bounds contain an empty row")
+        val values = encodedRow.split(",", -1).toSeq.map(_.trim)
+        require(
+          values.size == ordering.size,
+          s"MPP RANGE explicit boundary width ${values.size} does not match " +
+            s"${ordering.size} sort keys: $encodedRow")
+        values.zip(ordering).map {
+          case (value, _) if value.equalsIgnoreCase("null") => null
+          case (value, order) => explicitIntegralValue(value, order.dataType)
+        }
+    }
+    require(parsed.nonEmpty, "MPP RANGE explicit bounds cannot be empty")
+    require(
+      parsed.size < requestedPartitions,
+      s"MPP RANGE explicit boundary count ${parsed.size} must be smaller than " +
+        s"$requestedPartitions partitions")
+
+    val projection = UnsafeProjection.create(ordering.map(_.dataType).toArray)
+    val rows: Array[InternalRow] = parsed.map {
+      values => projection(new GenericInternalRow(values.toArray[Any])).copy(): InternalRow
+    }.toArray
+    val boundOrdering = new LazilyGeneratedOrdering(ordering.zipWithIndex.map {
+      case (order, index) =>
+        order.copy(child = BoundReference(index, order.dataType, order.nullable))
+    })
+    val comparisons =
+      rows.sliding(2).map(pair => boundOrdering.compare(pair(0), pair(1))).toArray
+    require(
+      comparisons.forall(_ <= 0),
+      "MPP RANGE explicit boundaries must be nondecreasing in the declared sort order")
+    val splitEqualKeys = comparisons.contains(0)
+    Some(Result(encode(ordering, rows, splitEqualKeys), rows.length))
+  }
+
+  private def explicitIntegralValue(raw: String, dataType: DataType): Any = {
+    val value = Try(raw.toLong).getOrElse {
+      throw new IllegalArgumentException(s"MPP RANGE explicit integral value is invalid: $raw")
+    }
+    dataType match {
+      case ByteType =>
+        require(
+          value >= Byte.MinValue && value <= Byte.MaxValue,
+          s"Byte boundary out of range: $raw")
+        value.toByte
+      case ShortType =>
+        require(
+          value >= Short.MinValue && value <= Short.MaxValue,
+          s"Short boundary out of range: $raw")
+        value.toShort
+      case IntegerType | DateType =>
+        require(
+          value >= Int.MinValue && value <= Int.MaxValue,
+          s"Integer boundary out of range: $raw")
+        value.toInt
+      case LongType | TimestampType => value
+      case timestampNtz if timestampNtz.typeName == "timestamp_ntz" => value
+      case other =>
+        throw new IllegalArgumentException(
+          s"MPP RANGE explicit bounds cannot encode ${other.catalogString}")
+    }
+  }
+
   private def parseBasicIsoDate(encoded: Long): Option[LocalDate] = {
     val text = encoded.toString
     if (text.length != 8) {
@@ -757,10 +847,16 @@ object MppRangeBoundsGenerator extends Logging {
     value
   }
 
-  private[utils] def encode(ordering: Seq[SortOrder], bounds: Array[InternalRow]): String = {
+  private[utils] def encode(
+      ordering: Seq[SortOrder],
+      bounds: Array[InternalRow],
+      splitEqualKeys: Boolean = false): String = {
     val mapper = new ObjectMapper
     val root = mapper.createObjectNode()
     root.put("version", 1)
+    if (splitEqualKeys) {
+      root.put("splitEqualKeys", true)
+    }
     val keys = root.putArray("keys")
     ordering.foreach {
       order =>

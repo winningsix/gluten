@@ -139,7 +139,7 @@ class VeloxListenerApi extends ListenerApi with Logging {
     UdfJniWrapper.registerFunctionSignatures()
 
     if (inLocalMode(conf)) {
-      initializeGpuConcurrency(conf)
+      initializeGpuMemoryTracker(conf)
     }
     GlutenMppDriverService.init(conf)
     GlutenMppDriverService.get().foreach {
@@ -176,7 +176,7 @@ class VeloxListenerApi extends ListenerApi with Logging {
 
     SparkDirectoryUtil.init(conf)
     initialize(conf, isDriver = false)
-    initializeGpuConcurrency(conf)
+    initializeGpuMemoryTracker(conf)
     addIfNeedMemoryDumpShutdownHook(conf)
     GlutenMppExecutorService.onExecutorStart(pc)
   }
@@ -258,54 +258,10 @@ class VeloxListenerApi extends ListenerApi with Logging {
     GlutenFormatFactory.register(new VeloxRowSplitter())
   }
 
-  private def initializeGpuConcurrency(conf: SparkConf): Unit = {
+  private def initializeGpuMemoryTracker(conf: SparkConf): Unit = {
     val cudfEnabled = conf.getBoolean(GlutenConfig.COLUMNAR_CUDF_ENABLED.key, false)
     if (!cudfEnabled) {
       return
-    }
-
-    val gpuMemorySize = conf
-      .getOption(CUDF_GPU_MEMORY_SIZE.key)
-      .map(_.toLong)
-      .getOrElse {
-        val memPercent = conf.getInt(CUDF_MEMORY_PERCENT.key, 50)
-        val detectedGpuMem =
-          try {
-            val total = GpuMemoryTrackerJniWrapper.getDeviceMemorySize()
-            if (total > 0) {
-              logInfo(s"Detected GPU device memory: ${total / (1024 * 1024)}MB")
-              total
-            } else {
-              logWarning("GPU memory detection returned 0, falling back to 16GB estimate")
-              16L * 1024 * 1024 * 1024
-            }
-          } catch {
-            case e: UnsatisfiedLinkError =>
-              logWarning(
-                s"getDeviceMemorySize JNI not available, falling back to 16GB estimate: " +
-                  s"${e.getMessage}")
-              16L * 1024 * 1024 * 1024
-          }
-        detectedGpuMem * memPercent / 100
-      }
-
-    val gpuBatchBytes =
-      conf.getLong(CUDF_GPU_TARGET_BATCH_BYTES.key, CUDF_GPU_TARGET_BATCH_BYTES.defaultValue.get)
-    val concurrentTasks = conf.getOption(CUDF_CONCURRENT_GPU_TASKS.key).map(_.toInt)
-    val maxConcurrent = concurrentTasks.getOrElse {
-      math.max(1, math.min(4, gpuMemorySize / (4 * math.max(gpuBatchBytes, 1)))).toInt
-    }
-
-    try {
-      GpuMemoryTrackerJniWrapper.setMaxConcurrentGpuTasks(maxConcurrent)
-      logInfo(
-        s"C++ GpuLock configured: maxConcurrent=$maxConcurrent, " +
-          s"gpuMemory=${gpuMemorySize / (1024 * 1024)}MB, " +
-          s"batchBytes=${gpuBatchBytes / (1024 * 1024)}MB")
-    } catch {
-      case e: UnsatisfiedLinkError =>
-        logWarning(
-          s"setMaxConcurrentGpuTasks JNI not available, using default (serial): ${e.getMessage}")
     }
 
     try {

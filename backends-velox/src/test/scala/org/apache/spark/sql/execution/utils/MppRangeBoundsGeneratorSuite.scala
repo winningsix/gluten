@@ -161,6 +161,38 @@ class MppRangeBoundsGeneratorSuite extends SparkFunSuite {
             bounds.get(index).get(2).get("isNull").asBoolean()))
   }
 
+  test("explicit integral bounds preserve repeats for equal-key splitting") {
+    val date = AttributeReference("fact_date", IntegerType, nullable = false)()
+    val utcDate = AttributeReference("fact_utc_date", IntegerType, nullable = false)()
+    val ordering = Seq(
+      SortOrder(date, Ascending, NullsFirst, Seq.empty),
+      SortOrder(utcDate, Ascending, NullsFirst, Seq.empty))
+
+    val result = MppRangeBoundsGenerator
+      .fromExplicitIntegralBounds(
+        ordering,
+        "20241231,20260101;20241231,20260101;20260111,null",
+        requestedPartitions = 4)
+      .get
+    val descriptor = new ObjectMapper().readTree(result.json)
+
+    assert(result.effectivePartitions == 4)
+    assert(descriptor.get("splitEqualKeys").asBoolean())
+    assert(descriptor.get("bounds").size() == 3)
+    assert(descriptor.get("bounds").get(0) == descriptor.get("bounds").get(1))
+    assert(descriptor.get("bounds").get(2).get(1).get("isNull").asBoolean())
+  }
+
+  test("explicit integral bounds reject decreasing rows") {
+    val key = AttributeReference("k", IntegerType, nullable = false)()
+    val ordering = Seq(SortOrder(key, Ascending, NullsFirst, Seq.empty))
+
+    val error = intercept[IllegalArgumentException] {
+      MppRangeBoundsGenerator.fromExplicitIntegralBounds(ordering, "20;10", requestedPartitions = 3)
+    }
+    assert(error.getMessage.contains("must be nondecreasing"))
+  }
+
   test("D1 type guard rejects Spark 4 collated strings when that API is available") {
     StringType.getClass.getMethods
       .find(

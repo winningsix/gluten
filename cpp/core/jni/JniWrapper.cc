@@ -1359,6 +1359,118 @@ JNIEXPORT jobject JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSeriali
   JNI_METHOD_END(nullptr)
 }
 
+JNIEXPORT jobject JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSerializerJniWrapper_serializeMany( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jlongArray handles) {
+  JNI_METHOD_START
+  auto ctx = getRuntime(env, wrapper);
+  const auto numBatches = env->GetArrayLength(handles);
+  GLUTEN_CHECK(numBatches > 0, "Cannot serialize an empty batch group");
+  auto safeHandles = getLongArrayElementsSafe(env, handles);
+  std::vector<std::shared_ptr<ColumnarBatch>> batches;
+  batches.reserve(numBatches);
+  for (int32_t index = 0; index < numBatches; ++index) {
+    auto batch = ObjectStore::retrieve<ColumnarBatch>(safeHandles.elems()[index]);
+    GLUTEN_CHECK(
+        batch != nullptr,
+        "Cannot find the ColumnarBatch with handle " +
+            std::to_string(safeHandles.elems()[index]));
+    batches.push_back(std::move(batch));
+  }
+
+  auto serializer = ctx->createColumnarBatchSerializer(nullptr);
+  serializer->appendMany(batches);
+  auto serializedSize = serializer->maxSerializedSize();
+  auto byteBuffer = env->CallStaticObjectMethod(
+      jniUnsafeByteBufferClass, jniUnsafeByteBufferAllocate, serializedSize);
+  auto byteBufferAddress =
+      env->CallLongMethod(byteBuffer, jniUnsafeByteBufferAddress);
+  auto byteBufferSize = env->CallLongMethod(byteBuffer, jniUnsafeByteBufferSize);
+  serializer->serializeTo(
+      reinterpret_cast<uint8_t*>(byteBufferAddress), byteBufferSize);
+  return byteBuffer;
+  JNI_METHOD_END(nullptr)
+}
+
+JNIEXPORT jlong JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSerializerJniWrapper_initParquetFileWriter( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jstring jpath) {
+  JNI_METHOD_START
+  auto ctx = getRuntime(env, wrapper);
+  auto serializer = std::shared_ptr<ColumnarBatchSerializer>(
+      ctx->createColumnarBatchSerializer(nullptr));
+  serializer->beginParquetFile(jStringToCString(env, jpath));
+  return ctx->saveObject(serializer);
+  JNI_METHOD_END(kInvalidObjectHandle)
+}
+
+JNIEXPORT jlong JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSerializerJniWrapper_appendParquetFileWriter( // NOLINT
+    JNIEnv* env,
+    jobject,
+    jlong writerHandle,
+    jlong batchHandle) {
+  JNI_METHOD_START
+  auto serializer = ObjectStore::retrieve<ColumnarBatchSerializer>(writerHandle);
+  GLUTEN_CHECK(serializer != nullptr, "Cannot find the Parquet cache writer");
+  auto batch = ObjectStore::retrieve<ColumnarBatch>(batchHandle);
+  GLUTEN_CHECK(
+      batch != nullptr,
+      "Cannot find the ColumnarBatch with handle " +
+          std::to_string(batchHandle));
+  return serializer->appendParquetFile(batch);
+  JNI_METHOD_END(-1)
+}
+
+JNIEXPORT jlong JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSerializerJniWrapper_appendParquetFileWriterMany( // NOLINT
+    JNIEnv* env,
+    jobject,
+    jlong writerHandle,
+    jlongArray handles) {
+  JNI_METHOD_START
+  auto serializer = ObjectStore::retrieve<ColumnarBatchSerializer>(writerHandle);
+  GLUTEN_CHECK(serializer != nullptr, "Cannot find the Parquet cache writer");
+  const auto numBatches = env->GetArrayLength(handles);
+  GLUTEN_CHECK(numBatches > 0, "Cannot append an empty Parquet cache micro-batch");
+  auto safeHandles = getLongArrayElementsSafe(env, handles);
+  std::vector<std::shared_ptr<ColumnarBatch>> batches;
+  batches.reserve(numBatches);
+  for (int32_t index = 0; index < numBatches; ++index) {
+    const auto handle = safeHandles.elems()[index];
+    auto batch = ObjectStore::retrieve<ColumnarBatch>(handle);
+    GLUTEN_CHECK(
+        batch != nullptr,
+        "Cannot find the ColumnarBatch with handle " + std::to_string(handle));
+    batches.push_back(std::move(batch));
+  }
+  return serializer->appendParquetFileMany(batches);
+  JNI_METHOD_END(-1)
+}
+
+JNIEXPORT jlong JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSerializerJniWrapper_finishParquetFileWriter( // NOLINT
+    JNIEnv* env,
+    jobject,
+    jlong writerHandle) {
+  JNI_METHOD_START
+  auto serializer = ObjectStore::retrieve<ColumnarBatchSerializer>(writerHandle);
+  GLUTEN_CHECK(serializer != nullptr, "Cannot find the Parquet cache writer");
+  const auto finalBytes = serializer->finishParquetFile();
+  ObjectStore::release(writerHandle);
+  return finalBytes;
+  JNI_METHOD_END(-1)
+}
+
+JNIEXPORT void JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSerializerJniWrapper_drainParquetFileWriters( // NOLINT
+    JNIEnv* env,
+    jobject wrapper) {
+  JNI_METHOD_START
+  auto ctx = getRuntime(env, wrapper);
+  auto serializer = ctx->createColumnarBatchSerializer(nullptr);
+  serializer->drainParquetFileWrites();
+  JNI_METHOD_END()
+}
+
 JNIEXPORT jlong JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSerializerJniWrapper_init( // NOLINT
     JNIEnv* env,
     jobject wrapper,
@@ -1398,6 +1510,68 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSerialize
   auto serializer = ObjectStore::retrieve<ColumnarBatchSerializer>(serializerHandle);
   GLUTEN_DCHECK(serializer != nullptr, "ColumnarBatchSerializer cannot be null");
   auto batch = serializer->deserialize((uint8_t*)address, size);
+  return ctx->saveObject(batch);
+  JNI_METHOD_END(kInvalidObjectHandle)
+}
+
+JNIEXPORT jlong JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSerializerJniWrapper_deserializeDirectSelected( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jlong serializerHandle,
+    jlong address,
+    jint size,
+    jintArray jcolumnIndices) {
+  JNI_METHOD_START
+  auto ctx = gluten::getRuntime(env, wrapper);
+
+  auto serializer = ObjectStore::retrieve<ColumnarBatchSerializer>(serializerHandle);
+  GLUTEN_DCHECK(serializer != nullptr, "ColumnarBatchSerializer cannot be null");
+  auto safeArray = getIntArrayElementsSafe(env, jcolumnIndices);
+  const auto numColumns = env->GetArrayLength(jcolumnIndices);
+  std::vector<int32_t> columnIndices;
+  columnIndices.reserve(numColumns);
+  for (int32_t index = 0; index < numColumns; ++index) {
+    columnIndices.push_back(safeArray.elems()[index]);
+  }
+  auto batch = serializer->deserializeSelected(
+      reinterpret_cast<uint8_t*>(address), size, columnIndices);
+  return ctx->saveObject(batch);
+  JNI_METHOD_END(kInvalidObjectHandle)
+}
+
+JNIEXPORT jlong JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSerializerJniWrapper_deserializeParquetFile( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jlong serializerHandle,
+    jstring jpath) {
+  JNI_METHOD_START
+  auto ctx = gluten::getRuntime(env, wrapper);
+  auto serializer = ObjectStore::retrieve<ColumnarBatchSerializer>(serializerHandle);
+  GLUTEN_DCHECK(serializer != nullptr, "ColumnarBatchSerializer cannot be null");
+  auto batch = serializer->deserializeParquetFile(jStringToCString(env, jpath));
+  return ctx->saveObject(batch);
+  JNI_METHOD_END(kInvalidObjectHandle)
+}
+
+JNIEXPORT jlong JNICALL Java_org_apache_gluten_vectorized_ColumnarBatchSerializerJniWrapper_deserializeParquetFileSelected( // NOLINT
+    JNIEnv* env,
+    jobject wrapper,
+    jlong serializerHandle,
+    jstring jpath,
+    jintArray jcolumnIndices) {
+  JNI_METHOD_START
+  auto ctx = gluten::getRuntime(env, wrapper);
+  auto serializer = ObjectStore::retrieve<ColumnarBatchSerializer>(serializerHandle);
+  GLUTEN_DCHECK(serializer != nullptr, "ColumnarBatchSerializer cannot be null");
+  auto safeArray = getIntArrayElementsSafe(env, jcolumnIndices);
+  const auto numColumns = env->GetArrayLength(jcolumnIndices);
+  std::vector<int32_t> columnIndices;
+  columnIndices.reserve(numColumns);
+  for (int32_t index = 0; index < numColumns; ++index) {
+    columnIndices.push_back(safeArray.elems()[index]);
+  }
+  auto batch = serializer->deserializeParquetFileSelected(
+      jStringToCString(env, jpath), columnIndices);
   return ctx->saveObject(batch);
   JNI_METHOD_END(kInvalidObjectHandle)
 }

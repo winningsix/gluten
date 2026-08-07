@@ -413,6 +413,15 @@ class MppCollapseRuleRowBoundarySuite extends SparkFunSuite {
     assert(mpp.child.find(node => MppJvmStreamInputMatcher.scan(node).contains(scan)).isDefined)
   }
 
+  test("a direct batch ExistingRDD under a native operator is an exact ingress") {
+    val attr = AttributeReference("a", IntegerType, nullable = true)()
+    val scan = existingRddScan(attr)
+    val nativeSuffix = ProjectExecTransformer(scan.output, scan)
+    val rule = MppCollapseRule(new GlutenConfig(SQLConf.get))
+
+    assert(rule.isSupportedJvmStreamHybridPlan(nativeSuffix))
+  }
+
   test("an ingress-only ExistingRDD plan gets an identity native fragment anchor") {
     val attr = AttributeReference("a", IntegerType, nullable = true)()
     val scan = existingRddScan(attr)

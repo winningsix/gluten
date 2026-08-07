@@ -46,7 +46,7 @@ object FallbackUtil extends Logging with AdaptiveSparkPlanHelper {
         true
       case InputAdapter(_) =>
         true
-      case AdaptiveSparkPlanExec(_, _, _, _, _) =>
+      case _: AdaptiveSparkPlanExec =>
         true
       case AQEShuffleReadExec(_, _) =>
         true

@@ -18,9 +18,10 @@ package org.apache.gluten.execution
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, AttributeReference, Literal, Rand, SortOrder}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, AttributeReference, Cast, Literal, Rand, SortOrder}
+import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.execution.{LeafExecNode, ProjectExec}
-import org.apache.spark.sql.types.{MapType, StringType}
+import org.apache.spark.sql.types.{IntegerType, MapType, StringType}
 
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -81,5 +82,39 @@ class MppHashJoinInputSortRewriteSuite extends AnyFunSuite {
 
     assert(rewritten.strippedSorts == 0)
     assert(rewritten.plan eq sort)
+  }
+
+  test("hash join partitioning requires the same ordered key sequence") {
+    val first = AttributeReference("first_key", IntegerType)()
+    val second = AttributeReference("second_key", IntegerType)()
+    val third = AttributeReference("third_key", IntegerType)()
+
+    assert(
+      MppHashJoinPartitioning
+        .exactlyMatches(HashPartitioning(Seq(first, second, third), 16), Seq(first, second, third)))
+    assert(
+      !MppHashJoinPartitioning
+        .exactlyMatches(HashPartitioning(Seq(second, first, third), 16), Seq(first, second, third)))
+  }
+
+  test("computed hash join keys are materialized as physical partition channels") {
+    val accountId = AttributeReference("account_id", IntegerType)()
+    val adjustmentId = AttributeReference("adjustment_id", StringType)()
+    val periodString = AttributeReference("period_string", StringType)()
+    val computedPeriod = Cast(periodString, IntegerType)
+
+    val result = MppHashJoinPartitioning.materializeKeys(
+      Seq(accountId, adjustmentId, periodString),
+      Seq(accountId, adjustmentId, computedPeriod),
+      "__test_hash_key")
+
+    assert(result.addedKeys == 1)
+    assert(result.projectList.size == 4)
+    assert(result.partitionKeys.size == 3)
+    assert(result.partitionKeys.take(2).map(_.exprId) == Seq(accountId.exprId, adjustmentId.exprId))
+    assert(result.partitionKeys.last.name == "__test_hash_key_2")
+    val materializedAlias = result.projectList.last.asInstanceOf[Alias]
+    assert(materializedAlias.child.semanticEquals(computedPeriod))
+    assert(materializedAlias.toAttribute.exprId == result.partitionKeys.last.exprId)
   }
 }

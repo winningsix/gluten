@@ -109,6 +109,15 @@ abstract class HashAggregateExecBaseTransformer(
   }
 
   override protected def doValidateInternal(): ValidationResult = {
+    // A zero-column batch can still carry a non-zero row count in Spark (for example,
+    // InMemoryTableScan under count(1)). cuDF tables cannot represent that state: a table
+    // without columns reports zero rows. Keep this aggregate on Spark so the cache serializer's
+    // empty-row iterator preserves the CachedBatch row count without decoding its payload.
+    if (child.output.isEmpty) {
+      return ValidationResult.failed(
+        "Native aggregation cannot preserve the row count of a zero-column input")
+    }
+
     val substraitContext = new SubstraitContext
     val operatorId = substraitContext.nextOperatorId(this.nodeName)
     val aggParams = new AggregationParams

@@ -151,6 +151,20 @@ class VeloxColumnarCacheSuite extends VeloxWholeStageTransformerSuite with Adapt
     }
   }
 
+  test("DISK_ONLY columnar cache restores selected columns in requested order") {
+    val source = spark.table("lineitem")
+    val cached = source.persist(StorageLevel.DISK_ONLY)
+    try {
+      // Exercise native cache projection instead of restoring the full cached
+      // payload and applying a Spark-side projection afterwards.
+      checkAnswer(
+        cached.select("l_comment", "l_orderkey"),
+        source.select("l_comment", "l_orderkey"))
+    } finally {
+      cached.unpersist()
+    }
+  }
+
   test("Support transform count(1) with table cache") {
     val cached = spark.table("lineitem").cache()
     try {

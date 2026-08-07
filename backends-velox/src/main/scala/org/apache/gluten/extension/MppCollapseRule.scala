@@ -30,7 +30,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, PlanExpression, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExecBase, ColumnarToRowExec, CommandResultExec, DeserializeToObjectExec, FilterExec, GenerateExec, ProjectExec, RowToColumnarExec, ScalarSubquery, SortExec, SparkPlan}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExecBase, ColumnarToRowExec, CommandResultExec, DeserializeToObjectExec, FilterExec, GenerateExec, ProjectExec, RDDScanExec, RowToColumnarExec, ScalarSubquery, SortExec, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
@@ -218,7 +218,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
               "the V2 writer remains the row/commit boundary and MppNativeQueryExec.doExecute " +
               "performs its final native-to-row conversion")
         }
-        collapseMppOrArrowHybrid(writeNormalization.plan) match {
+        val writeQuery = bridgeV2WriteCacheIngress(writeNormalization.plan)
+        collapseMppOrArrowHybrid(writeQuery) match {
           case Some(mppQuery) =>
             logWarning(
               s"MppCollapseRule: *** MPP MODE ACTIVE UNDER V2 WRITE *** " +
@@ -305,6 +306,31 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
 
   private def failOnFallback: Boolean = {
     SQLConf.get.getConfString("spark.gluten.mpp.failOnFallback", "false").toBoolean
+  }
+
+  /**
+   * Preserve Spark's already-materialized cache semantics while exposing the V2-write input through
+   * an exact columnar RDD ingress.
+   *
+   * Admitting InMemoryTableScanExec directly as a generic MPP stream changes how the eager cache
+   * actions are planned and fragments the native cache producer into very small batches. Building
+   * the columnar RDD here is lazy: the cache remains the data source, including its projection and
+   * predicates, but the final distributed write sees a stable columnar RDD leaf. This avoids a
+   * CudfVector -> UnsafeRow -> CudfVector round trip. The rewrite is deliberately invoked only for
+   * the V2 writer's query child.
+   */
+  private def bridgeV2WriteCacheIngress(plan: SparkPlan): SparkPlan = {
+    var bridged = 0
+    val rewritten = plan.transformUp {
+      case cache: InMemoryTableScanExec =>
+        bridged += 1
+        MppColumnarRDDScanExec(cache.output, cache.executeColumnar())
+    }
+    if (bridged > 0) {
+      logInfo(
+        s"MppCollapseRule: bridged $bridged V2-write cache input(s) through exact columnar RDD")
+    }
+    rewritten
   }
 
   /**
@@ -952,6 +978,9 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
   }
 
   private def isExactJvmStreamIngress(plan: SparkPlan): Boolean = plan match {
+    case scan: MppColumnarRDDScanExec =>
+      MppJvmStreamInputMatcher.rowInput(scan).isDefined
+    case scan: RDDScanExec => MppJvmStreamInputMatcher.rowInput(scan).isDefined
     case r2c: RowToColumnarExecBase => MppJvmStreamInputMatcher.rowInput(r2c).isDefined
     case r2c: RowToColumnarExec => MppJvmStreamInputMatcher.rowInput(r2c).isDefined
     case cache: InMemoryTableScanExec =>
@@ -997,12 +1026,18 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
             python.getTagValue(ARROW_SCALAR_NORMALIZATION_REJECTION_TAG).get)
         false
 
-      // Native-supported operators
-      case _: TransformSupport =>
-        plan.children.forall(isNativeSupported(_, allowJvmStreamIngress))
-
       // Exact matched rowInput is the only permitted JVM-backed input slot. Do not recurse into
       // it: MppNativeQueryExec captures and columnarizes the row plan as a local stream.
+      //
+      // Keep these cases before the generic TransformSupport case. RowToVeloxColumnarExec
+      // implements both RowToColumnarExecBase and TransformSupport; matching TransformSupport
+      // first incorrectly recurses into its RDDScanExec child and rejects the exact ingress.
+      case scan: MppColumnarRDDScanExec
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(scan).isDefined =>
+        true
+      case scan: RDDScanExec
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(scan).isDefined =>
+        true
       case r2c: RowToColumnarExecBase
           if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(r2c).isDefined =>
         true
@@ -1012,6 +1047,10 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case cache: InMemoryTableScanExec
           if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(cache).isDefined =>
         true
+
+      // Native-supported operators
+      case _: TransformSupport =>
+        plan.children.forall(isNativeSupported(_, allowJvmStreamIngress))
 
       // A remaining row transition is a real execution boundary. The only C2R shape that MPP may
       // elide is an identity C2R directly over Gluten's ColumnarExchange under a V2 write; that
@@ -1130,8 +1169,12 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
         Some(
           s"${python.getClass.getSimpleName}: " +
             python.getTagValue(ARROW_SCALAR_NORMALIZATION_REJECTION_TAG).get)
-      case _: TransformSupport =>
-        findInChildren(plan)
+      case scan: MppColumnarRDDScanExec
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(scan).isDefined =>
+        None
+      case scan: RDDScanExec
+          if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(scan).isDefined =>
+        None
       case r2c: RowToColumnarExecBase
           if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(r2c).isDefined =>
         None
@@ -1141,6 +1184,8 @@ case class MppCollapseRule(glutenConf: GlutenConfig) extends Rule[SparkPlan] wit
       case cache: InMemoryTableScanExec
           if allowJvmStreamIngress && MppJvmStreamInputMatcher.rowInput(cache).isDefined =>
         None
+      case _: TransformSupport =>
+        findInChildren(plan)
       case c2r: ColumnarToRowExecBase =>
         Some(describeExecutionBoundary(c2r, "native-to-row"))
       case c2r: ColumnarToRowExec =>

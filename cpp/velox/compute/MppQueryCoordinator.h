@@ -313,6 +313,10 @@ class MppQueryCoordinator {
   int32_t rootFetchCursor_{0};
   bool rootProducesOutput_{true};
   bool deviceRootOutput_{false};
+  /// True when a terminal GPU sink consumes root output in this executor.
+  /// The owning CudfVector then travels through a local queue without UCX
+  /// packing or an intermediate D2D copy.
+  bool localDeviceRootOutput_{false};
 #ifdef GLUTEN_ENABLE_GPU
   /// Root UCX buffers are synchronized by the producer before publication.
   /// Associate them with a coordinator-owned non-default stream so downstream
@@ -321,6 +325,14 @@ class MppQueryCoordinator {
 #endif
   /// True for RANGE (order-preserving) drain; false for round-robin.
   bool rootDrainSequential_{false};
+#ifdef GLUTEN_ENABLE_GPU
+  bool rootDeviceFetchStarted_{false};
+  std::chrono::steady_clock::time_point rootDeviceFetchLastProgressLog_;
+  std::vector<uint64_t> rootDeviceFetchNotReadyPolls_;
+  std::vector<uint64_t> rootDeviceFetchDequeues_;
+  std::vector<uint64_t> rootDeviceFetchRows_;
+  std::vector<uint64_t> rootDeviceFetchBytes_;
+#endif
 
   /// Watchdog thread periodically (every 5s after start) logs state of
   /// every (fragId, replicaIdx) Task so we can diagnose where the pipeline

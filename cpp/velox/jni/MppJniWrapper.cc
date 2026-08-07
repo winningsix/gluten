@@ -282,6 +282,10 @@ std::unordered_map<std::string, std::string> buildMppQueryConfig(
       std::to_string(veloxCfg->get<uint64_t>(
           kCudfPartitionedOutputBatchBytes,
           partitionedOutputBatchBytesDefault));
+  configs[velox::core::QueryConfig::kUcxPartitionedOutputBatchRows] =
+      std::to_string(veloxCfg->get<int64_t>(
+          "spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_rows",
+          32'000'000));
 #endif
 
   try {

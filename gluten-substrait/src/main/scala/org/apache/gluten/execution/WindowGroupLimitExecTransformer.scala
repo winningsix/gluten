@@ -122,7 +122,9 @@ case class WindowGroupLimitExecTransformer(
       }
       val message = StringValue
         .newBuilder()
-        .setValue(s"WindowGroupLimitParameters:window_function=$windowFunction\n")
+        .setValue(
+          s"WindowGroupLimitParameters:window_function=$windowFunction\n" +
+            s"partial_output=${mode == GlutenPartial}\n")
         .build()
       val extensionNode = ExtensionBuilder.makeAdvancedExtension(
         BackendsApiManager.getTransformerApiInstance.packPBMessage(message),

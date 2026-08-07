@@ -103,12 +103,8 @@ private object ShuffleManagerRouter {
     }
 
     def store(shuffleId: Int, manager: ShuffleManager): ShuffleManager = {
-      cache.compute(
-        shuffleId,
-        (id, m) => {
-          assert(m == null, s"Shuffle manager was already cached for shuffle id: $id")
-          manager
-        })
+      val existing = cache.putIfAbsent(shuffleId, manager)
+      if (existing == null) manager else existing
     }
 
     def get(shuffleId: Int): ShuffleManager = {

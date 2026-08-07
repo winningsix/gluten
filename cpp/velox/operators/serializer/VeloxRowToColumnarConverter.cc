@@ -248,6 +248,13 @@ bool supporteType(const RowTypePtr rowType) {
       case TypeKind::ARRAY:
       case TypeKind::MAP:
       case TypeKind::ROW:
+      case TypeKind::VARCHAR:
+      case TypeKind::VARBINARY:
+        // The scalar fast path decodes variable-width UnsafeRow fields by
+        // hand. Broadcast rows can legally contain zero-length or shared
+        // string payloads whose offset encoding is handled by UnsafeRowFast
+        // but can leave the hand-written StringView path dereferencing a null
+        // payload. Use Velox's general decoder for these schemas.
         return false;
       default:
         break;
@@ -268,6 +275,22 @@ VeloxRowToColumnarConverter::VeloxRowToColumnarConverter(
 
 std::shared_ptr<ColumnarBatch>
 VeloxRowToColumnarConverter::convert(int64_t numRows, int64_t* rowLength, uint8_t* memoryAddress) {
+  if (numRows > 0 && rowType_->size() > 0 && memoryAddress == nullptr) {
+    int64_t totalBytes = 0;
+    int64_t nonEmptyRows = 0;
+    for (auto i = 0; i < numRows; ++i) {
+      totalBytes += rowLength[i];
+      nonEmptyRows += rowLength[i] > 0;
+    }
+    VELOX_FAIL(
+        "Cannot decode {} UnsafeRows with a null data address: schema={}, "
+        "nonEmptyRows={}, totalBytes={}, firstRowBytes={}",
+        numRows,
+        rowType_->toString(),
+        nonEmptyRows,
+        totalBytes,
+        rowLength[0]);
+  }
   if (supporteType(asRowType(rowType_))) {
     return convertPrimitive(numRows, rowLength, memoryAddress);
   }

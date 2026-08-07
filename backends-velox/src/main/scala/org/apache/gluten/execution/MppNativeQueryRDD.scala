@@ -34,7 +34,7 @@ import org.apache.spark.util.{Namespace, SparkDirectoryUtil}
 import org.apache.commons.io.FileUtils
 
 import java.io.File
-import java.util.{HashMap => JHashMap, Iterator => JIterator}
+import java.util.{HashMap => JHashMap, Iterator => JIterator, Locale}
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
@@ -101,13 +101,23 @@ class MppNativeQueryRDD(
     var localInputRDDs: ColumnarInputRDDsWrapper,
     sparkPartitionCount: Int,
     broadcastProducerFragmentIds: Set[Int],
-    keepDeviceOutput: Boolean,
+    initialKeepDeviceOutput: Boolean,
     replicatedCartesianMaxBuildBytes: Long,
     pipelineTime: SQLMetric,
     outputRows: SQLMetric,
     outputBatches: SQLMetric
 ) extends RDD[ColumnarBatch](sc, localInputRDDs.getDependencies)
   with Logging {
+
+  // Spark constructs the cache producer RDD before CachedBatchSerializer sees it.  Keep this
+  // driver-side launch property mutable so the serializer can mark only its exact input graph as
+  // a terminal GPU sink.  The RDD is marked before Spark serializes any task, so executors still
+  // observe an immutable per-launch value; this is not task-time shared state.
+  @volatile private var keepDeviceOutput: Boolean = initialKeepDeviceOutput
+
+  private[gluten] def enableDeviceOutputForTerminalGpuSink(): Unit = {
+    keepDeviceOutput = true
+  }
 
   require(
     replicatedCartesianMaxBuildBytes >= 0,
@@ -178,6 +188,61 @@ class MppNativeQueryRDD(
     }
     if (keepDeviceOutput) {
       runtimeExtraConf.put("spark.gluten.sql.columnar.cudf.skipOutputToVelox", "true")
+      // Root output is consumed by the cache serializer in this executor JVM.
+      // Transfer the owning CudfVector directly; internal MPP exchanges still
+      // use independently-owned packed UCX pages. The environment switch is
+      // retained for an exact A/B fallback during rollout.
+      val directDeviceOutput = sys.env
+        .get("GLUTEN_CACHE_ROOT_DIRECT_DEVICE_OUTPUT")
+        .forall(value => !Set("0", "false", "no", "off").contains(value.toLowerCase(Locale.ROOT)))
+      runtimeExtraConf.put(
+        "spark.gluten.sql.columnar.backend.velox.cudf.cache_root_direct_device_output",
+        directDeviceOutput.toString)
+      // A terminal GPU cache sink consumes the root fragment locally; its
+      // output does not traverse the ordinary inter-fragment UCX network.
+      // Do not inherit the 128 MiB exchange page / one-million-row bounds here,
+      // otherwise a wide materialized table reaches the cache writer as tens
+      // of thousands of 80--90 MiB batches. Use a cache-specific byte target
+      // while leaving every internal exchange at its normal bounded setting.
+      val cacheInputBatchBytes = sys.env
+        .get("GLUTEN_CACHE_INPUT_BATCH_BYTES")
+        .flatMap(value => scala.util.Try(value.toLong).toOption)
+        .filter(_ > 0)
+        .getOrElse(1L << 30)
+      runtimeExtraConf.put(
+        "spark.gluten.sql.columnar.backend.velox.cudf.cache_root_output_batch_bytes",
+        cacheInputBatchBytes.toString)
+      runtimeExtraConf.put(
+        "spark.gluten.sql.columnar.backend.velox.cudf.cache_root_output_batch_rows",
+        "32000000")
+      // Cache fill has a different producer/consumer geometry from an MPP
+      // exchange. A wide scan benefits from coarse decode chunks, but only if
+      // the local owning root queue can retain enough data for scan/decode to
+      // overlap the Parquet writer. Keep that budget on a root-only key. The
+      // native runtime contains all fragments, so overriding
+      // mpp.maxOutputBufferSize here would also enlarge every internal UCX
+      // queue (e.g. three concurrent 8 GiB queues on a 32 GiB GPU).
+      def positiveCacheBytes(name: String, defaultValue: Long): Long = {
+        sys.env
+          .get(name)
+          .flatMap(value => scala.util.Try(value.toLong).toOption)
+          .filter(_ > 0)
+          .getOrElse(defaultValue)
+      }
+      runtimeExtraConf.put(
+        "spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk_read_limit",
+        positiveCacheBytes("GLUTEN_CACHE_SCAN_CHUNK_BYTES", 512L << 20).toString)
+      runtimeExtraConf.put(
+        "spark.gluten.sql.columnar.backend.velox.parquet.reader.pass_read_limit",
+        positiveCacheBytes("GLUTEN_CACHE_SCAN_PASS_BYTES", 1L << 30).toString)
+      runtimeExtraConf.put(
+        "spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_bytes",
+        positiveCacheBytes("GLUTEN_CACHE_PARTITIONED_OUTPUT_BATCH_BYTES", 256L << 20).toString
+      )
+      runtimeExtraConf.put(
+        "spark.gluten.sql.columnar.backend.velox.cudf.cache_root_output_buffer_bytes",
+        positiveCacheBytes("GLUTEN_CACHE_ROOT_OUTPUT_BUFFER_BYTES", 512L << 20).toString
+      )
     }
     val runtime =
       Runtimes.contextInstance(BackendsApiManager.getBackendName, "MppQuery", runtimeExtraConf)
@@ -699,7 +764,35 @@ final private[execution] class MppSpillRootLease(val root: File, deleteRoot: Fil
   }
 }
 
-private[execution] object MppNativeQueryRDD extends Logging {
+object MppNativeQueryRDD extends Logging {
+
+  /**
+   * Marks every MPP producer reachable from an exact terminal GPU consumer (currently Spark's
+   * columnar cache fill). The walk happens on the driver after the serializer receives its input
+   * RDD and before any task is submitted. It deliberately does not use a SQLConf switch: a
+   * session-wide switch would also change count/aggregate actions whose Spark consumers require a
+   * regular Velox boundary.
+   */
+  def enableDeviceOutputForTerminalGpuSink(rdd: RDD[_]): Int = {
+    val visited = java.util.Collections.newSetFromMap(
+      new java.util.IdentityHashMap[RDD[_], java.lang.Boolean]())
+
+    def visit(current: RDD[_]): Int = {
+      if (!visited.add(current)) {
+        0
+      } else {
+        val marked = current match {
+          case mpp: MppNativeQueryRDD =>
+            mpp.enableDeviceOutputForTerminalGpuSink()
+            1
+          case _ => 0
+        }
+        marked + current.dependencies.map(dependency => visit(dependency.rdd)).sum
+      }
+    }
+
+    visit(rdd)
+  }
 
   private val exchangeEndpointPattern =
     ("""(?s)"producerFragmentId"\s*:\s*(-?\d+)\s*,\s*""" +

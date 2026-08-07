@@ -23,7 +23,10 @@
 #include "velox/vector/FlatVector.h"
 
 #ifdef GLUTEN_ENABLE_GPU
+#include "cudf/GpuLock.h"
 #include "memory/GpuBufferColumnarBatch.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/vector/CudfVector.h"
 #endif
 
 namespace gluten {
@@ -154,6 +157,49 @@ std::shared_ptr<VeloxColumnarBatch> VeloxColumnarBatch::compose(
 std::shared_ptr<VeloxColumnarBatch> VeloxColumnarBatch::select(
     facebook::velox::memory::MemoryPool* pool,
     const std::vector<int32_t>& columnIndices) {
+#ifdef GLUTEN_ENABLE_GPU
+  // CudfVector deliberately has no Velox children: its columns live in the
+  // underlying cudf::table.  This select is a consuming JNI boundary (the JVM
+  // closes the input immediately), so move the requested columns into the
+  // output rather than copying them device-to-device.
+  if (auto cudfVector =
+          std::dynamic_pointer_cast<facebook::velox::cudf_velox::CudfVector>(
+              rowVector_)) {
+    const auto inputType = facebook::velox::asRowType(rowVector_->type());
+    std::vector<std::string> childNames;
+    std::vector<TypePtr> childTypes;
+    childNames.reserve(columnIndices.size());
+    childTypes.reserve(columnIndices.size());
+    for (const auto index : columnIndices) {
+      VELOX_CHECK_GE(index, 0);
+      VELOX_CHECK_LT(index, inputType->size());
+      childNames.push_back(inputType->nameOf(index));
+      childTypes.push_back(inputType->childAt(index));
+    }
+    auto outputType = ROW(std::move(childNames), std::move(childTypes));
+    auto stream = cudfVector->stream();
+    GpuLockGuard gpuLock;
+    auto inputColumns = cudfVector->release()->release();
+    std::vector<std::unique_ptr<cudf::column>> outputColumns;
+    outputColumns.reserve(columnIndices.size());
+    for (const auto index : columnIndices) {
+      VELOX_CHECK_NOT_NULL(
+          inputColumns[index],
+          "Duplicate CudfVector column selection is unsupported");
+      outputColumns.push_back(std::move(inputColumns[index]));
+    }
+    auto table = std::make_unique<cudf::table>(std::move(outputColumns));
+    auto output = std::make_shared<facebook::velox::cudf_velox::CudfVector>(
+        pool, outputType, numRows(), std::move(table), stream);
+    // CudfVector intentionally exposes no Velox child vectors, so the
+    // one-argument constructor would report zero columns to the JVM.  Keep
+    // the logical column count explicitly; otherwise a row consumer turns
+    // every record into a zero-byte UnsafeRow.
+    return std::make_shared<VeloxColumnarBatch>(
+        std::move(output), columnIndices.size());
+  }
+#endif
+
   std::vector<std::string> childNames;
   std::vector<VectorPtr> childVectors;
   childNames.reserve(columnIndices.size());

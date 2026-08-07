@@ -95,4 +95,14 @@ std::shared_ptr<ColumnarBatch> VeloxColumnarBatchSerializer::deserialize(uint8_t
   return std::make_shared<VeloxColumnarBatch>(result);
 }
 
+std::shared_ptr<ColumnarBatch> VeloxColumnarBatchSerializer::deserializeSelected(
+    uint8_t* data,
+    int32_t size,
+    const std::vector<int32_t>& columnIndices) {
+  auto batch = std::dynamic_pointer_cast<VeloxColumnarBatch>(
+      deserialize(data, size));
+  VELOX_CHECK_NOT_NULL(batch, "Expected a VeloxColumnarBatch");
+  return batch->select(veloxPool_.get(), columnIndices);
+}
+
 } // namespace gluten

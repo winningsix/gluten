@@ -95,6 +95,20 @@ core::TopNRowNumberNode::RankFunction windowGroupLimitRankFunction(
   return core::TopNRowNumberNode::rankFunctionFromName(functionName);
 }
 
+bool windowGroupLimitPartialOutput(
+    const ::substrait::WindowGroupLimitRel& windowGroupLimitRel) {
+  if (!windowGroupLimitRel.has_advanced_extension() ||
+      !windowGroupLimitRel.advanced_extension().has_optimization()) {
+    return false;
+  }
+  google::protobuf::StringValue msg;
+  if (!windowGroupLimitRel.advanced_extension().optimization().UnpackTo(&msg)) {
+    return false;
+  }
+  static const std::string kPartialOutput = "partial_output=true";
+  return msg.value().find(kPartialOutput) != std::string::npos;
+}
+
 std::vector<TypePtr> toVeloxAggregateRawInputTypes(
     const std::string& baseFuncName,
     const core::AggregationNode::Step funcStep,
@@ -1380,7 +1394,8 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(
       sortingOrders,
       rowNumberColumnName,
       static_cast<int32_t>(windowGroupLimitRel.limit()),
-      childNode);
+      childNode,
+      windowGroupLimitPartialOutput(windowGroupLimitRel));
 }
 
 core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::SetRel& setRel) {

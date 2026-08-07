@@ -156,6 +156,8 @@ WholeStageResultIterator::WholeStageResultIterator(
       std::string path;
       uint64_t start;
       uint64_t length;
+      uint64_t fileSize;
+      bool wholeFile;
       std::unordered_map<std::string, std::string> infoColumns;
     };
     std::vector<CudfFileInfo> cudfFileInfos;
@@ -296,8 +298,20 @@ WholeStageResultIterator::WholeStageResultIterator(
           } else if (cleanedPath.compare(0, kS3APrefix.size(), kS3APrefix) == 0) {
             cleanedPath.erase(kS3APrefix.size() - 2, 1);
           }
+          const bool hasFileSize = properties[idx].has_value() &&
+              properties[idx]->fileSize.has_value();
+          const auto fileSize = hasFileSize
+              ? static_cast<uint64_t>(*properties[idx]->fileSize)
+              : lengths[idx];
+          const bool wholeFile = starts[idx] == 0 && hasFileSize &&
+              lengths[idx] >= fileSize;
           cudfFileInfos.push_back(
-              {std::move(cleanedPath), starts[idx], lengths[idx], metadataColumn});
+              {std::move(cleanedPath),
+               starts[idx],
+               lengths[idx],
+               fileSize,
+               wholeFile,
+               metadataColumn});
         } else {
 #endif
           split = std::make_shared<velox::connector::hive::HiveConnectorSplit>(
@@ -330,20 +344,50 @@ WholeStageResultIterator::WholeStageResultIterator(
     // which the cuDF Parquet reader would treat as a complete file, failing
     // the header/footer magic check.
     if (!cudfFileInfos.empty()) {
-      // IBM baseline drops CoalescedFileRange + the 7-arg ctor. Per ferd:
-      // IO coalescing optimization not needed; one split per file is fine.
-      for (const auto& f : cudfFileInfos) {
+      const auto targetBytes = veloxCfg_->get<uint64_t>(
+          kCudfGpuTargetBatchBytes,
+          std::stoull(kCudfGpuTargetBatchBytesDefault));
+      const auto maxFiles = veloxCfg_->get<int32_t>(
+          kCudfIcebergMultiFileMaxFiles,
+          kCudfIcebergMultiFileMaxFilesDefault);
+      size_t i = 0;
+      while (i < cudfFileInfos.size()) {
+        const auto& primary = cudfFileInfos[i];
+        std::vector<
+            velox::cudf_velox::connector::hive::CudfCoalescedFile>
+            coalescedFiles;
+        uint64_t accumulatedBytes =
+            primary.wholeFile ? primary.fileSize : 0;
+        size_t next = i + 1;
+        while (primary.wholeFile && targetBytes > 0 && maxFiles > 1 &&
+               next < cudfFileInfos.size() &&
+               coalescedFiles.size() + 1 < static_cast<size_t>(maxFiles)) {
+          const auto& candidate = cudfFileInfos[next];
+          if (!candidate.wholeFile ||
+              candidate.infoColumns != primary.infoColumns ||
+              accumulatedBytes >= targetBytes ||
+              candidate.fileSize > targetBytes - accumulatedBytes) {
+            break;
+          }
+          coalescedFiles.push_back(
+              {candidate.path, candidate.fileSize});
+          accumulatedBytes += candidate.fileSize;
+          ++next;
+        }
         auto cudfSplit = std::make_shared<
             velox::cudf_velox::connector::hive::CudfHiveConnectorSplit>(
             kCudfHiveConnectorId,
-            f.path,
-            f.start,
-            f.length,
+            primary.path,
+            primary.start,
+            primary.length,
             /*splitWeight=*/0,
-            f.infoColumns);
+            primary.infoColumns,
+            std::move(coalescedFiles));
         connectorSplits.emplace_back(std::move(cudfSplit));
+        i = next;
       }
-      VLOG(1) << "Built " << connectorSplits.size() << " CUDF splits (one per file)";
+      VLOG(1) << "Coalesced " << cudfFileInfos.size()
+              << " CUDF files into " << connectorSplits.size() << " splits";
     }
 #endif
 

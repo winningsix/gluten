@@ -40,6 +40,11 @@ class VeloxColumnarBatchSerializer : public ColumnarBatchSerializer {
 
   std::shared_ptr<ColumnarBatch> deserialize(uint8_t* data, int32_t size) override;
 
+  std::shared_ptr<ColumnarBatch> deserializeSelected(
+      uint8_t* data,
+      int32_t size,
+      const std::vector<int32_t>& columnIndices) override;
+
  protected:
   std::shared_ptr<facebook::velox::memory::MemoryPool> veloxPool_;
   std::unique_ptr<facebook::velox::StreamArena> arena_;

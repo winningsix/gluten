@@ -64,6 +64,16 @@ class MppOuterJoinBuildSideSuite extends AnyFunSuite {
     }
   }
 
+  test("forced preserved-side build is symmetric for outer joins") {
+    withNormalizationConfig(outerJoinValue = "false", forceOuterJoin = "true") {
+      val left = statsLeaf("left_key", sizeInBytes = 16000, rowCount = Some(BigInt(1000)))
+      val right = statsLeaf("right_key", sizeInBytes = 160, rowCount = Some(BigInt(10)))
+
+      assert(normalize(leftOuterJoin(left, right, BuildRight)).buildSide == BuildLeft)
+      assert(normalize(rightOuterJoin(left, right, BuildLeft)).buildSide == BuildRight)
+    }
+  }
+
   test("unknown derived statistics do not override Spark's outer build side") {
     withNormalizationConfig(outerJoinValue = "null") {
       val derivedLeft =
@@ -223,13 +233,14 @@ class MppOuterJoinBuildSideSuite extends AnyFunSuite {
 
   private def withNormalizationConfig[T](
       outerJoinValue: String,
+      forceOuterJoin: String = "false",
       smallScanBytes: String = "64m",
       smallScanRows: String = "1000000")(body: => T): T = {
     val conf = SQLConf.get
     val values = Seq(
       NormalizeJoinKey -> "null",
       NormalizeOuterJoinKey -> outerJoinValue,
-      ForceOuterJoinKey -> "false",
+      ForceOuterJoinKey -> forceOuterJoin,
       SmallScanBytesKey -> smallScanBytes,
       SmallScanRowsKey -> smallScanRows
     )

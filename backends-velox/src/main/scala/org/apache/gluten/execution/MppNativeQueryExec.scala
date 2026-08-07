@@ -4275,8 +4275,14 @@ case class MppNativeQueryExec(
         // before the sampling action starts. Reuse the same transition repair and WST preparation
         // as normal BSP fallback so the bounded pre-action executes a convention-correct producer.
         val executableSamplePlan = prepareColumnarBspFallbackPlan(spec.rangeSamplePlan)
-        val inferredBounds =
+        val explicitBounds =
+          configuredExplicitIntegralRangeBounds(spec.rangeOrdering, spec.numPartitions)
+        val predicateBounds = if (explicitBounds.isDefined) {
+          None
+        } else {
           inferIntegralRangeBounds(executableSamplePlan, spec.rangeOrdering, spec.numPartitions)
+        }
+        val inferredBounds = explicitBounds.orElse(predicateBounds)
         val representativeScan =
           if (inferredBounds.isEmpty) {
             findRangeRepresentativeScan(executableSamplePlan, spec.rangeOrdering)
@@ -4322,7 +4328,8 @@ case class MppNativeQueryExec(
         logInfo(s"MppNativeQueryExec: RANGE exchange ${spec.id} " +
           (if (reused) "reused" else "computed") + " " +
           s"${bounds.boundaryCount} Spark-compatible boundaries " +
-          (if (inferredBounds.isDefined) "from integral predicate bounds "
+          (if (explicitBounds.isDefined) "from configured explicit integral bounds "
+           else if (predicateBounds.isDefined) "from integral predicate bounds "
            else if (footerBounds.isDefined) "from Parquet footer bounds "
            else if (representativeScan.isDefined) "from a representative leaf scan "
            else "from bounded samples ") +
@@ -4332,6 +4339,40 @@ case class MppNativeQueryExec(
           rangeBoundsJson = Some(bounds.json),
           rangeEffectivePartitions = Some(bounds.effectivePartitions))
       case spec => spec
+    }
+  }
+
+  /** Apply an explicit integral boundary matrix only to the named RANGE ordering. */
+  private def configuredExplicitIntegralRangeBounds(
+      ordering: Seq[SortOrder],
+      requestedPartitions: Int): Option[MppRangeBoundsGenerator.Result] = {
+    val boundsKey = "spark.gluten.mpp.rangeExplicitIntegralBounds"
+    val rawBounds = SQLConf.get.getConfString(boundsKey, "").trim
+    if (rawBounds.isEmpty) {
+      return None
+    }
+    val keysKey = "spark.gluten.mpp.rangeExplicitIntegralBounds.keys"
+    val configuredKeys = SQLConf.get
+      .getConfString(keysKey, "")
+      .split(",", -1)
+      .map(_.trim)
+      .filter(_.nonEmpty)
+      .toSeq
+    require(configuredKeys.nonEmpty, s"$keysKey must name the target RANGE ordering")
+    val orderingNames = ordering.map {
+      order =>
+        order.child match {
+          case attribute: Attribute => attribute.name
+          case other => other.sql
+        }
+    }
+    if (orderingNames != configuredKeys) {
+      None
+    } else {
+      logInfo(
+        s"MppNativeQueryExec: applying configured explicit integral RANGE bounds to " +
+          s"${orderingNames.mkString("[", ",", "]")} with $requestedPartitions partitions")
+      MppRangeBoundsGenerator.fromExplicitIntegralBounds(ordering, rawBounds, requestedPartitions)
     }
   }
 

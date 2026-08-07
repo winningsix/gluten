@@ -76,14 +76,16 @@ object SparkTaskUtil {
     val cpus = 1.asInstanceOf[Object] // Added in Spark 3.3.
     val resources = Map.empty.asInstanceOf[Object]
 
-    val ctor = {
-      val ctors = classOf[TaskContextImpl].getDeclaredConstructors
-      assert(ctors.size == 1)
-      ctors.head
-    }
+    val ctors = classOf[TaskContextImpl].getDeclaredConstructors
+    def ctorWithArity(arity: Int) =
+      ctors.find(_.getParameterCount == arity).getOrElse {
+        throw new IllegalStateException(
+          s"No TaskContextImpl constructor with $arity parameters; found " +
+            ctors.map(_.getParameterCount).sorted.mkString(","))
+      }
 
     if (SparkVersionUtil.lteSpark32) {
-      return ctor
+      return ctorWithArity(10)
         .newInstance(
           stageId,
           stageAttemptNumber,
@@ -100,7 +102,7 @@ object SparkTaskUtil {
     }
 
     if (SparkVersionUtil.eqSpark33) {
-      return ctor
+      return ctorWithArity(11)
         .newInstance(
           stageId,
           stageAttemptNumber,
@@ -117,22 +119,42 @@ object SparkTaskUtil {
         .asInstanceOf[TaskContext]
     }
 
-    // Since Spark 3.4.
-    ctor
-      .newInstance(
-        stageId,
-        stageAttemptNumber,
-        partitionId,
-        taskAttemptId,
-        attemptNumber,
-        numPartitions,
-        taskMemoryManager,
-        localProperties,
-        metricsSystem,
-        taskMetrics,
-        cpus,
-        resources
-      )
-      .asInstanceOf[TaskContext]
+    // Since Spark 3.4 the upstream full constructor has 12 arguments. EMR
+    // Spark 4.0.2 also exposes a 9-argument auxiliary constructor and a
+    // 13-argument full constructor carrying ExecutorBackend. Prefer the
+    // auxiliary form when present; it supplies the same defaults Spark uses
+    // for task metrics, CPUs, resources and backend without binding Gluten to
+    // an EMR-only type signature.
+    ctors.find(_.getParameterCount == 9) match {
+      case Some(ctor) =>
+        ctor
+          .newInstance(
+            stageId,
+            stageAttemptNumber,
+            partitionId,
+            taskAttemptId,
+            attemptNumber,
+            numPartitions,
+            taskMemoryManager,
+            localProperties,
+            metricsSystem)
+          .asInstanceOf[TaskContext]
+      case None =>
+        ctorWithArity(12)
+          .newInstance(
+            stageId,
+            stageAttemptNumber,
+            partitionId,
+            taskAttemptId,
+            attemptNumber,
+            numPartitions,
+            taskMemoryManager,
+            localProperties,
+            metricsSystem,
+            taskMetrics,
+            cpus,
+            resources)
+          .asInstanceOf[TaskContext]
+    }
   }
 }

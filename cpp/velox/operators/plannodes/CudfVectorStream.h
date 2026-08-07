@@ -153,6 +153,13 @@ class CudfVectorStream : public CudfVectorStreamBase {
           VELOX_CHECK_NOT_NULL(vb);
           auto vp = vb->getRowVector();
           VELOX_CHECK_NOT_NULL(vp);
+          // Velox operators must never return a non-null, zero-row vector.
+          // Empty cached/shuffle batches are legal at the Gluten iterator
+          // boundary, so consume them here instead of forwarding them to the
+          // CudfValueStream source operator.
+          if (vp->size() == 0) {
+            continue;
+          }
           auto cudfVector = std::dynamic_pointer_cast<facebook::velox::cudf_velox::CudfVector>(vp);
           if (cudfVector != nullptr) {
             if (!pendingRows_.empty()) {
@@ -160,6 +167,14 @@ class CudfVectorStream : public CudfVectorStreamBase {
               break;
             }
             GpuLockGuard gpuLock;
+            if (auto packed = cudfVector->releasePacked()) {
+              return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
+                  vp->pool(),
+                  outputType_,
+                  vp->size(),
+                  std::move(packed),
+                  cudfVector->stream());
+            }
             return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
                 vp->pool(), outputType_, vp->size(), cudfVector->release(), cudfVector->stream());
           }
@@ -173,6 +188,9 @@ class CudfVectorStream : public CudfVectorStreamBase {
         if (cb->getType() == "gpu") {
           auto gpuBatch = std::dynamic_pointer_cast<GpuBufferColumnarBatch>(cb);
           VELOX_CHECK_NOT_NULL(gpuBatch);
+          if (gpuBatch->numRows() == 0) {
+            continue;
+          }
           pendingBytes_ += gpuBatch->numBytes();
           pendingRowCount_ += gpuBatch->numRows();
           pendingGpuBatches_.push_back(std::move(gpuBatch));
@@ -192,6 +210,14 @@ class CudfVectorStream : public CudfVectorStreamBase {
       auto cudf = std::move(stashedCudf_);
       stashedCudf_ = nullptr;
       GpuLockGuard gpuLock;
+      if (auto packed = cudf->releasePacked()) {
+        return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
+            cudf->pool(),
+            outputType_,
+            cudf->size(),
+            std::move(packed),
+            cudf->stream());
+      }
       return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
           cudf->pool(), outputType_, cudf->size(), cudf->release(), cudf->stream());
     }
@@ -372,18 +398,24 @@ class CudfValueStream : public facebook::velox::exec::SourceOperator, public fac
     if (finished_) {
       return nullptr;
     }
-    if (rvStream_->hasNext() || rvStream_->hasPending()) {
+    while (rvStream_->hasNext() || rvStream_->hasPending()) {
       auto result = rvStream_->next();
       if (result == nullptr) {
         finished_ = true;
         reportCoalescedBatches();
+        return nullptr;
+      }
+      // A conversion can also collapse a non-empty transport batch into an
+      // empty vector (for example after filtering). Consume it at the source
+      // boundary: Velox forbids operators from returning zero-row vectors.
+      if (result->size() == 0) {
+        continue;
       }
       return result;
-    } else {
-      finished_ = true;
-      reportCoalescedBatches();
-      return nullptr;
     }
+    finished_ = true;
+    reportCoalescedBatches();
+    return nullptr;
   }
 
   facebook::velox::exec::BlockingReason isBlocked(facebook::velox::ContinueFuture* /* unused */) override {

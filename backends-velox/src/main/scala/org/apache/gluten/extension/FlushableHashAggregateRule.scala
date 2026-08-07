@@ -74,7 +74,7 @@ case class FlushableHashAggregateRule(session: SparkSession) extends Rule[SparkP
     def isUnsupportedAggregation(aggExpr: AggregateExpression): Boolean = {
       aggExpr.aggregateFunction match {
         case Sum(child, _) if isFloatingPointType(child.dataType) => true
-        case Average(child, _) if isFloatingPointType(child.dataType) => true
+        case average: Average if isFloatingPointType(average.child.dataType) => true
         case _ => false
       }
     }

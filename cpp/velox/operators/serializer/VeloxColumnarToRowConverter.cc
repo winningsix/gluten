@@ -20,6 +20,7 @@
 #include <cstdint>
 
 #include "memory/VeloxColumnarBatch.h"
+#include "operators/plannodes/RowVectorStream.h"
 #include "utils/Exception.h"
 #include "velox/row/UnsafeRowFast.h"
 
@@ -67,7 +68,18 @@ void VeloxColumnarToRowConverter::refreshStates(facebook::velox::RowVectorPtr ro
 
 void VeloxColumnarToRowConverter::convert(std::shared_ptr<ColumnarBatch> cb, int64_t startRow) {
   auto veloxBatch = VeloxColumnarBatch::from(veloxPool_.get(), cb);
-  refreshStates(veloxBatch->getRowVector(), startRow);
+  auto rowVector = veloxBatch->getRowVector();
+  // A VeloxColumnarBatch can wrap a CudfVector, whose physical columns live
+  // in a device table and whose RowVector children are intentionally empty.
+  // UnsafeRowFast is a CPU row serializer and must only see a materialized
+  // host RowVector. Reuse the validated CPU ValueStream boundary instead of
+  // interpreting the empty child list as row data.
+  rowVector = materializeRowVectorStreamBatch(
+      veloxPool_.get(), cb, facebook::velox::asRowType(rowVector->type()));
+  // UnsafeRowFast keeps non-owning pointers into the decoded vectors. Keep
+  // this local shared_ptr alive through the serialization loop below instead
+  // of moving the last owner into refreshStates' temporary parameter.
+  refreshStates(rowVector, startRow);
 
   // Initialize the offsets_ , lengths_
   lengths_.clear();
