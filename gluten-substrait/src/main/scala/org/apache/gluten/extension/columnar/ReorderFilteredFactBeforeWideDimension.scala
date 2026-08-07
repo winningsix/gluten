@@ -58,7 +58,7 @@ import scala.collection.mutable
  *
  * The output is projected back to the original child's attributes, including exprIds and order.
  * Gated by `spark.gluten.sql.columnar.reorderFilteredFactBeforeWideDimension.enabled`; it defaults
- * to the MPP enablement state.
+ * to the FLUX enablement state.
  */
 case class ReorderFilteredFactBeforeWideDimension(spark: SparkSession)
   extends Rule[LogicalPlan]
@@ -67,7 +67,7 @@ case class ReorderFilteredFactBeforeWideDimension(spark: SparkSession)
 
   private val enabledKey =
     "spark.gluten.sql.columnar.reorderFilteredFactBeforeWideDimension.enabled"
-  private val mppEnabledKey = "spark.gluten.mpp.enabled"
+  private val fluxEnabledKey = "spark.gluten.mpp.enabled"
   private val minLeafBytes = BigInt(1L << 30)
   private val minWideGroupingAttributes = 4
   private val minCostImprovement = 1.5
@@ -90,7 +90,7 @@ case class ReorderFilteredFactBeforeWideDimension(spark: SparkSession)
   private def enabled: Boolean = {
     val conf = spark.sessionState.conf
     conf
-      .getConfString(enabledKey, conf.getConfString(mppEnabledKey, "false"))
+      .getConfString(enabledKey, conf.getConfString(fluxEnabledKey, "false"))
       .toBoolean
   }
 
@@ -529,19 +529,19 @@ case class ReorderFilteredFactBeforeWideDimension(spark: SparkSession)
       val existingPush =
         current.collectFirst { case rule: PushSelectiveDimensionChainBeforeFact => rule }
       val existingHint = current
-        .collectFirst { case rule: MppFactProbeBroadcastHint => rule }
-        .getOrElse(MppFactProbeBroadcastHint(spark))
+        .collectFirst { case rule: FluxFactProbeBroadcastHint => rule }
+        .getOrElse(FluxFactProbeBroadcastHint(spark))
       val base = current.filterNot(
         rule =>
           rule.isInstanceOf[ReorderFilteredFactBeforeWideDimension] ||
             rule.isInstanceOf[PushSelectiveDimensionChainBeforeFact] ||
-            rule.isInstanceOf[MppFactProbeBroadcastHint])
+            rule.isInstanceOf[FluxFactProbeBroadcastHint])
       val reordered = base ++ Seq(existingRewrite) ++ existingPush.toSeq ++ Seq(existingHint)
       if (reordered != current) {
         experimental.extraOptimizations = reordered
         logDebug(
           "ReorderFilteredFactBeforeWideDimension: registered post-CBO before dimension-chain " +
-            "rewrite and MppFactProbeBroadcastHint")
+            "rewrite and FluxFactProbeBroadcastHint")
       }
     }
   }

@@ -35,7 +35,7 @@ import org.apache.spark.sql.types.IntegerType
  *   WITH r AS (...) SELECT ... FROM r
  *   WHERE r.value = (SELECT max(value) FROM r)
  * }}}
- * Spark inlines both CTE references and computes `r` twice. Native MPP can merge floating-point
+ * Spark inlines both CTE references and computes `r` twice. Native FLUX can merge floating-point
  * partial sums in a different arrival order in the two copies. The two mathematically identical
  * values can then differ by a few ULPs, making exact equality nondeterministically return no row.
  *
@@ -50,7 +50,7 @@ import org.apache.spark.sql.types.IntegerType
  * exchange. The relation is evaluated once and all rows tied for the maximum are retained.
  *
  * The match is deliberately narrow: both sides must be aggregates with equivalent grouping, value
- * expressions and inputs. It is enabled only for MPP and can be disabled with
+ * expressions and inputs. It is enabled only for FLUX and can be disabled with
  * `spark.gluten.mpp.rewriteSelfMaxScalarToDenseRank=false`.
  */
 case class RewriteSelfMaxScalarToDenseRank(spark: SparkSession)

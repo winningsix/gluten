@@ -52,7 +52,7 @@ class VeloxPlanConverter {
   }
 
   /// Advance / inspect the substrait converter's plan-node-id allocator.
-  /// MPP single-task merge uses these to keep ids unique across spliced
+  /// FLUX single-task merge uses these to keep ids unique across spliced
   /// fragments. See SubstraitToVeloxPlanConverter::setNextPlanNodeId.
   void setNextPlanNodeId(int planNodeId) {
     substraitVeloxPlanConverter_.setNextPlanNodeId(planNodeId);

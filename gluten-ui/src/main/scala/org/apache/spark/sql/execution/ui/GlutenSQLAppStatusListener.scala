@@ -16,7 +16,12 @@
  */
 package org.apache.spark.sql.execution.ui
 
-import org.apache.gluten.events.{GlutenBuildInfoEvent, GlutenMppPlanEvent, GlutenPlanFallbackEvent}
+import org.apache.gluten.events.{
+  GlutenBuildInfoEvent,
+  GlutenFluxPlanEvent,
+  GlutenFluxPlanFragmentEvent,
+  GlutenMppPlanEvent,
+  GlutenPlanFallbackEvent}
 
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.internal.Logging
@@ -31,7 +36,7 @@ private class GlutenSQLAppStatusListener(conf: SparkConf, kvstore: ElementTracki
   with Logging {
   private val executionIdToDescription = new mutable.HashMap[Long, String]
   private val executionIdToFallbackEvent = new mutable.HashMap[Long, GlutenPlanFallbackEvent]
-  private val executionIdToMppPlanEvent = new mutable.HashMap[Long, GlutenMppPlanEvent]
+  private val executionIdToFluxPlanEvent = new mutable.HashMap[Long, GlutenFluxPlanEvent]
 
   kvstore.addTrigger(classOf[GlutenSQLExecutionUIData], conf.get[Int](UI_RETAINED_EXECUTIONS)) {
     count => cleanupExecutions(count)
@@ -53,22 +58,22 @@ private class GlutenSQLAppStatusListener(conf: SparkConf, kvstore: ElementTracki
     }
   }
 
-  private def onGlutenMppPlan(event: GlutenMppPlanEvent): Unit = {
+  private def onGlutenFluxPlan(event: GlutenFluxPlanEvent): Unit = {
     val description = executionIdToDescription.get(event.executionId)
     if (description.isDefined) {
       writeExecution(event.executionId, description.get, None, Some(event))
     } else {
-      executionIdToMppPlanEvent.put(event.executionId, event.copy())
+      executionIdToFluxPlanEvent.put(event.executionId, event.copy())
     }
   }
 
   private def onSQLExecutionStart(event: SparkListenerSQLExecutionStart): Unit = {
     val fallbackEvent = executionIdToFallbackEvent.get(event.executionId)
-    val mppPlanEvent = executionIdToMppPlanEvent.get(event.executionId)
-    if (fallbackEvent.isDefined || mppPlanEvent.isDefined) {
-      writeExecution(event.executionId, event.description, fallbackEvent, mppPlanEvent)
+    val fluxPlanEvent = executionIdToFluxPlanEvent.get(event.executionId)
+    if (fallbackEvent.isDefined || fluxPlanEvent.isDefined) {
+      writeExecution(event.executionId, event.description, fallbackEvent, fluxPlanEvent)
       fallbackEvent.foreach(_ => executionIdToFallbackEvent.remove(event.executionId))
-      mppPlanEvent.foreach(_ => executionIdToMppPlanEvent.remove(event.executionId))
+      fluxPlanEvent.foreach(_ => executionIdToFluxPlanEvent.remove(event.executionId))
     }
     executionIdToDescription.put(event.executionId, event.description)
   }
@@ -76,7 +81,7 @@ private class GlutenSQLAppStatusListener(conf: SparkConf, kvstore: ElementTracki
   private def onSQLExecutionEnd(event: SparkListenerSQLExecutionEnd): Unit = {
     executionIdToDescription.remove(event.executionId)
     executionIdToFallbackEvent.remove(event.executionId)
-    executionIdToMppPlanEvent.remove(event.executionId)
+    executionIdToFluxPlanEvent.remove(event.executionId)
   }
 
   override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
@@ -84,7 +89,8 @@ private class GlutenSQLAppStatusListener(conf: SparkConf, kvstore: ElementTracki
     case e: SparkListenerSQLExecutionEnd => onSQLExecutionEnd(e)
     case e: GlutenBuildInfoEvent => onGlutenBuildInfo(e)
     case e: GlutenPlanFallbackEvent => onGlutenPlanFallback(e)
-    case e: GlutenMppPlanEvent => onGlutenMppPlan(e)
+    case e: GlutenFluxPlanEvent => onGlutenFluxPlan(e)
+    case e: GlutenMppPlanEvent => onGlutenFluxPlan(fromLegacyMppPlan(e))
     case _ => // Ignore
   }
 
@@ -92,13 +98,13 @@ private class GlutenSQLAppStatusListener(conf: SparkConf, kvstore: ElementTracki
       executionId: Long,
       description: String,
       fallbackEvent: Option[GlutenPlanFallbackEvent],
-      mppPlanEvent: Option[GlutenMppPlanEvent]): Unit = {
+      fluxPlanEvent: Option[GlutenFluxPlanEvent]): Unit = {
     val existing = readExecution(executionId)
     val fallback = fallbackEvent
       .map(ExistingFallbackData.from)
       .orElse(existing.map(ExistingFallbackData.from))
-    val mppPlan =
-      mppPlanEvent.map(toMppPlanUIData).orElse(existing.map(_.mppPlan).filter(_ != null))
+    val fluxPlan =
+      fluxPlanEvent.map(toFluxPlanUIData).orElse(existing.map(_.fluxPlan).filter(_ != null))
 
     val uiData = new GlutenSQLExecutionUIData(
       executionId,
@@ -107,7 +113,7 @@ private class GlutenSQLAppStatusListener(conf: SparkConf, kvstore: ElementTracki
       fallback.map(_.numFallbackNodes).getOrElse(0),
       fallback.map(_.physicalPlanDescription).getOrElse(""),
       fallback.map(_.fallbackNodeToReason.toSeq.sortBy(_._1)).getOrElse(Seq.empty),
-      mppPlan.orNull
+      fluxPlan.orNull
     )
     kvstore.write(uiData, checkTriggers = true)
   }
@@ -120,8 +126,8 @@ private class GlutenSQLAppStatusListener(conf: SparkConf, kvstore: ElementTracki
     }
   }
 
-  private def toMppPlanUIData(event: GlutenMppPlanEvent): GlutenMppPlanUIData = {
-    new GlutenMppPlanUIData(
+  private def toFluxPlanUIData(event: GlutenFluxPlanEvent): GlutenFluxPlanUIData = {
+    new GlutenFluxPlanUIData(
       event.queryId,
       event.numFragments,
       event.numExchanges,
@@ -134,7 +140,7 @@ private class GlutenSQLAppStatusListener(conf: SparkConf, kvstore: ElementTracki
       event.fragments
         .map {
           fragment =>
-            new GlutenMppPlanFragmentUIData(
+            new GlutenFluxPlanFragmentUIData(
               fragment.fragmentId,
               fragment.plan,
               fragment.originalCharCount,
@@ -143,6 +149,29 @@ private class GlutenSQLAppStatusListener(conf: SparkConf, kvstore: ElementTracki
         }
         .sortBy(_.fragmentId)
     )
+  }
+
+  private def fromLegacyMppPlan(event: GlutenMppPlanEvent): GlutenFluxPlanEvent = {
+    GlutenFluxPlanEvent(
+      event.executionId,
+      event.queryId,
+      event.numFragments,
+      event.numExchanges,
+      event.dumpPath,
+      event.totalOriginalCharCount,
+      event.planSha256,
+      event.truncated,
+      event.captureEnabled,
+      event.captureError,
+      event.fragments.map {
+        fragment =>
+          GlutenFluxPlanFragmentEvent(
+            fragment.fragmentId,
+            fragment.plan,
+            fragment.originalCharCount,
+            fragment.sha256,
+            fragment.truncated)
+      })
   }
 
   private def cleanupExecutions(count: Long): Unit = {

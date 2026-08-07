@@ -26,7 +26,7 @@ import scala.util.control.NonFatal
 private[execution] object InputPartitionCoalescer {
 
   private[execution] case class Eligibility(
-      mppEnabled: Boolean,
+      fluxEnabled: Boolean,
       singleTaskMode: Boolean,
       outputPartitioning: Partitioning,
       hasOutputOrdering: Boolean,
@@ -40,7 +40,7 @@ private[execution] object InputPartitionCoalescer {
       eligibility: Eligibility)(
       partitionInfo: InputPartition => Option[(Long, String)]): Seq[Seq[InputPartition]] = {
     if (
-      targetBytes <= 0 || !eligibility.mppEnabled || eligibility.singleTaskMode ||
+      targetBytes <= 0 || !eligibility.fluxEnabled || eligibility.singleTaskMode ||
       !eligibility.outputPartitioning.isInstanceOf[UnknownPartitioning] ||
       eligibility.hasOutputOrdering || eligibility.hasKeyGroupedPartitioning ||
       eligibility.hasCommonPartitionValues || eligibility.requiresPartitionIdentity ||

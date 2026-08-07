@@ -30,9 +30,9 @@ import org.apache.gluten.memory.{MemoryUsageRecorder, SimpleMemoryUsageRecorder}
 import org.apache.gluten.memory.listener.ReservationListener
 import org.apache.gluten.memory.memtarget.MemoryTarget
 import org.apache.gluten.monitor.VeloxMemoryProfiler
-import org.apache.gluten.mpp.control.GlutenMppDriverService
-import org.apache.gluten.mpp.control.GlutenMppExecutorService
-import org.apache.gluten.mpp.control.GlutenMppQueryControlListener
+import org.apache.gluten.flux.control.GlutenFluxDriverService
+import org.apache.gluten.flux.control.GlutenFluxExecutorService
+import org.apache.gluten.flux.control.GlutenFluxQueryControlListener
 import org.apache.gluten.udf.UdfJniWrapper
 import org.apache.gluten.utils._
 
@@ -141,14 +141,14 @@ class VeloxListenerApi extends ListenerApi with Logging {
     if (inLocalMode(conf)) {
       initializeGpuConcurrency(conf)
     }
-    GlutenMppDriverService.init(conf)
-    GlutenMppDriverService.get().foreach {
-      service => sc.addSparkListener(new GlutenMppQueryControlListener(service))
+    GlutenFluxDriverService.init(conf)
+    GlutenFluxDriverService.get().foreach {
+      service => sc.addSparkListener(new GlutenFluxQueryControlListener(service))
     }
   }
 
   override def onDriverShutdown(): Unit = {
-    GlutenMppDriverService.shutdown()
+    GlutenFluxDriverService.shutdown()
     // NativeBackendInitializer and GpuMemoryTracker are initialized once per JVM. Their terminal
     // cleanup is owned by NativeBackendInitializer's JVM shutdown hook so a later SparkContext in
     // this JVM can keep using the process-wide Velox backend.
@@ -170,7 +170,7 @@ class VeloxListenerApi extends ListenerApi with Logging {
       // Driver already did that.
       logInfo(
         "Gluten is running with Spark local mode. Skip running static initializer for executor.")
-      GlutenMppExecutorService.onExecutorStart(pc)
+      GlutenFluxExecutorService.onExecutorStart(pc)
       return
     }
 
@@ -178,11 +178,11 @@ class VeloxListenerApi extends ListenerApi with Logging {
     initialize(conf, isDriver = false)
     initializeGpuConcurrency(conf)
     addIfNeedMemoryDumpShutdownHook(conf)
-    GlutenMppExecutorService.onExecutorStart(pc)
+    GlutenFluxExecutorService.onExecutorStart(pc)
   }
 
   override def onExecutorShutdown(): Unit = {
-    GlutenMppExecutorService.onExecutorShutdown()
+    GlutenFluxExecutorService.onExecutorShutdown()
   }
 
   private def initialize(conf: SparkConf, isDriver: Boolean): Unit = {
@@ -236,7 +236,7 @@ class VeloxListenerApi extends ListenerApi with Logging {
     SharedLibraryLoaderUtils.load(conf, loader)
 
     // Load the combined native library (libgluten.so contains both core and
-    // backend symbols, including MPP JNI).
+    // backend symbols, including FLUX JNI).
     val libPath = conf.get(GlutenConfig.GLUTEN_LIB_PATH)
     if (StringUtils.isBlank(libPath)) {
       val baseLibName = conf.get(GlutenConfig.GLUTEN_LIB_NAME)

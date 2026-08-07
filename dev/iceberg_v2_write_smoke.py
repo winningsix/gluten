@@ -16,13 +16,13 @@ def command_plan(spark, statement):
 
 
 def assert_native_write_plan(name, plan, writer):
-    required_nodes = (writer, "MppNativeQuery")
+    required_nodes = (writer, "FluxNativeQuery")
     missing = [node for node in required_nodes if node not in plan]
     if missing:
         raise RuntimeError(f"{name} plan is missing {missing}:\n{plan}")
-    if plan.index("MppNativeQuery") < plan.index(writer):
+    if plan.index("FluxNativeQuery") < plan.index(writer):
         raise RuntimeError(
-            f"{name} MPP query is outside the Iceberg writer boundary:\n{plan}"
+            f"{name} FLUX query is outside the Iceberg writer boundary:\n{plan}"
         )
     if "ColumnarToRow" in plan:
         raise RuntimeError(f"{name} plan contains a row boundary:\n{plan}")
@@ -215,7 +215,7 @@ def main():
     )
 
     # Validate committed Iceberg state through Spark's reference readers. Iceberg metadata tables
-    # are intentionally outside the native write boundary and are not supported by strict MPP.
+    # are intentionally outside the native write boundary and are not supported by strict FLUX.
     spark.conf.set("spark.gluten.enabled", "false")
     spark.conf.set("spark.gluten.mpp.enabled", "false")
 

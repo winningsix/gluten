@@ -207,7 +207,7 @@ class SubstraitToVeloxPlanConverter {
   }
 
   /// Advance the next plan node id allocator without inserting any input.
-  /// Used by single-task MPP merge to avoid colliding plan node ids when
+  /// Used by single-task FLUX merge to avoid colliding plan node ids when
   /// splicing multiple fragments' Velox plans into one task tree.
   void setNextPlanNodeId(int planNodeId) {
     planNodeId_ = planNodeId;

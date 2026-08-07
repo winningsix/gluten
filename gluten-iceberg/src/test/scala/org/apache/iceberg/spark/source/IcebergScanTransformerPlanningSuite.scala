@@ -38,7 +38,7 @@ abstract class IcebergScanTransformerPlanningSuite extends QueryTest with Shared
   private val schema = new Schema(Types.NestedField.required(1, "id", Types.IntegerType.get()))
   private val spec = PartitionSpec.unpartitioned()
 
-  test("MPP unordered Iceberg transformer coalesces planned partitions") {
+  test("FLUX unordered Iceberg transformer coalesces planned partitions") {
     val planned = plannedPartitions(4, bytesPerPartition = 10L)
 
     withPlanningConf(singleTaskMode = false) {
@@ -73,7 +73,7 @@ abstract class IcebergScanTransformerPlanningSuite extends QueryTest with Shared
   private def withPlanningConf(singleTaskMode: Boolean)(body: => Unit): Unit = {
     withSQLConf(
       "spark.gluten.mpp.enabled" -> "true",
-      "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode" -> singleTaskMode.toString,
+      "spark.gluten.sql.columnar.backend.velox.flux.singleTaskMode" -> singleTaskMode.toString,
       "spark.sql.files.maxPartitionBytes" -> "64",
       "spark.sql.files.openCostInBytes" -> "1"
     )(body)

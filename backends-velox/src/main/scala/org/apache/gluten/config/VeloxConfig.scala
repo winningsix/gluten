@@ -389,17 +389,17 @@ object VeloxConfig extends ConfigRegistry {
       .booleanConf
       .createWithDefault(true)
 
-  val MPP_SINGLE_TASK_MODE =
-    buildConf("spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode")
+  val FLUX_SINGLE_TASK_MODE =
+    buildConf("spark.gluten.sql.columnar.backend.velox.flux.singleTaskMode")
       .doc(
-        "Collapse local-mode MPP fragments into one Velox task connected by local exchanges, " +
+        "Collapse local-mode FLUX fragments into one Velox task connected by local exchanges, " +
           "bypassing UcxExchange for single-worker execution.")
       .booleanConf
       .createWithDefault(true)
 
-  val MPP_SINGLE_TASK_MAX_DRIVERS =
-    buildConf("spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMaxDrivers")
-      .doc("Maximum driver count for the merged Velox task when MPP single-task mode is enabled.")
+  val FLUX_SINGLE_TASK_MAX_DRIVERS =
+    buildConf("spark.gluten.sql.columnar.backend.velox.flux.singleTaskMaxDrivers")
+      .doc("Maximum driver count for the merged Velox task when FLUX single-task mode is enabled.")
       .intConf
       .createWithDefault(2)
 

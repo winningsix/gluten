@@ -81,13 +81,15 @@ case class EliminateRedundantSelfAggregateJoin(spark: SparkSession)
       return plan
     }
     plan.transformUp {
-      case outer @ Aggregate(
-            _,
-            aggregateExpressions,
-            project @ Project(projectList, join @ Join(left, right, Inner, Some(condition), _)),
-            _) =>
-        rewrite(outer, aggregateExpressions, projectList, left, right, condition)
-          .getOrElse(outer)
+      case outer: Aggregate =>
+        outer.child match {
+          case project @ Project(
+                projectList,
+                join @ Join(left, right, Inner, Some(condition), _)) =>
+            rewrite(outer, outer.aggregateExpressions, projectList, left, right, condition)
+              .getOrElse(outer)
+          case _ => outer
+        }
     }
   }
 
@@ -222,8 +224,10 @@ case class EliminateRedundantSelfAggregateJoin(spark: SparkSession)
 
   private def collectSummaries(plan: LogicalPlan): Seq[Summary] = {
     plan.collect {
-      case aggregate @ Aggregate(grouping, aggregateExpressions, child, _)
-          if grouping.length == 1 =>
+      case aggregate: Aggregate if aggregate.groupingExpressions.length == 1 =>
+        val grouping = aggregate.groupingExpressions
+        val aggregateExpressions = aggregate.aggregateExpressions
+        val child = aggregate.child
         val key = grouping.head match {
           case attribute: Attribute => attribute
           case _ => null
@@ -422,7 +426,10 @@ case class EliminateRedundantSelfAggregateJoin(spark: SparkSession)
             rewritten -> rewritten.output.find(_.exprId == carried.exprId).get
         }
 
-      case aggregate @ Aggregate(grouping, outputs, child, _) if child.exists(_ eq target) =>
+      case aggregate: Aggregate if aggregate.child.exists(_ eq target) =>
+        val grouping = aggregate.groupingExpressions
+        val outputs = aggregate.aggregateExpressions
+        val child = aggregate.child
         propagateSummary(child, target, targetKey, targetSum).flatMap {
           case (newChild, carried)
               if isKeyOnlyDedup(aggregate, targetKey) &&

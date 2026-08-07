@@ -18,4 +18,4 @@
 # These are NOT required for the core Gluten JNI library; they are developer
 # iteration aids that link against the same `velox` shared library.
 
-add_subdirectory(mpp-substrait-runner)
+add_subdirectory(flux-substrait-runner)

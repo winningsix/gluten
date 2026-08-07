@@ -211,7 +211,7 @@ class VeloxColumnarWriteFilesRDD(
         // Initialize the native plan
         val iter = firstParent[ColumnarBatch].iterator(split, context)
         if (!iter.hasNext) {
-          // Write-in-MPP: a peer that owns no input slice for this write (e.g. a
+          // Write-in-FLUX: a peer that owns no input slice for this write (e.g. a
           // SINGLE gather feeding a global top-N, which lands entirely on peer 0)
           // produces no native commit batch for this Spark partition. Emit an
           // empty file, mirroring the empty-iterator write path below.
@@ -254,9 +254,10 @@ class VeloxColumnarWriteFilesRDD(
 
   override protected def getPartitions: Array[Partition] = firstParent[ColumnarBatch].partitions
 
-  // Delegate placement to the parent RDD. With an MppNativeQueryRDD parent, each partition is
-  // pinned to the executor where its MPP native peer lives; without this Spark may run the write on
-  // the wrong executor (single-host, multi-executor) and break the MPP pin -> native crash.
+  // Delegate placement to the parent RDD. With an FluxNativeQueryRDD parent, each partition is
+  // pinned to the executor where its FLUX native peer lives; without this Spark may run the write
+  // on
+  // the wrong executor (single-host, multi-executor) and break the FLUX pin -> native crash.
   override protected def getPreferredLocations(split: Partition): Seq[String] =
     firstParent[ColumnarBatch].preferredLocations(split)
 

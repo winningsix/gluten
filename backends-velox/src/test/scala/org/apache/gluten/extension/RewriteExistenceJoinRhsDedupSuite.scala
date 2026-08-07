@@ -17,7 +17,7 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
-import org.apache.gluten.extension.columnar.{RegisterMppExistencePostSubqueryRules, RewriteExistenceJoinRhsDedup}
+import org.apache.gluten.extension.columnar.{RegisterFluxExistencePostSubqueryRules, RewriteExistenceJoinRhsDedup}
 
 import org.apache.spark.sql.{QueryTest, Row}
 import org.apache.spark.sql.catalyst.plans.{LeftAnti, LeftSemi}
@@ -127,7 +127,7 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
           |order by id, supp
           |""".stripMargin
 
-      RegisterMppExistencePostSubqueryRules(spark)
+      RegisterFluxExistencePostSubqueryRules(spark)
         .apply(spark.sql(sql).queryExecution.analyzed)
 
       assert(
@@ -258,11 +258,11 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
         |""".stripMargin
 
     withSQLConf("spark.gluten.mpp.enabled" -> "true") {
-      val mppDefaultPlan = rewrite(spark.sql(sql).queryExecution.optimizedPlan)
+      val fluxDefaultPlan = rewrite(spark.sql(sql).queryExecution.optimizedPlan)
       assert(
-        hasOptimizedExistenceAggregate(mppDefaultPlan),
-        "Expected MPP default to preserve min/max existence summary:\n" +
-          mppDefaultPlan.treeString)
+        hasOptimizedExistenceAggregate(fluxDefaultPlan),
+        "Expected FLUX default to preserve min/max existence summary:\n" +
+          fluxDefaultPlan.treeString)
     }
 
     withSQLConf(

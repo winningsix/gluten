@@ -85,8 +85,8 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
   private val maxWrapperDepth = 4
   private val maxProbeSpineDepth = 8
   private val maxSelectiveInListValues = 16
-  private val singleTaskModeKey = "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode"
-  private val mppPartitionsKey = "spark.gluten.mpp.multiExecutor.numPartitions"
+  private val singleTaskModeKey = "spark.gluten.sql.columnar.backend.velox.flux.singleTaskMode"
+  private val fluxPartitionsKey = "spark.gluten.mpp.multiExecutor.numPartitions"
   private val firstApplyLog = new AtomicBoolean(false)
 
   registerPostCboPass()
@@ -293,7 +293,7 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
   private def registerPostCboPass(): Unit = {
     // injectOptimizerRule runs in Spark's Operator Optimization batches, before CBO can choose
     // an expensive fact-ward join order. Also register a post-CBO pass in SparkOptimizer's
-    // "User Provided Optimizers" batch. MppFactProbeBroadcastHint runs in the earlier
+    // "User Provided Optimizers" batch. FluxFactProbeBroadcastHint runs in the earlier
     // operator-optimization batches and may attach hints to the CBO output; accept those hints
     // while matching, then run a post-CBO hint pass after this rewrite so the rebuilt joins still
     // get the all-REPLICATE build-side choices.
@@ -307,18 +307,18 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
       val existingRewrite =
         current.collectFirst { case r: PushSelectiveDimensionChainBeforeFact => r }.getOrElse(this)
       val existingHint = current
-        .collectFirst { case r: MppFactProbeBroadcastHint => r }
-        .getOrElse(MppFactProbeBroadcastHint(spark))
+        .collectFirst { case r: FluxFactProbeBroadcastHint => r }
+        .getOrElse(FluxFactProbeBroadcastHint(spark))
       val reordered = current.filterNot(
         r =>
           r.isInstanceOf[PushSelectiveDimensionChainBeforeFact] ||
-            r.isInstanceOf[MppFactProbeBroadcastHint]) :+ existingRewrite :+ existingHint
+            r.isInstanceOf[FluxFactProbeBroadcastHint]) :+ existingRewrite :+ existingHint
 
       if (reordered != current) {
         experimental.extraOptimizations = reordered
         logDebug(
           "PushSelectiveDimensionChainBeforeFact: registered post-CBO rewrite plus " +
-            "MppFactProbeBroadcastHint in spark.experimental.extraOptimizations")
+            "FluxFactProbeBroadcastHint in spark.experimental.extraOptimizations")
       }
     }
   }
@@ -924,7 +924,7 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
             // Keep the conservative 10M/1GiB path unchanged. A larger chain is admitted only
             // when it has multiple high-NDV exits and either an explicit configured allowance or
             // a favorable cost estimate. The cost estimate charges the projected chain once per
-            // MPP peer (worst-case broadcast) and credits only the victim bytes avoided at those
+            // FLUX peer (worst-case broadcast) and credits only the victim bytes avoided at those
             // downstream exits. This lets a selective SF30000 supplier/nation chain prune l1,
             // while preventing a generic single-exit star join from crossing the old size gate.
             val chainIsEligible =
@@ -1108,7 +1108,7 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
       realScanBytes(plan) <= maxBasePrunableChainDimensionSizeInBytes
 
   /**
-   * Compare a conservative MPP broadcast cost with the downstream victim work the prune avoids.
+   * Compare a conservative FLUX broadcast cost with the downstream victim work the prune avoids.
    * This is deliberately not a query-name or table-name check. It uses only plan statistics and
    * topology, and it is applied in addition to the strict semantic/shape checks in this rule.
    */
@@ -1126,7 +1126,7 @@ case class PushSelectiveDimensionChainBeforeFact(spark: SparkSession)
     }
 
     val configuredPeers = positiveLongConf(
-      mppPartitionsKey,
+      fluxPartitionsKey,
       math.max(1L, spark.sessionState.conf.numShufflePartitions.toLong))
     val peerCount = BigInt(math.max(1L, configuredPeers))
     val broadcastCostBytes = chainBytes * peerCount

@@ -63,7 +63,7 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
         val rewriteIndex = experimental.extraOptimizations.indexWhere(
           _.isInstanceOf[PushSelectiveDimensionChainBeforeFact])
         val hintIndex =
-          experimental.extraOptimizations.indexWhere(_.isInstanceOf[MppFactProbeBroadcastHint])
+          experimental.extraOptimizations.indexWhere(_.isInstanceOf[FluxFactProbeBroadcastHint])
         assert(rewriteIndex >= 0 && hintIndex > rewriteIndex)
         rule(q5LikePlan().plan)
         assert(postCboRewriteCount(experimental) == 1)
@@ -240,7 +240,7 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
     }
   }
 
-  test("cost admits a large chain only when multiple exits repay worst-case MPP broadcast") {
+  test("cost admits a large chain only when multiple exits repay worst-case FLUX broadcast") {
     val singleExit = directChainVictimPlan(chainRows = 300000000L, victimRows = 180000000000L)
     val twoExits = directChainVictimPlan(
       chainRows = 300000000L,
@@ -683,18 +683,18 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
 
     val leftSmaller = sizedInnerJoin(leftBytes = oneGb, rightBytes = fourGb)
     withSQLConf("spark.sql.autoBroadcastJoinThreshold" -> twoGb.toString) {
-      assert(broadcastHintSide(MppFactProbeBroadcastHint(spark)(leftSmaller)).contains("left"))
+      assert(broadcastHintSide(FluxFactProbeBroadcastHint(spark)(leftSmaller)).contains("left"))
     }
     withSQLConf("spark.sql.autoBroadcastJoinThreshold" -> (512L << 20).toString) {
-      assert(broadcastHintSide(MppFactProbeBroadcastHint(spark)(leftSmaller)).isEmpty)
+      assert(broadcastHintSide(FluxFactProbeBroadcastHint(spark)(leftSmaller)).isEmpty)
     }
 
     val rightSmaller = sizedInnerJoin(leftBytes = fourGb, rightBytes = oneGb)
     withSQLConf("spark.sql.autoBroadcastJoinThreshold" -> twoGb.toString) {
-      assert(broadcastHintSide(MppFactProbeBroadcastHint(spark)(rightSmaller)).contains("right"))
+      assert(broadcastHintSide(FluxFactProbeBroadcastHint(spark)(rightSmaller)).contains("right"))
     }
     withSQLConf("spark.sql.autoBroadcastJoinThreshold" -> "-1") {
-      assert(broadcastHintSide(MppFactProbeBroadcastHint(spark)(rightSmaller)).isEmpty)
+      assert(broadcastHintSide(FluxFactProbeBroadcastHint(spark)(rightSmaller)).isEmpty)
     }
   }
 
@@ -712,7 +712,7 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
       rightStatsBytes = sixtyFourGb)
     withSQLConf("spark.sql.autoBroadcastJoinThreshold" -> twoGb.toString) {
       assert(
-        broadcastHintSide(MppFactProbeBroadcastHint(spark)(projectedSmallSide)).contains("left"))
+        broadcastHintSide(FluxFactProbeBroadcastHint(spark)(projectedSmallSide)).contains("left"))
     }
 
     val statsTooLarge = sizedInnerJoin(
@@ -721,7 +721,7 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
       leftStatsBytes = threeGb,
       rightStatsBytes = sixtyFourGb)
     withSQLConf("spark.sql.autoBroadcastJoinThreshold" -> twoGb.toString) {
-      assert(broadcastHintSide(MppFactProbeBroadcastHint(spark)(statsTooLarge)).isEmpty)
+      assert(broadcastHintSide(FluxFactProbeBroadcastHint(spark)(statsTooLarge)).isEmpty)
     }
 
     val rightProjectedSmallSide = sizedInnerJoin(
@@ -731,12 +731,12 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
       rightStatsBytes = oneGb)
     withSQLConf("spark.sql.autoBroadcastJoinThreshold" -> twoGb.toString) {
       assert(
-        broadcastHintSide(MppFactProbeBroadcastHint(spark)(rightProjectedSmallSide))
+        broadcastHintSide(FluxFactProbeBroadcastHint(spark)(rightProjectedSmallSide))
           .contains("right"))
     }
   }
 
-  test("fact-probe broadcast hint extends the threshold only when MPP network cost wins") {
+  test("fact-probe broadcast hint extends the threshold only when FLUX network cost wins") {
     val twoGb = 2L << 30
     val threeGb = 3L << 30
     val fourGb = 4L << 30
@@ -756,7 +756,7 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
       "spark.sql.autoBroadcastJoinThreshold" -> twoGb.toString,
       maxBuildKey -> fourGb.toString,
       partitionsKey -> "8") {
-      assert(broadcastHintSide(MppFactProbeBroadcastHint(spark)(networkWin)).contains("right"))
+      assert(broadcastHintSide(FluxFactProbeBroadcastHint(spark)(networkWin)).contains("right"))
     }
 
     val networkLoss = sizedInnerJoin(
@@ -768,7 +768,7 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
       "spark.sql.autoBroadcastJoinThreshold" -> twoGb.toString,
       maxBuildKey -> fourGb.toString,
       partitionsKey -> "8") {
-      assert(broadcastHintSide(MppFactProbeBroadcastHint(spark)(networkLoss)).isEmpty)
+      assert(broadcastHintSide(FluxFactProbeBroadcastHint(spark)(networkLoss)).isEmpty)
     }
 
     val overMemoryCeiling = sizedInnerJoin(
@@ -780,7 +780,7 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
       "spark.sql.autoBroadcastJoinThreshold" -> twoGb.toString,
       maxBuildKey -> fourGb.toString,
       partitionsKey -> "8") {
-      assert(broadcastHintSide(MppFactProbeBroadcastHint(spark)(overMemoryCeiling)).isEmpty)
+      assert(broadcastHintSide(FluxFactProbeBroadcastHint(spark)(overMemoryCeiling)).isEmpty)
     }
   }
 
@@ -790,7 +790,7 @@ class PushSelectiveDimensionChainBeforeFactSuite extends GlutenQueryTest with Sh
     experimental.extraOptimizations.count(_.isInstanceOf[PushSelectiveDimensionChainBeforeFact])
 
   private def postCboHintCount(experimental: org.apache.spark.sql.ExperimentalMethods): Int =
-    experimental.extraOptimizations.count(_.isInstanceOf[MppFactProbeBroadcastHint])
+    experimental.extraOptimizations.count(_.isInstanceOf[FluxFactProbeBroadcastHint])
 
   private def splitAnd(e: Expression): Seq[Expression] = e match {
     case And(l, r) => splitAnd(l) ++ splitAnd(r)

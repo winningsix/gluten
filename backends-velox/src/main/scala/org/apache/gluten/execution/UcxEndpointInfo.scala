@@ -17,9 +17,9 @@
 package org.apache.gluten.execution
 
 /**
- * Per-executor UCX endpoint info used by MPP peer resolution. Relocated out of the (removed)
+ * Per-executor UCX endpoint info used by FLUX peer resolution. Relocated out of the (removed)
  * UcxEndpointProbeRDD; still produced by the driver endpoint registry path
- * (GlutenMppPeerMapper.fromEndpointRecords) and consumed by GlutenMppPeerMapper.toMppPeerInfos.
+ * (GlutenFluxPeerMapper.fromEndpointRecords) and consumed by GlutenFluxPeerMapper.toFluxPeerInfos.
  */
 case class UcxEndpointInfo(
     executorId: String,

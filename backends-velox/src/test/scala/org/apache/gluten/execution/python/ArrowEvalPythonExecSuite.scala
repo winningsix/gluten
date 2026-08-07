@@ -16,13 +16,18 @@
  */
 package org.apache.gluten.execution.python
 
-import org.apache.gluten.execution.{MppNativeQueryExec, WholeStageTransformerSuite}
+import org.apache.gluten.execution.{FluxNativeQueryExec, WholeStageTransformerSuite}
 import org.apache.gluten.vectorized.ArrowWritableColumnVector
 
 import org.apache.spark.SparkConf
-import org.apache.spark.api.python.{ArrowUdfSerializationAckTestSupport, ColumnarArrowEvalPythonExec}
+import org.apache.spark.api.python.{
+  ArrowUdfSerializationAckTestSupport,
+  ColumnarArrowEvalPythonExec}
 import org.apache.spark.sql.{DataFrame, IntegratedUDFTestUtils, Row}
-import org.apache.spark.sql.execution.python.{BatchEvalPythonExec, EvalPythonExecTransformer, UserDefinedPythonFunction}
+import org.apache.spark.sql.execution.python.{
+  BatchEvalPythonExec,
+  EvalPythonExecTransformer,
+  UserDefinedPythonFunction}
 import org.apache.spark.sql.functions.lit
 import org.apache.spark.sql.types.{DataType, LongType, StringType}
 import org.apache.spark.util.SparkVersionUtil
@@ -406,7 +411,7 @@ class ArrowEvalPythonExecSuite extends WholeStageTransformerSuite {
     }
   }
 
-  testWithMaxSparkVersion("strict MPP reports nullable ordinary Arrow UDF semantic guard", "4.0") {
+  testWithMaxSparkVersion("strict FLUX reports nullable ordinary Arrow UDF semantic guard", "4.0") {
     assume(SparkVersionUtil.gteSpark35, "ordinary scalar Arrow UDF eval type requires Spark 3.5+")
     withSQLConf(
       "spark.sql.execution.pythonUDF.arrow.enabled" -> "true",
@@ -428,7 +433,7 @@ class ArrowEvalPythonExecSuite extends WholeStageTransformerSuite {
   }
 
   testWithMaxSparkVersion(
-    "strict MPP treats ColumnarArrowEvalPythonExec as intentional columnar B1 boundary",
+    "strict FLUX treats ColumnarArrowEvalPythonExec as intentional columnar B1 boundary",
     "4.0") {
     assume(SparkVersionUtil.gteSpark35, "ordinary scalar Arrow UDF eval type requires Spark 3.5+")
     withSQLConf(
@@ -447,7 +452,9 @@ class ArrowEvalPythonExecSuite extends WholeStageTransformerSuite {
       val arrowStages = plan.collect { case stage: ColumnarArrowEvalPythonExec => stage }
 
       assert(arrowStages.size == 1, plan.treeString)
-      assert(arrowStages.head.collect { case _: MppNativeQueryExec => 1 }.nonEmpty, plan.treeString)
+      assert(
+        arrowStages.head.collect { case _: FluxNativeQueryExec => 1 }.nonEmpty,
+        plan.treeString)
       val pythonBoundaryTree = arrowStages.head.treeString
       assert(!pythonBoundaryTree.contains("BatchEvalPythonExec"), pythonBoundaryTree)
       assert(!pythonBoundaryTree.contains("RowToVeloxColumnarExec"), pythonBoundaryTree)

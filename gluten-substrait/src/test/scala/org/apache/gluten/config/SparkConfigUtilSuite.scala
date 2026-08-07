@@ -44,13 +44,13 @@ class SparkConfigUtilSuite extends AnyFunSuiteLike {
     assert(SparkConfigUtil.get(conf, GlutenConfig.GLUTEN_LOAD_LIB_OS).isEmpty)
   }
 
-  test("GlutenConfig preserves MPP mode in native backend config") {
-    val mppEnabled = "spark.gluten.mpp.enabled"
+  test("GlutenConfig preserves FLUX mode in native backend config") {
+    val fluxEnabled = "spark.gluten.mpp.enabled"
     val nativeConf = GlutenConfig.getNativeBackendConf(
       "velox",
-      Map(mppEnabled -> "true", "spark.unrelated.config" -> "ignored"))
+      Map(fluxEnabled -> "true", "spark.unrelated.config" -> "ignored"))
 
-    assert(nativeConf.get(mppEnabled) === "true")
+    assert(nativeConf.get(fluxEnabled) === "true")
     assert(!nativeConf.containsKey("spark.unrelated.config"))
   }
 }

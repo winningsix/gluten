@@ -119,12 +119,12 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
   protected val externalDataDir: String =
     nonNullProperty("gluten.tpch.externalDataDir", "/data/tpch/sf1k_v2_float")
 
-  private val mppDumpDir: String =
+  private val fluxDumpDir: String =
     sys.props
       .get("spark.gluten.mpp.substraitDumpDir")
-      .orElse(sys.env.get("CURSOR_MPP_DUMP_DIR"))
+      .orElse(sys.env.get("CURSOR_FLUX_DUMP_DIR"))
       .filter(_.nonEmpty)
-      .getOrElse("/opt/gluten/mpp-dumps-tpch-sf1k")
+      .getOrElse("/opt/gluten/flux-dumps-tpch-sf1k")
 
   override protected def createTPCHNotNullTables(): Unit = {
     TPCHTableDataFrames = TPCHTables
@@ -165,11 +165,11 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
       .set("spark.gluten.sql.columnar.cudf", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enabled", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan", "true")
-      // Keep the bounded async MR large enough for the single-GPU SF1K MPP profile.
+      // Keep the bounded async MR large enough for the single-GPU SF1K FLUX profile.
       .set("spark.gluten.sql.columnar.backend.velox.cudf.memoryPercent", "90")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.jit_expression_enabled", "false")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.ast_expression_enabled", "true")
-      .set("spark.gluten.mpp.substraitDumpDir", mppDumpDir)
+      .set("spark.gluten.mpp.substraitDumpDir", fluxDumpDir)
 
     Seq(
       "spark.master",
@@ -285,7 +285,7 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
   }
 
   if (q13InnerDiagnosticEnabled) {
-    test("TPC-H q13 inner MPP vs CPU diagnostic") {
+    test("TPC-H q13 inner FLUX vs CPU diagnostic") {
       failAfter(perQueryTimeout) {
         compareQ13InnerSubquery()
       }
@@ -548,8 +548,8 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
       s"[CURSOR-Q13-INNER] bounded diagnostic customerStart=$q13DiagnosticCustomerStart " +
         s"customerEnd=$q13DiagnosticCustomerEnd bucketCount=$q13DiagnosticBucketCount")
 
-    val mppFingerprint = collectOutput(spark.sql(q13BoundedInnerBucketFingerprintSql))
-    val mppDistribution = collectOutput(spark.sql(q13BoundedOuterDistributionSql))
+    val fluxFingerprint = collectOutput(spark.sql(q13BoundedInnerBucketFingerprintSql))
+    val fluxDistribution = collectOutput(spark.sql(q13BoundedOuterDistributionSql))
 
     withSQLConf(
       "spark.gluten.enabled" -> "false",
@@ -558,20 +558,20 @@ class VeloxTPCHFloatSF1KCompareSuite extends VeloxTPCHTableSupport with TimeLimi
       val cpuFingerprint = collectOutput(spark.sql(q13BoundedInnerBucketFingerprintSql))
       val cpuDistribution = collectOutput(spark.sql(q13BoundedOuterDistributionSql))
 
-      logDiagnosticOutput("Q13 bounded inner bucket fingerprint MPP", mppFingerprint)
+      logDiagnosticOutput("Q13 bounded inner bucket fingerprint FLUX", fluxFingerprint)
       logDiagnosticOutput("Q13 bounded inner bucket fingerprint CPU", cpuFingerprint)
-      logDiagnosticOutput("Q13 bounded outer distribution MPP", mppDistribution)
+      logDiagnosticOutput("Q13 bounded outer distribution FLUX", fluxDistribution)
       logDiagnosticOutput("Q13 bounded outer distribution CPU", cpuDistribution)
 
       val innerMismatch =
         collectedOutputMismatch(
-          "Q13 bounded inner bucket fingerprint MPP vs CPU",
-          mppFingerprint,
+          "Q13 bounded inner bucket fingerprint FLUX vs CPU",
+          fluxFingerprint,
           cpuFingerprint)
       val outerMismatch =
         collectedOutputMismatch(
-          "Q13 bounded outer distribution MPP vs CPU",
-          mppDistribution,
+          "Q13 bounded outer distribution FLUX vs CPU",
+          fluxDistribution,
           cpuDistribution)
       val classification = (innerMismatch, outerMismatch) match {
         case (Some(_), _) => "INNER_JOIN_FILTER_AGGREGATE"

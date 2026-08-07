@@ -180,7 +180,7 @@ abstract class HashAggregateExecBaseTransformer(
  * Backend opt-in for rebuilding an already-offloaded aggregate after a pre-project rewrite.
  *
  * Keep this separate from [[HashAggregateExecBaseTransformer]] so a backend is not required to
- * implement a rewrite that it does not use. In particular, Velox strict MPP opts in while other
+ * implement a rewrite that it does not use. In particular, Velox strict FLUX opts in while other
  * backends retain their existing aggregate planning behavior.
  */
 private[gluten] trait RewritableHashAggregateExecTransformer {

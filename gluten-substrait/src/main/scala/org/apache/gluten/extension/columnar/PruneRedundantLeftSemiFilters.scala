@@ -33,7 +33,7 @@ import org.apache.spark.sql.internal.SQLConf
  * graph.
  *
  * Spark can derive a second semi filter from constraints after rewriting an IN/EXISTS subquery.
- * Spark physical planning may hide the duplicate with ReusedExchange, but MPP fragment extraction
+ * Spark physical planning may hide the duplicate with ReusedExchange, but FLUX fragment extraction
  * cannot safely share one producer fragment across multiple consumers yet. This rule only removes a
  * semi filter when another semi filter in the same inner-join cluster:
  *   - has an equivalent RHS plan,

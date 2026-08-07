@@ -31,14 +31,14 @@ class VeloxTPCHFloatSuite extends VeloxTPCHSuite {
       // Override shuffle partitions to force shuffle exchanges in the plan.
       // The parent sets it to 1, which lets Spark optimize away shuffles entirely.
       // With 4 partitions, agg/join queries will have ShuffleExchange nodes,
-      // giving MppCollapseRule something to absorb.
+      // giving FluxCollapseRule something to absorb.
       .set("spark.sql.shuffle.partitions", "4")
       .set("spark.sql.adaptive.enabled", "false")
-      // Plan C (MppStrategy) — intercept at Strategy level
+      // Plan C (FluxStrategy) — intercept at Strategy level
       .set("spark.gluten.mpp.enabled", "true")
       .set("spark.gluten.mpp.strategy.enabled", "true")
-      // Dump every MppNativeQueryExec plan for offline comparison with Presto
-      .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps-tpch")
+      // Dump every FluxNativeQueryExec plan for offline comparison with Presto
+      .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/flux-dumps-tpch")
       // Plan-shape parity with Presto (opt-in cross-cut rules)
       .set("spark.gluten.mpp.singlePartitionSort", "true")
       .set("spark.gluten.mpp.removeRedundantShuffle", "true")

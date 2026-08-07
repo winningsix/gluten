@@ -411,7 +411,7 @@ struct CudfIcebergWriter::Impl {
     std::unique_ptr<cudf::table> convertedInput;
     const auto table = [&]() -> cudf::table_view {
       if (cudfInput) {
-        // MPP operators may use a different stream. The synchronization keeps
+        // FLUX operators may use a different stream. The synchronization keeps
         // the input device buffers ready before this writer consumes them.
         cudfInput->stream().synchronize();
         return cudfInput->getTableView();
@@ -419,7 +419,7 @@ struct CudfIcebergWriter::Impl {
 
       // A V2 write can retain a Spark/BSP boundary above an otherwise native
       // plan (for example an unsupported nested left-anti join). Preserve the
-      // GPU writer in that case by uploading the CPU RowVector. Fully GPU MPP
+      // GPU writer in that case by uploading the CPU RowVector. Fully GPU FLUX
       // output continues to use the zero-copy CudfVector path above.
       convertedInput =
           facebook::velox::cudf_velox::with_arrow::toCudfTable(
@@ -444,7 +444,7 @@ struct CudfIcebergWriter::Impl {
     }
 
     if (partitionChannels.empty()) {
-      // Keep one batch in flight so the MPP root can produce the next device
+      // Keep one batch in flight so the FLUX root can produce the next device
       // batch while libcudf compresses this one.  The next call reaches this
       // point only after that new input is already available; wait here before
       // releasing the previous input buffers and queueing another write.

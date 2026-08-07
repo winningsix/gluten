@@ -30,7 +30,7 @@ import org.apache.iceberg.types.TypeUtil
 abstract class AbstractIcebergWriteExec extends IcebergWriteExec {
 
   override protected def executeColumnarForWrite(): RDD[ColumnarBatch] = query match {
-    case mpp: MppNativeQueryExec => mpp.executeColumnarForGpuSink()
+    case flux: FluxNativeQueryExec => flux.executeColumnarForGpuSink()
     case _ => query.executeColumnar()
   }
 

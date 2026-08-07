@@ -1,6 +1,6 @@
 # Presto-GPU + UCX TPC-H Testing Recipe
 
-End-to-end recipe for running TPC-H benchmarks on the Presto-GPU + UCX shuffle reference image. Used as the **comparison baseline** for the Spark-Gluten MPP path: same TPC-H queries, same SF1 / SF1K data, same physical plan operators, same exchange transport (UCX).
+End-to-end recipe for running TPC-H benchmarks on the Presto-GPU + UCX shuffle reference image. Used as the **comparison baseline** for the Spark-Gluten FLUX path: same TPC-H queries, same SF1 / SF1K data, same physical plan operators, same exchange transport (UCX).
 
 This document is descriptive — the actual scripts live in `code/velox-testing/presto/` and the launchers (`start_native_gpu_presto.sh`, `setup_benchmark_tables.sh`, `analyze_tables.sh`) wrap the docker compose / Hive metastore steps.
 
@@ -142,7 +142,7 @@ Two flavors; both are wrapped by scripts under `code/velox-testing/presto/script
 ./run_tpch_explain.sh -s tpch_probe -o /home/nfs/ferdinandx/q2/runs/presto-gpu-ucx-sf1k/plans
 ```
 
-Produces 22 distributed-plan text files + 22 JSON files. The 22 distributed-plan texts are the **canonical reference** for the Spark-Gluten MPP fragment graph: stage count, exchange types, operator names per stage.
+Produces 22 distributed-plan text files + 22 JSON files. The 22 distributed-plan texts are the **canonical reference** for the Spark-Gluten FLUX fragment graph: stage count, exchange types, operator names per stage.
 
 ### TIMED RUN (wall-clock + result CSV)
 
@@ -180,7 +180,7 @@ Captured 2026-04-24 under `/home/nfs/ferdinandx/q2/runs/presto-gpu-ucx-sf1k/`:
 
 - **22-query wall-clock total: ~66 s**
 - Q1: 2.57 s (4 rows) — the Spark-Gluten Q1 reference target
-- Q6: 1.29 s (1 row, revenue ≈ 1.233136e11) — the same scalar value Spark-Gluten MPP must hit
+- Q6: 1.29 s (1 row, revenue ≈ 1.233136e11) — the same scalar value Spark-Gluten FLUX must hit
 
 The SF1 (small) corpus also has 22-query results captured under `presto-gpu-ucx-sf1/` for plan-shape comparison; wall times there are too small (0.05–0.74 s) for throughput conclusions but the **physical plan** is the relevant comparison axis.
 

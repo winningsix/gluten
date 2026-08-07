@@ -1,5 +1,5 @@
 #!/bin/bash
-# Incremental rebuild of libgluten.so for the MPP Direction-B development loop.
+# Incremental rebuild of libgluten.so for the FLUX Direction-B development loop.
 #
 # Run this script INSIDE one of the gluten build containers (gluten_q2_run or
 # gluten_q2_build) where /opt/gluten is bind-mounted. It does NOT touch Java/Maven
@@ -111,8 +111,8 @@ fi
 # refactored symbols are present we can grow this list as the refactor settles.
 echo "==> JNI symbol sanity check"
 for sym in \
-  Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery \
-  Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeStartMppQuery \
+  Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery \
+  Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeStartFluxQuery \
   ; do
   if ! nm -D "$OUT_LIB" 2>/dev/null | awk -v sym="$sym" '$2 == "T" && $3 == sym { found = 1 } END { exit !found }'; then
     echo "fatal: expected JNI symbol absent: $sym" >&2

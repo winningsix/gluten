@@ -265,7 +265,7 @@ class PushSelectiveDimensionFilterIntoAggregateSuite extends QueryTest with Shar
     }
   }
 
-  test("cost gate respects the explicit MPP build ceiling") {
+  test("cost gate respects the explicit FLUX build ceiling") {
     withSQLConf(
       "spark.sql.autoBroadcastJoinThreshold" -> "1",
       maxBuildBytesKey -> "2",

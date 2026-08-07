@@ -48,6 +48,29 @@ case class GlutenPlanFallbackEvent(
     fallbackNodeToReason: Map[String, String])
   extends GlutenEvent {}
 
+case class GlutenFluxPlanFragmentEvent(
+  fragmentId: Int,
+  plan: String,
+  originalCharCount: Int,
+  sha256: String,
+  truncated: Boolean)
+
+case class GlutenFluxPlanEvent(
+  executionId: Long,
+  queryId: String,
+  numFragments: Int,
+    numExchanges: Int,
+    dumpPath: String,
+    totalOriginalCharCount: Long,
+    planSha256: String,
+  truncated: Boolean,
+  captureEnabled: Boolean,
+  captureError: String,
+  fragments: Seq[GlutenFluxPlanFragmentEvent])
+  extends GlutenEvent {}
+
+/** Compatibility event types used when reading event logs produced before the Flux rename. */
+@deprecated("Use GlutenFluxPlanFragmentEvent", "1.6.0")
 case class GlutenMppPlanFragmentEvent(
     fragmentId: Int,
     plan: String,
@@ -55,6 +78,7 @@ case class GlutenMppPlanFragmentEvent(
     sha256: String,
     truncated: Boolean)
 
+@deprecated("Use GlutenFluxPlanEvent", "1.6.0")
 case class GlutenMppPlanEvent(
     executionId: Long,
     queryId: String,

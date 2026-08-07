@@ -51,35 +51,35 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
 
   /**
    * Marker check: after RANGE preparation and every fallback-capable validation succeeds,
-   * MppNativeQueryExec tags this exchange dead because Plan C single-task merge has inlined the
-   * build subtree into the consumer fragment (see MppJniWrapper "single-task merge BROADCAST, no
+   * FluxNativeQueryExec tags this exchange dead because Plan C single-task merge has inlined the
+   * build subtree into the consumer fragment (see FluxJniWrapper "single-task merge BROADCAST, no
    * LocalPartition wrap"). The driver-side relationFuture collect is dead work in that path, and
    * keeping it leaks ColumnarBatchSerializeResult arrays into driver heap (~5 GB per Q14 iter, OOM
    * by iter 3). Stays false on the BSP fallback path, which still needs executeBroadcast for
-   * non-MPP BroadcastHashJoin.
+   * non-FLUX BroadcastHashJoin.
    *
    * Implemented as a TreeNodeTag (not a transient var on the case class) so the marker survives
    * Catalyst plan transformations (`copy()`, `withNewChildren()`, `transform*()`) -- Spark
    * frequently rebuilds tree nodes during later columnar rules, and a per-instance var would
    * silently reset to false.
    */
-  def isMppSuppressed: Boolean =
-    getTagValue(ColumnarBroadcastExchangeExec.MppSuppressedTag).contains(true)
+  def isFluxSuppressed: Boolean =
+    getTagValue(ColumnarBroadcastExchangeExec.FluxSuppressedTag).contains(true)
 
   /**
-   * Skip Spark's eager `prepare()` launch while an enclosing MPP query is still validating.
+   * Skip Spark's eager `prepare()` launch while an enclosing FLUX query is still validating.
    *
-   * Unlike [[isMppSuppressed]], this marker is reversible in behavior: `doExecuteBroadcast` and
+   * Unlike [[isFluxSuppressed]], this marker is reversible in behavior: `doExecuteBroadcast` and
    * direct access to [[relationFuture]] still start the broadcast on demand. This lets RANGE
    * sampling and BSP fallback consume a live exchange without also running dead broadcast jobs for
-   * queries that commit to native MPP.
+   * queries that commit to native FLUX.
    */
-  def isMppPrepareDeferred: Boolean =
-    getTagValue(ColumnarBroadcastExchangeExec.MppPrepareDeferredTag).contains(true)
+  def isFluxPrepareDeferred: Boolean =
+    getTagValue(ColumnarBroadcastExchangeExec.FluxPrepareDeferredTag).contains(true)
 
-  def deferPrepareForMppNativeExecution(): Boolean = synchronized {
-    val newlyMarked = !isMppPrepareDeferred
-    setTagValue(ColumnarBroadcastExchangeExec.MppPrepareDeferredTag, true)
+  def deferPrepareForFluxNativeExecution(): Boolean = synchronized {
+    val newlyMarked = !isFluxPrepareDeferred
+    setTagValue(ColumnarBroadcastExchangeExec.FluxPrepareDeferredTag, true)
     newlyMarked
   }
 
@@ -97,8 +97,8 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
   @transient
   override lazy val relationFuture: java.util.concurrent.Future[broadcast.Broadcast[Any]] = {
     val future =
-      if (isMppSuppressed) {
-        failedMppSuppressedFuture()
+      if (isFluxSuppressed) {
+        failedFluxSuppressedFuture()
       } else {
         SQLExecution.withThreadLocalCaptured[broadcast.Broadcast[Any]](
           session,
@@ -165,11 +165,11 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
     future
   }
 
-  def suppressForMppNativeExecution(): Boolean = synchronized {
-    val newlyMarked = !isMppSuppressed
-    setTagValue(ColumnarBroadcastExchangeExec.MppSuppressedTag, true)
+  def suppressForFluxNativeExecution(): Boolean = synchronized {
+    val newlyMarked = !isFluxSuppressed
+    setTagValue(ColumnarBroadcastExchangeExec.FluxSuppressedTag, true)
 
-    val ex = mppSuppressedException
+    val ex = fluxSuppressedException
     promise.tryFailure(ex)
     Option(relationFutureRef).foreach {
       future =>
@@ -181,17 +181,18 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
     newlyMarked
   }
 
-  private def failedMppSuppressedFuture(): java.util.concurrent.Future[broadcast.Broadcast[Any]] = {
-    val ex = mppSuppressedException
+  private def failedFluxSuppressedFuture():
+      java.util.concurrent.Future[broadcast.Broadcast[Any]] = {
+    val ex = fluxSuppressedException
     promise.tryFailure(ex)
     val failed = new CompletableFuture[broadcast.Broadcast[Any]]()
     failed.completeExceptionally(ex)
     failed
   }
 
-  private def mppSuppressedException: IllegalStateException = {
+  private def fluxSuppressedException: IllegalStateException = {
     new IllegalStateException(
-      "ColumnarBroadcastExchangeExec is marked mppSuppressed and will not start " +
+      "ColumnarBroadcastExchangeExec is marked fluxSuppressed and will not start " +
         "driver-side relationFuture collection.")
   }
 
@@ -216,10 +217,10 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
 
   override def doPrepare(): Unit = {
     // Skip the driver-side build-side collect when an enclosing
-    // MppNativeQueryExec has inlined this build subtree into its consumer
-    // fragment via single-task merge. See [[isMppSuppressed]] for the full
-    // rationale and MppNativeQueryExec for the commit point.
-    if (isMppSuppressed || isMppPrepareDeferred) return
+    // FluxNativeQueryExec has inlined this build subtree into its consumer
+    // fragment via single-task merge. See [[isFluxSuppressed]] for the full
+    // rationale and FluxNativeQueryExec for the commit point.
+    if (isFluxSuppressed || isFluxPrepareDeferred) return
     relationFuture
   }
 
@@ -230,14 +231,14 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
 
   override protected[sql] def doExecuteBroadcast[T](): broadcast.Broadcast[T] = {
     // A suppressed exchange must never be consumed via doExecuteBroadcast: the
-    // build subtree has been inlined into a native MPP fragment and no one is
+    // build subtree has been inlined into a native FLUX fragment and no one is
     // supposed to await the broadcast variable. Fail loudly so a future
     // re-enable of fused-broadcast paths or an unexpected BSP consumer surface
     // here instead of returning null / a stale promise.
-    if (isMppSuppressed) {
+    if (isFluxSuppressed) {
       throw new IllegalStateException(
-        "ColumnarBroadcastExchangeExec is marked mppSuppressed (build inlined " +
-          "into MppNativeQueryExec consumer fragment) and cannot serve " +
+        "ColumnarBroadcastExchangeExec is marked fluxSuppressed (build inlined " +
+          "into FluxNativeQueryExec consumer fragment) and cannot serve " +
           "doExecuteBroadcast.")
     }
     try {
@@ -275,21 +276,21 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
 object ColumnarBroadcastExchangeExec {
 
   /**
-   * Prevent eager `doPrepare` for a broadcast below MPP while keeping lazy broadcast execution
+   * Prevent eager `doPrepare` for a broadcast below FLUX while keeping lazy broadcast execution
    * available to RANGE sampling and BSP fallback.
    */
-  val MppPrepareDeferredTag: TreeNodeTag[Boolean] =
-    TreeNodeTag[Boolean]("mpp.prepareDeferred")
+  val FluxPrepareDeferredTag: TreeNodeTag[Boolean] =
+    TreeNodeTag[Boolean]("flux.prepareDeferred")
 
   /**
-   * Plan-tree-attached marker committed by `MppNativeQueryExec` after fallback-capable validation
+   * Plan-tree-attached marker committed by `FluxNativeQueryExec` after fallback-capable validation
    * to indicate this exchange is dead work because the enclosing native fragment has inlined the
-   * build subtree into its consumer. See `ColumnarBroadcastExchangeExec.isMppSuppressed` for full
+   * build subtree into its consumer. See `ColumnarBroadcastExchangeExec.isFluxSuppressed` for full
    * rationale.
    *
    * Using a `TreeNodeTag` (rather than a non-ctor `var` on the case class) means the marker
    * survives `copy()` / `withNewChildren()` / `transform*()` because `TreeNode.copyTagsFrom`
    * carries tags through plan rewrites.
    */
-  val MppSuppressedTag: TreeNodeTag[Boolean] = TreeNodeTag[Boolean]("mpp.suppressed")
+  val FluxSuppressedTag: TreeNodeTag[Boolean] = TreeNodeTag[Boolean]("flux.suppressed")
 }

@@ -427,7 +427,7 @@ case class WholeStageTransformer(child: SparkPlan, materializeInput: Boolean = f
         plan
     }
     // Terminate is a metrics-tree traversal sentinel, not an updater bound to an operator. Native
-    // virtual-table leaves (for example LocalTableScanExecTransformer and MPP exchange sources)
+    // virtual-table leaves (for example LocalTableScanExecTransformer and FLUX exchange sources)
     // deliberately return it. A first-stage iterator may still exhaust such a leaf while RANGE
     // preparation scans a producer plan, so do not invoke the sentinel as an input-metrics updater.
     val leafMetricsUpdater =

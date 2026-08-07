@@ -76,10 +76,10 @@ class InputPartitionCoalescerSuite extends AnyFunSuite {
         input)
   }
 
-  test("only coalesces MPP scans outside single-task mode") {
+  test("only coalesces FLUX scans outside single-task mode") {
     val input = mockGroups(4, cost = 10)
 
-    assert(coalesce(input, eligibility = defaultEligibility.copy(mppEnabled = false))() eq input)
+    assert(coalesce(input, eligibility = defaultEligibility.copy(fluxEnabled = false))() eq input)
     assert(coalesce(input, eligibility = defaultEligibility.copy(singleTaskMode = true))() eq input)
   }
 
@@ -149,7 +149,7 @@ class InputPartitionCoalescerSuite extends AnyFunSuite {
   }
 
   private val defaultEligibility = InputPartitionCoalescer.Eligibility(
-    mppEnabled = true,
+    fluxEnabled = true,
     singleTaskMode = false,
     outputPartitioning = UnknownPartitioning(4),
     hasOutputOrdering = false,

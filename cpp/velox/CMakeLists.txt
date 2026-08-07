@@ -149,8 +149,8 @@ get_filename_component(VELOX_PROTO_DIR ${VELOX_PROTO_SRC_DIR}/ DIRECTORY)
 # Build Velox backend.
 set(VELOX_SRCS
     ${VELOX_PROTO_SRCS}
-    compute/MppDumpLoader.cc
-    compute/MppQueryCoordinator.cc
+    compute/FluxDumpLoader.cc
+    compute/FluxQueryCoordinator.cc
     compute/VeloxBackend.cc
     compute/VeloxRuntime.cc
     compute/VeloxPlanConverter.cc
@@ -158,7 +158,7 @@ set(VELOX_SRCS
     compute/iceberg/IcebergPlanConverter.cc
     jni/JniFileSystem.cc
     jni/JniUdf.cc
-    jni/MppJniWrapper.cc
+    jni/FluxJniWrapper.cc
     jni/VeloxJniWrapper.cc
     memory/BufferOutputStream.cc
     memory/VeloxColumnarBatch.cc
@@ -246,7 +246,7 @@ endif()
 add_library(velox SHARED ${VELOX_SRCS})
 
 # Produce libgluten.so instead of libvelox.so so that a single shared library
-# contains both core Gluten JNI symbols and backend (Velox/MPP) JNI symbols.
+# contains both core Gluten JNI symbols and backend (Velox/FLUX) JNI symbols.
 set_target_properties(velox PROPERTIES OUTPUT_NAME gluten)
 
 if(NOT CMAKE_SYSTEM_NAME MATCHES "Darwin")
@@ -618,14 +618,14 @@ if(BUILD_EXAMPLES)
   add_subdirectory(udf/examples)
 endif()
 
-# Standalone developer tool binaries (mpp-substrait-runner, etc). Always added
-# so `cmake --build --target mpp-substrait-runner` works without needing to
+# Standalone developer tool binaries (flux-substrait-runner, etc). Always added
+# so `cmake --build --target flux-substrait-runner` works without needing to
 # re-run cmake with an extra flag. The binaries link against the existing
 # `velox` target so they incur no extra heavy deps.
 add_subdirectory(tools)
 
 if(ENABLE_GPU)
-  # Propagate GPU flag to velox target so MppJniWrapper.cc and other sources can
+  # Propagate GPU flag to velox target so FluxJniWrapper.cc and other sources can
   # use #ifdef GLUTEN_ENABLE_GPU for GPU-specific code paths.
   target_compile_definitions(velox PRIVATE GLUTEN_ENABLE_GPU)
 

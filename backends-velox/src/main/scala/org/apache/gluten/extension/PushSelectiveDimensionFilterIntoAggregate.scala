@@ -74,7 +74,7 @@ case class PushSelectiveDimensionFilterIntoAggregate(spark: SparkSession)
   private val minImprovementRatioKey =
     "spark.gluten.mpp.pushSelectiveDimensionFilterIntoAggregate.minImprovementRatio"
   private val maxBuildBytesKey = "spark.gluten.mpp.factProbeBroadcastHint.maxBuildBytes"
-  private val mppPartitionsKey = "spark.gluten.mpp.multiExecutor.numPartitions"
+  private val fluxPartitionsKey = "spark.gluten.mpp.multiExecutor.numPartitions"
 
   registerPostCboPass()
 
@@ -306,7 +306,7 @@ case class PushSelectiveDimensionFilterIntoAggregate(spark: SparkSession)
       return false
     }
 
-    // Preserve the original Spark behavior below the standard auto-broadcast threshold. The MPP
+    // Preserve the original Spark behavior below the standard auto-broadcast threshold. The FLUX
     // extension is deliberately stricter: a larger duplicated build must fit an explicit memory
     // ceiling and save enough aggregate work to repay its scan, hash build and replicated network
     // costs.
@@ -317,7 +317,7 @@ case class PushSelectiveDimensionFilterIntoAggregate(spark: SparkSession)
     val maxBuildBytes = configuredMaxBuildBytes(broadcastThreshold)
     val literalFilters = distinctLiteralEqualityCount(dimension)
     val aggregateInputBytes = aggregate.child.stats.sizeInBytes
-    val peers = configuredMppPartitions
+    val peers = configuredFluxPartitions
     if (
       maxBuildBytes <= broadcastThreshold || dimensionOutputBytes > maxBuildBytes ||
       literalFilters < 2 || aggregateInputBytes <= 0 ||
@@ -389,10 +389,10 @@ case class PushSelectiveDimensionFilterIntoAggregate(spark: SparkSession)
     }
   }
 
-  private def configuredMppPartitions: Int = {
+  private def configuredFluxPartitions: Int = {
     val conf = SQLConf.get
     val fallback = conf.numShufflePartitions
-    Try(conf.getConfString(mppPartitionsKey, fallback.toString).toInt).toOption
+    Try(conf.getConfString(fluxPartitionsKey, fallback.toString).toInt).toOption
       .filter(_ > 0)
       .getOrElse(fallback)
   }
@@ -450,7 +450,7 @@ case class PushSelectiveDimensionFilterIntoAggregate(spark: SparkSession)
   /**
    * Scalar-subquery decorrelation happens after Spark's normal injected optimizer-rule batch.
    * Register during rule construction so the first query in a fresh session is already covered,
-   * then re-check from apply() in case another MPP rule reordered the user optimizer list.
+   * then re-check from apply() in case another FLUX rule reordered the user optimizer list.
    */
   private def registerPostCboPass(): Unit = {
     val conf = spark.sessionState.conf

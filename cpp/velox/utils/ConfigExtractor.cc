@@ -273,7 +273,7 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorSessionC
   configs[facebook::velox::connector::hive::FileConfig::kUseColumnNamesSession] =
       conf->get<bool>(kOrcUseColumnNames, true) ? "true" : "false";
 
-  // Opt-in MPP scan chunk sizing (spark.gluten.mpp.largeParquetScanChunks, default
+  // Opt-in FLUX scan chunk sizing (spark.gluten.mpp.largeParquetScanChunks, default
   // false). Q16 Nsys shows Spark issues ~8.7x more libcudf:has_next calls than
   // Presto with higher parquet_decode kernel time; raising cuDF chunked reader
   // limits per session reduces per-chunk scan overhead without changing plans.

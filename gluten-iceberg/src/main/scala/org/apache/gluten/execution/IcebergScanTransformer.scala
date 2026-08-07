@@ -77,11 +77,11 @@ case class IcebergScanTransformer(
     }
 
     val conf = SQLConf.get
-    val mppEnabled = conf
+    val fluxEnabled = conf
       .getConfString("spark.gluten.mpp.enabled", "false")
       .equalsIgnoreCase("true")
     val singleTaskMode = !conf
-      .getConfString("spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode", "false")
+      .getConfString("spark.gluten.sql.columnar.backend.velox.flux.singleTaskMode", "false")
       .equalsIgnoreCase("false")
     val targetBytes = conf.filesMaxPartitionBytes
     val openCostInBytes = conf.filesOpenCostInBytes
@@ -90,7 +90,7 @@ case class IcebergScanTransformer(
       inputPartitionGroups,
       targetBytes,
       InputPartitionCoalescer.Eligibility(
-        mppEnabled,
+        fluxEnabled,
         singleTaskMode,
         outputPartitioning,
         outputOrdering.nonEmpty,

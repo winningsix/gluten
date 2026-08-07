@@ -100,14 +100,14 @@ class PartitionsUtilSuite extends AnyFunSuite {
     assert(result.size === 0)
   }
 
-  test("MPP scan native split cap preserves larger partition packing") {
+  test("FLUX scan native split cap preserves larger partition packing") {
     val mb = 1024L * 1024L
 
-    val result = PartitionsUtil.planMppScanSplitBytes(
+    val result = PartitionsUtil.planFluxScanSplitBytes(
       sparkMaxSplitBytes = 256 * mb,
       fileSizes = Seq.fill(60)(3 * 1024 * mb),
       openCostInBytes = 4 * mb,
-      mppEnabled = true,
+      fluxEnabled = true,
       sizeAwareEnabled = true,
       targetSplitBytes = Some(1024 * mb),
       maxWholeFileBytes = 8 * 1024 * mb,
@@ -120,14 +120,14 @@ class PartitionsUtilSuite extends AnyFunSuite {
     assert(result.partitionMaxSplitBytes === 3 * 1024 * mb + 4 * mb)
   }
 
-  test("MPP scan target split keeps legacy behavior without native split cap") {
+  test("FLUX scan target split keeps legacy behavior without native split cap") {
     val mb = 1024L * 1024L
 
-    val result = PartitionsUtil.planMppScanSplitBytes(
+    val result = PartitionsUtil.planFluxScanSplitBytes(
       sparkMaxSplitBytes = 256 * mb,
       fileSizes = Seq(3 * 1024 * mb),
       openCostInBytes = 4 * mb,
-      mppEnabled = true,
+      fluxEnabled = true,
       sizeAwareEnabled = true,
       targetSplitBytes = Some(1024 * mb),
       maxWholeFileBytes = 8 * 1024 * mb,
@@ -140,14 +140,14 @@ class PartitionsUtilSuite extends AnyFunSuite {
     assert(result.partitionMaxSplitBytes === 1024 * mb)
   }
 
-  test("MPP scan target split does not widen packing for ineligible large-file scans") {
+  test("FLUX scan target split does not widen packing for ineligible large-file scans") {
     val mb = 1024L * 1024L
 
-    val result = PartitionsUtil.planMppScanSplitBytes(
+    val result = PartitionsUtil.planFluxScanSplitBytes(
       sparkMaxSplitBytes = 256 * mb,
       fileSizes = Seq(3 * 1024 * mb),
       openCostInBytes = 4 * mb,
-      mppEnabled = true,
+      fluxEnabled = true,
       sizeAwareEnabled = true,
       targetSplitBytes = Some(1024 * mb),
       maxWholeFileBytes = 8 * 1024 * mb,
@@ -160,14 +160,14 @@ class PartitionsUtilSuite extends AnyFunSuite {
     assert(result.partitionMaxSplitBytes === 256 * mb)
   }
 
-  test("MPP scan size-aware disabled keeps Spark split bytes") {
+  test("FLUX scan size-aware disabled keeps Spark split bytes") {
     val mb = 1024L * 1024L
 
-    val result = PartitionsUtil.planMppScanSplitBytes(
+    val result = PartitionsUtil.planFluxScanSplitBytes(
       sparkMaxSplitBytes = 256 * mb,
       fileSizes = Seq.fill(15)(3 * 1024 * mb),
       openCostInBytes = 4 * mb,
-      mppEnabled = true,
+      fluxEnabled = true,
       sizeAwareEnabled = false,
       targetSplitBytes = None,
       maxWholeFileBytes = 8 * 1024 * mb,

@@ -50,8 +50,8 @@ case class SelectiveDimensionJoinReorder(spark: SparkSession)
   private val maxFilteredDimensionWrapperDepth = 4
   private val selectiveDimensionJoinReorderKey =
     GlutenConfig.SELECTIVE_DIMENSION_JOIN_REORDER_ENABLED.key
-  private val mppEnabledKey = "spark.gluten.mpp.enabled"
-  private val singleTaskModeKey = "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode"
+  private val fluxEnabledKey = "spark.gluten.mpp.enabled"
+  private val singleTaskModeKey = "spark.gluten.sql.columnar.backend.velox.flux.singleTaskMode"
 
   registerPostCboPass()
 
@@ -188,7 +188,7 @@ case class SelectiveDimensionJoinReorder(spark: SparkSession)
       val existing =
         current.collectFirst { case r: SelectiveDimensionJoinReorder => r }.getOrElse(this)
       val without = current.filterNot(_.isInstanceOf[SelectiveDimensionJoinReorder])
-      val hintIndex = without.indexWhere(_.isInstanceOf[MppFactProbeBroadcastHint])
+      val hintIndex = without.indexWhere(_.isInstanceOf[FluxFactProbeBroadcastHint])
       val reordered =
         if (hintIndex >= 0) {
           without.patch(hintIndex, Seq(existing), 0)
@@ -211,7 +211,7 @@ case class SelectiveDimensionJoinReorder(spark: SparkSession)
       conf.getAllConfs
         .get(selectiveDimensionJoinReorderKey)
         .map(_.toBoolean)
-        .getOrElse(conf.getConfString(mppEnabledKey, "false").toBoolean)
+        .getOrElse(conf.getConfString(fluxEnabledKey, "false").toBoolean)
     }
   }
 

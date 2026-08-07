@@ -143,19 +143,19 @@ const std::string kVeloxSsdCheckSumReadVerificationEnabled =
 const std::string kVeloxIOThreads = "spark.gluten.sql.columnar.backend.velox.IOThreads";
 const uint32_t kVeloxIOThreadsDefault = 0;
 
-// MPP local mode: collapse all fragments into one Velox Task connected via
+// FLUX local mode: collapse all fragments into one Velox Task connected via
 // LocalPartitionNode (intra-task), bypassing UcxExchange entirely. This is the
 // default path for the single-worker/local-task GPU backend. It supports
 // SINGLE/HASH/RANGE/ROUND_ROBIN via LocalPartition and BROADCAST by inlining the
 // producer plan.
-const std::string kMppSingleTaskMode = "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMode";
-const bool kMppSingleTaskModeDefault = true;
+const std::string kFluxSingleTaskMode = "spark.gluten.sql.columnar.backend.velox.flux.singleTaskMode";
+const bool kFluxSingleTaskModeDefault = true;
 
 // Per-fragment UCX output queue high-water mark.  A multi-fragment query can
 // have dozens of producers alive at once, so the old fixed 1 GiB allowance per
 // fragment can exhaust a GPU long before backpressure engages.
-const std::string kMppMaxOutputBufferSize = "spark.gluten.sql.columnar.backend.velox.mpp.maxOutputBufferSize";
-const uint64_t kMppMaxOutputBufferSizeDefault = 1L << 30;
+const std::string kFluxMaxOutputBufferSize = "spark.gluten.sql.columnar.backend.velox.flux.maxOutputBufferSize";
+const uint64_t kFluxMaxOutputBufferSizeDefault = 1L << 30;
 
 // Cap on per-task driver count (= local-partition lane count) when single-
 // task mode is active. Mirrors IBM's pbench GPU deployment choice
@@ -166,8 +166,8 @@ const uint64_t kMppMaxOutputBufferSizeDefault = 1L << 30;
 // contention (RMM mutex, cuda runtime) more than parallelism. Same number
 // also caps how many partitions a HASH/RANGE LocalPartitionNode emits in
 // single-task mode (= consumer pipeline driver count).
-const std::string kMppSingleTaskMaxDrivers = "spark.gluten.sql.columnar.backend.velox.mpp.singleTaskMaxDrivers";
-const int32_t kMppSingleTaskMaxDriversDefault = 2;
+const std::string kFluxSingleTaskMaxDrivers = "spark.gluten.sql.columnar.backend.velox.flux.singleTaskMaxDrivers";
+const int32_t kFluxSingleTaskMaxDriversDefault = 2;
 
 // Number of local Velox driver lanes for a distributed HASH exchange that
 // feeds a keyed FINAL aggregation. Values > 1 insert a LocalPartitionNode
@@ -177,8 +177,8 @@ const int32_t kMppSingleTaskMaxDriversDefault = 2;
 // across all queries; it is primarily an escape hatch for very large FINAL
 // group-bys whose single driver would exceed cuDF's row/contiguous-allocation
 // limits.
-const std::string kMppKeyedFinalLocalDrivers = "spark.gluten.sql.columnar.backend.velox.mpp.keyedFinalLocalDrivers";
-const int32_t kMppKeyedFinalLocalDriversDefault = 1;
+const std::string kFluxKeyedFinalLocalDrivers = "spark.gluten.sql.columnar.backend.velox.flux.keyedFinalLocalDrivers";
+const int32_t kFluxKeyedFinalLocalDriversDefault = 1;
 const std::string kVeloxAsyncTimeoutOnTaskStopping =
     "spark.gluten.sql.columnar.backend.velox.asyncTimeoutOnTaskStopping";
 const int32_t kVeloxAsyncTimeoutOnTaskStoppingDefault = 30000; // 30s
@@ -297,18 +297,18 @@ const std::string kCudfPartialIdentityAggregationDefault = "false";
 
 const std::string kCudfOrderBySortedRunBytes = "spark.gluten.sql.columnar.backend.velox.cudf.orderBySortedRunBytes";
 const std::string kCudfOrderBySortedRunBytesDefault = "268435456";
-const std::string kCudfOrderBySortedRunBytesMppDefault = "3221225472";
+const std::string kCudfOrderBySortedRunBytesFluxDefault = "3221225472";
 
 const std::string kCudfOrderByMergeFanIn = "spark.gluten.sql.columnar.backend.velox.cudf.orderByMergeFanIn";
 const std::string kCudfOrderByMergeFanInDefault = "8";
 
 const std::string kCudfOrderByOutputChunkBytes = "spark.gluten.sql.columnar.backend.velox.cudf.orderByOutputChunkBytes";
 const std::string kCudfOrderByOutputChunkBytesDefault = "33554432";
-const std::string kCudfOrderByOutputChunkBytesMppDefault = "3221225472";
+const std::string kCudfOrderByOutputChunkBytesFluxDefault = "3221225472";
 
 const std::string kCudfOrderByMaxOutputRows = "spark.gluten.sql.columnar.backend.velox.cudf.orderByMaxOutputRows";
 const std::string kCudfOrderByMaxOutputRowsDefault = "262144";
-const std::string kCudfOrderByMaxOutputRowsMppDefault = "2147483647";
+const std::string kCudfOrderByMaxOutputRowsFluxDefault = "2147483647";
 
 // Forward to IBM CudfConfig::kCudfBatchSizeMinThreshold. Target minimum row
 // count CudfBatchConcat coalesces upstream batches up to. Only used when
@@ -368,10 +368,9 @@ const std::string kCudfHiveExecutorSplitPrefetchConcurrency =
     "spark.gluten.sql.columnar.backend.velox.cudf.hive.executorSplitPrefetchConcurrency";
 const uint32_t kCudfHiveExecutorSplitPrefetchConcurrencyDefault = 0;
 
-// Target bytes for UCX partitioned-output accumulation and chunking. The
-// high-cardinality partial-identity path uses a smaller default because each
-// window is split across destinations; regular queries retain the configured
-// GPU compute batch target unless this setting is explicit.
+// Target bytes for UCX partitioned-output accumulation and chunking. When it
+// is not set explicitly, FLUX uses kCudfGpuTargetBatchBytes so byte-aware UCX
+// batching follows the configured GPU batch target by default.
 const std::string kCudfPartitionedOutputBatchBytes =
     "spark.gluten.sql.columnar.backend.velox.cudf.partitioned_output_batch_bytes";
 const uint64_t kCudfPartitionedOutputBatchBytesPartialIdentityDefault = 64UL << 20;

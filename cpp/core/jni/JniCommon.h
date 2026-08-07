@@ -423,7 +423,7 @@ class SparkAllocationListener final : public gluten::AllocationListener {
     if (size == 0) {
       return;
     }
-    // MPP fanout can allocate from many native Velox driver threads at once.
+    // FLUX fanout can allocate from many native Velox driver threads at once.
     // Keep the Java ReservationListener callback single-threaded; Spark's
     // task/global memory targets are the shared state behind this JNI edge.
     std::lock_guard<std::recursive_mutex> guard(allocationMutex_);

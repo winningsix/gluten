@@ -62,7 +62,7 @@ class VeloxBackendProcessLifecycleSuite extends AnyFunSuite {
       val plan = spark.sql("SELECT array(1, 2) AS value").queryExecution.executedPlan
       assert(
         plan.find {
-          case _: ProjectExecTransformer | _: MppNativeQueryExec => true
+          case _: ProjectExecTransformer | _: FluxNativeQueryExec => true
           case _ => false
         }.isDefined,
         plan.treeString)

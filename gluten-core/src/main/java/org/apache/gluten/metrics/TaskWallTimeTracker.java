@@ -78,7 +78,7 @@ public class TaskWallTimeTracker {
   public void logAndReset(int stageId, long taskAttemptId) {
     long taskWallNanos = (taskStartNanos > 0) ? System.nanoTime() - taskStartNanos : 0;
     // Driver-side validation uses synthetic contexts with stage/task id -1. They are not Spark
-    // tasks and can number in the thousands for a large MPP plan, so logging them adds noise and
+    // tasks and can number in the thousands for a large FLUX plan, so logging them adds noise and
     // measurable planning overhead. Keep full timing for real executor tasks.
     if (stageId >= 0 && taskAttemptId >= 0) {
       LOG.warn(

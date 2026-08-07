@@ -39,7 +39,7 @@ class SelectiveDimensionJoinReorderSuite extends GlutenQueryTest with SharedSpar
     assert(SelectiveDimensionJoinReorder(spark)(testPlan.plan).fastEquals(testPlan.plan))
   }
 
-  test("auto-enables selective dimension join reorder under MPP") {
+  test("auto-enables selective dimension join reorder under FLUX") {
     val testPlan = q11LikePlan()
     val experimental = spark.experimental
     val before = experimental.extraOptimizations
@@ -58,7 +58,7 @@ class SelectiveDimensionJoinReorderSuite extends GlutenQueryTest with SharedSpar
     }
   }
 
-  test("explicit false disables selective dimension join reorder under MPP") {
+  test("explicit false disables selective dimension join reorder under FLUX") {
     val testPlan = q11LikePlan(projectNation = true)
 
     withSQLConf(confKey -> "false", "spark.gluten.mpp.enabled" -> "true") {
@@ -74,7 +74,7 @@ class SelectiveDimensionJoinReorderSuite extends GlutenQueryTest with SharedSpar
         experimental.extraOptimizations = before.filterNot(
           r =>
             r.isInstanceOf[SelectiveDimensionJoinReorder] ||
-              r.isInstanceOf[MppFactProbeBroadcastHint]) :+ MppFactProbeBroadcastHint(spark)
+              r.isInstanceOf[FluxFactProbeBroadcastHint]) :+ FluxFactProbeBroadcastHint(spark)
       }
 
       withSQLConf(confKey -> "true") {
@@ -83,7 +83,7 @@ class SelectiveDimensionJoinReorderSuite extends GlutenQueryTest with SharedSpar
         val rewriteIndex =
           experimental.extraOptimizations.indexWhere(_.isInstanceOf[SelectiveDimensionJoinReorder])
         val hintIndex =
-          experimental.extraOptimizations.indexWhere(_.isInstanceOf[MppFactProbeBroadcastHint])
+          experimental.extraOptimizations.indexWhere(_.isInstanceOf[FluxFactProbeBroadcastHint])
         assert(rewriteIndex >= 0 && hintIndex > rewriteIndex)
         rule(q11LikePlan().plan)
         assert(postCboRewriteCount == 1)

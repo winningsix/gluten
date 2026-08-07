@@ -67,9 +67,9 @@ class GlutenSQLExecutionUIData(
     val numFallbackNodes: Int,
     val fallbackDescription: String,
     val fallbackNodeToReason: Seq[(String, String)],
-    val mppPlan: GlutenMppPlanUIData) {}
+    val fluxPlan: GlutenFluxPlanUIData) {}
 
-class GlutenMppPlanUIData(
+class GlutenFluxPlanUIData(
     val queryId: String,
     val numFragments: Int,
     val numExchanges: Int,
@@ -79,9 +79,9 @@ class GlutenMppPlanUIData(
     val truncated: Boolean,
     val captureEnabled: Boolean,
     val captureError: String,
-    val fragments: Seq[GlutenMppPlanFragmentUIData]) {}
+    val fragments: Seq[GlutenFluxPlanFragmentUIData]) {}
 
-class GlutenMppPlanFragmentUIData(
+class GlutenFluxPlanFragmentUIData(
     val fragmentId: Int,
     val plan: String,
     val originalCharCount: Int,

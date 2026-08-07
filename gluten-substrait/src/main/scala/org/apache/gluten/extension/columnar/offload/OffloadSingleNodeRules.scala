@@ -335,7 +335,7 @@ object OffloadOthers {
                 reason =>
                   rowTransformer.setTagValue(ARROW_SCALAR_NORMALIZATION_REJECTION_TAG, reason)
                   logWarning(reason)
-                  failStrictMppOnArrowNormalizationRejection(reason)
+                  failStrictFluxOnArrowNormalizationRejection(reason)
               }
               rowTransformer
           }
@@ -460,7 +460,7 @@ object OffloadOthers {
       }
     }
 
-    private def failStrictMppOnArrowNormalizationRejection(reason: String): Unit = {
+    private def failStrictFluxOnArrowNormalizationRejection(reason: String): Unit = {
       val conf = SQLConf.get
       if (
         conf.getConfString("spark.gluten.mpp.enabled", "false").toBoolean &&

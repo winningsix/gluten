@@ -68,7 +68,7 @@ object VeloxRuleApi {
     // Register the paired-existence rules in Spark's post-RewriteSubquery optimizer batch before
     // the first query reaches optimization. The registrar only updates the rule list and returns
     // the analyzer plan unchanged; the whole-plan transforms themselves remain optimizer-only.
-    injector.injectPostHocResolutionRule(RegisterMppExistencePostSubqueryRules.apply)
+    injector.injectPostHocResolutionRule(RegisterFluxExistencePostSubqueryRules.apply)
     injector.injectOptimizerRule(MergeSelfCorrelatedExistenceState.apply)
     injector.injectPreCBORule(MergeSelfCorrelatedExistenceState.apply)
     injector.injectOptimizerRule(RewriteExistenceJoinRhsDedup.apply)
@@ -90,7 +90,7 @@ object VeloxRuleApi {
     // SelectiveDimensionJoinReorder above cannot reach. The rule self-registers into
     // spark.experimental.extraOptimizations so it can also run after CostBasedJoinReorder.
     injector.injectOptimizerRule(PushSelectiveDimensionChainBeforeFact.apply)
-    injector.injectOptimizerRule(MppFactProbeBroadcastHint.apply)
+    injector.injectOptimizerRule(FluxFactProbeBroadcastHint.apply)
     injector.injectOptimizerRule(RewriteCastFromArray.apply)
     injector.injectOptimizerRule(RewriteUnboundedWindow.apply)
     // Evaluate a CTE-derived aggregate once for `value = scalar(max(value))`. The
@@ -116,10 +116,10 @@ object VeloxRuleApi {
     if (BackendsApiManager.getSettings.supportAppendDataExec()) {
       injector.injectPlannerStrategy(SparkShimLoader.getSparkShims.getRewriteCreateTableAsSelect(_))
     }
-    // Plan C: MPP strategy -- intercepts entire logical plan before EnsureRequirements.
+    // Plan C: FLUX strategy -- intercepts entire logical plan before EnsureRequirements.
     // Must be injected after other strategies so it can see the full logical plan.
-    // extraStrategies are tried BEFORE built-in strategies, so MppStrategy gets first shot.
-    injector.injectPlannerStrategy(session => MppStrategy(session))
+    // extraStrategies are tried BEFORE built-in strategies, so FluxStrategy gets first shot.
+    injector.injectPlannerStrategy(session => FluxStrategy(session))
   }
 
   /**
@@ -187,14 +187,14 @@ object VeloxRuleApi {
     SparkShimLoader.getSparkShims
       .getExtendedColumnarPostRules()
       .foreach(each => injector.injectPost(c => each(c.session)))
-    // MPP collapse runs BEFORE BSP collapse: if the plan is fully MPP-eligible,
-    // MppCollapseRule wraps it in MppNativeQueryExec and ColumnarCollapseTransformStages becomes
-    // a no-op on that subtree. Do not run MPP shuffle-shape rewrites as global Spark columnar
+    // FLUX collapse runs BEFORE BSP collapse: if the plan is fully FLUX-eligible,
+    // FluxCollapseRule wraps it in FluxNativeQueryExec and ColumnarCollapseTransformStages becomes
+    // a no-op on that subtree. Do not run FLUX shuffle-shape rewrites as global Spark columnar
     // rules: AQE verifies that custom columnar rules preserve ShuffleExchange nodes, and these
-    // rules intentionally rewrite or remove them. MppNativeQueryExec re-runs the same opt-in
+    // rules intentionally rewrite or remove them. FluxNativeQueryExec re-runs the same opt-in
     // rewrites inside its wrapped child during fragment extraction, after Spark's shuffle
     // preservation check has passed.
-    injector.injectPost(c => MppCollapseRule(new GlutenConfig(c.sqlConf)))
+    injector.injectPost(c => FluxCollapseRule(new GlutenConfig(c.sqlConf)))
     injector.injectPost(c => ColumnarCollapseTransformStages(new GlutenConfig(c.sqlConf)))
     injector.injectPost(_ => GenerateTransformStageId())
     injector.injectPost(c => CudfNodeValidationRule(new GlutenConfig(c.sqlConf)))
@@ -210,10 +210,10 @@ object VeloxRuleApi {
     injector.injectFinal(c => GlutenFallbackReporter(new GlutenConfig(c.sqlConf), c.session))
     injector.injectFinal(_ => RemoveFallbackTagRule())
     // Runs after all transforms and ColumnarBroadcastExchangeExec insertion: mark every
-    // BroadcastExchange under an MppNativeQueryExec as dead so SparkPlan.prepare()'s
+    // BroadcastExchange under an FluxNativeQueryExec as dead so SparkPlan.prepare()'s
     // recursive doPrepare chain does not driver-collect a build side that the native
     // single-task merge has already inlined into the consumer fragment.
-    injector.injectFinal(_ => MppSuppressDeadBroadcastsRule())
+    injector.injectFinal(_ => FluxSuppressDeadBroadcastsRule())
   }
 
   /**
@@ -301,11 +301,11 @@ object VeloxRuleApi {
     SparkShimLoader.getSparkShims
       .getExtendedColumnarPostRules()
       .foreach(each => injector.injectPostTransform(c => each(c.session)))
-    // MPP collapse runs BEFORE BSP collapse in the RAS path as well. Keep MPP shuffle-shape
+    // FLUX collapse runs BEFORE BSP collapse in the RAS path as well. Keep FLUX shuffle-shape
     // rewrites out of Spark's global post-transform rule list for the same AQE shuffle-node
-    // preservation reason described in injectVanilla(); MppNativeQueryExec applies them locally
+    // preservation reason described in injectVanilla(); FluxNativeQueryExec applies them locally
     // during fragment extraction.
-    injector.injectPostTransform(c => MppCollapseRule(new GlutenConfig(c.sqlConf)))
+    injector.injectPostTransform(c => FluxCollapseRule(new GlutenConfig(c.sqlConf)))
     injector.injectPostTransform(c => ColumnarCollapseTransformStages(new GlutenConfig(c.sqlConf)))
     injector.injectPostTransform(_ => GenerateTransformStageId())
     injector.injectPostTransform(c => CudfNodeValidationRule(new GlutenConfig(c.sqlConf)))

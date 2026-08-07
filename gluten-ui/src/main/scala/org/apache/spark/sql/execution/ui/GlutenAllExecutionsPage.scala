@@ -225,7 +225,7 @@ private[ui] class GlutenExecutionPagedTable(
       }
       concat.append("\n\n")
       concat.append(execution.fallbackDescription)
-      appendMppPlanDetails(execution, concat)
+      appendFluxPlanDetails(execution, concat)
 
       <span onclick="this.parentNode.querySelector('.stage-details').classList.toggle('collapsed')"
             class="expand-details">
@@ -248,37 +248,37 @@ private[ui] class GlutenExecutionPagedTable(
     <div>{desc}{details}</div>
   }
 
-  private def appendMppPlanDetails(
+  private def appendFluxPlanDetails(
       execution: GlutenSQLExecutionUIData,
       concat: PlanStringConcat): Unit = {
-    val mppPlan = execution.mppPlan
-    if (mppPlan == null) {
+    val fluxPlan = execution.fluxPlan
+    if (fluxPlan == null) {
       return
     }
 
-    concat.append("\n\n== MPP Final Velox Plan ==\n")
-    concat.append(s"Query ID: ${mppPlan.queryId}\n")
+    concat.append("\n\n== Flux Final Velox Plan ==\n")
+    concat.append(s"Query ID: ${fluxPlan.queryId}\n")
     concat.append(s"Spark SQL page: ${executionURL(execution.executionId)}\n")
-    concat.append(s"Fragments: ${mppPlan.numFragments}, Exchanges: ${mppPlan.numExchanges}\n")
-    if (mppPlan.dumpPath != null && mppPlan.dumpPath.nonEmpty) {
-      concat.append(s"Substrait dump path: ${mppPlan.dumpPath}\n")
+    concat.append(s"Fragments: ${fluxPlan.numFragments}, Exchanges: ${fluxPlan.numExchanges}\n")
+    if (fluxPlan.dumpPath != null && fluxPlan.dumpPath.nonEmpty) {
+      concat.append(s"Substrait dump path: ${fluxPlan.dumpPath}\n")
     }
-    concat.append(s"Capture enabled: ${mppPlan.captureEnabled}\n")
-    concat.append(s"Original chars: ${mppPlan.totalOriginalCharCount}\n")
-    if (mppPlan.planSha256 != null && mppPlan.planSha256.nonEmpty) {
-      concat.append(s"Plan sha256: ${mppPlan.planSha256}\n")
+    concat.append(s"Capture enabled: ${fluxPlan.captureEnabled}\n")
+    concat.append(s"Original chars: ${fluxPlan.totalOriginalCharCount}\n")
+    if (fluxPlan.planSha256 != null && fluxPlan.planSha256.nonEmpty) {
+      concat.append(s"Plan sha256: ${fluxPlan.planSha256}\n")
     }
-    if (mppPlan.truncated) {
+    if (fluxPlan.truncated) {
       concat.append("Plan text was truncated for event-log size control.\n")
     }
-    if (mppPlan.captureError != null && mppPlan.captureError.nonEmpty) {
-      concat.append(s"Capture error: ${mppPlan.captureError}\n")
+    if (fluxPlan.captureError != null && fluxPlan.captureError.nonEmpty) {
+      concat.append(s"Capture error: ${fluxPlan.captureError}\n")
     }
-    if (mppPlan.fragments == null || mppPlan.fragments.isEmpty) {
+    if (fluxPlan.fragments == null || fluxPlan.fragments.isEmpty) {
       concat.append("No final Velox plan text captured.\n")
       return
     }
-    mppPlan.fragments.foreach {
+    fluxPlan.fragments.foreach {
       fragment =>
         concat.append(
           s"\n-- Fragment ${fragment.fragmentId} " +

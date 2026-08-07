@@ -17,7 +17,7 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
-import org.apache.gluten.extension.columnar.{MergeSelfCorrelatedExistenceState, RegisterMppExistencePostSubqueryRules, RewriteExistenceJoinRhsDedup}
+import org.apache.gluten.extension.columnar.{MergeSelfCorrelatedExistenceState, RegisterFluxExistencePostSubqueryRules, RewriteExistenceJoinRhsDedup}
 
 import org.apache.spark.sql.{QueryTest, Row}
 import org.apache.spark.sql.catalyst.expressions.{And, AttributeReference, EqualTo, Not}
@@ -508,7 +508,7 @@ class MergeSelfCorrelatedExistenceStateSuite extends QueryTest with SharedSparkS
         GlutenConfig.MERGE_PAIRED_EXISTENCE_STATE_MIN_SOURCE_BYTES.key -> "0",
         SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> ConvertToLocalRelation.ruleName
       ) {
-        RegisterMppExistencePostSubqueryRules(spark).apply(analyzed)
+        RegisterFluxExistencePostSubqueryRules(spark).apply(analyzed)
       }
       val mergeIndex = experimental.extraOptimizations.indexWhere(
         _.isInstanceOf[MergeSelfCorrelatedExistenceState])

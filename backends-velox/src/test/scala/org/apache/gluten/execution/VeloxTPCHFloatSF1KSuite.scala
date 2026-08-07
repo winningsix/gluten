@@ -26,10 +26,10 @@ import org.scalatest.time.{Seconds, Span}
 import java.io.File
 
 /**
- * Run the five TPC-H queries whose Gluten MPP plan matches Presto (Q6, Q12, Q16, Q17, Q18) against
- * an external 1TB TPC-H float parquet dataset, using the Plan-C MppStrategy and the cross-cut
+ * Run the five TPC-H queries whose Gluten FLUX plan matches Presto (Q6, Q12, Q16, Q17, Q18) against
+ * an external 1TB TPC-H float parquet dataset, using the Plan-C FluxStrategy and the cross-cut
  * plan-shape parity flags. Goal: prove the matching queries actually execute end-to-end via
- * MppNativeQueryRDD's JNI path.
+ * FluxNativeQueryRDD's JNI path.
  *
  * Dataset directory is taken from the system property `gluten.tpch.externalDataDir` (default
  * `/data/tpch/sf1k_v2_float`). Each TPC-H table is expected at `${externalDataDir}/[table]/`.
@@ -104,10 +104,10 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
           .get("spark.driver.maxResultSize")
           .filter(v => v.nonEmpty && v != "null")
           .getOrElse("8g"))
-      // Plan-C MppStrategy: intercept queries at planner level and route through MPP.
+      // Plan-C FluxStrategy: intercept queries at planner level and route through FLUX.
       .set("spark.gluten.mpp.enabled", "true")
       .set("spark.gluten.mpp.strategy.enabled", "true")
-      // Cross-cut plan-shape parity (re-applied inside MppNativeQueryExec).
+      // Cross-cut plan-shape parity (re-applied inside FluxNativeQueryExec).
       .set("spark.gluten.mpp.singlePartitionSort", "true")
       .set("spark.gluten.mpp.removeRedundantShuffle", "true")
       .set("spark.gluten.mpp.parallelSortSplit", "true")
@@ -119,7 +119,7 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       .set("spark.gluten.sql.columnar.cudf", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enabled", "true")
       .set("spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan", "true")
-      // Keep the bounded async MR large enough for the single-GPU SF1K MPP profile.
+      // Keep the bounded async MR large enough for the single-GPU SF1K FLUX profile.
       .set("spark.gluten.sql.columnar.backend.velox.cudf.memoryPercent", "90")
       // Disable cudf JIT-fused expressions: NVRTC fails to compile EQUAL on Q12's
       // filter (`cudf::ast::operator_functor<EQUAL, true>::operator() no instance
@@ -136,8 +136,8 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
       // all and falls back to CPU. The Q17/Q18 issues are separate and need
       // narrower handling (per-expression check, not whole-AST disable).
       .set("spark.gluten.sql.columnar.backend.velox.cudf.ast_expression_enabled", "true")
-      // Dump every MppNativeQueryExec plan for offline diagnosis if the run fails.
-      .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/mpp-dumps-tpch-sf1k")
+      // Dump every FluxNativeQueryExec plan for offline diagnosis if the run fails.
+      .set("spark.gluten.mpp.substraitDumpDir", "/opt/gluten/flux-dumps-tpch-sf1k")
 
     if (!conf.contains("spark.master")) {
       conf.set("spark.master", "local[2]")
@@ -270,14 +270,14 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
 
   // Print actual rows for offline diff vs Presto-GPU SF1K reference (post-ANALYZE).
   // compareResult=false because we don't ship a q*.out reference in this suite's
-  // resources; the [MPP-RESULT] tag lets us grep run logs deterministically.
+  // resources; the [FLUX-RESULT] tag lets us grep run logs deterministically.
   private def dumpRows(qid: Int, df: org.apache.spark.sql.DataFrame): Unit = {
     val rows = df.collect()
     // scalastyle:off println
-    println(s"[MPP-RESULT] Q$qid count=${rows.length} schema=${df.schema.simpleString}")
-    rows.take(10).foreach(r => println(s"[MPP-RESULT] Q$qid row: ${r.mkString("|")}"))
+    println(s"[FLUX-RESULT] Q$qid count=${rows.length} schema=${df.schema.simpleString}")
+    rows.take(10).foreach(r => println(s"[FLUX-RESULT] Q$qid row: ${r.mkString("|")}"))
     if (rows.length > 10) {
-      rows.takeRight(2).foreach(r => println(s"[MPP-RESULT] Q$qid tail: ${r.mkString("|")}"))
+      rows.takeRight(2).foreach(r => println(s"[FLUX-RESULT] Q$qid tail: ${r.mkString("|")}"))
     }
     // scalastyle:on println
   }
@@ -303,7 +303,7 @@ class VeloxTPCHFloatSF1KSuite extends VeloxTPCHTableSupport with TimeLimits {
     )
   }
 
-  // Run all 22 TPC-H queries. noFallBack=false so non-MPP-eligible queries
+  // Run all 22 TPC-H queries. noFallBack=false so non-FLUX-eligible queries
   // surface as their actual failure mode (not as a generic fallback test
   // failure). The 60s per-query failAfter contains hangs.
   // Optional sys-prop filter: -Dgluten.tpch.onlyQuery=6 registers only Q6.

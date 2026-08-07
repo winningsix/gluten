@@ -38,7 +38,7 @@ import org.apache.spark.sql.types.{BooleanType, DoubleType, FloatType}
  * first query in a fresh session. This post-hoc analyzer rule performs registration only; it never
  * transforms the analyzer plan.
  */
-case class RegisterMppExistencePostSubqueryRules(spark: SparkSession) extends Rule[LogicalPlan] {
+case class RegisterFluxExistencePostSubqueryRules(spark: SparkSession) extends Rule[LogicalPlan] {
   override def apply(plan: LogicalPlan): LogicalPlan = {
     MergeSelfCorrelatedExistenceState.registerPostSubqueryRules(spark)
     plan
@@ -626,7 +626,7 @@ case class MergeSelfCorrelatedExistenceState(spark: SparkSession)
         context.candidate
       }
     // The restriction-key aggregate and final semijoin both reference the selective candidate.
-    // Spark can represent that as a reused shuffle, but native MPP deliberately gives each
+    // Spark can represent that as a reused shuffle, but native Flux deliberately gives each
     // consumer an independent producer because one PartitionedOutput cannot yet fan out safely.
     // Repartitioning here therefore duplicated the whole candidate scan and also forced the
     // unrestricted fact source through a sort-merge exchange. Keep both small state relations as

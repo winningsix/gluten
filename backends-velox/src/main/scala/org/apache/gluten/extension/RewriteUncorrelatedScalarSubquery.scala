@@ -17,7 +17,7 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.backendsapi.BackendsApiManager
-import org.apache.gluten.execution.{BasicScanExecTransformer, ColumnarToColumnarExec, ColumnarToRowExecBase, FileSourceScanExecTransformer, FilterExecTransformer, FilterExecTransformerBase, MppNativeQueryExec, MppPreparedChildExec, ProjectExecTransformer, TransformSupport}
+import org.apache.gluten.execution.{BasicScanExecTransformer, ColumnarToColumnarExec, ColumnarToRowExecBase, FileSourceScanExecTransformer, FilterExecTransformer, FilterExecTransformerBase, FluxNativeQueryExec, FluxPreparedChildExec, ProjectExecTransformer, TransformSupport}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression, NamedExpression}
@@ -39,8 +39,8 @@ import java.util.Locale
  * into the filter via [[org.apache.gluten.expression.ScalarSubqueryTransformer]].
  *
  * Keeping the subquery on the driver means:
- *   - the outer plan stays out of MPP until we whitelist the enclosing Filter/Project (S8 patch);
- *   - the subquery itself never runs on GPU even when MPP claims the outer plan.
+ *   - the outer plan stays out of FLUX until we whitelist the enclosing Filter/Project (S8 patch);
+ *   - the subquery itself never runs on GPU even when FLUX claims the outer plan.
  *
  * This rule removes both gaps by transforming, for each qualifying Filter/Project node:
  * {{{
@@ -83,7 +83,7 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
         rewriteFilter(f, broadcastCache)
       case p: ProjectExec if p.projectList.exists(hasUncorrelatedScalarSubquery) =>
         rewriteProject(p, broadcastCache)
-      // By the time MppCollapseRule (Post rule) sees the plan, Gluten's HeuristicTransform /
+      // By the time FluxCollapseRule (Post rule) sees the plan, Gluten's HeuristicTransform /
       // OffloadOthers has already converted vanilla FilterExec / ProjectExec carrying
       // ScalarSubquery into their transformer variants -- ScalarSubquery IS a supported
       // expression in ExpressionConverter, so offload succeeds. Match those too.
@@ -135,7 +135,7 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
     val rewrittenCondition = replaceScalarSubqueries(filter.condition, replacements)
     val newFilter = FilterExecTransformer(rewrittenCondition, joinedChild)
     // Strip the scalar columns introduced by the BNLJ so the filter's callers see the original
-    // output schema. ProjectExecTransformer is a plain TransformSupport, so MppCollapseRule will
+    // output schema. ProjectExecTransformer is a plain TransformSupport, so FluxCollapseRule will
     // absorb it into the native fragment alongside the filter and the BNLJ.
     val restoringProjectList: Seq[NamedExpression] = filter.output.map(a => a: NamedExpression)
     ProjectExecTransformer(restoringProjectList, newFilter)
@@ -146,7 +146,7 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
    * pushDownFilters. When this rule later replaces a ScalarSubquery conjunct with a broadcast
    * attribute, the copied scan predicate otherwise keeps the original ScalarSubquery alive. Spark
    * then materializes that stale copy even though the rewritten filter computes the same predicate
-   * inside the main MPP graph.
+   * inside the main FLUX graph.
    *
    * Remove only pushdown predicates containing a scalar that this filter is about to rewrite. The
    * enclosing filter remains in place with the equivalent broadcast-attribute predicate, so this
@@ -264,7 +264,7 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
       if (isRuntimeBloomFilterSubquery(innerExec.child)) {
         // Runtime-DPP bloom filters are already driven by materializeScalarSubqueries.
         // Keeping them materialized avoids embedding a SINGLE->BROADCAST bloom producer
-        // chain inside the main multi-peer MPP graph, which can leave Q21 waiting on
+        // chain inside the main multi-peer FLUX graph, which can leave Q21 waiting on
         // cross-peer broadcast/SINGLE completion. Ordinary scalar subqueries still use
         // the exchange-based rewrite.
         logDebug(
@@ -348,11 +348,11 @@ object RewriteUncorrelatedScalarSubquery extends Logging {
     // access is not possible -- but it extends UnaryExecNode, so children.head is the child.
     case c2r: ColumnarToRowExecBase => peelColumnarWrappers(c2r.children.head)
     case c2c: ColumnarToColumnarExec => peelColumnarWrappers(c2c.child)
-    // MppCollapseRule wraps already-collapsed subquery plans in MppNativeQueryExec before the
+    // FluxCollapseRule wraps already-collapsed subquery plans in FluxNativeQueryExec before the
     // outer plan's rewrite runs. Peel it so we reach the underlying TransformSupport tree that
     // we can wrap in a ColumnarBroadcastExchangeExec on the broadcast side.
-    case mpp: MppNativeQueryExec => peelColumnarWrappers(mpp.child)
-    case prepared: MppPreparedChildExec => peelColumnarWrappers(prepared.hiddenPlan)
+    case flux: FluxNativeQueryExec => peelColumnarWrappers(flux.child)
+    case prepared: FluxPreparedChildExec => peelColumnarWrappers(prepared.hiddenPlan)
     case other => other
   }
 

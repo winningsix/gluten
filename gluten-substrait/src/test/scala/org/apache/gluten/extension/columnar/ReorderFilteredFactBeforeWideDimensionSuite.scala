@@ -96,7 +96,7 @@ class ReorderFilteredFactBeforeWideDimensionSuite extends GlutenQueryTest with S
         assert(rules.count(_.isInstanceOf[ReorderFilteredFactBeforeWideDimension]) == 1)
         val rewriteIndex =
           rules.indexWhere(_.isInstanceOf[ReorderFilteredFactBeforeWideDimension])
-        val hintIndex = rules.indexWhere(_.isInstanceOf[MppFactProbeBroadcastHint])
+        val hintIndex = rules.indexWhere(_.isInstanceOf[FluxFactProbeBroadcastHint])
         assert(rewriteIndex >= 0 && hintIndex > rewriteIndex)
         val dimensionIndex =
           rules.indexWhere(_.isInstanceOf[PushSelectiveDimensionChainBeforeFact])

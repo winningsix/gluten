@@ -155,7 +155,7 @@ void VeloxBackend::init(
     }
   }
   FLAGS_logtostderr = true;
-  // folly::Init (used by mpp-substrait-runner and other standalone tools)
+  // folly::Init (used by flux-substrait-runner and other standalone tools)
   // already initializes glog; double-init FATALs. JNI path has no prior
   // init, so this guard is a no-op there.
   if (!google::IsGoogleLoggingInitialized()) {
@@ -208,13 +208,17 @@ void VeloxBackend::init(
 
 #ifdef GLUTEN_ENABLE_GPU
   if (backendConf_->get<bool>(kCudfEnabled, kCudfEnabledDefault)) {
-    const auto mppEnabled = backendConf_->get<bool>("spark.gluten.mpp.enabled", false);
-    const auto& orderBySortedRunBytesDefault =
-        mppEnabled ? kCudfOrderBySortedRunBytesMppDefault : kCudfOrderBySortedRunBytesDefault;
-    const auto& orderByOutputChunkBytesDefault =
-        mppEnabled ? kCudfOrderByOutputChunkBytesMppDefault : kCudfOrderByOutputChunkBytesDefault;
-    const auto& orderByMaxOutputRowsDefault =
-        mppEnabled ? kCudfOrderByMaxOutputRowsMppDefault : kCudfOrderByMaxOutputRowsDefault;
+    const auto fluxEnabled = backendConf_->get<bool>(
+        "spark.gluten.mpp.enabled", false);
+    const auto& orderBySortedRunBytesDefault = fluxEnabled
+        ? kCudfOrderBySortedRunBytesFluxDefault
+        : kCudfOrderBySortedRunBytesDefault;
+    const auto& orderByOutputChunkBytesDefault = fluxEnabled
+        ? kCudfOrderByOutputChunkBytesFluxDefault
+        : kCudfOrderByOutputChunkBytesDefault;
+    const auto& orderByMaxOutputRowsDefault = fluxEnabled
+        ? kCudfOrderByMaxOutputRowsFluxDefault
+        : kCudfOrderByMaxOutputRowsDefault;
     std::unordered_map<std::string, std::string> options = {
         {velox::cudf_velox::CudfConfig::kCudfEnabled, "true"},
         {velox::cudf_velox::CudfConfig::kCudfDebugEnabled, backendConf_->get(kDebugCudf, kDebugCudfDefault)},
@@ -232,7 +236,7 @@ void VeloxBackend::init(
         // gluten cpp call sites that previously read them (CudfVectorStream.h,
         // GpuBufferBatchResizer.cc). The Spark-side conf keys remain so user
         // settings still parse cleanly; we just don't forward them.
-        // MPP single-node GPU exchange: route PartitionedOutput/Exchange through
+        // FLUX single-node GPU exchange: route PartitionedOutput/Exchange through
         // IBM cudf's UcxPartitionedOutput/UcxExchange. With intra_node_exchange
         // on, UcxExchangeServer/Source detect same-Communicator-instance and use
         // IntraNodeTransferRegistry to pass cudf::packed_columns shared_ptrs
@@ -299,11 +303,13 @@ void VeloxBackend::init(
         // Wide exchange inputs can exhaust the device before reaching the row
         // target. Keep the default large enough to avoid excessive UCX batches.
         {velox::cudf_velox::CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
-         backendConf_->get(kCudfExchangeBatchSizeMinThresholdBytes, kCudfExchangeBatchSizeMinThresholdBytesDefault)},
-        // Keep the new bounded external-sort implementation. MPP uses the
+         backendConf_->get(
+             kCudfExchangeBatchSizeMinThresholdBytes,
+             kCudfExchangeBatchSizeMinThresholdBytesDefault)},
+        // Keep the new bounded external-sort implementation. FLUX uses the
         // previously validated 3 GiB run/output bounds so 30 TB Q2/Q11 do not
         // spill or split already materialized local sorts into thousands of
-        // batches; non-MPP execution retains the native conservative limits.
+        // batches; non-FLUX execution retains the native conservative limits.
         {velox::cudf_velox::CudfConfig::kCudfOrderBySortedRunBytes,
          backendConf_->get(kCudfOrderBySortedRunBytes, orderBySortedRunBytesDefault)},
         {velox::cudf_velox::CudfConfig::kCudfOrderByMergeFanIn,

@@ -659,9 +659,9 @@ object GlutenConfig extends ConfigRegistry {
       SQLConf.LEGACY_TIME_PARSER_POLICY.key,
       SQLConf.LEGACY_STATISTICAL_AGGREGATE.key,
       COLUMNAR_CUDF_ENABLED.key,
-      // Velox initializes process-wide cuDF operator limits before any MPP
-      // fragment exists. Preserve the top-level MPP switch in the static
-      // native config so that initialization can select its MPP defaults.
+      // Velox initializes process-wide cuDF operator limits before any FLUX
+      // fragment exists. Preserve the top-level FLUX switch in the static
+      // native config so that initialization can select its FLUX defaults.
       "spark.gluten.mpp.enabled"
     )
 

@@ -22,9 +22,9 @@
 #include <thread>
 #include <glog/logging.h>
 
-// MPP livelock diagnosis: GpuLock is bypassed entirely. lockGpu/unlockGpu
+// FLUX livelock diagnosis: GpuLock is bypassed entirely. lockGpu/unlockGpu
 // early-return with no futex/cv wait so we can prove the lock is a symptom,
-// not the root cause of the MppNativeQueryExec hang on Q1.
+// not the root cause of the FluxNativeQueryExec hang on Q1.
 // Symbols are kept exported so other TUs that reference them still link.
 // Stderr markers are compiled out to keep executor logs quiet; flip
 // GLUTEN_GPULOCK_TRACE to 1 to re-enable.
@@ -69,7 +69,7 @@ int getMaxConcurrentGpuTasks() {
 }
 
 void lockGpu() {
-  // MPP livelock diagnosis: no-op. No futex/cv wait.
+  // FLUX livelock diagnosis: no-op. No futex/cv wait.
 #if GLUTEN_GPULOCK_TRACE
   std::cerr << "GPU_LOCK [lockGpu-bypass] tid="
             << std::this_thread::get_id() << std::endl;
@@ -77,7 +77,7 @@ void lockGpu() {
 }
 
 void unlockGpu() {
-  // MPP livelock diagnosis: no-op. Paired with the bypassed lockGpu.
+  // FLUX livelock diagnosis: no-op. Paired with the bypassed lockGpu.
 #if GLUTEN_GPULOCK_TRACE
   std::cerr << "GPU_LOCK [unlockGpu-bypass] tid="
             << std::this_thread::get_id() << std::endl;
