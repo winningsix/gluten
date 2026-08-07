@@ -111,12 +111,30 @@ class GlutenMppPeerMapperSuite extends AnyFunSuite {
     assert(out.head.preferredLocation == "executor_localhost_e1")
   }
 
-  test("UCX connection does not replace listener host with loopback placement host") {
+  test("one-peer executor-local UCX connection uses loopback placement host") {
     val infos =
       Seq(info("e1", host = "infoHost", blockManagerHost = "127.0.0.1", ucxHost = "ucxHost"))
     val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 1)
-    assert(out.head.host == "ucxHost")
+    assert(out.head.host == "127.0.0.1")
     assert(out.head.preferredLocation == "executor_127.0.0.1_e1")
+  }
+
+  test("co-located loopback executors connect over loopback") {
+    val infos = Seq(
+      info("e1", host = "infoHost", blockManagerHost = "127.0.0.1", ucxHost = "10.87.140.44"),
+      info("e2", host = "infoHost", blockManagerHost = "127.0.0.1", ucxHost = "10.87.140.44")
+    )
+    val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 2)
+    assert(out.map(_.host) == Seq("127.0.0.1", "127.0.0.1"))
+  }
+
+  test("loopback executors on different listener hosts keep routable addresses") {
+    val infos = Seq(
+      info("e1", host = "infoHost", blockManagerHost = "127.0.0.1", ucxHost = "10.87.140.44"),
+      info("e2", host = "infoHost", blockManagerHost = "127.0.0.1", ucxHost = "10.87.140.45")
+    )
+    val out = GlutenMppPeerMapper.toMppPeerInfos(infos, 2)
+    assert(out.map(_.host) == Seq("10.87.140.44", "10.87.140.45"))
   }
 
   test("host selection falls through to URI host when blockManagerHost empty") {

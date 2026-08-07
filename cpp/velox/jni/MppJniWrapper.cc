@@ -866,8 +866,6 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
                      .id(exchangeNodeId)
                      .outputType(wireType)
                      .serdeKind("Presto")
-                     .transportType(
-                         velox::core::ExchangeNode::TransportType::kUcx)
                      .build();
       if (repartitionRemoteHashLocally) {
         VELOX_CHECK_EQ(
@@ -936,7 +934,6 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
             .id(exchangeNodeId)
             .outputType(consumerType)
             .serdeKind("Presto")
-            .transportType(velox::core::ExchangeNode::TransportType::kUcx)
             .build();
       }
       // A keyed FINAL with multiple local drivers wraps the remote Exchange
@@ -1509,20 +1506,20 @@ velox::core::PlanNodePtr wrapWithMppPartitionedOutput(
         numOutputPartitions,
         veloxPlanNode->outputType(),
         /*serdeKind=*/"Presto",
-        veloxPlanNode,
-        velox::core::PartitionedOutputNode::TransportType::kUcx);
+        std::string{velox::core::TransportKind::kUcx},
+        veloxPlanNode);
   }
 
   if (numOutputPartitions == 1) {
     const auto transportType = (outboundExchange != nullptr)
-        ? velox::core::PartitionedOutputNode::TransportType::kUcx
-        : velox::core::PartitionedOutputNode::TransportType::kHttp;
+        ? std::string{velox::core::TransportKind::kUcx}
+        : std::string{velox::core::TransportKind::kInMemory};
     return velox::core::PartitionedOutputNode::single(
         outputNodeId,
         veloxPlanNode->outputType(),
         /*serdeKind=*/"Presto",
-        veloxPlanNode,
-        transportType);
+        transportType,
+        veloxPlanNode);
   }
 
   const auto& keyIndices =
@@ -1553,8 +1550,8 @@ velox::core::PlanNodePtr wrapWithMppPartitionedOutput(
       std::move(specPair.funcSpec),
       veloxPlanNode->outputType(),
       /*serdeKind=*/"Presto",
-      veloxPlanNode,
-      velox::core::PartitionedOutputNode::TransportType::kUcx);
+      std::string{velox::core::TransportKind::kUcx},
+      veloxPlanNode);
 }
 
 struct MppPeerSpec {
@@ -2381,8 +2378,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
           numOutputPartitions,
           veloxPlanNode->outputType(),
           /*serdeKind=*/"Presto",
-          veloxPlanNode,
-          velox::core::PartitionedOutputNode::TransportType::kUcx);
+          std::string{velox::core::TransportKind::kUcx},
+          veloxPlanNode);
     } else if (numOutputPartitions == 1) {
       // Single-partition gather output. Two cases:
       //   1. Producer fragment with a SINGLE-gather outbound exchange
@@ -2396,14 +2393,14 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       //      and hands a CudfVector directly to the libcudf writer.
       const auto transportType =
           (outboundExchange != nullptr || keepDeviceRootOutput)
-          ? velox::core::PartitionedOutputNode::TransportType::kUcx
-          : velox::core::PartitionedOutputNode::TransportType::kHttp;
+          ? std::string{velox::core::TransportKind::kUcx}
+          : std::string{velox::core::TransportKind::kInMemory};
       wrappedPlan = velox::core::PartitionedOutputNode::single(
           outputNodeId,
           veloxPlanNode->outputType(),
           /*serdeKind=*/"Presto",
-          veloxPlanNode,
-          transportType);
+          transportType,
+          veloxPlanNode);
     } else {
       // Multi-partition output. RANGE uses a dedicated Spark-boundary PID
       // function; it is never substituted with hash or round-robin.
@@ -2453,8 +2450,8 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
           std::move(specPair.funcSpec),
           veloxPlanNode->outputType(),
           /*serdeKind=*/"Presto",
-          veloxPlanNode,
-          velox::core::PartitionedOutputNode::TransportType::kUcx);
+          std::string{velox::core::TransportKind::kUcx},
+          veloxPlanNode);
     }
 
     LOG(INFO) << "MppJniWrapper: fragment " << i

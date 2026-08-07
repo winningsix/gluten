@@ -268,9 +268,9 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorSessionC
       conf->get<std::string>(kMaxPartitions, "10000");
   configs[facebook::velox::connector::hive::HiveConfig::kIgnoreMissingFilesSession] =
       conf->get<bool>(kIgnoreMissingFiles, false) ? "true" : "false";
-  configs[facebook::velox::connector::hive::HiveConfig::kParquetUseColumnNamesSession] =
+  configs[facebook::velox::connector::hive::FileConfig::kUseColumnNamesSession] =
       conf->get<bool>(kParquetUseColumnNames, true) ? "true" : "false";
-  configs[facebook::velox::connector::hive::HiveConfig::kOrcUseColumnNamesSession] =
+  configs[facebook::velox::connector::hive::FileConfig::kUseColumnNamesSession] =
       conf->get<bool>(kOrcUseColumnNames, true) ? "true" : "false";
 
   // Opt-in MPP scan chunk sizing (spark.gluten.mpp.largeParquetScanChunks, default
@@ -343,10 +343,10 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorConfig(
   // Spark "footerEstimatedSize" still affect IBM Hive's tail-read sizing.
   auto footerSize =
       conf->get<std::string>(kFooterEstimatedSize, footerEstimatedSize); // 32K
+  hiveConfMap[facebook::velox::parquet::ParquetConfig::
+                  kFooterSpeculativeIoSizeSession] = footerSize;
   hiveConfMap[facebook::velox::connector::hive::HiveConfig::
-                  kParquetFooterSpeculativeIoSize] = footerSize;
-  hiveConfMap[facebook::velox::connector::hive::HiveConfig::
-                  kOrcFooterSpeculativeIoSize] = footerSize;
+                  kOrcFooterSpeculativeIoSizeSession] = footerSize;
   hiveConfMap[facebook::velox::connector::hive::HiveConfig::kFilePreloadThreshold] =
       conf->get<std::string>(kFilePreloadThreshold, "1048576"); // 1M
 

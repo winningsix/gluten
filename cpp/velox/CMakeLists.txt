@@ -329,6 +329,10 @@ target_include_directories(
          ${VELOX_BUILD_PATH}/_deps/cuco-src/include
          ${VELOX_BUILD_PATH}/_deps/kvikio-src/cpp/include
          ${VELOX_BUILD_PATH}/_deps/rapids_logger-src/include
+         ${VELOX_BUILD_PATH}/_deps/fmt-src/include
+         ${VELOX_BUILD_PATH}/_deps/xsimd-src/include
+         ${VELOX_BUILD_PATH}/_deps/re2-src
+         ${VELOX_BUILD_PATH}/_deps/absl-src
          # CUDA runtime headers (cuda_runtime_api.h etc.) used transitively by
          # rmm/cuda_stream_view.hpp.
          /usr/local/cuda/include
@@ -351,6 +355,22 @@ set_target_properties(velox PROPERTIES LIBRARY_OUTPUT_DIRECTORY
 # `-DCMAKE_PREFIX_PATH="${folly lib path}" to cmake arguments. It is also
 # applicable to other dependencies.
 find_package(Folly REQUIRED CONFIG)
+
+# Some Folly package configurations expose only Folly's own include directory
+# and omit headers from these public dependencies. Discover them explicitly so
+# a separately installed Folly can be used with a separately built Velox tree.
+find_path(
+  GLUTEN_DOUBLE_CONVERSION_INCLUDE_DIR
+  NAMES double-conversion/double-conversion.h
+  REQUIRED)
+find_path(GLUTEN_LIBEVENT_INCLUDE_DIR NAMES event2/event.h REQUIRED)
+find_path(
+  GLUTEN_FBTHRIFT_INCLUDE_DIR
+  NAMES thrift/lib/cpp2/protocol/CompactV1Protocol.h
+  REQUIRED)
+target_include_directories(
+  velox PUBLIC ${GLUTEN_DOUBLE_CONVERSION_INCLUDE_DIR}
+               ${GLUTEN_LIBEVENT_INCLUDE_DIR} ${GLUTEN_FBTHRIFT_INCLUDE_DIR})
 
 if(ENABLE_JEMALLOC_STATS)
   include(Findjemalloc)
@@ -397,8 +417,10 @@ if(NOT EXISTS "${GLUTEN_S2_LIBRARY}")
   find_library(GLUTEN_S2_LIBRARY NAMES s2 REQUIRED)
 endif()
 import_library(external::s2 ${GLUTEN_S2_LIBRARY})
-file(GLOB GLUTEN_ABSL_LIBRARIES "/usr/local/lib/libabsl*.a"
-     "/usr/local/lib64/libabsl*.a")
+file(GLOB GLUTEN_ABSL_LIBRARIES
+     "/usr/local/lib/libabsl*.a"
+     "/usr/local/lib64/libabsl*.a"
+     "${VELOX_BUILD_PATH}/_deps/absl-build/absl/*/libabsl*.a")
 list(SORT GLUTEN_ABSL_LIBRARIES)
 set(GLUTEN_QUADMATH_LIBRARY "")
 if(NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
@@ -657,6 +679,47 @@ if(ENABLE_GPU)
   # velox_cudf_exec and must be linked exactly once. Linking the standalone
   # objects again registers gflags and process-wide UCX singletons twice.
 
+  # The combined Gluten library needs both Apache Thrift (used by the Spark
+  # RAPIDS JNI dependency) and the current FBThrift static archives used by
+  # Velox.  Older build images happened to install all of them under
+  # /usr/local/lib; discover them explicitly so a separately-built Velox tree
+  # can be used as well.
+  set(GLUTEN_APACHE_THRIFT_LIBRARY ""
+      CACHE FILEPATH "Apache Thrift library used by the cuDF JNI dependency")
+  if(NOT GLUTEN_APACHE_THRIFT_LIBRARY)
+    find_library(
+      GLUTEN_APACHE_THRIFT_LIBRARY
+      NAMES thrift
+      PATHS /usr/local/lib /usr/local/lib64)
+  endif()
+  if(NOT GLUTEN_APACHE_THRIFT_LIBRARY)
+    message(FATAL_ERROR "Apache Thrift library (libthrift.a) not found")
+  endif()
+
+  set(GLUTEN_FBTHRIFT_LIBRARY_DIR ""
+      CACHE PATH "Directory containing the FBThrift static archives")
+  if(NOT GLUTEN_FBTHRIFT_LIBRARY_DIR)
+    find_path(
+      GLUTEN_FBTHRIFT_LIBRARY_DIR
+      NAMES libthriftcpp2.a
+      PATHS /usr/local/lib /usr/local/lib64
+            ${VELOX_BUILD_PATH}/_deps/fbthrift-build/lib)
+  endif()
+  if(NOT GLUTEN_FBTHRIFT_LIBRARY_DIR)
+    message(FATAL_ERROR "FBThrift static library directory not found")
+  endif()
+  set(GLUTEN_FBTHRIFT_LIBRARIES)
+  foreach(_gluten_fbthrift_name IN ITEMS
+          thriftcpp2 thriftprotocol thrift-core thrifttyperep thriftannotation
+          thrifttype thriftanyrep thriftmetadata thriftfrozen2)
+    set(_gluten_fbthrift_path
+        "${GLUTEN_FBTHRIFT_LIBRARY_DIR}/lib${_gluten_fbthrift_name}.a")
+    if(NOT EXISTS "${_gluten_fbthrift_path}")
+      message(FATAL_ERROR "Missing FBThrift archive: ${_gluten_fbthrift_path}")
+    endif()
+    list(APPEND GLUTEN_FBTHRIFT_LIBRARIES "${_gluten_fbthrift_path}")
+  endforeach()
+
   target_compile_definitions(
     velox PRIVATE LIBCUDACXX_ENABLE_EXPERIMENTAL_MEMORY_RESOURCE)
 
@@ -678,6 +741,7 @@ if(ENABLE_GPU)
       ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/libvelox_cudf_hive_connector.a
       ${VELOX_BUILD_PATH}/velox/experimental/cudf/connectors/hive/iceberg/libvelox_cudf_iceberg_connector.a
       ${VELOX_BUILD_PATH}/velox/experimental/cudf/expression/libvelox_cudf_expression.a
+      ${VELOX_BUILD_PATH}/velox/experimental/cudf/expression/libvelox_cudf_expression_registry.a
       -Wl,--no-whole-archive)
   # The cuDF connector archives above contain S3 callers. Repeat the static AWS
   # SDK closure after those archives so one-pass GNU linking retains the
@@ -687,10 +751,63 @@ if(ENABLE_GPU)
   endif()
   # Shared libs consumers need at link time (cudf::cudf, libcurl): PUBLIC.
   target_link_libraries(velox PUBLIC cudf::cudf velox_curl)
-  # IBM baseline brings in apache thrift symbols transitively (Presto serde uses
-  # thrift for handshake / buffered transport). System Arrow doesn't link them
-  # in, so add /usr/local/lib/libthrift.a here.
-  target_link_libraries(velox PUBLIC /usr/local/lib/libthrift.a)
+  target_link_libraries(velox PUBLIC ${GLUTEN_APACHE_THRIFT_LIBRARY})
+  # Velox's command-line/configuration code uses Boost.Program_options.  The
+  # static Velox archive leaves those symbols unresolved, so make the shared
+  # dependency explicit on libgluten.so instead of relying on the host JVM
+  # process to preload it.
+  find_library(
+    GLUTEN_BOOST_PROGRAM_OPTIONS_LIBRARY
+    NAMES boost_program_options
+    PATHS /usr/local/lib64 /usr/local/lib)
+  if(NOT GLUTEN_BOOST_PROGRAM_OPTIONS_LIBRARY)
+    message(FATAL_ERROR "Boost.Program_options library not found")
+  endif()
+  target_link_libraries(velox PUBLIC ${GLUTEN_BOOST_PROGRAM_OPTIONS_LIBRARY})
+  foreach(_gluten_boost_component IN ITEMS filesystem system context)
+    string(TOUPPER "${_gluten_boost_component}" _gluten_boost_component_upper)
+    find_library(
+      GLUTEN_BOOST_${_gluten_boost_component_upper}_LIBRARY
+      NAMES boost_${_gluten_boost_component}
+      PATHS /usr/local/lib64 /usr/local/lib)
+    if(NOT GLUTEN_BOOST_${_gluten_boost_component_upper}_LIBRARY)
+      message(FATAL_ERROR
+              "Boost.${_gluten_boost_component} library not found")
+    endif()
+    target_link_libraries(
+      velox PUBLIC ${GLUTEN_BOOST_${_gluten_boost_component_upper}_LIBRARY})
+  endforeach()
+  foreach(_gluten_runtime_name IN ITEMS zstd event_core sodium)
+    find_library(
+      GLUTEN_${_gluten_runtime_name}_LIBRARY
+      NAMES ${_gluten_runtime_name})
+    if(NOT GLUTEN_${_gluten_runtime_name}_LIBRARY)
+      message(FATAL_ERROR "Runtime library not found: ${_gluten_runtime_name}")
+    endif()
+    target_link_libraries(velox PUBLIC ${GLUTEN_${_gluten_runtime_name}_LIBRARY})
+  endforeach()
+  find_library(
+    GLUTEN_FMT_LIBRARY
+    NAMES fmt
+    PATHS ${VELOX_BUILD_PATH}/_deps/fmt-build)
+  if(NOT GLUTEN_FMT_LIBRARY)
+    message(FATAL_ERROR "Bundled fmt archive not found")
+  endif()
+  target_link_libraries(velox PUBLIC ${GLUTEN_FMT_LIBRARY})
+  find_library(
+    GLUTEN_DOUBLE_CONVERSION_LIBRARY
+    NAMES double-conversion)
+  if(NOT GLUTEN_DOUBLE_CONVERSION_LIBRARY)
+    message(FATAL_ERROR "double-conversion archive not found")
+  endif()
+  target_link_libraries(velox PUBLIC ${GLUTEN_DOUBLE_CONVERSION_LIBRARY})
+  find_library(
+    GLUTEN_SNAPPY_LIBRARY
+    NAMES snappy)
+  if(NOT GLUTEN_SNAPPY_LIBRARY)
+    message(FATAL_ERROR "Snappy library not found")
+  endif()
+  target_link_libraries(velox PUBLIC ${GLUTEN_SNAPPY_LIBRARY})
   # Legacy RAPIDS layouts expose these dependencies as shared libraries and
   # require explicit links. Current cuDF builds absorb their static archives
   # into libcudf.so; their build-tree locations may also disappear when CMake
@@ -794,16 +911,8 @@ target_link_libraries(
           Arrow::arrow_bundled_dependencies
           facebook::velox::dwio_parquet_thrift_raw
           external::s2
-          /usr/local/lib/libthrift.a
-          /usr/local/lib/libthriftcpp2.a
-          /usr/local/lib/libthriftprotocol.a
-          /usr/local/lib/libthrift-core.a
-          /usr/local/lib/libthrifttyperep.a
-          /usr/local/lib/libthriftannotation.a
-          /usr/local/lib/libthrifttype.a
-          /usr/local/lib/libthriftanyrep.a
-          /usr/local/lib/libthriftmetadata.a
-          /usr/local/lib/libthriftfrozen2.a
+          ${GLUTEN_APACHE_THRIFT_LIBRARY}
+          ${GLUTEN_FBTHRIFT_LIBRARIES}
           ${GLUTEN_ABSL_LIBRARIES}
           ${GLUTEN_QUADMATH_LIBRARY}
           -Wl,--end-group)

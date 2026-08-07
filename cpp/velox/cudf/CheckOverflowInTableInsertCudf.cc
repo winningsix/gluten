@@ -40,18 +40,26 @@ constexpr const char* kUnsupported =
 
 class CheckOverflowInTableInsertCudfFunction final : public CudfFunction {
  public:
-  explicit CheckOverflowInTableInsertCudfFunction(const std::shared_ptr<exec::Expr>& expr) {
+  explicit CheckOverflowInTableInsertCudfFunction(
+      const core::TypedExprPtr& expr) {
     if (expr->inputs().size() != 2 || expr->type()->kind() != TypeKind::INTEGER ||
         expr->inputs()[0]->type()->kind() != TypeKind::BIGINT ||
         expr->inputs()[1]->type()->kind() != TypeKind::VARCHAR) {
       VELOX_UNSUPPORTED("{}", kUnsupported);
     }
 
-    const auto columnNameExpr = std::dynamic_pointer_cast<exec::ConstantExpr>(expr->inputs()[1]);
-    if (columnNameExpr == nullptr || columnNameExpr->value() == nullptr || columnNameExpr->value()->isNullAt(0)) {
+    const auto columnNameExpr =
+        std::dynamic_pointer_cast<const core::ConstantTypedExpr>(
+            expr->inputs()[1]);
+    if (columnNameExpr == nullptr || columnNameExpr->isNull()) {
       VELOX_UNSUPPORTED("{}", kUnsupported);
     }
-    columnName_ = columnNameExpr->value()->toString(0);
+    if (columnNameExpr->hasValueVector()) {
+      columnName_ = columnNameExpr->valueVector()->toString(0);
+    } else {
+      const auto value = columnNameExpr->value().value<TypeKind::VARCHAR>();
+      columnName_ = std::string(value.data(), value.size());
+    }
   }
 
   ColumnOrView eval(
@@ -87,7 +95,9 @@ void registerCheckOverflowInTableInsertCudfFunction(const std::string& prefix) {
 
   facebook::velox::cudf_velox::registerCudfFunction(
       prefix + kCheckOverflowInTableInsert,
-      [](const std::string&, const std::shared_ptr<exec::Expr>& expr) {
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool*) {
         return std::make_shared<CheckOverflowInTableInsertCudfFunction>(expr);
       },
       {FunctionSignatureBuilder().returnType("integer").argumentType("bigint").constantArgumentType("varchar").build()},

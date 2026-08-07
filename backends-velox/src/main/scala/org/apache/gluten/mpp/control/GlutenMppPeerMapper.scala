@@ -50,7 +50,26 @@ object GlutenMppPeerMapper {
    */
   def toMppPeerInfos(infos: Seq[UcxEndpointInfo], requestedCount: Int): Seq[MppPeerInfo] = {
     require(requestedCount >= 0, s"requestedCount=$requestedCount must be non-negative")
-    infos.take(requestedCount).map {
+    val selectedInfos = infos.take(requestedCount)
+    // Spark standalone workers started on loopback can host multiple executors in separate JVMs.
+    // Their UCX listeners advertise the same physical NIC address with different ports, even
+    // though every listener accepts loopback connections. Keep that traffic on loopback: using
+    // the physical address forces a fresh set of UCX/TCP wire-up connections through the NIC for
+    // each query. A one-peer query is executor-local by construction, so it must use the same
+    // loopback address too; that lets scalar/broadcast stages reuse the endpoint established by a
+    // preceding multi-peer stage. Do not apply this to records with different listener hosts,
+    // since those may be executors on different machines whose loopback addresses are not mutually
+    // reachable.
+    val useSharedLoopback = selectedInfos.nonEmpty &&
+      selectedInfos.forall(info => Option(info.blockManagerHost).exists(isLoopbackIpLiteral)) &&
+      selectedInfos
+        .flatMap(_.nativeUcxListenerEndpoint)
+        .map(endpoint => Option(new URI(endpoint).getHost).getOrElse(""))
+        .filter(_.nonEmpty)
+        .distinct
+        .size == 1
+
+    selectedInfos.map {
       info =>
         val rawEndpoint = info.nativeUcxListenerEndpoint
           .getOrElse(
@@ -71,7 +90,11 @@ object GlutenMppPeerMapper {
         // hostname parsing failures under concurrent TableWrite startup.
         val blockManagerIp = blockManagerHost.filter(isNonLoopbackIpLiteral)
         val connectionHost =
-          blockManagerIp.orElse(endpointHost).getOrElse(blockManagerHost.getOrElse(info.host))
+          if (useSharedLoopback) {
+            blockManagerHost.get
+          } else {
+            blockManagerIp.orElse(endpointHost).getOrElse(blockManagerHost.getOrElse(info.host))
+          }
         val placementHost = blockManagerHost.getOrElse(info.host)
         MppPeerInfo(
           peerId = info.executorId,
@@ -89,6 +112,9 @@ object GlutenMppPeerMapper {
       !address.isAnyLocalAddress && !address.isLoopbackAddress
     }
   }
+
+  private def isLoopbackIpLiteral(host: String): Boolean =
+    InetAddresses.isInetAddress(host) && InetAddresses.forString(host).isLoopbackAddress
 
   /** Map registry endpoint records through the same contract as probe-discovered endpoint info. */
   def fromEndpointRecords(

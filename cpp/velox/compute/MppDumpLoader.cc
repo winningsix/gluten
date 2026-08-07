@@ -135,8 +135,7 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
     return std::make_shared<velox::core::ExchangeNode>(
         exchangeNodeId,
         node->outputType(),
-        std::string{"Presto"},
-        velox::core::ExchangeNode::TransportType::kUcx);
+        std::string{"Presto"});
   }
 
   const auto& sources = node->sources();
@@ -515,8 +514,8 @@ MppDumpLoadResult loadMppQueryFromDump(
           std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>(),
           veloxPlanNode->outputType(),
           std::string{"Presto"},
-          veloxPlanNode,
-          velox::core::PartitionedOutputNode::TransportType::kUcx);
+          std::string{velox::core::TransportKind::kUcx},
+          veloxPlanNode);
     } else if (numOutputPartitions == 1) {
       // Single-partition gather. Two cases (mirrors MppJniWrapper.cc:646-665):
       //   - producer with SINGLE-gather outbound exchange (outboundExchange!=nullptr)
@@ -526,14 +525,14 @@ MppDumpLoadResult loadMppQueryFromDump(
       //     coordinator) → kHttp so DefaultOutputBufferManager receives
       //     pages.
       const auto transportType = (outboundExchange != nullptr)
-          ? velox::core::PartitionedOutputNode::TransportType::kUcx
-          : velox::core::PartitionedOutputNode::TransportType::kHttp;
+          ? std::string{velox::core::TransportKind::kUcx}
+          : std::string{velox::core::TransportKind::kInMemory};
       wrappedPlan = velox::core::PartitionedOutputNode::single(
           outputNodeId,
           veloxPlanNode->outputType(),
           std::string{"Presto"},
-          veloxPlanNode,
-          transportType);
+          transportType,
+          veloxPlanNode);
     } else {
       const std::string& partitionType = outboundExchange
           ? outboundExchange->partitionType
@@ -606,8 +605,8 @@ MppDumpLoadResult loadMppQueryFromDump(
           std::move(funcSpec),
           veloxPlanNode->outputType(),
           std::string{"Presto"},
-          veloxPlanNode,
-          velox::core::PartitionedOutputNode::TransportType::kUcx);
+          std::string{velox::core::TransportKind::kUcx},
+          veloxPlanNode);
     }
 
     // 3g. Package into MppFragmentSpec.
