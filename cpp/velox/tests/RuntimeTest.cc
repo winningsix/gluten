@@ -18,6 +18,7 @@
 #include "compute/VeloxRuntime.h"
 
 #include <gtest/gtest.h>
+#include "compute/FluxOperatorMetrics.h"
 #include "compute/VeloxBackend.h"
 #include "memory.pb.h"
 
@@ -141,6 +142,32 @@ TEST(TestRuntime, CreateRuntime) {
   auto runtime = Runtime::create(kDummyBackendKind, &mm);
   ASSERT_EQ(typeid(*runtime), typeid(DummyRuntime));
   Runtime::release(runtime);
+}
+
+TEST(TestRuntime, SerializeFluxOperatorRuntimeStats) {
+  using facebook::velox::RuntimeCounter;
+  using facebook::velox::RuntimeMetric;
+
+  std::unordered_map<std::string, RuntimeMetric> runtimeStats;
+  runtimeStats.emplace("storageReadBytes", RuntimeMetric(8'192, 2, 4'096, 4'096, RuntimeCounter::Unit::kBytes));
+  runtimeStats.emplace("numLocalRead", RuntimeMetric(3));
+  runtimeStats.emplace("localReadBytes", RuntimeMetric(12'288, 3, 4'096, 4'096, RuntimeCounter::Unit::kBytes));
+  runtimeStats.emplace("numRamRead", RuntimeMetric(5));
+  runtimeStats.emplace("ramReadBytes", RuntimeMetric(20'480, 5, 4'096, 4'096, RuntimeCounter::Unit::kBytes));
+
+  const auto serialized = detail::serializeFluxOperatorRuntimeStats(runtimeStats);
+  ASSERT_EQ(serialized.size(), runtimeStats.size());
+
+  EXPECT_EQ(serialized["storageReadBytes"]["sum"].asInt(), 8'192);
+  EXPECT_EQ(serialized["storageReadBytes"]["count"].asInt(), 2);
+  EXPECT_EQ(serialized["storageReadBytes"]["min"].asInt(), 4'096);
+  EXPECT_EQ(serialized["storageReadBytes"]["max"].asInt(), 4'096);
+  EXPECT_EQ(serialized["numLocalRead"]["sum"].asInt(), 3);
+  EXPECT_EQ(serialized["localReadBytes"]["sum"].asInt(), 12'288);
+  EXPECT_EQ(serialized["numRamRead"]["sum"].asInt(), 5);
+  EXPECT_EQ(serialized["ramReadBytes"]["sum"].asInt(), 20'480);
+
+  EXPECT_TRUE(detail::serializeFluxOperatorRuntimeStats({}).empty());
 }
 
 TEST(TestRuntime, CreateVeloxRuntime) {

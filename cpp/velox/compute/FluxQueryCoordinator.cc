@@ -17,6 +17,8 @@
 
 #include "FluxQueryCoordinator.h"
 
+#include "compute/FluxOperatorMetrics.h"
+
 #include <fmt/format.h>
 #include <folly/dynamic.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
@@ -2337,6 +2339,7 @@ void FluxQueryCoordinator::logOperatorMetrics() const {
           row["numMemoryAllocations"] = static_cast<int64_t>(opStats.memoryStats.numMemoryAllocations);
           row["spilledBytes"] = static_cast<int64_t>(opStats.spilledBytes);
           row["spilledRows"] = static_cast<int64_t>(opStats.spilledRows);
+          row["customStats"] = detail::serializeFluxOperatorRuntimeStats(opStats.runtimeStats);
           LOG(WARNING) << "[FLUX_OPERATOR_METRICS] " << folly::toJson(row);
           ++emitted;
         }

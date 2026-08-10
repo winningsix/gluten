@@ -155,6 +155,7 @@ add_velox_test(spark_functions_test SOURCES SparkFunctionTest.cc
                FunctionTest.cc)
 target_link_libraries(spark_functions_test Folly::folly)
 add_velox_test(runtime_test SOURCES RuntimeTest.cc)
+target_link_libraries(runtime_test Folly::folly)
 add_velox_test(velox_backend_lifecycle_test SOURCES
                VeloxBackendLifecycleTest.cc)
 add_velox_test(velox_memory_test SOURCES MemoryManagerTest.cc)
