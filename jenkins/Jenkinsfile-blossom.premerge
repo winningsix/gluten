@@ -58,7 +58,7 @@ pipeline {
         string(name: 'PREBUILD_IMAGE',
             defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/gluten-builder:latest",
             description: 'cuDF-pinned Colt prebuild image. A matching image is required.')
-        string(name: 'GPU_TYPE', defaultValue: 'RESERVED_POOL',
+        string(name: 'GPU_TYPE', defaultValue: 'NIGHTLY_POOL',
             description: 'Blossom lockable GPU pool label. One GPU is allocated to DinD.')
         string(name: 'COLT_RUNNER_IMAGE',
             defaultValue: "${common.ARTIFACTORY_NAME}/sw-spark-docker/" +
