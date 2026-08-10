@@ -187,18 +187,18 @@ target_link_libraries(gluten LINK_PUBLIC ${PROTOBUF_LIBRARY})
 
 add_custom_command(
   OUTPUT ${SUBSTRAIT_PROTO_OUTPUT_FILES}
-  COMMAND ${PROTOC_BIN} --proto_path ${SUBSTRAIT_PROTO_SRC_DIR}/ --proto_path
-          ${PROTOBUF_INCLUDE} --cpp_out ${PROTO_OUTPUT_DIR}
-          ${SUBSTRAIT_PROTO_FILES}
+  COMMAND
+    ${PROTOC_BIN} --proto_path ${SUBSTRAIT_PROTO_SRC_DIR}/ --proto_path
+    ${PROTOBUF_INCLUDE} --cpp_out ${PROTO_OUTPUT_DIR} ${SUBSTRAIT_PROTO_FILES}
   DEPENDS ${SUBSTRAIT_PROTO_DIR}
   COMMENT "Running Substrait PROTO compiler"
   VERBATIM)
 
 add_custom_command(
   OUTPUT ${GLUTEN_PROTO_OUTPUT_FILES}
-  COMMAND ${PROTOC_BIN} --proto_path ${GLUTEN_PROTO_SRC_DIR}/ --proto_path
-          ${PROTOBUF_INCLUDE} --cpp_out ${PROTO_OUTPUT_DIR}
-          ${GLUTEN_PROTO_FILES}
+  COMMAND
+    ${PROTOC_BIN} --proto_path ${GLUTEN_PROTO_SRC_DIR}/ --proto_path
+    ${PROTOBUF_INCLUDE} --cpp_out ${PROTO_OUTPUT_DIR} ${GLUTEN_PROTO_FILES}
   DEPENDS ${GLUTEN_PROTO_DIR}
   COMMENT "Running Gluten PROTO compiler"
   VERBATIM)

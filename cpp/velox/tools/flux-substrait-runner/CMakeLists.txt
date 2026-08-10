@@ -77,4 +77,4 @@ endif()
 # Helpful install location so the binary lands next to the other artifacts.
 set_target_properties(
   flux-substrait-runner PROPERTIES RUNTIME_OUTPUT_DIRECTORY
-                                  ${root_directory}/releases)
+                                   ${root_directory}/releases)

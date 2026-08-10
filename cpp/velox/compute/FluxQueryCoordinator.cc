@@ -1313,6 +1313,20 @@ void FluxQueryCoordinator::start() {
               scanInfo->lengths[j],
               /*splitWeight=*/0,
               metadataColumn);
+          const auto prefetchPath = cleanedCudfPath(scanInfo->paths[j]);
+          if (queryCtx_->executor() != nullptr &&
+              prefetchPath.starts_with("s3://") &&
+              j < scanInfo->properties.size() &&
+              scanInfo->properties[j].has_value() &&
+              scanInfo->properties[j]->fileSize.has_value()) {
+            cudf_velox::connector::hive::ExecutorSplitPrefetch::registerSplit(
+                queryCtx_->executor(),
+                queryCtx_->queryId(),
+                prefetchPath,
+                {{prefetchPath,
+                  static_cast<uint64_t>(
+                      *scanInfo->properties[j]->fileSize)}});
+          }
         } else
 #endif
         {

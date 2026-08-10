@@ -357,17 +357,13 @@ set_target_properties(velox PROPERTIES LIBRARY_OUTPUT_DIRECTORY
 find_package(Folly REQUIRED CONFIG)
 
 # Some Folly package configurations expose only Folly's own include directory
-# and omit headers from these public dependencies. Discover them explicitly so
-# a separately installed Folly can be used with a separately built Velox tree.
-find_path(
-  GLUTEN_DOUBLE_CONVERSION_INCLUDE_DIR
-  NAMES double-conversion/double-conversion.h
-  REQUIRED)
+# and omit headers from these public dependencies. Discover them explicitly so a
+# separately installed Folly can be used with a separately built Velox tree.
+find_path(GLUTEN_DOUBLE_CONVERSION_INCLUDE_DIR
+          NAMES double-conversion/double-conversion.h REQUIRED)
 find_path(GLUTEN_LIBEVENT_INCLUDE_DIR NAMES event2/event.h REQUIRED)
-find_path(
-  GLUTEN_FBTHRIFT_INCLUDE_DIR
-  NAMES thrift/lib/cpp2/protocol/CompactV1Protocol.h
-  REQUIRED)
+find_path(GLUTEN_FBTHRIFT_INCLUDE_DIR
+          NAMES thrift/lib/cpp2/protocol/CompactV1Protocol.h REQUIRED)
 target_include_directories(
   velox PUBLIC ${GLUTEN_DOUBLE_CONVERSION_INCLUDE_DIR}
                ${GLUTEN_LIBEVENT_INCLUDE_DIR} ${GLUTEN_FBTHRIFT_INCLUDE_DIR})
@@ -417,8 +413,7 @@ if(NOT EXISTS "${GLUTEN_S2_LIBRARY}")
   find_library(GLUTEN_S2_LIBRARY NAMES s2 REQUIRED)
 endif()
 import_library(external::s2 ${GLUTEN_S2_LIBRARY})
-file(GLOB GLUTEN_ABSL_LIBRARIES
-     "/usr/local/lib/libabsl*.a"
+file(GLOB GLUTEN_ABSL_LIBRARIES "/usr/local/lib/libabsl*.a"
      "/usr/local/lib64/libabsl*.a"
      "${VELOX_BUILD_PATH}/_deps/absl-build/absl/*/libabsl*.a")
 list(SORT GLUTEN_ABSL_LIBRARIES)
@@ -625,8 +620,8 @@ endif()
 add_subdirectory(tools)
 
 if(ENABLE_GPU)
-  # Propagate GPU flag to velox target so FluxJniWrapper.cc and other sources can
-  # use #ifdef GLUTEN_ENABLE_GPU for GPU-specific code paths.
+  # Propagate GPU flag to velox target so FluxJniWrapper.cc and other sources
+  # can use #ifdef GLUTEN_ENABLE_GPU for GPU-specific code paths.
   target_compile_definitions(velox PRIVATE GLUTEN_ENABLE_GPU)
 
   # A cuDF build-tree package config resolves transitive RAPIDS dependencies
@@ -684,7 +679,8 @@ if(ENABLE_GPU)
   # Velox.  Older build images happened to install all of them under
   # /usr/local/lib; discover them explicitly so a separately-built Velox tree
   # can be used as well.
-  set(GLUTEN_APACHE_THRIFT_LIBRARY ""
+  set(GLUTEN_APACHE_THRIFT_LIBRARY
+      ""
       CACHE FILEPATH "Apache Thrift library used by the cuDF JNI dependency")
   if(NOT GLUTEN_APACHE_THRIFT_LIBRARY)
     find_library(
@@ -696,7 +692,8 @@ if(ENABLE_GPU)
     message(FATAL_ERROR "Apache Thrift library (libthrift.a) not found")
   endif()
 
-  set(GLUTEN_FBTHRIFT_LIBRARY_DIR ""
+  set(GLUTEN_FBTHRIFT_LIBRARY_DIR
+      ""
       CACHE PATH "Directory containing the FBThrift static archives")
   if(NOT GLUTEN_FBTHRIFT_LIBRARY_DIR)
     find_path(
@@ -709,9 +706,17 @@ if(ENABLE_GPU)
     message(FATAL_ERROR "FBThrift static library directory not found")
   endif()
   set(GLUTEN_FBTHRIFT_LIBRARIES)
-  foreach(_gluten_fbthrift_name IN ITEMS
-          thriftcpp2 thriftprotocol thrift-core thrifttyperep thriftannotation
-          thrifttype thriftanyrep thriftmetadata thriftfrozen2)
+  foreach(
+    _gluten_fbthrift_name IN
+    ITEMS thriftcpp2
+          thriftprotocol
+          thrift-core
+          thrifttyperep
+          thriftannotation
+          thrifttype
+          thriftanyrep
+          thriftmetadata
+          thriftfrozen2)
     set(_gluten_fbthrift_path
         "${GLUTEN_FBTHRIFT_LIBRARY_DIR}/lib${_gluten_fbthrift_name}.a")
     if(NOT EXISTS "${_gluten_fbthrift_path}")
@@ -771,20 +776,19 @@ if(ENABLE_GPU)
       NAMES boost_${_gluten_boost_component}
       PATHS /usr/local/lib64 /usr/local/lib)
     if(NOT GLUTEN_BOOST_${_gluten_boost_component_upper}_LIBRARY)
-      message(FATAL_ERROR
-              "Boost.${_gluten_boost_component} library not found")
+      message(FATAL_ERROR "Boost.${_gluten_boost_component} library not found")
     endif()
     target_link_libraries(
       velox PUBLIC ${GLUTEN_BOOST_${_gluten_boost_component_upper}_LIBRARY})
   endforeach()
   foreach(_gluten_runtime_name IN ITEMS zstd event_core sodium)
-    find_library(
-      GLUTEN_${_gluten_runtime_name}_LIBRARY
-      NAMES ${_gluten_runtime_name})
+    find_library(GLUTEN_${_gluten_runtime_name}_LIBRARY
+                 NAMES ${_gluten_runtime_name})
     if(NOT GLUTEN_${_gluten_runtime_name}_LIBRARY)
       message(FATAL_ERROR "Runtime library not found: ${_gluten_runtime_name}")
     endif()
-    target_link_libraries(velox PUBLIC ${GLUTEN_${_gluten_runtime_name}_LIBRARY})
+    target_link_libraries(velox
+                          PUBLIC ${GLUTEN_${_gluten_runtime_name}_LIBRARY})
   endforeach()
   find_library(
     GLUTEN_FMT_LIBRARY
@@ -794,16 +798,12 @@ if(ENABLE_GPU)
     message(FATAL_ERROR "Bundled fmt archive not found")
   endif()
   target_link_libraries(velox PUBLIC ${GLUTEN_FMT_LIBRARY})
-  find_library(
-    GLUTEN_DOUBLE_CONVERSION_LIBRARY
-    NAMES double-conversion)
+  find_library(GLUTEN_DOUBLE_CONVERSION_LIBRARY NAMES double-conversion)
   if(NOT GLUTEN_DOUBLE_CONVERSION_LIBRARY)
     message(FATAL_ERROR "double-conversion archive not found")
   endif()
   target_link_libraries(velox PUBLIC ${GLUTEN_DOUBLE_CONVERSION_LIBRARY})
-  find_library(
-    GLUTEN_SNAPPY_LIBRARY
-    NAMES snappy)
+  find_library(GLUTEN_SNAPPY_LIBRARY NAMES snappy)
   if(NOT GLUTEN_SNAPPY_LIBRARY)
     message(FATAL_ERROR "Snappy library not found")
   endif()
