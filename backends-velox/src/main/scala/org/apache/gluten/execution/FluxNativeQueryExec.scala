@@ -250,6 +250,66 @@ private[execution] object FluxRangeTopology {
 }
 
 /**
+ * Validates the native partition-count contract at a fragment boundary.
+ *
+ * Catalyst partitioning describes the Spark shuffle before FLUX rewrites and native partition
+ * caps. The native coordinator instead consumes [[ExchangeSpec]]s, so those finalized specs are
+ * the source of truth: every non-broadcast edge entering one consumer fragment must expose the
+ * same destination count. Keep this check on the JVM side as well as in FluxQueryCoordinator so an
+ * invalid topology can delegate to BSP before JNI execution starts.
+ */
+private[execution] object FluxExchangeTopology {
+  def finalizedHashInboundPartitionCount(
+      exchanges: Seq[ExchangeSpec],
+      consumerFragmentId: Int): Either[String, Int] = {
+    val inbound = exchanges
+      .filter(
+        spec =>
+          spec.consumerFragmentId == consumerFragmentId && spec.exchangeType == "HASH")
+      .sortBy(_.id)
+
+    inbound match {
+      case Seq() =>
+        Left(s"fragment $consumerFragmentId has no inbound HASH exchange")
+      case specs if specs.exists(_.numPartitions <= 0) =>
+        val counts = specs.map(spec => s"E${spec.id}=${spec.numPartitions}")
+        Left(
+          s"fragment $consumerFragmentId has non-positive inbound HASH partition counts " +
+            counts.mkString("[", ", ", "]"))
+      case specs =>
+        specs.map(_.numPartitions).distinct match {
+          case Seq(count) => Right(count)
+          case _ =>
+            val counts = specs.map(spec => s"E${spec.id}=${spec.numPartitions}")
+            Left(
+              s"fragment $consumerFragmentId has inconsistent inbound HASH partition counts " +
+                counts.mkString("[", ", ", "]"))
+        }
+    }
+  }
+
+  def inconsistentInboundPartitionCountReason(exchanges: Seq[ExchangeSpec]): Option[String] = {
+    exchanges
+      .filterNot(_.exchangeType == "BROADCAST")
+      .groupBy(_.consumerFragmentId)
+      .toSeq
+      .sortBy(_._1)
+      .collectFirst {
+        case (consumerId, inbound) if inbound.exists(_.numPartitions <= 0) =>
+          val counts = inbound.sortBy(_.id).map(spec => s"E${spec.id}=${spec.numPartitions}")
+          s"fragment $consumerId has non-positive inbound partition counts " +
+            counts.mkString("[", ", ", "]")
+        case (consumerId, inbound) if inbound.map(_.numPartitions).distinct.size > 1 =>
+          val counts = inbound.sortBy(_.id).map {
+            spec => s"E${spec.id}:${spec.exchangeType}=${spec.numPartitions}"
+          }
+          s"fragment $consumerId has inconsistent non-broadcast inbound partition counts " +
+            counts.mkString("[", ", ", "]")
+      }
+  }
+}
+
+/**
  * Removes the ordering contract that becomes redundant when a sort-merge join becomes a hash join.
  * PullOutPreProject can leave deterministic projects between the join and its local Sort, so
  * checking only the direct child retains an unnecessary full-row OrderBy.
@@ -548,6 +608,13 @@ case class FluxNativeQueryExec(
   private[gluten] def fragmentExtractionPlanForTests: SparkPlan =
     applyCrossCutRules(preparedChildPlan)
 
+  /** Extract the native fragment topology without starting JNI execution. */
+  private[gluten] def fragmentTopologyForTests: (Seq[NativeFragment], Seq[ExchangeSpec]) = {
+    val (extractedFragments, extractedExchanges, _, _, _) =
+      extractFragmentsFromChildPlan(preparedChildPlan)
+    (extractedFragments, extractedExchanges)
+  }
+
   override def output: Seq[Attribute] = preparedChildPlan.output
   override def outputPartitioning: Partitioning = preparedChildPlan.outputPartitioning
   override def outputOrdering: Seq[SortOrder] = preparedChildPlan.outputOrdering
@@ -778,6 +845,16 @@ case class FluxNativeQueryExec(
               s"FluxNativeQueryExec: RANGE exchange preparation failed: ${exceptionSummary(e)}")
         }
 
+      FluxExchangeTopology
+        .inconsistentInboundPartitionCountReason(preparedExtractedExchanges)
+        .foreach {
+          reason =>
+            return delegateToBsp(
+              executionChild,
+              s"FluxNativeQueryExec: delegating to BSP because the extracted FLUX exchange " +
+                s"topology is invalid: $reason")
+        }
+
       // Generate Substrait plan for each fragment
       val fragmentSubstraitPlans =
         try {
@@ -924,6 +1001,14 @@ case class FluxNativeQueryExec(
             executionChild,
             s"FluxNativeQueryExec: RANGE exchange preparation failed: ${exceptionSummary(e)}")
       }
+
+    FluxExchangeTopology.inconsistentInboundPartitionCountReason(preparedExchanges).foreach {
+      reason =>
+        return delegateToBsp(
+          executionChild,
+          s"FluxNativeQueryExec: delegating to BSP because the pre-extracted FLUX exchange " +
+            s"topology is invalid: $reason")
+    }
 
     // Update fragment/exchange count metrics.
     metrics("numFragments") += fragments.size
@@ -1140,6 +1225,7 @@ case class FluxNativeQueryExec(
   private def extractFragmentsFromChildPlan(plan: SparkPlan): FragmentExtractionResult = {
     val extractedFragments = mutable.ArrayBuffer[NativeFragment]()
     val extractedExchanges = mutable.ArrayBuffer[ExchangeSpec]()
+    val topologyParallelismFragmentIds = mutable.HashSet[Int]()
     val fragmentCounter = new AtomicInteger(0)
     val exchangeCounter = new AtomicInteger(0)
     // Track fused broadcasts per consumer fragment so we can pre-populate
@@ -1263,6 +1349,8 @@ case class FluxNativeQueryExec(
           val childExchangeFragIds = exchangeChildren.map(walk)
 
           val fragId = fragmentCounter.getAndIncrement()
+          val containsShuffledJoin =
+            fragmentWst.find(_.isInstanceOf[ColumnarShuffledJoin]).isDefined
           // Write-in-FLUX: a fragment whose WST contains a WriteFilesExecTransformer must run
           // single-writer per Spark task attempt dir. With parallelism>1, multiple native
           // TableWrite drivers in one task emit the same part-NNNNN-<uuid> filename and the
@@ -1272,6 +1360,12 @@ case class FluxNativeQueryExec(
             if (fragmentWst.find(_.isInstanceOf[WriteFilesExecTransformer]).isDefined) {
               logInfo(
                 s"FluxNativeQueryExec: write fragment $fragId -> parallelism=1 (1 writer/task)")
+              1
+            } else if (containsShuffledJoin) {
+              // A shuffled join's Catalyst outputPartitioning can be stale after the FLUX
+              // correctness rewrites that run after EnsureRequirements. Resolve its local driver
+              // budget from capped native HASH inputs once the exchange graph is available.
+              topologyParallelismFragmentIds += fragId
               1
             } else {
               inferParallelism(fragmentWst)
@@ -1548,6 +1642,24 @@ case class FluxNativeQueryExec(
     // Sort fragments by ID (ensures topological order: producers before consumers)
     val sortedFragments = extractedFragments.sortBy(_.id).toSeq
     val cappedExchanges = capLocalHashExchangeTasks(extractedExchanges.toSeq)
+    val topologyResolvedFragments = sortedFragments.map {
+      case fragment if topologyParallelismFragmentIds.contains(fragment.id) =>
+        val nativePartitionCount = FluxExchangeTopology
+          .finalizedHashInboundPartitionCount(cappedExchanges, fragment.id) match {
+          case Right(count) => count
+          case Left(reason) =>
+            throw new IllegalStateException(
+              s"FluxNativeQueryExec: cannot resolve topology-first parallelism: $reason")
+        }
+        logInfo(
+          s"FluxNativeQueryExec: using finalized native HASH partition count " +
+            s"$nativePartitionCount for shuffled-join fragment F${fragment.id} driver planning")
+        fragment.copy(
+          parallelism = inferParallelism(
+            fragment.rootOperator,
+            nativePartitionCountHint = Some(nativePartitionCount)))
+      case fragment => fragment
+    }
     // Experimental escape hatch for small globally sorted outputs. A SINGLE exchange still
     // preserves total ordering, while avoiding the Spark-side RANGE sampling pre-action. Reduce
     // the corresponding consumer fragment to one task as well so all rows are sorted by the same
@@ -1564,13 +1676,13 @@ case class FluxNativeQueryExec(
       }
     val rangePlanningFragments =
       if (forcedRangeConsumerIds.nonEmpty) {
-        sortedFragments.map {
+        topologyResolvedFragments.map {
           case fragment if forcedRangeConsumerIds.contains(fragment.id) =>
             fragment.copy(parallelism = 1)
           case fragment => fragment
         }
       } else {
-        sortedFragments
+        topologyResolvedFragments
       }
     val singleDriverExchanges =
       // Write fragments intentionally use one native writer per peer. Their local driver count is
@@ -4207,6 +4319,11 @@ case class FluxNativeQueryExec(
     }
   }
 
+  private[execution] def capLocalHashExchangeTasksForTests(
+      exchanges: Seq[ExchangeSpec]): Seq[ExchangeSpec] = {
+    capLocalHashExchangeTasks(exchanges)
+  }
+
   private def smallFluxRangeMaxBytes: BigInt = {
     val key = "spark.gluten.mpp.smallRangeMaxEstimatedBytes"
     val raw = SQLConf.get.getConfString(key, (64L << 20).toString).trim
@@ -5376,7 +5493,7 @@ case class FluxNativeQueryExec(
   }
 
   /**
-   * Infer the parallelism for a fragment based on its output partitioning.
+   * Infer fragment parallelism from either Catalyst metadata or a finalized native-topology hint.
    *
    * In FLUX mode every fragment runs in-process as a set of Velox drivers, so the "parallelism"
    * here
@@ -5390,12 +5507,10 @@ case class FluxNativeQueryExec(
    * Cap driver count at the executor core count. On multi-executor M2 this still gives the right
    * parallelism (each executor caps locally).
    */
-  private def inferParallelism(plan: SparkPlan): Int = {
-    val raw = plan.outputPartitioning match {
-      case p if p.numPartitions > 0 => p.numPartitions
-      case _ =>
-        SQLConf.get.getConfString("spark.sql.shuffle.partitions", "200").toInt
-    }
+  private def inferParallelism(
+      plan: SparkPlan,
+      nativePartitionCountHint: Option[Int] = None): Int = {
+    val raw = fragmentDriverPartitionCount(plan, nativePartitionCountHint)
     val cores = SQLConf.get.getConfString("spark.executor.cores", "16").toInt
     val joinDriverOverride = positiveIntConf("spark.gluten.mpp.joinDriversPerFragment")
       .filter(
@@ -5439,6 +5554,30 @@ case class FluxNativeQueryExec(
         capped
       case None => coreCapped
     }
+  }
+
+  /** Select a local driver-count hint without conflating Catalyst and native topology. */
+  private def fragmentDriverPartitionCount(
+      plan: SparkPlan,
+      nativePartitionCountHint: Option[Int]): Int = {
+    val defaultPartitions =
+      SQLConf.get.getConfString("spark.sql.shuffle.partitions", "200").toInt
+    nativePartitionCountHint match {
+      case Some(count) =>
+        require(count > 0, s"native partition-count hint must be positive, got $count")
+        count
+      case None =>
+        plan.outputPartitioning match {
+          case p if p.numPartitions > 0 => p.numPartitions
+          case _ => defaultPartitions
+        }
+    }
+  }
+
+  private[execution] def fragmentDriverPartitionCountForTests(
+      plan: SparkPlan,
+      nativePartitionCountHint: Option[Int] = None): Int = {
+    fragmentDriverPartitionCount(plan, nativePartitionCountHint)
   }
 
   private def positiveIntConf(key: String): Option[Int] = {

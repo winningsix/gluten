@@ -16,11 +16,19 @@
  */
 package org.apache.gluten.extension
 
-import org.apache.gluten.execution.{LocalTableScanExecTransformer, FluxExchangeSourceTransformer, FluxNativeQueryExec, FluxPreparedChildExec, VeloxWholeStageTransformerSuite, WholeStageTransformer}
+import org.apache.gluten.config.GlutenConfig
+import org.apache.gluten.execution.{ColumnarShuffledJoin, FluxExchangeSourceTransformer, FluxNativeQueryExec, FluxPreparedChildExec, LocalTableScanExecTransformer, VeloxWholeStageTransformerSuite, WholeStageTransformer}
 import org.apache.gluten.metrics.MetricsUpdater
 
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
+
+import org.apache.commons.io.FileUtils
+
+import java.io.File
+import java.nio.charset.StandardCharsets
+
+import scala.util.Try
 
 /**
  * Test suite verifying FluxStrategy (Plan C) behavior:
@@ -50,6 +58,16 @@ class FluxStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
   override def beforeAll(): Unit = {
     super.beforeAll()
     createTPCHNotNullTables()
+  }
+
+  private lazy val tpchQueriesPath =
+    getClass.getResource("/").getPath +
+      "../../../../tools/gluten-it/common/src/main/resources/tpch-queries"
+
+  private def tpchQuery(queryNumber: Int): String = {
+    FileUtils.readFileToString(
+      new File(tpchQueriesPath, s"q$queryNumber.sql"),
+      StandardCharsets.UTF_8)
   }
 
   private def findFluxExec(df: org.apache.spark.sql.DataFrame): Option[FluxNativeQueryExec] = {
@@ -352,6 +370,56 @@ class FluxStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
           s"Substrait plan bytes should be non-empty for stage ${wst.stageId}")
 
         logInfo(s"Stage ${wst.stageId}: Substrait plan = ${planBytes.length} bytes")
+    }
+  }
+
+  testWithSpecifiedSparkVersion(
+    "Q21 extraction uses planned native HASH counts for asymmetric join metadata",
+    "4.0") {
+    withSQLConf(
+      "spark.sql.shuffle.partitions" -> "200",
+      "spark.sql.autoBroadcastJoinThreshold" -> "-1",
+      "spark.sql.adaptive.enabled" -> "false",
+      GlutenConfig.COLUMNAR_FORCE_SHUFFLED_HASH_JOIN_ENABLED.key -> "true",
+      "spark.gluten.mpp.localHashExchangeTasks" -> "4",
+      "spark.gluten.mpp.multiExecutor.enabled" -> "true",
+      "spark.gluten.mpp.multiExecutor.numPartitions" -> "4"
+    ) {
+      val fluxExec = findFluxExec(spark.sql(tpchQuery(21))).getOrElse {
+        fail("Expected Q21 to be planned as FluxNativeQueryExec")
+      }
+      val extractionPlan = fluxExec.fragmentExtractionPlanForTests
+      val asymmetricJoinMetadata = extractionPlan.collect {
+        case join: ColumnarShuffledJoin
+            if Try(join.outputPartitioning).failed.toOption.exists {
+              error =>
+                Option(error.getMessage).exists(
+                  _.contains(
+                    "PartitioningCollection requires all of its partitionings have the same "))
+            } =>
+          join
+      }
+      assert(
+        asymmetricJoinMetadata.nonEmpty,
+        "Expected the Q21 regression shape to retain asymmetric Catalyst join metadata:\n" +
+          extractionPlan.treeString)
+
+      val (fragments, exchanges) = fluxExec.fragmentTopologyForTests
+      val nativeFanIn = exchanges
+        .filterNot(_.exchangeType == "BROADCAST")
+        .groupBy(_.consumerFragmentId)
+        .values
+        .filter(_.size >= 2)
+        .toSeq
+
+      assert(fragments.nonEmpty)
+      assert(nativeFanIn.nonEmpty, "Expected Q21 to contain a multi-input native fragment")
+      assert(
+        nativeFanIn.forall(_.map(_.numPartitions).distinct.size == 1),
+        nativeFanIn.mkString("Expected every Q21 fan-in to be co-partitioned:\n", "\n", ""))
+      assert(
+        nativeFanIn.exists(_.map(_.numPartitions).distinct == Seq(4)),
+        nativeFanIn.mkString("Expected an affected Q21 fan-in to use 4 partitions:\n", "\n", ""))
     }
   }
 
