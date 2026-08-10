@@ -49,24 +49,24 @@ case class GlutenPlanFallbackEvent(
   extends GlutenEvent {}
 
 case class GlutenFluxPlanFragmentEvent(
-  fragmentId: Int,
-  plan: String,
-  originalCharCount: Int,
-  sha256: String,
-  truncated: Boolean)
+    fragmentId: Int,
+    plan: String,
+    originalCharCount: Int,
+    sha256: String,
+    truncated: Boolean)
 
 case class GlutenFluxPlanEvent(
-  executionId: Long,
-  queryId: String,
-  numFragments: Int,
+    executionId: Long,
+    queryId: String,
+    numFragments: Int,
     numExchanges: Int,
     dumpPath: String,
     totalOriginalCharCount: Long,
     planSha256: String,
-  truncated: Boolean,
-  captureEnabled: Boolean,
-  captureError: String,
-  fragments: Seq[GlutenFluxPlanFragmentEvent])
+    truncated: Boolean,
+    captureEnabled: Boolean,
+    captureError: String,
+    fragments: Seq[GlutenFluxPlanFragmentEvent])
   extends GlutenEvent {}
 
 /** Compatibility event types used when reading event logs produced before the Flux rename. */

@@ -37,8 +37,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * FluxQueryCoordinator.
  *
  * This runs BEFORE EnsureRequirements -- no ShuffleExchange nodes are ever created for FLUX
- * queries.
- * The strategy:
+ * queries. The strategy:
  *
  *   1. Checks if FLUX is enabled via `spark.gluten.mpp.enabled` and
  *      `spark.gluten.mpp.strategy.enabled`. 2. Generates a "shadow" physical plan using Spark's
@@ -206,8 +205,7 @@ case class FluxStrategy(session: SparkSession) extends SparkStrategy with Loggin
 
   /**
    * Generate a "shadow" physical plan by running Spark's internal planner (with FLUX fully
-   * disabled)
-   * and letting EnsureRequirements insert ShuffleExchange nodes.
+   * disabled) and letting EnsureRequirements insert ShuffleExchange nodes.
    *
    * We use `QueryExecution.executedPlan` which runs the full preparation pipeline including
    * EnsureRequirements.

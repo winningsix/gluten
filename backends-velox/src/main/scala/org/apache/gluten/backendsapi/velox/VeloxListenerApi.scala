@@ -23,6 +23,9 @@ import org.apache.gluten.config.VeloxConfig._
 import org.apache.gluten.execution.datasource.GlutenFormatFactory
 import org.apache.gluten.expression.UDFMappings
 import org.apache.gluten.extension.columnar.transition.Convention
+import org.apache.gluten.flux.control.GlutenFluxDriverService
+import org.apache.gluten.flux.control.GlutenFluxExecutorService
+import org.apache.gluten.flux.control.GlutenFluxQueryControlListener
 import org.apache.gluten.gpu.GpuMemoryTrackerJniWrapper
 import org.apache.gluten.init.NativeBackendInitializer
 import org.apache.gluten.jni.{JniLibLoader, JniWorkspace}
@@ -30,9 +33,6 @@ import org.apache.gluten.memory.{MemoryUsageRecorder, SimpleMemoryUsageRecorder}
 import org.apache.gluten.memory.listener.ReservationListener
 import org.apache.gluten.memory.memtarget.MemoryTarget
 import org.apache.gluten.monitor.VeloxMemoryProfiler
-import org.apache.gluten.flux.control.GlutenFluxDriverService
-import org.apache.gluten.flux.control.GlutenFluxExecutorService
-import org.apache.gluten.flux.control.GlutenFluxQueryControlListener
 import org.apache.gluten.udf.UdfJniWrapper
 import org.apache.gluten.utils._
 

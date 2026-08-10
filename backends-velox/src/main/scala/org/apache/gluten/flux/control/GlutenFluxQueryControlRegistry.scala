@@ -236,34 +236,34 @@ class GlutenFluxQueryControlRegistry(
     expirePeersLocked(clock())
   }
 
-  private[control] def snapshot(
-      runId: FluxQueryRunId): Option[FluxQueryRunSnapshot] = synchronized {
-    runs.get(runId).map {
-      run =>
-        FluxQueryRunSnapshot(
-          run.runId,
-          run.expectedPeerCount,
-          run.state,
-          run.peers.values.toSeq.sortBy(_.peerIndex).map {
-            peer =>
-              FluxPeerControlSnapshot(
-                peer.peerIndex,
-                peer.taskAttemptId,
-                peer.executorId,
-                peer.executorSessionId,
-                peer.state,
-                peer.lastHeartbeatMs,
-                peer.acceptedAbortSequence,
-                peer.terminal,
-                peer.outputComplete
-              )
-          },
-          run.firstFailure,
-          run.abortSequence,
-          run.terminalAtMs
-        )
+  private[control] def snapshot(runId: FluxQueryRunId): Option[FluxQueryRunSnapshot] =
+    synchronized {
+      runs.get(runId).map {
+        run =>
+          FluxQueryRunSnapshot(
+            run.runId,
+            run.expectedPeerCount,
+            run.state,
+            run.peers.values.toSeq.sortBy(_.peerIndex).map {
+              peer =>
+                FluxPeerControlSnapshot(
+                  peer.peerIndex,
+                  peer.taskAttemptId,
+                  peer.executorId,
+                  peer.executorSessionId,
+                  peer.state,
+                  peer.lastHeartbeatMs,
+                  peer.acceptedAbortSequence,
+                  peer.terminal,
+                  peer.outputComplete
+                )
+            },
+            run.firstFailure,
+            run.abortSequence,
+            run.terminalAtMs
+          )
+      }
     }
-  }
 
   private[control] def size: Int = synchronized(runs.size)
 

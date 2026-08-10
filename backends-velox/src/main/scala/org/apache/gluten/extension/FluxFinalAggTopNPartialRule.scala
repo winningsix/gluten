@@ -16,11 +16,7 @@
  */
 package org.apache.gluten.extension
 
-import org.apache.gluten.execution.{
-  HashAggregateExecTransformer,
-  ProjectExecTransformer,
-  TakeOrderedAndProjectExecTransformer,
-  TopNTransformer}
+import org.apache.gluten.execution.{HashAggregateExecTransformer, ProjectExecTransformer, TakeOrderedAndProjectExecTransformer, TopNTransformer}
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession

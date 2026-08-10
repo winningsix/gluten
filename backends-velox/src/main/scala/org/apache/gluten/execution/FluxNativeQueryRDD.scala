@@ -17,18 +17,12 @@
 package org.apache.gluten.execution
 
 import org.apache.gluten.backendsapi.BackendsApiManager
+import org.apache.gluten.flux.control.{FluxPeerState, FluxQueryRunId, GlutenFluxExecutorService}
 import org.apache.gluten.iterator.Iterators
-import org.apache.gluten.flux.control.{GlutenFluxExecutorService, FluxPeerState, FluxQueryRunId}
 import org.apache.gluten.runtime.Runtimes
 import org.apache.gluten.vectorized.{ColumnarBatchInIterator, FluxQueryJniWrapper}
 
-import org.apache.spark.{
-  NarrowDependency,
-  Partition,
-  SparkContext,
-  SparkEnv,
-  TaskContext,
-  TaskKilledException}
+import org.apache.spark.{NarrowDependency, Partition, SparkContext, SparkEnv, TaskContext, TaskKilledException}
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.execution.metric.SQLMetric
@@ -775,9 +769,8 @@ private[execution] object FluxNativeQueryRDD extends Logging {
 
   /**
    * Keep native memory pools alive before destroying an FLUX coordinator. Returned zero-copy
-   * batches
-   * can outlive the coordinator on both success and error paths; closing first would leave their
-   * buffers pointing at an already-destroyed MemoryPool.
+   * batches can outlive the coordinator on both success and error paths; closing first would leave
+   * their buffers pointing at an already-destroyed MemoryPool.
    */
   private[execution] def closeAfterHoldingMemory(
       holdMemory: () => Unit,
@@ -964,8 +957,7 @@ private[execution] object FluxNativeQueryRDD extends Logging {
    * Materialize the broadcasted BuildSideRelation into a Java Iterator[ColumnarBatch] suitable for
    * hand-off to the C++ side via `makeJniColumnarBatchIterator`. Mirrors
    * [[VeloxBroadcastBuildSideRDD.genBroadcastBuildSideIterator]] but lives here to keep the FLUX
-   * RDD
-   * self-contained.
+   * RDD self-contained.
    */
   def materializeFusedBroadcastIteratorImpl(fb: FusedBroadcast): JIterator[ColumnarBatch] = {
     val start = System.nanoTime()

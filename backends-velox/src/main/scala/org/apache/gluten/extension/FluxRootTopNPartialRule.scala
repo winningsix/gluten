@@ -31,9 +31,8 @@ import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
  * Presto rewrites a single TopN into partial TopN followed by final TopN. This keeps only the top-K
  * rows per local stream before the gather and lets the root TopN merge a much smaller input.
  * Spark's TakeOrderedAndProject hides that split inside one root operator, so the FLUX fragment
- * walk
- * otherwise creates a join-heavy producer fragment followed by a SINGLE gather into a single-driver
- * final TopN fragment.
+ * walk otherwise creates a join-heavy producer fragment followed by a SINGLE gather into a
+ * single-driver final TopN fragment.
  *
  * Gated by spark.gluten.mpp.rootTopNPartial (default: false).
  */

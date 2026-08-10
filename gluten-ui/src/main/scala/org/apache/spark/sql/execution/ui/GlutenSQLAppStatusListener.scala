@@ -16,12 +16,7 @@
  */
 package org.apache.spark.sql.execution.ui
 
-import org.apache.gluten.events.{
-  GlutenBuildInfoEvent,
-  GlutenFluxPlanEvent,
-  GlutenFluxPlanFragmentEvent,
-  GlutenMppPlanEvent,
-  GlutenPlanFallbackEvent}
+import org.apache.gluten.events.{GlutenBuildInfoEvent, GlutenFluxPlanEvent, GlutenFluxPlanFragmentEvent, GlutenMppPlanEvent, GlutenPlanFallbackEvent}
 
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.internal.Logging
@@ -171,7 +166,8 @@ private class GlutenSQLAppStatusListener(conf: SparkConf, kvstore: ElementTracki
             fragment.originalCharCount,
             fragment.sha256,
             fragment.truncated)
-      })
+      }
+    )
   }
 
   private def cleanupExecutions(count: Long): Unit = {

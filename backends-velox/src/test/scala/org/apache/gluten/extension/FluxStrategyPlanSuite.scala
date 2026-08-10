@@ -390,12 +390,10 @@ class FluxStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
       }
       val extractionPlan = fluxExec.fragmentExtractionPlanForTests
       val asymmetricJoinMetadata = extractionPlan.collect {
-        case join: ColumnarShuffledJoin
-            if Try(join.outputPartitioning).failed.toOption.exists {
+        case join: ColumnarShuffledJoin if Try(join.outputPartitioning).failed.toOption.exists {
               error =>
-                Option(error.getMessage).exists(
-                  _.contains(
-                    "PartitioningCollection requires all of its partitionings have the same "))
+                Option(error.getMessage).exists(_.contains(
+                  "PartitioningCollection requires all of its partitionings have the same "))
             } =>
           join
       }

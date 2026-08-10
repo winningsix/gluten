@@ -98,8 +98,53 @@ class FluxRangeBoundsGeneratorSuite extends SparkFunSuite {
     assert(FluxRangeBoundsGenerator.supports(IntegerType))
     assert(FluxRangeBoundsGenerator.supports(StringType))
     assert(!FluxRangeBoundsGenerator.supports(DecimalType(18, 2)))
-    assert(!FluxRangeBoundsGenerator.supports(FloatType))
-    assert(!FluxRangeBoundsGenerator.supports(DoubleType))
+    assert(FluxRangeBoundsGenerator.supports(FloatType))
+    assert(FluxRangeBoundsGenerator.supports(DoubleType))
+  }
+
+  test("range descriptor encodes floating-point boundaries") {
+    val floatKey = AttributeReference("f", FloatType, nullable = false)()
+    val doubleKey = AttributeReference("d", DoubleType, nullable = false)()
+    val projection = UnsafeProjection.create(Seq(floatKey, doubleKey), Seq(floatKey, doubleKey))
+    val rows: Array[InternalRow] = Array(
+      projection(new GenericInternalRow(Array[Any](1.25f, 2.5d))).copy(),
+      projection(new GenericInternalRow(Array[Any](3.75f, 4.5d))).copy())
+    val ordering = Seq(
+      SortOrder(floatKey, Ascending, NullsFirst, Seq.empty),
+      SortOrder(doubleKey, Descending, NullsLast, Seq.empty))
+
+    val descriptor = new ObjectMapper().readTree(FluxRangeBoundsGenerator.encode(ordering, rows))
+
+    assert(descriptor.get("bounds").get(0).get(0).get("value").asDouble() == 1.25d)
+    assert(descriptor.get("bounds").get(0).get(1).get("value").asDouble() == 2.5d)
+    assert(descriptor.get("bounds").get(1).get(0).get("value").asDouble() == 3.75d)
+    assert(descriptor.get("bounds").get(1).get(1).get("value").asDouble() == 4.5d)
+  }
+
+  test("range descriptor fails closed for non-finite floating-point boundaries") {
+    val floatKey = AttributeReference("f", FloatType, nullable = false)()
+    val doubleKey = AttributeReference("d", DoubleType, nullable = false)()
+    val projection = UnsafeProjection.create(Seq(floatKey, doubleKey), Seq(floatKey, doubleKey))
+    val ordering = Seq(
+      SortOrder(floatKey, Ascending, NullsFirst, Seq.empty),
+      SortOrder(doubleKey, Ascending, NullsFirst, Seq.empty))
+
+    Seq(Float.NaN, Float.PositiveInfinity, Float.NegativeInfinity).foreach {
+      boundary =>
+        val row = projection(new GenericInternalRow(Array[Any](boundary, 1.0d))).copy()
+        val error = intercept[IllegalArgumentException] {
+          FluxRangeBoundsGenerator.encode(ordering, Array(row))
+        }
+        assert(error.getMessage.contains("non-finite float boundary"))
+    }
+    Seq(Double.NaN, Double.PositiveInfinity, Double.NegativeInfinity).foreach {
+      boundary =>
+        val row = projection(new GenericInternalRow(Array[Any](1.0f, boundary))).copy()
+        val error = intercept[IllegalArgumentException] {
+          FluxRangeBoundsGenerator.encode(ordering, Array(row))
+        }
+        assert(error.getMessage.contains("non-finite double boundary"))
+    }
   }
 
   test("footer interval inference is limited to integral keys and bounded file sets") {

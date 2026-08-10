@@ -71,9 +71,8 @@ private[gluten] object FluxBroadcastLifecycle {
  *
  * Spark calls `prepare()` before `FluxNativeQueryExec` reaches its runtime validation point.
  * Leaving a broadcast untouched here starts its relation future eagerly, so a native FLUX query
- * runs an
- * unused Spark collect in parallel and may send tens of GiB to the driver. Marking the exchange as
- * prepare-deferred prevents that eager launch without failing its relation promise.
+ * runs an unused Spark collect in parallel and may send tens of GiB to the driver. Marking the
+ * exchange as prepare-deferred prevents that eager launch without failing its relation promise.
  *
  * [[FluxNativeQueryExec]] still owns irreversible suppression. RANGE sampling and BSP fallback can
  * call `doExecuteBroadcast`, which starts a deferred exchange lazily. Once all fallback-capable

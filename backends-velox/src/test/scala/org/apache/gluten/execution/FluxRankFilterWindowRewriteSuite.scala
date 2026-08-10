@@ -18,37 +18,10 @@ package org.apache.gluten.execution
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{
-  Add,
-  Alias,
-  And,
-  Ascending,
-  Attribute,
-  AttributeReference,
-  CurrentRow,
-  DenseRank,
-  EqualTo,
-  Literal,
-  Murmur3Hash,
-  Rand,
-  Rank,
-  RowFrame,
-  RowNumber,
-  SortOrder,
-  SpecifiedWindowFrame,
-  UnboundedPreceding,
-  WindowExpression,
-  WindowSpecDefinition}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, And, Ascending, Attribute, AttributeReference, CurrentRow, DenseRank, EqualTo, Literal, Murmur3Hash, Rand, Rank, RowFrame, RowNumber, SortOrder, SpecifiedWindowFrame, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
 import org.apache.spark.sql.catalyst.plans.physical.HashPartitioning
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
-import org.apache.spark.sql.execution.{
-  ColumnarInputAdapter,
-  ColumnarShuffleExchangeExec,
-  InputIteratorTransformer,
-  LeafExecNode,
-  ProjectExec,
-  SparkPlan,
-  UnionExec}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, InputIteratorTransformer, LeafExecNode, ProjectExec, SparkPlan, UnionExec}
 import org.apache.spark.sql.execution.exchange.ENSURE_REQUIREMENTS
 import org.apache.spark.sql.execution.window.{GlutenFinal, GlutenPartial}
 import org.apache.spark.sql.types.{IntegerType, LongType}
@@ -359,9 +332,8 @@ class FluxRankFilterWindowRewriteSuite extends AnyFunSuite {
           s"malformed_$hashProjectKind",
           includeExchange = true,
           options = BranchOptions(
-            partial = PartialOptions(
-              fluxBoundaryWrappers = true,
-              hashProjectKind = hashProjectKind))
+            partial =
+              PartialOptions(fluxBoundaryWrappers = true, hashProjectKind = hashProjectKind))
         )
 
         val (rewritten, stats) =

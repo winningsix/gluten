@@ -51,7 +51,8 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
       exchange(2, consumerId = 7, exchangeType = "RANGE", numPartitions = 4),
       exchange(3, consumerId = 7, exchangeType = "BROADCAST", numPartitions = 1),
       exchange(4, consumerId = 8, exchangeType = "HASH", numPartitions = 2),
-      exchange(5, consumerId = 8, exchangeType = "ROUND_ROBIN", numPartitions = 2))
+      exchange(5, consumerId = 8, exchangeType = "ROUND_ROBIN", numPartitions = 2)
+    )
 
     assert(FluxExchangeTopology.inconsistentInboundPartitionCountReason(exchanges).isEmpty)
   }
@@ -62,8 +63,9 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
       exchange(1, consumerId = 7, exchangeType = "HASH", numPartitions = 200))
 
     assert(
-      FluxExchangeTopology.inconsistentInboundPartitionCountReason(exchanges).contains(
-        "fragment 7 has inconsistent non-broadcast inbound partition counts " +
+      FluxExchangeTopology
+        .inconsistentInboundPartitionCountReason(exchanges)
+        .contains("fragment 7 has inconsistent non-broadcast inbound partition counts " +
           "[E1:HASH=200, E2:HASH=4]"))
   }
 
@@ -71,7 +73,8 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
     val exchanges = Seq(
       exchange(1, consumerId = 7, exchangeType = "HASH", numPartitions = 4),
       exchange(2, consumerId = 7, exchangeType = "HASH", numPartitions = 4),
-      exchange(3, consumerId = 7, exchangeType = "BROADCAST", numPartitions = 1))
+      exchange(3, consumerId = 7, exchangeType = "BROADCAST", numPartitions = 1)
+    )
 
     assert(FluxExchangeTopology.finalizedHashInboundPartitionCount(exchanges, 7) === Right(4))
   }
@@ -90,8 +93,9 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
     val exchanges = Seq(exchange(5, consumerId = 9, exchangeType = "HASH", numPartitions = 0))
 
     assert(
-      FluxExchangeTopology.inconsistentInboundPartitionCountReason(exchanges).contains(
-        "fragment 9 has non-positive inbound partition counts [E5=0]"))
+      FluxExchangeTopology
+        .inconsistentInboundPartitionCountReason(exchanges)
+        .contains("fragment 9 has non-positive inbound partition counts [E5=0]"))
   }
 
   test("uses finalized topology without reading asymmetric Catalyst metadata") {
@@ -109,7 +113,8 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
       condition = None,
       left = left,
       right = right,
-      isSkewJoin = false)
+      isSkewJoin = false
+    )
     val exec = FluxNativeQueryExec(join, fragments = Seq.empty, exchanges = Seq.empty)
 
     assert(exec.fragmentDriverPartitionCountForTests(join, Some(4)) === 4)
@@ -179,9 +184,7 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
     }
   }
 
-  private case class PartitioningFailureLeaf(
-      override val output: Seq[Attribute],
-      message: String)
+  private case class PartitioningFailureLeaf(override val output: Seq[Attribute], message: String)
     extends LeafExecNode {
     override def outputPartitioning: Partitioning = throw new IllegalArgumentException(message)
 
@@ -190,9 +193,7 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
     }
   }
 
-  private case class PartitionedLeaf(
-      override val output: Seq[Attribute],
-      numPartitions: Int)
+  private case class PartitionedLeaf(override val output: Seq[Attribute], numPartitions: Int)
     extends LeafExecNode {
     override def outputPartitioning: Partitioning = {
       HashPartitioning(Seq(output.head), numPartitions)

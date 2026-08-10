@@ -20,14 +20,9 @@ import org.apache.gluten.execution.{FluxNativeQueryExec, WholeStageTransformerSu
 import org.apache.gluten.vectorized.ArrowWritableColumnVector
 
 import org.apache.spark.SparkConf
-import org.apache.spark.api.python.{
-  ArrowUdfSerializationAckTestSupport,
-  ColumnarArrowEvalPythonExec}
+import org.apache.spark.api.python.{ArrowUdfSerializationAckTestSupport, ColumnarArrowEvalPythonExec}
 import org.apache.spark.sql.{DataFrame, IntegratedUDFTestUtils, Row}
-import org.apache.spark.sql.execution.python.{
-  BatchEvalPythonExec,
-  EvalPythonExecTransformer,
-  UserDefinedPythonFunction}
+import org.apache.spark.sql.execution.python.{BatchEvalPythonExec, EvalPythonExecTransformer, UserDefinedPythonFunction}
 import org.apache.spark.sql.functions.lit
 import org.apache.spark.sql.types.{DataType, LongType, StringType}
 import org.apache.spark.util.SparkVersionUtil

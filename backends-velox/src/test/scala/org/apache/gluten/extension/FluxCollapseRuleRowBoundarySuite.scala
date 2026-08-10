@@ -18,7 +18,7 @@ package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.exception.GlutenException
-import org.apache.gluten.execution.{ColumnarCoalesceExec, ColumnarUnionExec, FlushableHashAggregateExecTransformer, GenerateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, FluxJvmStreamInputMatcher, FluxNativeQueryExec, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, UnionExecTransformer, VeloxColumnarToRowExec}
+import org.apache.gluten.execution.{ColumnarCoalesceExec, ColumnarUnionExec, FlushableHashAggregateExecTransformer, FluxJvmStreamInputMatcher, FluxNativeQueryExec, GenerateExecTransformer, HashAggregateExecBaseTransformer, LocalTableScanExecTransformer, ProjectExecTransformer, RegularHashAggregateExecTransformer, RowToVeloxColumnarExec, SortExecTransformer, UnionExecTransformer, VeloxColumnarToRowExec}
 import org.apache.gluten.expression.aggregate.VeloxCollectList
 import org.apache.gluten.extension.columnar.FallbackTags
 

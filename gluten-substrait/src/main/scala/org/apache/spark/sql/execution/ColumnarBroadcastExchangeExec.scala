@@ -181,8 +181,8 @@ case class ColumnarBroadcastExchangeExec(mode: BroadcastMode, child: SparkPlan)
     newlyMarked
   }
 
-  private def failedFluxSuppressedFuture():
-      java.util.concurrent.Future[broadcast.Broadcast[Any]] = {
+  private def failedFluxSuppressedFuture()
+      : java.util.concurrent.Future[broadcast.Broadcast[Any]] = {
     val ex = fluxSuppressedException
     promise.tryFailure(ex)
     val failed = new CompletableFuture[broadcast.Broadcast[Any]]()

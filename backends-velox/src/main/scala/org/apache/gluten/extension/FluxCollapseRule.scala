@@ -21,8 +21,7 @@ import org.apache.gluten.backendsapi.velox.VeloxBatchType
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution._
 import org.apache.gluten.extension.columnar.{FallbackTags, UnionTransformerRule}
-import org.apache.gluten.extension.columnar.offload.OffloadOthers.
-  ARROW_SCALAR_NORMALIZATION_REJECTION_TAG
+import org.apache.gluten.extension.columnar.offload.OffloadOthers.ARROW_SCALAR_NORMALIZATION_REJECTION_TAG
 import org.apache.gluten.extension.columnar.rewrite.{PullOutPostProject, PullOutPreProject}
 import org.apache.gluten.extension.columnar.transition.InsertTransitions
 
@@ -31,19 +30,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, PlanExpression, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.execution.{
-  ColumnarInputAdapter,
-  ColumnarShuffleExchangeExecBase,
-  ColumnarToRowExec,
-  CommandResultExec,
-  DeserializeToObjectExec,
-  FilterExec,
-  GenerateExec,
-  ProjectExec,
-  RowToColumnarExec,
-  ScalarSubquery,
-  SortExec,
-  SparkPlan}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExecBase, ColumnarToRowExec, CommandResultExec, DeserializeToObjectExec, FilterExec, GenerateExec, ProjectExec, RowToColumnarExec, ScalarSubquery, SortExec, SparkPlan}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
@@ -1632,9 +1619,8 @@ object FluxCollapseRule {
    * not an observable row consumer: the V2 writer immediately consumes the rows, and
    * FluxNativeQueryExec.doExecute supplies that one required native-to-row conversion. Removing the
    * explicit adapter lets the complete columnar query (including sort and exchange) collapse to
-   * FLUX
-   * without an intermediate C2R -> R2C round trip. Exact C2R(ColumnarShuffleExchange) adapters may
-   * also appear below the root and remain safe to remove. Any adapter around a real row child
+   * FLUX without an intermediate C2R -> R2C round trip. Exact C2R(ColumnarShuffleExchange) adapters
+   * may also appear below the root and remain safe to remove. Any adapter around a real row child
    * remains untouched.
    */
   private[extension] def normalizeV2WriteExchangeAdapters(

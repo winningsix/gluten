@@ -63,8 +63,7 @@ final case class FluxQueryRunId(queryId: String, stageId: Int, stageAttemptNumbe
  * Executor-reported lifecycle of one native FLUX peer.
  *
  * This is distinct from `FluxQueryRunState`, which is the driver-owned aggregate state for all
- * peers
- * in a run. A peer reaches `AbortRequested` when an abort is accepted locally and reaches a
+ * peers in a run. A peer reaches `AbortRequested` when an abort is accepted locally and reaches a
  * terminal state only after the Spark task thread reports cleanup.
  */
 object FluxPeerState {

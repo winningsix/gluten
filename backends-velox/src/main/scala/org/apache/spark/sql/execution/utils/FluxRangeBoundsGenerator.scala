@@ -23,17 +23,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{
-  Ascending,
-  Attribute,
-  BoundReference,
-  Descending,
-  GenericInternalRow,
-  NullsFirst,
-  NullsLast,
-  SortOrder,
-  UnsafeProjection,
-  UnsafeRow}
+import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, BoundReference, Descending, GenericInternalRow, NullsFirst, NullsLast, SortOrder, UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.catalyst.expressions.codegen.LazilyGeneratedOrdering
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.internal.SQLConf
@@ -179,8 +169,8 @@ object FluxRangeBoundsGenerator extends Logging {
   }
 
   def supports(dataType: DataType): Boolean = dataType match {
-    case BooleanType | ByteType | ShortType | IntegerType | LongType | StringType | DateType |
-        TimestampType =>
+    case BooleanType | ByteType | ShortType | IntegerType | LongType | FloatType | DoubleType |
+        StringType | DateType | TimestampType =>
       true
     // Keep older Spark profiles source-compatible: timestamp_ntz may not expose a stable singleton
     // there. Every other accepted type uses exact singleton matching, which deliberately rejects
@@ -807,6 +797,18 @@ object FluxRangeBoundsGenerator extends Logging {
                 case IntegerType | DateType => value.put("value", row.getInt(index))
                 case LongType | TimestampType => value.put("value", row.getLong(index))
                 case t if t.typeName == "timestamp_ntz" => value.put("value", row.getLong(index))
+                case FloatType =>
+                  val boundary = row.getFloat(index)
+                  require(
+                    java.lang.Float.isFinite(boundary),
+                    s"FLUX RANGE D1 cannot encode non-finite float boundary: $boundary")
+                  value.put("value", boundary.toDouble)
+                case DoubleType =>
+                  val boundary = row.getDouble(index)
+                  require(
+                    java.lang.Double.isFinite(boundary),
+                    s"FLUX RANGE D1 cannot encode non-finite double boundary: $boundary")
+                  value.put("value", boundary)
                 case StringType => value.put("value", row.getUTF8String(index).toString)
                 case other =>
                   throw new IllegalArgumentException(

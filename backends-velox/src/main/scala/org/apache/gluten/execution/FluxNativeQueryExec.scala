@@ -20,29 +20,14 @@ import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.events.{GlutenFluxPlanEvent, GlutenFluxPlanFragmentEvent}
 import org.apache.gluten.expression.ConverterUtils
-import org.apache.gluten.extension.{
-  ExchangeSpec,
-  FlushableHashAggregateRule,
-  FluxBroadcastLifecycle,
-  FluxFinalAggTopNPartialRule,
-  FluxParallelSortSplitRule,
-  FluxRemoveRedundantShuffleRule,
-  FluxReplicatedCartesianRule,
-  FluxRootTopNPartialRule,
-  FluxSinglePartitionSortRule,
-  NativeFragment,
-  RewriteUncorrelatedScalarSubquery}
-import org.apache.gluten.extension.FluxReplicatedCartesianRule.
-  REPLICATED_CARTESIAN_MAX_BUILD_BYTES_TAG
+import org.apache.gluten.extension.{ExchangeSpec, FlushableHashAggregateRule, FluxBroadcastLifecycle, FluxFinalAggTopNPartialRule, FluxParallelSortSplitRule, FluxRemoveRedundantShuffleRule, FluxReplicatedCartesianRule, FluxRootTopNPartialRule, FluxSinglePartitionSortRule, NativeFragment, RewriteUncorrelatedScalarSubquery}
+import org.apache.gluten.extension.FluxReplicatedCartesianRule.REPLICATED_CARTESIAN_MAX_BUILD_BYTES_TAG
 import org.apache.gluten.extension.columnar.UnionTransformerRule
 import org.apache.gluten.extension.columnar.heuristic.HeuristicTransform
 import org.apache.gluten.extension.columnar.rewrite.{PullOutPostProject, PullOutPreProject}
-import org.apache.gluten.extension.columnar.transition.{
-  Convention,
-  ConventionReq,
-  InsertTransitions}
-import org.apache.gluten.metrics.MetricsUpdater
+import org.apache.gluten.extension.columnar.transition.{Convention, ConventionReq, InsertTransitions}
 import org.apache.gluten.flux.control.{GlutenFluxPeerResolution, GlutenFluxPeerResolver}
+import org.apache.gluten.metrics.MetricsUpdater
 import org.apache.gluten.runtime.Runtimes
 import org.apache.gluten.sql.shims.SparkShimLoader
 import org.apache.gluten.substrait.SubstraitContext
@@ -56,72 +41,20 @@ import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{
-  Alias,
-  Attribute,
-  AttributeSet,
-  Expression,
-  GreaterThan,
-  GreaterThanOrEqual,
-  LessThan,
-  LessThanOrEqual,
-  Literal,
-  NamedExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeSet, Expression, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, Literal, NamedExpression}
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Complete, Final, Partial}
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
-import org.apache.spark.sql.catalyst.plans.{
-  ExistenceJoin,
-  FullOuter,
-  Inner,
-  InnerLike,
-  LeftAnti,
-  LeftOuter,
-  LeftSemi,
-  RightOuter}
+import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, FullOuter, Inner, InnerLike, LeftAnti, LeftOuter, LeftSemi, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{Join, LeafNode, Statistics}
-import org.apache.spark.sql.catalyst.plans.physical.{
-  BroadcastPartitioning,
-  HashPartitioning,
-  Partitioning,
-  RangePartitioning,
-  RoundRobinPartitioning,
-  SinglePartition}
+import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
 import org.apache.spark.sql.connector.read.SupportsReportStatistics
-import org.apache.spark.sql.execution.{
-  ColumnarBroadcastExchangeExec,
-  ColumnarCachedBatchSerializer,
-  ColumnarCollapseTransformStages,
-  ColumnarInputAdapter,
-  ColumnarShuffleExchangeExec,
-  ExecSubqueryExpression,
-  ExternalRDDScanExec,
-  FilterExec,
-  InputAdapter,
-  InputIteratorTransformer,
-  LeafExecNode,
-  LocalTableScanExec,
-  ProjectExec,
-  RDDScanExec,
-  SerializeFromObjectExec,
-  SortExec,
-  SparkPlan,
-  SQLExecution,
-  UnaryExecNode}
+import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCachedBatchSerializer, ColumnarCollapseTransformStages, ColumnarInputAdapter, ColumnarShuffleExchangeExec, ExecSubqueryExpression, ExternalRDDScanExec, FilterExec, InputAdapter, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
-import org.apache.spark.sql.execution.exchange.{
-  BroadcastExchangeLike,
-  Exchange,
-  ReusedExchangeExec,
-  ShuffleExchangeExec,
-  ShuffleExchangeLike}
-import org.apache.spark.sql.execution.joins.{
-  BroadcastHashJoinExec,
-  BuildSideRelation,
-  HashedRelationBroadcastMode,
-  ShuffledHashJoinExec}
+import org.apache.spark.sql.execution.exchange.{BroadcastExchangeLike, Exchange, ReusedExchangeExec, ShuffleExchangeExec, ShuffleExchangeLike}
+import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BuildSideRelation, HashedRelationBroadcastMode, ShuffledHashJoinExec}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.ui.GlutenUIUtils
 import org.apache.spark.sql.execution.utils.FluxRangeBoundsGenerator
@@ -252,10 +185,10 @@ private[execution] object FluxRangeTopology {
 /**
  * Validates the native partition-count contract at a fragment boundary.
  *
- * Catalyst partitioning describes the Spark shuffle before FLUX rewrites and native partition
- * caps. The native coordinator instead consumes [[ExchangeSpec]]s, so those finalized specs are
- * the source of truth: every non-broadcast edge entering one consumer fragment must expose the
- * same destination count. Keep this check on the JVM side as well as in FluxQueryCoordinator so an
+ * Catalyst partitioning describes the Spark shuffle before FLUX rewrites and native partition caps.
+ * The native coordinator instead consumes [[ExchangeSpec]]s, so those finalized specs are the
+ * source of truth: every non-broadcast edge entering one consumer fragment must expose the same
+ * destination count. Keep this check on the JVM side as well as in FluxQueryCoordinator so an
  * invalid topology can delegate to BSP before JNI execution starts.
  */
 private[execution] object FluxExchangeTopology {
@@ -263,9 +196,7 @@ private[execution] object FluxExchangeTopology {
       exchanges: Seq[ExchangeSpec],
       consumerFragmentId: Int): Either[String, Int] = {
     val inbound = exchanges
-      .filter(
-        spec =>
-          spec.consumerFragmentId == consumerFragmentId && spec.exchangeType == "HASH")
+      .filter(spec => spec.consumerFragmentId == consumerFragmentId && spec.exchangeType == "HASH")
       .sortBy(_.id)
 
     inbound match {
@@ -358,8 +289,7 @@ private[execution] object FluxHashJoinInputSortRewrite {
  * deliberately unary and transparent: conversion/adaptor nodes are accepted; C2R, Python,
  * projections, filters, whole stages, nested object operators, and every other row operator are
  * not. Spark 4 also carries an optional streaming source on RDDScanExec; strict FLUX admits only
- * the
- * batch form. Spark 3.x has no such accessor, so the reflective check below is a cross-version
+ * the batch form. Spark 3.x has no such accessor, so the reflective check below is a cross-version
  * compatibility guard rather than a relaxation.
  */
 private[gluten] object FluxJvmStreamInputMatcher {
@@ -4804,8 +4734,8 @@ case class FluxNativeQueryExec(
       case _ => None
     })
     if (
-      !key.exists { candidate =>
-        FluxRangeBoundsGenerator.supportsIntegralInterval(candidate.dataType)
+      !key.exists {
+        candidate => FluxRangeBoundsGenerator.supportsIntegralInterval(candidate.dataType)
       }
     ) {
       return None
@@ -4964,7 +4894,7 @@ case class FluxNativeQueryExec(
       fragment =>
         if (inboundCounts.getOrElse(fragment.id, 0) >= 2 && fragment.parallelism < requested) {
           logInfo(
-              s"FluxNativeQueryExec: raising multi-input join consumer fragment F${fragment.id} " +
+            s"FluxNativeQueryExec: raising multi-input join consumer fragment F${fragment.id} " +
               s"drivers from ${fragment.parallelism} to $requested")
           fragment.copy(parallelism = requested)
         } else {
@@ -5386,10 +5316,9 @@ case class FluxNativeQueryExec(
    * Peel off the synthetic hash-prefix ProjectExecTransformer that
    * VeloxSparkPlanExecApi.genColumnarShuffleExchange may inject above the shuffle child for HASH
    * partitioning. The injected project's first column is always aliased "hash_partition_key" and
-   * computes Murmur3Hash. In FLUX we recompute the hash inside Velox's
-   * HashPartitionFunctionSpec, so
-   * the prefix column is dead weight and -- worse -- shifts every real partition-key column right
-   * by one. The C++ side strips the prefix on receive (FluxJniWrapper.cc) but the producer's
+   * computes Murmur3Hash. In FLUX we recompute the hash inside Velox's HashPartitionFunctionSpec,
+   * so the prefix column is dead weight and -- worse -- shifts every real partition-key column
+   * right by one. The C++ side strips the prefix on receive (FluxJniWrapper.cc) but the producer's
    * PartitionedOutputNode partitions BEFORE the strip, so partition-key indices computed against
    * the prefix-shifted schema misroute every record. On TPC-H Q1 SF1K this surfaces as 4 keys * 4
    * active F1 drivers = 16 rows instead of 4. Mirrors FluxCollapseRule.stripSyntheticHashProject
@@ -5496,8 +5425,7 @@ case class FluxNativeQueryExec(
    * Infer fragment parallelism from either Catalyst metadata or a finalized native-topology hint.
    *
    * In FLUX mode every fragment runs in-process as a set of Velox drivers, so the "parallelism"
-   * here
-   * becomes the driver count passed to task->start(numDrivers). With the default of
+   * here becomes the driver count passed to task->start(numDrivers). With the default of
    * spark.sql.shuffle.partitions (=200) on a 16-core single-GPU executor this spawns 200 driver
    * threads per fragment, which (a) thrashes on 16 cores, (b) contends heavily on the GpuSemaphore
    * (maxConcurrentGpuTasks ~= 6), and (c) leaves dozens of drivers with zero scan splits that still
