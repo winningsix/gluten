@@ -45,6 +45,7 @@ class FluxStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
 
   override protected def sparkConf: org.apache.spark.SparkConf = {
     super.sparkConf
+      .set("spark.sql.ansi.enabled", "false")
       .set("spark.sql.shuffle.partitions", "4")
       .set("spark.sql.adaptive.enabled", "false")
       .set("spark.gluten.mpp.enabled", "true")
@@ -418,6 +419,47 @@ class FluxStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
       assert(
         nativeFanIn.exists(_.map(_.numPartitions).distinct == Seq(4)),
         nativeFanIn.mkString("Expected an affected Q21 fan-in to use 4 partitions:\n", "\n", ""))
+    }
+  }
+
+  testWithSpecifiedSparkVersion(
+    "Q14 root extraction does not inherit topology-first planning from producer joins",
+    "4.0") {
+    withSQLConf(
+      "spark.sql.shuffle.partitions" -> "200",
+      "spark.sql.autoBroadcastJoinThreshold" -> "-1",
+      "spark.sql.adaptive.enabled" -> "false",
+      GlutenConfig.COLUMNAR_FORCE_SHUFFLED_HASH_JOIN_ENABLED.key -> "true",
+      "spark.gluten.mpp.localHashExchangeTasks" -> "4",
+      "spark.gluten.mpp.multiExecutor.enabled" -> "true",
+      "spark.gluten.mpp.multiExecutor.numPartitions" -> "4"
+    ) {
+      val fluxExec = findFluxExec(spark.sql(tpchQuery(14))).getOrElse {
+        fail("Expected Q14 to be planned as FluxNativeQueryExec")
+      }
+      val (fragments, exchanges) = fluxExec.fragmentTopologyForTests
+      val root = fragments.maxBy(_.id)
+      val rootInbound = exchanges.filter(_.consumerFragmentId == root.id)
+
+      assert(
+        root.rootOperator.find(_.isInstanceOf[ColumnarShuffledJoin]).isDefined,
+        "Expected broad SparkPlan traversal to reach a shuffled join in a producer fragment")
+      assert(rootInbound.nonEmpty, "Expected the Q14 root fragment to have an inbound edge")
+      assert(
+        rootInbound.forall(_.exchangeType != "HASH"),
+        rootInbound.mkString("Expected only non-HASH edges into the Q14 root:\n", "\n", ""))
+
+      val fragmentsById = fragments.map(fragment => fragment.id -> fragment).toMap
+      val resolvedJoinFanIn = exchanges
+        .filter(_.exchangeType == "HASH")
+        .groupBy(_.consumerFragmentId)
+        .exists {
+          case (consumerId, inbound) =>
+            inbound.size >= 2 &&
+              inbound.map(_.numPartitions).distinct == Seq(4) &&
+              fragmentsById(consumerId).parallelism == 4
+        }
+      assert(resolvedJoinFanIn, "Expected a genuine Q14 shuffled-join fragment to resolve HASH=4")
     }
   }
 

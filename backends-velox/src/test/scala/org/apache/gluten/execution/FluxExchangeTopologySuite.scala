@@ -23,8 +23,9 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference}
 import org.apache.spark.sql.catalyst.optimizer.BuildRight
 import org.apache.spark.sql.catalyst.plans.Inner
-import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning}
-import org.apache.spark.sql.execution.LeafExecNode
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, SinglePartition}
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, InputIteratorTransformer, LeafExecNode}
+import org.apache.spark.sql.execution.exchange.ENSURE_REQUIREMENTS
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.LongType
 
@@ -87,6 +88,19 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
     assert(
       FluxExchangeTopology.finalizedHashInboundPartitionCount(exchanges, 7) ===
         Left("fragment 7 has inconsistent inbound HASH partition counts [E1=1, E2=4]"))
+  }
+
+  test("requires a positive finalized HASH input for a genuine shuffled-join fragment") {
+    val noHash = Seq(exchange(1, consumerId = 7, exchangeType = "SINGLE", numPartitions = 1))
+    val nonPositiveHash =
+      Seq(exchange(2, consumerId = 7, exchangeType = "HASH", numPartitions = 0))
+
+    assert(
+      FluxExchangeTopology.finalizedHashInboundPartitionCount(noHash, 7) ===
+        Left("fragment 7 has no inbound HASH exchange"))
+    assert(
+      FluxExchangeTopology.finalizedHashInboundPartitionCount(nonPositiveHash, 7) ===
+        Left("fragment 7 has non-positive inbound HASH partition counts [E2=0]"))
   }
 
   test("rejects a non-positive native partition count") {
@@ -170,6 +184,44 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
     assert(error.getMessage === "unrelated partitioning failure")
   }
 
+  test("does not inherit a producer shuffled join across a synthetic SINGLE boundary") {
+    val join = shuffledJoin(leftPartitions = 4, rightPartitions = 4)
+    val producer = WholeStageTransformer(join)(transformStageId = 11)
+    val single = ColumnarShuffleExchangeExec(
+      SinglePartition,
+      producer,
+      ENSURE_REQUIREMENTS,
+      producer.output,
+      None)
+    val parent = WholeStageTransformer(
+      InputIteratorTransformer(ColumnarInputAdapter(single)))(transformStageId = 12)
+    val exec = FluxNativeQueryExec(parent, fragments = Seq.empty, exchanges = Seq.empty)
+
+    assert(
+      parent.find(_.isInstanceOf[ColumnarShuffledJoin]).isDefined,
+      "SparkPlan.find must reproduce the old cross-boundary false positive")
+    assert(!exec.containsFragmentLocalShuffledJoinForTests(parent))
+    withSQLConf(
+      "spark.executor.cores" -> "16",
+      "spark.gluten.mpp.joinDriversPerFragment" -> "3") {
+      assert(exec.inferParallelismForTests(parent) === 1)
+    }
+  }
+
+  test("still finds a shuffled join in a truly local native iterator subtree") {
+    val join = shuffledJoin(leftPartitions = 4, rightPartitions = 4)
+    val parent = WholeStageTransformer(
+      InputIteratorTransformer(ColumnarInputAdapter(join)))(transformStageId = 13)
+    val exec = FluxNativeQueryExec(parent, fragments = Seq.empty, exchanges = Seq.empty)
+
+    assert(exec.containsFragmentLocalShuffledJoinForTests(parent))
+    withSQLConf(
+      "spark.executor.cores" -> "16",
+      "spark.gluten.mpp.joinDriversPerFragment" -> "3") {
+      assert(exec.inferParallelismForTests(parent) === 3)
+    }
+  }
+
   private def withSQLConf(values: (String, String)*)(body: => Unit): Unit = {
     val conf = SQLConf.get
     val previous = values.map { case (key, _) => key -> conf.getAllConfs.get(key) }
@@ -182,6 +234,26 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
         case (key, None) => conf.unsetConf(key)
       }
     }
+  }
+
+  private def shuffledJoin(
+      leftPartitions: Int,
+      rightPartitions: Int): ShuffledHashJoinExecTransformer = {
+    val left = PartitionedLeaf(
+      Seq(AttributeReference("left_key", LongType, nullable = false)()),
+      numPartitions = leftPartitions)
+    val right = PartitionedLeaf(
+      Seq(AttributeReference("right_key", LongType, nullable = false)()),
+      numPartitions = rightPartitions)
+    ShuffledHashJoinExecTransformer(
+      leftKeys = Seq(left.output.head),
+      rightKeys = Seq(right.output.head),
+      joinType = Inner,
+      buildSide = BuildRight,
+      condition = None,
+      left = left,
+      right = right,
+      isSkewJoin = false)
   }
 
   private case class PartitioningFailureLeaf(override val output: Seq[Attribute], message: String)

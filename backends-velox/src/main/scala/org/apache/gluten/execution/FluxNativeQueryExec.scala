@@ -1279,8 +1279,7 @@ case class FluxNativeQueryExec(
           val childExchangeFragIds = exchangeChildren.map(walk)
 
           val fragId = fragmentCounter.getAndIncrement()
-          val containsShuffledJoin =
-            fragmentWst.find(_.isInstanceOf[ColumnarShuffledJoin]).isDefined
+          val containsShuffledJoin = containsFragmentLocalShuffledJoin(fragmentWst)
           // Write-in-FLUX: a fragment whose WST contains a WriteFilesExecTransformer must run
           // single-writer per Spark task attempt dir. With parallelism>1, multiple native
           // TableWrite drivers in one task emit the same part-NNNNN-<uuid> filename and the
@@ -5105,6 +5104,37 @@ case class FluxNativeQueryExec(
     result.toSeq
   }
 
+  /**
+   * Return whether this native fragment, rather than any of its exchange producers, contains a
+   * shuffled join.
+   *
+   * SparkPlan.find descends through InputIteratorTransformer and its exchange child into producer
+   * WholeStageTransformers. That crosses the same fragment boundary which findExchangeChildren
+   * records above. Match that traversal instead: an iterator around a truly local native subtree is
+   * transparent, while a real exchange, top-N gather, replicated build, or other non-local input
+   * ends the search.
+   */
+  private def containsFragmentLocal(
+      plan: SparkPlan)(predicate: SparkPlan => Boolean): Boolean = {
+    plan match {
+      case _: FluxReplicatedJoinBuildInput => false
+      case nested: WholeStageTransformer => containsFragmentLocal(nested.child)(predicate)
+      case iit: InputIteratorTransformer =>
+        localNativeInputIteratorChild(iit.child).exists(containsFragmentLocal(_)(predicate))
+      case local if predicate(local) => true
+      case other => other.children.exists(containsFragmentLocal(_)(predicate))
+    }
+  }
+
+  private def containsFragmentLocalShuffledJoin(wst: WholeStageTransformer): Boolean = {
+    containsFragmentLocal(wst.child)(_.isInstanceOf[ColumnarShuffledJoin])
+  }
+
+  private[execution] def containsFragmentLocalShuffledJoinForTests(
+      wst: WholeStageTransformer): Boolean = {
+    containsFragmentLocalShuffledJoin(wst)
+  }
+
   /** Unwrap wrapper nodes to find the Exchange (shuffle or broadcast) underneath. */
   private def unwrapToExchange(plan: SparkPlan): Option[Exchange] = {
     plan match {
@@ -5443,10 +5473,10 @@ case class FluxNativeQueryExec(
     val joinDriverOverride = positiveIntConf("spark.gluten.mpp.joinDriversPerFragment")
       .filter(
         _ =>
-          plan.find {
+          containsFragmentLocal(plan) {
             case _: HashJoinLikeExecTransformer => true
             case _ => false
-          }.isDefined)
+          })
     if (joinDriverOverride.isDefined) {
       // A downstream SINGLE gather describes the fragment's network output, not the amount of
       // local join work. Do not clamp join drivers to raw=1 in that shape: Velox hash-join drivers
@@ -5506,6 +5536,10 @@ case class FluxNativeQueryExec(
       plan: SparkPlan,
       nativePartitionCountHint: Option[Int] = None): Int = {
     fragmentDriverPartitionCount(plan, nativePartitionCountHint)
+  }
+
+  private[execution] def inferParallelismForTests(plan: SparkPlan): Int = {
+    inferParallelism(plan)
   }
 
   private def positiveIntConf(key: String): Option[Int] = {
