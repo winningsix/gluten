@@ -683,6 +683,7 @@ if(ENABLE_GPU)
       ""
       CACHE FILEPATH "Apache Thrift library used by the cuDF JNI dependency")
   if(NOT GLUTEN_APACHE_THRIFT_LIBRARY)
+    unset(GLUTEN_APACHE_THRIFT_LIBRARY CACHE)
     find_library(
       GLUTEN_APACHE_THRIFT_LIBRARY
       NAMES thrift
@@ -696,6 +697,7 @@ if(ENABLE_GPU)
       ""
       CACHE PATH "Directory containing the FBThrift static archives")
   if(NOT GLUTEN_FBTHRIFT_LIBRARY_DIR)
+    unset(GLUTEN_FBTHRIFT_LIBRARY_DIR CACHE)
     find_path(
       GLUTEN_FBTHRIFT_LIBRARY_DIR
       NAMES libthriftcpp2.a
