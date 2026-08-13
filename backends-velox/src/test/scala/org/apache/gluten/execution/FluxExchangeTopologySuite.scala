@@ -193,31 +193,28 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
       ENSURE_REQUIREMENTS,
       producer.output,
       None)
-    val parent = WholeStageTransformer(
-      InputIteratorTransformer(ColumnarInputAdapter(single)))(transformStageId = 12)
+    val parent = WholeStageTransformer(InputIteratorTransformer(ColumnarInputAdapter(single)))(
+      transformStageId = 12)
     val exec = FluxNativeQueryExec(parent, fragments = Seq.empty, exchanges = Seq.empty)
 
     assert(
       parent.find(_.isInstanceOf[ColumnarShuffledJoin]).isDefined,
       "SparkPlan.find must reproduce the old cross-boundary false positive")
     assert(!exec.containsFragmentLocalShuffledJoinForTests(parent))
-    withSQLConf(
-      "spark.executor.cores" -> "16",
-      "spark.gluten.mpp.joinDriversPerFragment" -> "3") {
+    withSQLConf("spark.executor.cores" -> "16", "spark.gluten.mpp.joinDriversPerFragment" -> "3") {
       assert(exec.inferParallelismForTests(parent) === 1)
     }
   }
 
   test("still finds a shuffled join in a truly local native iterator subtree") {
     val join = shuffledJoin(leftPartitions = 4, rightPartitions = 4)
-    val parent = WholeStageTransformer(
-      InputIteratorTransformer(ColumnarInputAdapter(join)))(transformStageId = 13)
+    val parent =
+      WholeStageTransformer(InputIteratorTransformer(ColumnarInputAdapter(join)))(transformStageId =
+        13)
     val exec = FluxNativeQueryExec(parent, fragments = Seq.empty, exchanges = Seq.empty)
 
     assert(exec.containsFragmentLocalShuffledJoinForTests(parent))
-    withSQLConf(
-      "spark.executor.cores" -> "16",
-      "spark.gluten.mpp.joinDriversPerFragment" -> "3") {
+    withSQLConf("spark.executor.cores" -> "16", "spark.gluten.mpp.joinDriversPerFragment" -> "3") {
       assert(exec.inferParallelismForTests(parent) === 3)
     }
   }
@@ -253,7 +250,8 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
       condition = None,
       left = left,
       right = right,
-      isSkewJoin = false)
+      isSkewJoin = false
+    )
   }
 
   private case class PartitioningFailureLeaf(override val output: Seq[Attribute], message: String)

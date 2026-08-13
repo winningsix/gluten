@@ -5114,8 +5114,7 @@ case class FluxNativeQueryExec(
    * transparent, while a real exchange, top-N gather, replicated build, or other non-local input
    * ends the search.
    */
-  private def containsFragmentLocal(
-      plan: SparkPlan)(predicate: SparkPlan => Boolean): Boolean = {
+  private def containsFragmentLocal(plan: SparkPlan)(predicate: SparkPlan => Boolean): Boolean = {
     plan match {
       case _: FluxReplicatedJoinBuildInput => false
       case nested: WholeStageTransformer => containsFragmentLocal(nested.child)(predicate)

@@ -443,7 +443,8 @@ class FluxStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
 
       assert(
         root.rootOperator.find(_.isInstanceOf[ColumnarShuffledJoin]).isDefined,
-        "Expected broad SparkPlan traversal to reach a shuffled join in a producer fragment")
+        "Expected broad SparkPlan traversal to reach a shuffled join in a producer fragment"
+      )
       assert(rootInbound.nonEmpty, "Expected the Q14 root fragment to have an inbound edge")
       assert(
         rootInbound.forall(_.exchangeType != "HASH"),
@@ -456,8 +457,8 @@ class FluxStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
         .exists {
           case (consumerId, inbound) =>
             inbound.size >= 2 &&
-              inbound.map(_.numPartitions).distinct == Seq(4) &&
-              fragmentsById(consumerId).parallelism == 4
+            inbound.map(_.numPartitions).distinct == Seq(4) &&
+            fragmentsById(consumerId).parallelism == 4
         }
       assert(resolvedJoinFanIn, "Expected a genuine Q14 shuffled-join fragment to resolve HASH=4")
     }
