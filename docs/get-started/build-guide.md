@@ -21,6 +21,10 @@ Please set them via `--`, e.g. `--build_type=Release`.
 | enable_hdfs            | Build with HDFS support.                                                                      | OFF     |
 | enable_abfs            | Build with ABFS support.                                                                      | OFF     |
 | enable_vcpkg           | Enable vcpkg for static build.                                                                | OFF     |
+| cudf_source            | Resolve cuDF from the Velox build (`BUNDLED`) or an installed package (`SYSTEM`).             | BUNDLED |
+| cudf_version_info      | Data-only installed-cuDF identity marker; required for checked `SYSTEM` builds.               | ""      |
+| cudf_compatibility_check | Verify installed cuDF identity for `SYSTEM`; `OFF` fully skips the check.                    | ON      |
+| rebuild_if_mismatch    | Rebuild bundled cuDF after a recognized installed-artifact mismatch.                          | OFF     |
 | run_setup_script       | Run setup script to install Velox dependencies.                                               | ON      |
 | velox_repo             | Specify your own Velox repo to build.                                                         | ""      |
 | velox_branch           | Specify your own Velox branch to build.                                                       | ""      |
@@ -41,10 +45,66 @@ Please set them via `--`, e.g., `--velox_home=/YOUR/PATH`.
 | enable_gcs       | Build Velox with GCS support.                                 | OFF                                      |
 | enable_hdfs      | Build Velox with HDFS support.                                | OFF                                      |
 | enable_abfs      | Build Velox with ABFS support.                                | OFF                                      |
+| cudf_source      | Resolve cuDF from `BUNDLED` source or a `SYSTEM` package.     | BUNDLED                                  |
+| cudf_version_info | Installed-cuDF identity marker required for checked `SYSTEM` builds. | ""                                |
+| cudf_compatibility_check | Verify installed cuDF identity; `OFF` fully skips the check. | ON                                  |
+| rebuild_if_mismatch | Rebuild bundled cuDF after a recognized SYSTEM mismatch.   | OFF                                      |
 | run_setup_script | Run setup script to install Velox dependencies before build.  | ON                                       |
 | build_test_utils | Build Velox with cmake arg -DVELOX_BUILD_TEST_UTILS=ON if ON. | OFF                                      |
 | build_tests      | Build Velox test.                                             | OFF                                      |
 | build_benchmarks | Build Velox benchmarks.                                       | OFF                                      |
+
+### Build a complete bundle against an installed cuDF package
+
+GPU builds use the cuDF revision selected by Velox by default. `SYSTEM` is an
+opt-in mode for a host or container that already contains compatible cuDF and
+UCXX CMake packages plus their build dependencies.
+
+The installed artifact must provide a data-only marker such as
+`/usr/local/share/gluten/cudf-build-info`:
+
+```properties
+CUDF_COMMIT=<full-40-character-git-sha>
+CUDF_VERSION=<version>
+```
+
+The build reads this file as data and never sources it as shell code. It derives
+the required commit from the selected Velox source and classifies compatibility
+before compilation:
+
+- The default (`check=ON`, `rebuild=OFF`) fails on a missing, malformed,
+  ambiguous, or mismatched installed identity.
+- `--rebuild_if_mismatch=ON` changes only a recognized installed-artifact
+  incompatibility to one clean bundled-cuDF build. Failure to derive the
+  selected Velox identity remains fatal.
+- `--cudf_compatibility_check=OFF` performs no Velox or marker reads and uses
+  the installed package with an explicit unverified-provenance warning. It
+  cannot be combined with rebuild-on-mismatch.
+
+The local fallback belongs to Gluten's build entrypoint. Preparing and
+publishing a replacement dependency image remains an external CI/CD concern.
+
+Use the normal bundle entrypoint to build Velox, Gluten C++, and the Maven
+bundle in one invocation:
+
+```bash
+export INSTALL_PREFIX=/opt/cudf-dependencies
+export CMAKE_PREFIX_PATH="$INSTALL_PREFIX${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+
+./dev/buildbundle-veloxbe.sh \
+  --enable_gpu=ON \
+  --cudf_source=SYSTEM \
+  --cudf_version_info="$INSTALL_PREFIX/share/gluten/cudf-build-info" \
+  --spark_version=3.5
+```
+
+The native library is written under `cpp/build/releases/`, and the bundle JAR
+is written under `package/target/`. Use `dev/builddeps-veloxbe.sh` with the same
+options when only the native build is required.
+
+The entrypoints reuse compatible native state. They remove the selected Velox
+build directory before a SYSTEM/BUNDLED transition or a mismatch-triggered
+bundled rebuild, so both native configurations use the same effective source.
 
 ### Maven build parameters
 The below parameters can be set via `-P` for mvn.

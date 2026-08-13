@@ -35,7 +35,7 @@ function build_for_spark {
     fi
   fi
 
-  ${MVN_CMD} clean install -P${maven_profiles} -DskipTests -Dmaven.test.skip=true \
+  ${MVN_CMD} clean install -P${maven_profiles} -DskipTests \
     -Dspotless.check.skip=true
 }
 

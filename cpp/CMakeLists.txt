@@ -57,6 +57,16 @@ option(ENABLE_ORC "Enable ORC" OFF)
 option(ENABLE_ABFS "Enable ABFS" OFF)
 option(ENABLE_GPU "Enable GPU" OFF)
 option(ENABLE_ENHANCED_FEATURES "Enable enhanced features" OFF)
+option(CUDF_COMPATIBILITY_CHECK "Verify installed cuDF against Velox" ON)
+option(CUDF_COMPATIBILITY_RECONCILED
+       "Installed cuDF was already reconciled by the build entrypoint" OFF)
+set(cudf_SOURCE
+    "BUNDLED"
+    CACHE STRING "cuDF source: BUNDLED or SYSTEM")
+set_property(CACHE cudf_SOURCE PROPERTY STRINGS BUNDLED SYSTEM)
+if(NOT cudf_SOURCE STREQUAL "BUNDLED" AND NOT cudf_SOURCE STREQUAL "SYSTEM")
+  message(FATAL_ERROR "Invalid cudf_SOURCE: ${cudf_SOURCE}")
+endif()
 
 set(root_directory ${PROJECT_BINARY_DIR})
 get_filename_component(GLUTEN_HOME ${CMAKE_SOURCE_DIR} DIRECTORY)
@@ -64,6 +74,34 @@ get_filename_component(GLUTEN_HOME ${CMAKE_SOURCE_DIR} DIRECTORY)
 if(NOT DEFINED VELOX_HOME)
   set(VELOX_HOME ${GLUTEN_HOME}/ep/build-velox/build/velox_ep)
   message(STATUS "Set VELOX_HOME to ${VELOX_HOME}")
+endif()
+
+if(ENABLE_GPU
+   AND cudf_SOURCE STREQUAL "SYSTEM"
+   AND NOT CUDF_COMPATIBILITY_RECONCILED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(CUDF_VERIFY_OPTIONS --velox-home "${VELOX_HOME}")
+  if(CUDF_COMPATIBILITY_CHECK)
+    list(APPEND CUDF_VERIFY_OPTIONS --version-info "${CUDF_VERSION_INFO}")
+  else()
+    list(APPEND CUDF_VERIFY_OPTIONS --skip)
+  endif()
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${GLUTEN_HOME}/dev/verify-system-cudf.py"
+            ${CUDF_VERIFY_OPTIONS}
+    RESULT_VARIABLE CUDF_VERIFY_RESULT
+    OUTPUT_VARIABLE CUDF_VERIFY_OUTPUT
+    ERROR_VARIABLE CUDF_VERIFY_ERROR
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE)
+  if(NOT CUDF_VERIFY_RESULT EQUAL 0)
+    message(FATAL_ERROR "${CUDF_VERIFY_OUTPUT}${CUDF_VERIFY_ERROR}")
+  endif()
+  if(CUDF_VERIFY_OUTPUT)
+    message(STATUS "${CUDF_VERIFY_OUTPUT}")
+  endif()
+  if(CUDF_VERIFY_ERROR)
+    message(WARNING "${CUDF_VERIFY_ERROR}")
+  endif()
 endif()
 
 if(${CMAKE_BUILD_TYPE} STREQUAL "Debug")

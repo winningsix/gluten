@@ -39,6 +39,12 @@ ENABLE_ABFS=OFF
 ENABLE_VCPKG=OFF
 ENABLE_GPU=OFF
 CUDA_ARCH="native"
+CUDF_SOURCE=BUNDLED
+CUDF_VERSION_INFO=""
+CUDF_COMPATIBILITY_CHECK=ON
+REBUILD_IF_MISMATCH=OFF
+EFFECTIVE_CUDF_SOURCE=$CUDF_SOURCE
+CUDF_RECONCILED=OFF
 ENABLE_ENHANCED_FEATURES=OFF
 RUN_SETUP_SCRIPT=ON
 VELOX_REPO=""
@@ -47,6 +53,7 @@ VELOX_HOME="$GLUTEN_DIR/ep/build-velox/build/velox_ep"
 VELOX_PARAMETER=""
 BUILD_ARROW=ON
 SPARK_VERSION=ALL
+INVOCATION_DIR=$(pwd -P)
 
 # set default number of threads as cpu cores minus 2
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -116,6 +123,22 @@ do
         CUDA_ARCH=("${arg#*=}")
         shift # Remove argument name from processing
         ;;
+        --cudf_source=*)
+        CUDF_SOURCE=("${arg#*=}")
+        shift # Remove argument name from processing
+        ;;
+        --cudf_version_info=*)
+        CUDF_VERSION_INFO=("${arg#*=}")
+        shift # Remove argument name from processing
+        ;;
+        --cudf_compatibility_check=*)
+        CUDF_COMPATIBILITY_CHECK=("${arg#*=}")
+        shift # Remove argument name from processing
+        ;;
+        --rebuild_if_mismatch=*)
+        REBUILD_IF_MISMATCH=("${arg#*=}")
+        shift # Remove argument name from processing
+        ;;
         --enable_enhanced_features=*)
         ENABLE_ENHANCED_FEATURES=("${arg#*=}")
         shift # Remove argument name from processing
@@ -162,6 +185,31 @@ do
         ;;
     esac
 done
+
+if [ "$CUDF_SOURCE" != "BUNDLED" ] && [ "$CUDF_SOURCE" != "SYSTEM" ]; then
+  echo "Invalid cudf source: $CUDF_SOURCE. Supported values: BUNDLED, SYSTEM" >&2
+  exit 1
+fi
+if [ "$CUDF_COMPATIBILITY_CHECK" != "ON" ] && [ "$CUDF_COMPATIBILITY_CHECK" != "OFF" ]; then
+  echo "Invalid cuDF compatibility check: $CUDF_COMPATIBILITY_CHECK. Supported values: ON, OFF" >&2
+  exit 1
+fi
+if [ "$REBUILD_IF_MISMATCH" != "ON" ] && [ "$REBUILD_IF_MISMATCH" != "OFF" ]; then
+  echo "Invalid rebuild-if-mismatch policy: $REBUILD_IF_MISMATCH. Supported values: ON, OFF" >&2
+  exit 1
+fi
+if [ "$REBUILD_IF_MISMATCH" == "ON" ] && [ "$CUDF_SOURCE" != "SYSTEM" ]; then
+  echo "--rebuild_if_mismatch=ON requires --cudf_source=SYSTEM" >&2
+  exit 1
+fi
+if [ "$REBUILD_IF_MISMATCH" == "ON" ] && [ "$CUDF_COMPATIBILITY_CHECK" == "OFF" ]; then
+  echo "--rebuild_if_mismatch=ON requires --cudf_compatibility_check=ON" >&2
+  exit 1
+fi
+
+if [ -n "$CUDF_VERSION_INFO" ] && [[ "$CUDF_VERSION_INFO" != /* ]]; then
+  CUDF_VERSION_INFO="$INVOCATION_DIR/$CUDF_VERSION_INFO"
+fi
 
 if [[ "$(uname)" == "Darwin" ]]; then
     export INSTALL_PREFIX=${INSTALL_PREFIX:-${VELOX_HOME}/deps-install}
@@ -226,17 +274,90 @@ function build_arrow {
   source ./build-arrow.sh
 }
 
+function clean_velox_cudf_state {
+  local compile_type=release
+  if [[ "$BUILD_TYPE" == "debug" ]] || [[ "$BUILD_TYPE" == "Debug" ]]; then
+    compile_type=debug
+  fi
+  local velox_build_path="$VELOX_HOME/_build/$compile_type"
+  if [ -d "$velox_build_path" ]; then
+    echo "Removing incompatible Velox build state: $velox_build_path"
+    rm -rf "$velox_build_path"
+  fi
+}
+
+function require_full_velox_rebuild {
+  if [ "${CUDF_ALLOW_VELOX_CLEAN:-OFF}" != "ON" ]; then
+    echo "cuDF source reconciliation requires rebuilding Velox; run build_velox_backend or the normal bundle entrypoint" >&2
+    exit 1
+  fi
+}
+
+function clean_changed_cudf_source_state {
+  local compile_type=release
+  if [[ "$BUILD_TYPE" == "debug" ]] || [[ "$BUILD_TYPE" == "Debug" ]]; then
+    compile_type=debug
+  fi
+  local cmake_cache="$VELOX_HOME/_build/$compile_type/CMakeCache.txt"
+  local cached_cudf_source=""
+  if [ -f "$cmake_cache" ]; then
+    cached_cudf_source=$(sed -n 's/^cudf_SOURCE:[^=]*=//p' "$cmake_cache" | tail -1)
+  fi
+  if [ -n "$cached_cudf_source" ] && [ "$cached_cudf_source" != "$EFFECTIVE_CUDF_SOURCE" ]; then
+    require_full_velox_rebuild
+    clean_velox_cudf_state
+  fi
+}
+
+function reconcile_cudf_source {
+  if [ "$CUDF_RECONCILED" == "ON" ]; then
+    return
+  fi
+  EFFECTIVE_CUDF_SOURCE=$CUDF_SOURCE
+  if [ "$CUDF_SOURCE" != "SYSTEM" ]; then
+    CUDF_RECONCILED=ON
+    clean_changed_cudf_source_state
+    return
+  fi
+  if [ "$CUDF_COMPATIBILITY_CHECK" == "OFF" ]; then
+    python3 "$GLUTEN_DIR/dev/verify-system-cudf.py" --skip
+    CUDF_RECONCILED=ON
+    clean_changed_cudf_source_state
+    return
+  fi
+
+  local verify_result=0
+  python3 "$GLUTEN_DIR/dev/verify-system-cudf.py" \
+    --velox-home "$VELOX_HOME" --version-info "$CUDF_VERSION_INFO" || verify_result=$?
+  if [ "$verify_result" == "10" ] && [ "$REBUILD_IF_MISMATCH" == "ON" ]; then
+    echo "SYSTEM cuDF is incompatible; action=rebuild-bundled"
+    EFFECTIVE_CUDF_SOURCE=BUNDLED
+    require_full_velox_rebuild
+    clean_velox_cudf_state
+  elif [ "$verify_result" != "0" ]; then
+    echo "SYSTEM cuDF reconciliation failed; action=fail" >&2
+    exit "$verify_result"
+  fi
+  CUDF_RECONCILED=ON
+  clean_changed_cudf_source_state
+}
+
 function build_velox {
+  CUDF_ALLOW_VELOX_CLEAN=ON
+  reconcile_cudf_source
   echo "Start to build Velox"
   cd $GLUTEN_DIR/ep/build-velox/src
   # When BUILD_TESTS is on for gluten cpp, we need turn on VELOX_BUILD_TEST_UTILS via build_test_utils.
-  ./build-velox.sh --enable_s3=$ENABLE_S3 --enable_gcs=$ENABLE_GCS --build_type=$BUILD_TYPE --enable_hdfs=$ENABLE_HDFS \
+  GLUTEN_CUDF_RECONCILED=ON ./build-velox.sh --enable_s3=$ENABLE_S3 --enable_gcs=$ENABLE_GCS --build_type=$BUILD_TYPE --enable_hdfs=$ENABLE_HDFS \
                    --enable_abfs=$ENABLE_ABFS --enable_gpu=$ENABLE_GPU --cuda_arch=$CUDA_ARCH --build_test_utils=$BUILD_TESTS \
                    --build_tests=$BUILD_VELOX_TESTS --build_benchmarks=$BUILD_VELOX_BENCHMARKS --num_threads=$NUM_THREADS \
-                   --velox_home=$VELOX_HOME
+                   --velox_home=$VELOX_HOME --cudf_source=$EFFECTIVE_CUDF_SOURCE \
+                   --cudf_version_info="$CUDF_VERSION_INFO" --cudf_compatibility_check=$CUDF_COMPATIBILITY_CHECK \
+                   --rebuild_if_mismatch=OFF
 }
 
 function build_gluten_cpp {
+  reconcile_cudf_source
   echo "Start to build Gluten CPP"
   cd $GLUTEN_DIR/cpp
   rm -rf build
@@ -263,11 +384,21 @@ function build_gluten_cpp {
     GLUTEN_CMAKE_OPTIONS+=" -DCMAKE_PREFIX_PATH=$INSTALL_PREFIX"
   fi
 
-  cmake $GLUTEN_CMAKE_OPTIONS ..
+  if [ "$EFFECTIVE_CUDF_SOURCE" == "SYSTEM" ]; then
+    cmake $GLUTEN_CMAKE_OPTIONS -Dcudf_SOURCE=SYSTEM \
+      "-DCMAKE_PREFIX_PATH=${INSTALL_PREFIX:-/usr/local}" \
+      "-DCUDF_VERSION_INFO=$CUDF_VERSION_INFO" \
+      -DCUDF_COMPATIBILITY_CHECK=$CUDF_COMPATIBILITY_CHECK \
+      -DCUDF_COMPATIBILITY_RECONCILED=ON ..
+  else
+    cmake $GLUTEN_CMAKE_OPTIONS ..
+  fi
   make -j $NUM_THREADS
 }
 
 function build_velox_backend {
+  CUDF_ALLOW_VELOX_CLEAN=ON
+  reconcile_cudf_source
   if [ $BUILD_ARROW == "ON" ]; then
     build_arrow
   fi
@@ -327,6 +458,8 @@ commands_to_run=(${OTHER_ARGUMENTS[@]:-})
     else
       echo "VELOX_HOME=$VELOX_HOME already exists, skipping Velox checkout."
     fi
+    CUDF_ALLOW_VELOX_CLEAN=ON
+    reconcile_cudf_source
     if [ -z "${GLUTEN_VCPKG_ENABLED:-}" ] && [ $RUN_SETUP_SCRIPT == "ON" ]; then
       setup_dependencies
     fi

@@ -303,32 +303,33 @@ else()
   endif()
 endif()
 
+set(GLUTEN_CUDF_BUILD_TREE_INCLUDE_DIRS)
+if(ENABLE_GPU AND cudf_SOURCE STREQUAL "BUNDLED")
+  list(
+    APPEND
+    GLUTEN_CUDF_BUILD_TREE_INCLUDE_DIRS
+    ${VELOX_BUILD_PATH}/_deps/cudf-src/cpp/include
+    ${VELOX_BUILD_PATH}/_deps/rmm-src/cpp/include
+    ${VELOX_BUILD_PATH}/_deps/rmm-build/include
+    ${VELOX_BUILD_PATH}/_deps/cccl-src/libcudacxx/include
+    ${VELOX_BUILD_PATH}/_deps/cccl-src/cub
+    ${VELOX_BUILD_PATH}/_deps/cccl-src/thrust
+    ${VELOX_BUILD_PATH}/_deps/cuco-src/include
+    ${VELOX_BUILD_PATH}/_deps/kvikio-src/cpp/include
+    ${VELOX_BUILD_PATH}/_deps/rapids_logger-src/include
+    /opt/velox/_build/ucx-probe/_deps/ucxx-src/cpp/include
+    ${VELOX_BUILD_PATH}/_deps/ucxx-src/cpp/include)
+endif()
+
 target_include_directories(
   velox
   PUBLIC ${CMAKE_SYSTEM_INCLUDE_PATH}
          ${JNI_INCLUDE_DIRS}
          ${VELOX_BUILD_PATH}
-         # ucxx headers fetched by velox FetchContent. The release build tree
-         # (VELOX_BUILD_PATH) does not stage them under _deps, so point at the
-         # ucx-probe build dir explicitly. Required by
-         # velox/experimental/ucx-exchange/Communicator.h's `#include
-         # "ucxx/api.h"`.
-         /opt/velox/_build/ucx-probe/_deps/ucxx-src/cpp/include
-         ${VELOX_BUILD_PATH}/_deps/ucxx-src/cpp/include
-         # cudf + transitive dep headers fetched by velox FetchContent. cudf
-         # interop types (e.g. cudf/io/types.hpp) aren't propagated through
-         # velox cudf static-library targets; cudf headers transitively include
-         # rmm + cccl + others, so we list each FetchContent _src/include
-         # subtree explicitly.
-         ${VELOX_BUILD_PATH}/_deps/cudf-src/cpp/include
-         ${VELOX_BUILD_PATH}/_deps/rmm-src/cpp/include
-         ${VELOX_BUILD_PATH}/_deps/rmm-build/include
-         ${VELOX_BUILD_PATH}/_deps/cccl-src/libcudacxx/include
-         ${VELOX_BUILD_PATH}/_deps/cccl-src/cub
-         ${VELOX_BUILD_PATH}/_deps/cccl-src/thrust
-         ${VELOX_BUILD_PATH}/_deps/cuco-src/include
-         ${VELOX_BUILD_PATH}/_deps/kvikio-src/cpp/include
-         ${VELOX_BUILD_PATH}/_deps/rapids_logger-src/include
+         # BUNDLED cuDF and UCXX do not propagate every FetchContent include
+         # path through their Velox targets. SYSTEM uses only installed package
+         # targets and must not inherit these build-tree paths.
+         ${GLUTEN_CUDF_BUILD_TREE_INCLUDE_DIRS}
          ${VELOX_BUILD_PATH}/_deps/fmt-src/include
          ${VELOX_BUILD_PATH}/_deps/xsimd-src/include
          ${VELOX_BUILD_PATH}/_deps/re2-src
@@ -625,10 +626,11 @@ if(ENABLE_GPU)
   target_compile_definitions(velox PRIVATE GLUTEN_ENABLE_GPU)
 
   # A cuDF build-tree package config resolves transitive RAPIDS dependencies
-  # through CPMFindPackage.  Standalone Gluten reconfiguration does not load
+  # through CPMFindPackage. Standalone Gluten reconfiguration does not load
   # Velox's top-level CPM bootstrap, so load the already-generated CPM module
-  # before importing cuDF.
-  if(NOT COMMAND CPMFindPackage)
+  # for BUNDLED builds. An installed SYSTEM package resolves its dependencies
+  # through its exported package closure and must not depend on that build tree.
+  if(cudf_SOURCE STREQUAL "BUNDLED" AND NOT COMMAND CPMFindPackage)
     # CPM records initialization in a GLOBAL property, but CMake command
     # definitions are directory-scoped. Another subproject can therefore set the
     # property without making CPMFindPackage visible in this directory. Clear
@@ -650,6 +652,9 @@ if(ENABLE_GPU)
   endif()
 
   find_package(cudf CONFIG REQUIRED)
+  if(cudf_SOURCE STREQUAL "SYSTEM")
+    find_package(ucxx CONFIG REQUIRED)
+  endif()
 
   import_library(
     facebook::velox::velox_cudf_expression
@@ -828,72 +833,77 @@ if(ENABLE_GPU)
   endif()
 
   set(GLUTEN_EXPLICIT_RAPIDS_LIBRARIES)
-
-  set(_gluten_rmm_shared "${VELOX_BUILD_PATH}/_deps/rmm-build/librmm.so")
-  if(EXISTS "${_gluten_rmm_shared}")
-    list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_rmm_shared}")
-    message(STATUS "Using legacy shared RMM library: ${_gluten_rmm_shared}")
+  if(cudf_SOURCE STREQUAL "SYSTEM")
+    set(GLUTEN_UCXX_LIBRARY ucxx::ucxx)
   else()
-    message(
-      STATUS "Using RMM absorbed by shared cuDF: ${_gluten_cudf_location}")
-  endif()
-
-  set(_gluten_logger_shared
-      "${VELOX_BUILD_PATH}/_deps/rapids_logger-build/librapids_logger.so")
-  if(EXISTS "${_gluten_logger_shared}")
-    list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_logger_shared}")
-    message(
-      STATUS
-        "Using legacy shared RAPIDS logger library: ${_gluten_logger_shared}")
-  else()
-    message(
-      STATUS
-        "Using RAPIDS logger absorbed by shared cuDF: ${_gluten_cudf_location}")
-  endif()
-
-  set(_gluten_kvikio_shared
-      "${VELOX_BUILD_PATH}/_deps/kvikio-build/libkvikio.so")
-  if(EXISTS "${_gluten_kvikio_shared}")
-    list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_kvikio_shared}")
-    message(
-      STATUS "Using legacy shared KvikIO library: ${_gluten_kvikio_shared}")
-  else()
-    find_library(
-      _gluten_kvikio_system
-      NAMES kvikio
-      PATHS /usr/local/lib64 /usr/local/lib
-      NO_DEFAULT_PATH)
-    if(_gluten_kvikio_system)
-      list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_kvikio_system}")
-      message(STATUS "Using system shared KvikIO library: "
-                     "${_gluten_kvikio_system}")
+    set(_gluten_rmm_shared "${VELOX_BUILD_PATH}/_deps/rmm-build/librmm.so")
+    if(EXISTS "${_gluten_rmm_shared}")
+      list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_rmm_shared}")
+      message(STATUS "Using legacy shared RMM library: ${_gluten_rmm_shared}")
     else()
       message(
-        STATUS "Using KvikIO absorbed by shared cuDF: ${_gluten_cudf_location}")
+        STATUS "Using RMM absorbed by shared cuDF: ${_gluten_cudf_location}")
+    endif()
+
+    set(_gluten_logger_shared
+        "${VELOX_BUILD_PATH}/_deps/rapids_logger-build/librapids_logger.so")
+    if(EXISTS "${_gluten_logger_shared}")
+      list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_logger_shared}")
+      message(
+        STATUS
+          "Using legacy shared RAPIDS logger library: ${_gluten_logger_shared}")
+    else()
+      message(
+        STATUS
+          "Using RAPIDS logger absorbed by shared cuDF: ${_gluten_cudf_location}"
+      )
+    endif()
+
+    set(_gluten_kvikio_shared
+        "${VELOX_BUILD_PATH}/_deps/kvikio-build/libkvikio.so")
+    if(EXISTS "${_gluten_kvikio_shared}")
+      list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_kvikio_shared}")
+      message(
+        STATUS "Using legacy shared KvikIO library: ${_gluten_kvikio_shared}")
+    else()
+      find_library(
+        _gluten_kvikio_system
+        NAMES kvikio
+        PATHS /usr/local/lib64 /usr/local/lib
+        NO_DEFAULT_PATH)
+      if(_gluten_kvikio_system)
+        list(APPEND GLUTEN_EXPLICIT_RAPIDS_LIBRARIES "${_gluten_kvikio_system}")
+        message(STATUS "Using system shared KvikIO library: "
+                       "${_gluten_kvikio_system}")
+      else()
+        message(
+          STATUS
+            "Using KvikIO absorbed by shared cuDF: ${_gluten_cudf_location}")
+      endif()
+    endif()
+
+    set(_gluten_ucxx_bundled "${VELOX_BUILD_PATH}/_deps/ucxx-build/libucxx.so")
+    if(EXISTS "${_gluten_ucxx_bundled}")
+      set(GLUTEN_UCXX_LIBRARY "${_gluten_ucxx_bundled}")
+    else()
+      find_library(
+        _gluten_ucxx_system
+        NAMES ucxx
+        PATHS /usr/local/lib64 /usr/local/lib
+        NO_DEFAULT_PATH)
+      set(GLUTEN_UCXX_LIBRARY "${_gluten_ucxx_system}")
+    endif()
+    if(NOT GLUTEN_UCXX_LIBRARY OR NOT EXISTS "${GLUTEN_UCXX_LIBRARY}")
+      message(
+        FATAL_ERROR
+          "GPU builds require either Velox's bundled UCXX artifact or an "
+          "installed libucxx.so")
     endif()
   endif()
 
   set(GLUTEN_CUDART_LIBRARY /usr/local/cuda/lib64/libcudart.so)
   if(EXISTS /usr/local/cuda/lib64/libcudart.so.13)
     set(GLUTEN_CUDART_LIBRARY /usr/local/cuda/lib64/libcudart.so.13)
-  endif()
-
-  set(_gluten_ucxx_bundled "${VELOX_BUILD_PATH}/_deps/ucxx-build/libucxx.so")
-  if(EXISTS "${_gluten_ucxx_bundled}")
-    set(GLUTEN_UCXX_LIBRARY "${_gluten_ucxx_bundled}")
-  else()
-    find_library(
-      _gluten_ucxx_system
-      NAMES ucxx
-      PATHS /usr/local/lib64 /usr/local/lib
-      NO_DEFAULT_PATH)
-    set(GLUTEN_UCXX_LIBRARY "${_gluten_ucxx_system}")
-  endif()
-  if(NOT GLUTEN_UCXX_LIBRARY OR NOT EXISTS "${GLUTEN_UCXX_LIBRARY}")
-    message(
-      FATAL_ERROR
-        "GPU builds require either Velox's bundled UCXX artifact or an "
-        "installed libucxx.so")
   endif()
   message(STATUS "Using UCXX library: ${GLUTEN_UCXX_LIBRARY}")
 

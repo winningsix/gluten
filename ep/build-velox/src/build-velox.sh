@@ -28,6 +28,12 @@ ENABLE_HDFS=OFF
 ENABLE_ABFS=OFF
 # Enable GPU support
 ENABLE_GPU=OFF
+# Select whether Velox builds cuDF or uses an installed package.
+CUDF_SOURCE=BUNDLED
+CUDF_VERSION_INFO=""
+CUDF_COMPATIBILITY_CHECK=ON
+REBUILD_IF_MISMATCH=OFF
+CUDF_RECONCILED=${GLUTEN_CUDF_RECONCILED:-OFF}
 # CUDA architectures: "native" (auto-detect local GPU), "all-major", or specific
 # compute capabilities e.g. "75", "86", "89;90". Defaults to native.
 CUDA_ARCH="native"
@@ -43,6 +49,7 @@ BUILD_TEST_UTILS=OFF
 NUM_THREADS=""
 
 OTHER_ARGUMENTS=""
+INVOCATION_DIR=$(pwd -P)
 
 OS=`uname -s`
 ARCH=`uname -m`
@@ -97,12 +104,53 @@ for arg in "$@"; do
     CUDA_ARCH=("${arg#*=}")
     shift # Remove argument name from processing
     ;;
+  --cudf_source=*)
+    CUDF_SOURCE=("${arg#*=}")
+    shift # Remove argument name from processing
+    ;;
+  --cudf_version_info=*)
+    CUDF_VERSION_INFO=("${arg#*=}")
+    shift # Remove argument name from processing
+    ;;
+  --cudf_compatibility_check=*)
+    CUDF_COMPATIBILITY_CHECK=("${arg#*=}")
+    shift # Remove argument name from processing
+    ;;
+  --rebuild_if_mismatch=*)
+    REBUILD_IF_MISMATCH=("${arg#*=}")
+    shift # Remove argument name from processing
+    ;;
   *)
     OTHER_ARGUMENTS+=("$1")
     shift # Remove generic argument from processing
     ;;
   esac
 done
+
+if [ "$CUDF_SOURCE" != "BUNDLED" ] && [ "$CUDF_SOURCE" != "SYSTEM" ]; then
+  echo "Invalid cudf source: $CUDF_SOURCE. Supported values: BUNDLED, SYSTEM" >&2
+  exit 1
+fi
+if [ "$CUDF_COMPATIBILITY_CHECK" != "ON" ] && [ "$CUDF_COMPATIBILITY_CHECK" != "OFF" ]; then
+  echo "Invalid cuDF compatibility check: $CUDF_COMPATIBILITY_CHECK. Supported values: ON, OFF" >&2
+  exit 1
+fi
+if [ "$REBUILD_IF_MISMATCH" != "ON" ] && [ "$REBUILD_IF_MISMATCH" != "OFF" ]; then
+  echo "Invalid rebuild-if-mismatch policy: $REBUILD_IF_MISMATCH. Supported values: ON, OFF" >&2
+  exit 1
+fi
+if [ "$REBUILD_IF_MISMATCH" == "ON" ] && [ "$CUDF_SOURCE" != "SYSTEM" ]; then
+  echo "--rebuild_if_mismatch=ON requires --cudf_source=SYSTEM" >&2
+  exit 1
+fi
+if [ "$REBUILD_IF_MISMATCH" == "ON" ] && [ "$CUDF_COMPATIBILITY_CHECK" == "OFF" ]; then
+  echo "--rebuild_if_mismatch=ON requires --cudf_compatibility_check=ON" >&2
+  exit 1
+fi
+
+if [ -n "$CUDF_VERSION_INFO" ] && [[ "$CUDF_VERSION_INFO" != /* ]]; then
+  CUDF_VERSION_INFO="$INVOCATION_DIR/$CUDF_VERSION_INFO"
+fi
 
 function compile {
   # -Wno-unknown-warning-option is a Clang-originated flag. GCC ignores unrecognized -Wno- flags to
@@ -144,7 +192,10 @@ function compile {
     # CMake lists use semicolons; escape them so they survive Make→shell expansion
     CUDA_ARCH_CMAKE="${CUDA_ARCH//,/\\;}"
     COMPILE_OPTION="$COMPILE_OPTION -DVELOX_ENABLE_GPU=ON -DVELOX_ENABLE_CUDF=ON -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH_CMAKE} \
-        -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -Dcudf_SOURCE=BUNDLED"
+        -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -Dcudf_SOURCE=$CUDF_SOURCE"
+  fi
+  if [ "$CUDF_SOURCE" == "SYSTEM" ]; then
+    COMPILE_OPTION="$COMPILE_OPTION -DCMAKE_PREFIX_PATH=${INSTALL_PREFIX:-/usr/local}"
   fi
   if [ -n "${GLUTEN_VCPKG_ENABLED:-}" ]; then
     COMPILE_OPTION="$COMPILE_OPTION -DVELOX_GFLAGS_TYPE=static"
@@ -187,7 +238,7 @@ function compile {
         $SUDO cmake --install xsimd-build/
       fi
     fi
-    if [ -d cudf-build ]; then
+    if [ "$CUDF_SOURCE" == "BUNDLED" ] && [ -d cudf-build ]; then
       echo "INSTALL cudf."
       if [ $OS == 'Linux' ]; then
         $SUDO cmake --install cudf-build/
@@ -210,9 +261,61 @@ CURRENT_DIR=$(
   pwd
 )
 
+function get_velox_build_path {
+  local compile_type=release
+  if [[ "$BUILD_TYPE" == "debug" ]] || [[ "$BUILD_TYPE" == "Debug" ]]; then
+    compile_type=debug
+  fi
+  echo "$VELOX_HOME/_build/$compile_type"
+}
+
+function clean_velox_cudf_state {
+  local velox_build_path
+  velox_build_path=$(get_velox_build_path)
+  if [ -d "$velox_build_path" ]; then
+    echo "Removing incompatible Velox build state: $velox_build_path"
+    rm -rf "$velox_build_path"
+  fi
+}
+
+function clean_changed_cudf_source_state {
+  local cmake_cache="$(get_velox_build_path)/CMakeCache.txt"
+  local cached_cudf_source=""
+  if [ -f "$cmake_cache" ]; then
+    cached_cudf_source=$(sed -n 's/^cudf_SOURCE:[^=]*=//p' "$cmake_cache" | tail -1)
+  fi
+  if [ -n "$cached_cudf_source" ] && [ "$cached_cudf_source" != "$CUDF_SOURCE" ]; then
+    clean_velox_cudf_state
+  fi
+}
+
 if [ "$VELOX_HOME" == "" ]; then
   VELOX_HOME="$CURRENT_DIR/../build/velox_ep"
 fi
+
+if [ "$CUDF_SOURCE" == "SYSTEM" ] && [ "$ENABLE_GPU" != "ON" ]; then
+  echo "ERROR: --cudf_source=SYSTEM requires --enable_gpu=ON" >&2
+  exit 1
+fi
+
+if [ "$CUDF_SOURCE" == "SYSTEM" ] && [ "$CUDF_RECONCILED" != "ON" ]; then
+  if [ "$CUDF_COMPATIBILITY_CHECK" == "OFF" ]; then
+    python3 "$CURRENT_DIR/../../../dev/verify-system-cudf.py" --skip
+  else
+    VERIFY_RESULT=0
+    python3 "$CURRENT_DIR/../../../dev/verify-system-cudf.py" \
+      --velox-home "$VELOX_HOME" --version-info "$CUDF_VERSION_INFO" || VERIFY_RESULT=$?
+    if [ "$VERIFY_RESULT" == "10" ] && [ "$REBUILD_IF_MISMATCH" == "ON" ]; then
+      echo "SYSTEM cuDF is incompatible; action=rebuild-bundled"
+      CUDF_SOURCE=BUNDLED
+      clean_velox_cudf_state
+    elif [ "$VERIFY_RESULT" != "0" ]; then
+      echo "SYSTEM cuDF reconciliation failed; action=fail" >&2
+      exit "$VERIFY_RESULT"
+    fi
+  fi
+fi
+clean_changed_cudf_source_state
 
 echo "Start building Velox..."
 echo "CMAKE Arguments:"
