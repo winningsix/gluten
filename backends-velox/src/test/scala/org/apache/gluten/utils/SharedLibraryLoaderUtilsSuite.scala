@@ -17,12 +17,21 @@
 package org.apache.gluten.utils
 
 import org.apache.gluten.config.GlutenConfig.{GLUTEN_LOAD_LIB_FROM_JAR, GLUTEN_LOAD_LIB_OS, GLUTEN_LOAD_LIB_OS_VERSION}
+import org.apache.gluten.spi.SharedLibraryLoaderAmazonLinux2023
 
 import org.apache.spark.SparkConf
 
 import org.scalatest.funsuite.AnyFunSuite
 
 class SharedLibraryLoaderUtilsSuite extends AnyFunSuite {
+
+  test("Recognize Amazon Linux 2023 native bundle target") {
+    val loader = new SharedLibraryLoaderAmazonLinux2023
+    assert(loader.accepts("Amazon Linux", "2023"))
+    assert(loader.accepts("Amazon Linux", "2023.7"))
+    assert(!loader.accepts("Amazon Linux", "2"))
+    assert(!loader.accepts("Ubuntu", "24.04"))
+  }
 
   test("Load SharedLibraryLoader with SPI") {
     val sparkConf = new SparkConf()

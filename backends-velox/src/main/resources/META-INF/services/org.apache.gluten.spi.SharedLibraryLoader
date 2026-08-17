@@ -18,6 +18,7 @@
 org.apache.gluten.spi.SharedLibraryLoaderCentos7
 org.apache.gluten.spi.SharedLibraryLoaderCentos8
 org.apache.gluten.spi.SharedLibraryLoaderCentos9
+org.apache.gluten.spi.SharedLibraryLoaderAmazonLinux2023
 org.apache.gluten.spi.SharedLibraryLoaderDebian11
 org.apache.gluten.spi.SharedLibraryLoaderDebian12
 org.apache.gluten.spi.SharedLibraryLoaderMacOS
