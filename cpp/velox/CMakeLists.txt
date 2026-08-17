@@ -114,6 +114,14 @@ macro(find_re2)
 endmacro()
 
 macro(find_awssdk)
+  # Prefer the installed CURL package so AWS SDK imported targets can resolve
+  # the exact CURL target name recorded by that package. Fall back to CMake's
+  # module for environments that do not install a CURL package config.
+  find_package(ZLIB REQUIRED)
+  find_package(CURL CONFIG QUIET)
+  if(NOT TARGET CURL::libcurl)
+    find_package(CURL MODULE REQUIRED)
+  endif()
   find_package(AWSSDK REQUIRED COMPONENTS s3;identity-management;s3-crt)
 endmacro()
 
@@ -205,10 +213,6 @@ set(VELOX_SRCS
 # where that overload is absent.
 if(NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
   list(APPEND VELOX_SRCS utils/GccFloat128ToCharsShim.cc)
-endif()
-
-if(ENABLE_S3)
-  find_package(ZLIB)
 endif()
 
 if(ENABLE_GPU)

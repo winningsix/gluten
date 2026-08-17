@@ -24,6 +24,16 @@ VELOX_ARROW_BUILD_VERSION=15.0.0
 ARROW_PREFIX=$CURRENT_DIR/../ep/_ep/arrow_ep
 BUILD_TYPE=Release
 INSTALL_PREFIX=${INSTALL_PREFIX:-"/usr/local"}
+BUILD_ARROW_JAVA=${BUILD_ARROW_JAVA:-"ON"}
+
+case "${BUILD_ARROW_JAVA}" in
+  ON|OFF)
+    ;;
+  *)
+    echo "BUILD_ARROW_JAVA must be ON or OFF, got: ${BUILD_ARROW_JAVA}" >&2
+    exit 1
+    ;;
+esac
 
 function prepare_arrow_build() {
   mkdir -p ${ARROW_PREFIX}/../ && pushd ${ARROW_PREFIX}/../ && ${SUDO} rm -rf arrow_ep/
@@ -124,5 +134,9 @@ echo "Start to build Arrow"
 prepare_arrow_build
 build_arrow_cpp
 echo "Finished building arrow CPP"
-build_arrow_java
-echo "Finished building arrow Java"
+if [[ "${BUILD_ARROW_JAVA}" == "ON" ]]; then
+  build_arrow_java
+  echo "Finished building arrow Java"
+else
+  echo "Skipped building arrow Java"
+fi
