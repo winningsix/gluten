@@ -542,7 +542,47 @@ TEST_F(VeloxSubstraitRoundTripTest, avgCompanion) {
                   .singleAggregation({}, {"avg_merge_extract_double(a0)"})
                   .planNode();
 
-  assertPlanConversion(plan, "SELECT avg(c4) FROM tmp");
+  assertQuery(plan, "SELECT avg(c4) FROM tmp");
+
+  google::protobuf::Arena arena;
+  auto& substraitPlan = veloxConvertor_->toSubstrait(arena, plan);
+  auto* finalMeasure = substraitPlan.mutable_relations(0)
+                           ->mutable_root()
+                           ->mutable_input()
+                           ->mutable_aggregate()
+                           ->mutable_measures(0)
+                           ->mutable_measure();
+  finalMeasure->set_phase(::substrait::AGGREGATION_PHASE_INTERMEDIATE_TO_RESULT);
+
+  bool foundFunction = false;
+  for (auto& extension : *substraitPlan.mutable_extensions()) {
+    if (extension.has_extension_function() &&
+        extension.extension_function().function_anchor() == finalMeasure->function_reference()) {
+      extension.mutable_extension_function()->set_name("avg:struct<fp64,i64>");
+      foundFunction = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(foundFunction);
+
+  auto veloxCfg = std::make_shared<facebook::velox::config::ConfigBase>(std::unordered_map<std::string, std::string>());
+  auto substraitConverter = std::make_shared<SubstraitToVeloxPlanConverter>(
+      pool_.get(), veloxCfg.get(), std::vector<std::shared_ptr<ResultIterator>>(), std::nullopt, std::nullopt, true);
+  auto convertedPlan = substraitConverter->toVeloxPlan(substraitPlan);
+
+  auto finalAggregation = std::dynamic_pointer_cast<const core::AggregationNode>(convertedPlan);
+  ASSERT_NE(finalAggregation, nullptr);
+  ASSERT_EQ(finalAggregation->step(), core::AggregationNode::Step::kFinal);
+  ASSERT_EQ(finalAggregation->aggregates().size(), 1);
+  const auto& aggregate = finalAggregation->aggregates()[0];
+  EXPECT_EQ(aggregate.call->name(), "avg_merge_extract_DOUBLE");
+  ASSERT_EQ(aggregate.call->inputs().size(), 1);
+  const auto& rawInputTypes = aggregate.rawInputTypes;
+  ASSERT_EQ(rawInputTypes.size(), 1);
+  EXPECT_TRUE(rawInputTypes[0]->equivalent(*ROW({DOUBLE(), BIGINT()})));
+  EXPECT_TRUE(rawInputTypes[0]->equivalent(*aggregate.call->inputs()[0]->type()));
+
+  assertQuery(convertedPlan, "SELECT avg(c4) FROM tmp");
 }
 
 } // namespace gluten

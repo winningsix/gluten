@@ -95,24 +95,6 @@ core::TopNRowNumberNode::RankFunction windowGroupLimitRankFunction(
   return core::TopNRowNumberNode::rankFunctionFromName(functionName);
 }
 
-std::vector<TypePtr> toVeloxAggregateRawInputTypes(
-    const std::string& baseFuncName,
-    const core::AggregationNode::Step funcStep,
-    const std::vector<TypePtr>& functionSignatureTypes) {
-  if ((funcStep == core::AggregationNode::Step::kFinal ||
-       funcStep == core::AggregationNode::Step::kIntermediate) &&
-      baseFuncName == "avg" && functionSignatureTypes.size() == 1 &&
-      functionSignatureTypes[0]->isRow()) {
-    const auto& stateType = functionSignatureTypes[0]->asRow();
-    if (stateType.size() == 2 && stateType.childAt(0)->isDouble() &&
-        stateType.childAt(1)->isBigint()) {
-      return {DOUBLE()};
-    }
-  }
-
-  return functionSignatureTypes;
-}
-
 /// Holds the information required to create
 /// a project node to simulate the emit
 /// behavior in Substrait.
@@ -618,10 +600,8 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
     auto funcName = toAggregationFunctionName(baseFuncName, funcStep, aggVeloxType);
 
     auto aggExpr = std::make_shared<const core::CallTypedExpr>(aggVeloxType, std::move(aggParams), funcName);
-    auto functionSignatureTypes =
-        SubstraitParser::sigToTypes(SubstraitParser::findFunctionSpec(functionMap_, aggFunction.function_reference()));
     std::vector<TypePtr> rawInputTypes =
-        toVeloxAggregateRawInputTypes(baseFuncName, funcStep, functionSignatureTypes);
+        SubstraitParser::sigToTypes(SubstraitParser::findFunctionSpec(functionMap_, aggFunction.function_reference()));
     aggregates.emplace_back(core::AggregationNode::Aggregate{aggExpr, rawInputTypes, mask, {}, {}});
   }
 
