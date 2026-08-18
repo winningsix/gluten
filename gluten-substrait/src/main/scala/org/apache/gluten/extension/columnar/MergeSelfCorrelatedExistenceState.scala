@@ -21,7 +21,7 @@ import org.apache.gluten.config.GlutenConfig
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.analysis.MultiInstanceRelation
-import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, AttributeReference, AttributeSet, EqualTo, Exists, Expression, ExprId, If, Literal, MonotonicallyIncreasingID, NamedExpression, Not, PredicateHelper}
+import org.apache.spark.sql.catalyst.expressions.{Alias, And, Attribute, AttributeReference, AttributeSet, EqualTo, Exists, Expression, ExprId, If, IsNotNull, Literal, MonotonicallyIncreasingID, NamedExpression, Not, PredicateHelper}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Max, Min}
 import org.apache.spark.sql.catalyst.optimizer.ColumnPruning
 import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, Inner, LeftAnti, LeftSemi}
@@ -823,9 +823,8 @@ case class MergeSelfCorrelatedExistenceState(spark: SparkSession)
       return None
     }
 
-    // Start with the strict, high-value case: the positive EXISTS ranges over the entire source.
-    // This is also what makes a single source scan sufficient.
-    if (allView.sourcePredicates.nonEmpty || delayedView.sourcePredicates.isEmpty) {
+    // The delayed branch must provide the predicate used by the conditional MIN/MAX state.
+    if (delayedView.sourcePredicates.isEmpty) {
       return None
     }
 
@@ -847,6 +846,20 @@ case class MergeSelfCorrelatedExistenceState(spark: SparkSession)
       candidateView.sourceOrdinal(antiKeys.leftNotEqual).getOrElse(return None)
     val delayedValueOrdinal =
       delayedView.sourceOrdinal(antiKeys.rightNotEqual).getOrElse(return None)
+
+    // The positive EXISTS must range over the entire join-visible source. Spark may push
+    // IsNotNull guards for the equality and not-equality keys into a Parquet scan; those guards are
+    // implied by SQL join comparison semantics and therefore do not narrow the set of possible
+    // matches. Reject every other source predicate so the single shared scan remains sound.
+    val allJoinVisibleOrdinals = allKeyOrdinals.toSet + allValueOrdinal
+    val allPredicatesAreJoinImpliedNotNulls = allView.sourcePredicates.forall {
+      case IsNotNull(attribute: Attribute) =>
+        allView.sourceOrdinal(attribute).exists(allJoinVisibleOrdinals.contains)
+      case _ => false
+    }
+    if (!allPredicatesAreJoinImpliedNotNulls) {
+      return None
+    }
 
     if (
       candidateKeyOrdinals.isEmpty || candidateKeyOrdinals.distinct.length !=
@@ -1212,6 +1225,8 @@ case class PruneCandidateFirstExistenceColumns(spark: SparkSession) extends Rule
 
 object MergeSelfCorrelatedExistenceState {
 
+  import RewriteExistenceJoinRhsDedup.LateFallback
+
   val CandidateFirstExistenceAttributePrefix: String = "_gluten_candidate_first_exists_"
   val RestrictedCandidateKeyAttributePrefix: String = "_gluten_restricted_candidate_key_"
 
@@ -1249,7 +1264,7 @@ object MergeSelfCorrelatedExistenceState {
         insertion,
         Seq(
           MergeSelfCorrelatedExistenceState(spark),
-          RewriteExistenceJoinRhsDedup(spark),
+          RewriteExistenceJoinRhsDedup(spark, LateFallback),
           PruneCandidateFirstExistenceColumns(spark),
           EliminateRedundantSelfAggregateJoin(spark)
         ),

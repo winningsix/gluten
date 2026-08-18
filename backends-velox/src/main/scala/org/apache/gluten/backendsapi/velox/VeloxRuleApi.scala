@@ -56,6 +56,8 @@ class VeloxRuleApi extends RuleApi {
 
 object VeloxRuleApi {
 
+  import RewriteExistenceJoinRhsDedup.PreservePairedSpines
+
   /**
    * Registers Spark rules or extensions, except for Gluten's columnar rules that are supposed to be
    * injected through [[injectLegacy]] / [[injectRas]].
@@ -71,8 +73,8 @@ object VeloxRuleApi {
     injector.injectPostHocResolutionRule(RegisterFluxExistencePostSubqueryRules.apply)
     injector.injectOptimizerRule(MergeSelfCorrelatedExistenceState.apply)
     injector.injectPreCBORule(MergeSelfCorrelatedExistenceState.apply)
-    injector.injectOptimizerRule(RewriteExistenceJoinRhsDedup.apply)
-    injector.injectPreCBORule(RewriteExistenceJoinRhsDedup.apply)
+    injector.injectOptimizerRule(spark => RewriteExistenceJoinRhsDedup(spark, PreservePairedSpines))
+    injector.injectPreCBORule(spark => RewriteExistenceJoinRhsDedup(spark, PreservePairedSpines))
     // If a branch already computed one SUM per key from a fact source, reuse that summary when
     // the parent joins the same source on the same key only to SUM the same value again.
     injector.injectOptimizerRule(EliminateRedundantSelfAggregateJoin.apply)

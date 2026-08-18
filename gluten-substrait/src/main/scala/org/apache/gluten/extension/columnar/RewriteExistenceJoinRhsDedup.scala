@@ -41,10 +41,20 @@ import org.apache.spark.sql.catalyst.rules.Rule
  * registration-only post-hoc rule installs it in User Provided Optimizers before the first query,
  * providing post-RewriteSubquery coverage without transforming an analyzer plan.
  */
-case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
+object RewriteExistenceJoinRhsDedup {
+  sealed trait Mode
+  case object PreservePairedSpines extends Mode
+  case object LateFallback extends Mode
+}
+
+case class RewriteExistenceJoinRhsDedup(
+    spark: SparkSession,
+    mode: RewriteExistenceJoinRhsDedup.Mode)
   extends Rule[LogicalPlan]
   with PredicateHelper
   with Logging {
+
+  import RewriteExistenceJoinRhsDedup._
 
   private case class EqualityKey(left: Expression, right: Attribute)
   private case class NotEqualKey(left: Expression, right: Attribute)
@@ -62,7 +72,10 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
         // single-state rule can inspect both joins together. If its proof fails, this rule still
         // sees and summarizes the resulting individual LeftSemi / LeftAnti joins in the later
         // User Provided Optimizers pass.
-        if (MergeSelfCorrelatedExistenceState.hasPotentialPairedExistence(condition)) {
+        if (
+          mode == PreservePairedSpines &&
+          MergeSelfCorrelatedExistenceState.hasPotentialPairedExistence(condition)
+        ) {
           Filter(condition, child)
         } else {
           Filter(rewriteExistsExpression(condition), child)
@@ -72,13 +85,54 @@ case class RewriteExistenceJoinRhsDedup(spark: SparkSession)
       return rewrittenSubqueries
     }
 
-    rewrittenSubqueries.transformUp {
+    mode match {
+      case PreservePairedSpines => rewriteJoinsPreservingPairedSpines(rewrittenSubqueries)
+      case LateFallback => rewriteAllJoins(rewrittenSubqueries)
+    }
+  }
+
+  private def rewriteAllJoins(plan: LogicalPlan): LogicalPlan = {
+    plan.transformUp {
       case join @ Join(_, right, joinType, Some(condition), _)
           if isExistenceJoin(joinType) && !isCandidateFirstExistenceJoin(joinType) &&
             condition.deterministic =>
         rewriteJoin(join, right, condition)
           .getOrElse(join)
     }
+  }
+
+  /**
+   * Preserve a materialized LeftSemi + LeftAnti spine for the strict paired-state rule while still
+   * rewriting independent existence joins below it. Matching and traversal are structural: no Join
+   * object identity survives optimizer tree copies reliably.
+   */
+  private def rewriteJoinsPreservingPairedSpines(plan: LogicalPlan): LogicalPlan = {
+    plan match {
+      case anti @ Join(
+            semi @ Join(candidate, allRhs, LeftSemi, Some(_), _),
+            delayedRhs,
+            LeftAnti,
+            Some(_),
+            _) =>
+        anti.copy(
+          left = semi.copy(
+            left = rewriteJoinsPreservingPairedSpines(candidate),
+            right = rewriteJoinsPreservingPairedSpines(allRhs)),
+          right = rewriteJoinsPreservingPairedSpines(delayedRhs)
+        )
+
+      case current =>
+        val withRewrittenChildren = current.mapChildren(rewriteJoinsPreservingPairedSpines)
+        rewriteCurrentJoin(withRewrittenChildren)
+    }
+  }
+
+  private def rewriteCurrentJoin(plan: LogicalPlan): LogicalPlan = plan match {
+    case join @ Join(_, right, joinType, Some(condition), _)
+        if isExistenceJoin(joinType) && !isCandidateFirstExistenceJoin(joinType) &&
+          condition.deterministic =>
+      rewriteJoin(join, right, condition).getOrElse(join)
+    case _ => plan
   }
 
   private def isExistenceJoin(joinType: org.apache.spark.sql.catalyst.plans.JoinType): Boolean = {

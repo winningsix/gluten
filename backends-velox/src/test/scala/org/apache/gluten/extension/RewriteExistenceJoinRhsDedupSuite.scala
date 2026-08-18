@@ -18,6 +18,7 @@ package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.extension.columnar.{RegisterFluxExistencePostSubqueryRules, RewriteExistenceJoinRhsDedup}
+import org.apache.gluten.extension.columnar.RewriteExistenceJoinRhsDedup.LateFallback
 
 import org.apache.spark.sql.{QueryTest, Row}
 import org.apache.spark.sql.catalyst.plans.{LeftAnti, LeftSemi}
@@ -101,7 +102,7 @@ class RewriteExistenceJoinRhsDedupSuite extends QueryTest with SharedSparkSessio
   }
 
   private def rewrite(plan: LogicalPlan): LogicalPlan = {
-    RewriteExistenceJoinRhsDedup(spark).apply(plan)
+    RewriteExistenceJoinRhsDedup(spark, LateFallback).apply(plan)
   }
 
   test("registration-only analyzer pass installs post-subquery optimizer rule") {

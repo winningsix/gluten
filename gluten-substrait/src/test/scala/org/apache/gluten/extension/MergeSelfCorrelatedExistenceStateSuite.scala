@@ -18,12 +18,13 @@ package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.extension.columnar.{MergeSelfCorrelatedExistenceState, RegisterFluxExistencePostSubqueryRules, RewriteExistenceJoinRhsDedup}
+import org.apache.gluten.extension.columnar.RewriteExistenceJoinRhsDedup.{LateFallback, PreservePairedSpines}
 
 import org.apache.spark.sql.{QueryTest, Row}
-import org.apache.spark.sql.catalyst.expressions.{And, AttributeReference, EqualTo, Not}
+import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeReference, EqualTo, GreaterThan, IsNotNull, Literal, Not}
 import org.apache.spark.sql.catalyst.optimizer.ConvertToLocalRelation
 import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, LeftAnti, LeftSemi}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, BROADCAST, HintInfo, Join, JoinHint, LocalRelation, LogicalPlan}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, BROADCAST, Filter, HintInfo, Join, JoinHint, LocalRelation, LogicalPlan}
 import org.apache.spark.sql.classic.ClassicDataset
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
@@ -165,6 +166,22 @@ class MergeSelfCorrelatedExistenceStateSuite extends QueryTest with SharedSparkS
     }.size
   }
 
+  private def summarizedExistenceJoinCount(plan: LogicalPlan): Int = {
+    plan.collect {
+      case Join(_, right, LeftSemi | LeftAnti, _, _) if right.exists(_.isInstanceOf[Aggregate]) =>
+        true
+    }.size
+  }
+
+  private def restrictedRowStateAggregateCount(plan: LogicalPlan): Int = {
+    plan.collect {
+      case aggregate: Aggregate
+          if aggregate.aggregateExpressions.exists(
+            _.name.startsWith("_restricted_row_existence_")) =>
+        aggregate
+    }.size
+  }
+
   private def candidateFirstExistenceJoins(plan: LogicalPlan): Seq[Join] = {
     plan.collect {
       case join @ Join(_, _, ExistenceJoin(exists), _, _)
@@ -212,12 +229,51 @@ class MergeSelfCorrelatedExistenceStateSuite extends QueryTest with SharedSparkS
     assert(rewrittenAgain.output.map(_.exprId) == raw.output.map(_.exprId))
   }
 
+  test("positive source accepts only join-implied IsNotNull scan predicates") {
+    createCanonicalView()
+    val raw = rawOptimizedPlan(canonicalSql)
+
+    def withPositiveRhsPredicate(
+        buildPredicate: Seq[Attribute] => org.apache.spark.sql.catalyst.expressions.Expression)
+        : LogicalPlan = {
+      var injected = false
+      val updated = raw.transformUp {
+        case join @ Join(_, right, LeftSemi, Some(condition), _) if !injected =>
+          val rightReferences = condition.references.toSeq.filter(right.outputSet.contains)
+          assert(rightReferences.size == 2, s"Expected equality and value RHS keys:\n$join")
+          injected = true
+          join.copy(right = Filter(buildPredicate(rightReferences), right))
+      }
+      assert(injected)
+      updated
+    }
+
+    val withNullGuards = withPositiveRhsPredicate {
+      attributes => attributes.map(IsNotNull).reduce(And)
+    }
+    val rewrittenNullGuards = rewrite(withNullGuards)
+    assert(
+      pairedStateAggregateCount(rewrittenNullGuards) == 1,
+      s"Join-implied null guards must preserve the paired rewrite:\n" +
+        rewrittenNullGuards.treeString)
+
+    val withNarrowingPredicate = withPositiveRhsPredicate {
+      attributes => GreaterThan(attributes.last, Literal(0))
+    }
+    val rejected = rewrite(withNarrowingPredicate)
+    assert(
+      pairedStateAggregateCount(rejected) == 0 && existenceJoinCount(rejected) == 2,
+      s"A narrowing positive-source predicate must reject the paired rewrite:\n" +
+        rejected.treeString
+    )
+  }
+
   test("generic existence dedup does not re-aggregate the paired state") {
     createCanonicalView()
     val rewritten = rewrite(rawOptimizedPlan(canonicalSql))
     val afterGenericDedup =
       withConfigValues(GlutenConfig.ENABLE_EXISTENCE_JOIN_RHS_DEDUP.key -> "true") {
-        RewriteExistenceJoinRhsDedup(spark).apply(rewritten)
+        RewriteExistenceJoinRhsDedup(spark, LateFallback).apply(rewritten)
       }
 
     assert(
@@ -226,6 +282,95 @@ class MergeSelfCorrelatedExistenceStateSuite extends QueryTest with SharedSparkS
         afterGenericDedup.treeString)
     assert(pairedStateAggregateCount(afterGenericDedup) == 1)
     assert(pairedStateSemiJoinCount(afterGenericDedup) == 1)
+  }
+
+  test("generic existence dedup preserves a raw pair for the ordered merge pass") {
+    createCanonicalView()
+    val raw = rawOptimizedPlan(canonicalSql)
+    val afterEarlyDedup =
+      withConfigValues(GlutenConfig.ENABLE_EXISTENCE_JOIN_RHS_DEDUP.key -> "true") {
+        RewriteExistenceJoinRhsDedup(spark, PreservePairedSpines).apply(raw)
+      }
+
+    assert(
+      afterEarlyDedup.fastEquals(raw),
+      s"An early dedup pass must not consume either half of a paired spine:\n" +
+        afterEarlyDedup.treeString)
+    assert(existenceJoinCount(afterEarlyDedup) == 2)
+  }
+
+  test("ordered merge rejection reaches late per-join fallback") {
+    createCanonicalView()
+    val raw = rawOptimizedPlan(canonicalSql)
+    var hinted = false
+    val withHint = raw.transformUp {
+      case join @ Join(_, _, LeftSemi, _, JoinHint.NONE) if !hinted =>
+        hinted = true
+        join.copy(hint = JoinHint(None, Some(HintInfo(strategy = Some(BROADCAST)))))
+    }
+    assert(hinted)
+
+    val afterEarlyDedup =
+      withConfigValues(GlutenConfig.ENABLE_EXISTENCE_JOIN_RHS_DEDUP.key -> "true") {
+        RewriteExistenceJoinRhsDedup(spark, PreservePairedSpines).apply(withHint)
+      }
+    val afterRejectedMerge = rewrite(afterEarlyDedup)
+    val afterLateFallback =
+      withConfigValues(GlutenConfig.ENABLE_EXISTENCE_JOIN_RHS_DEDUP.key -> "true") {
+        RewriteExistenceJoinRhsDedup(spark, LateFallback).apply(afterRejectedMerge)
+      }
+
+    assert(afterEarlyDedup.fastEquals(withHint))
+    assert(afterRejectedMerge.fastEquals(afterEarlyDedup))
+    assert(
+      summarizedExistenceJoinCount(afterLateFallback) == 2,
+      s"Both joins rejected by the paired merge must reach late RHS dedup:\n" +
+        afterLateFallback.treeString
+    )
+    assert(
+      afterLateFallback.collect {
+        case Join(_, _, LeftSemi, _, hint) if hint != JoinHint.NONE => hint
+      }.nonEmpty,
+      s"Late fallback must retain the original join hint:\n${afterLateFallback.treeString}"
+    )
+  }
+
+  test("restricted-rowid production ordering consumes the preserved canonical pair") {
+    createCanonicalView()
+    val raw = rawOptimizedPlan(canonicalSql)
+    val afterEarlyDedup =
+      withConfigValues(GlutenConfig.ENABLE_EXISTENCE_JOIN_RHS_DEDUP.key -> "true") {
+        RewriteExistenceJoinRhsDedup(spark, PreservePairedSpines).apply(raw)
+      }
+    val afterMerge = withConfigValues(
+      GlutenConfig.MERGE_PAIRED_EXISTENCE_STATE_ENABLED.key -> "true",
+      GlutenConfig.MERGE_PAIRED_EXISTENCE_STATE_MIN_SOURCE_BYTES.key -> "0",
+      GlutenConfig.MERGE_PAIRED_EXISTENCE_STATE_MIN_SCAN_REDUCTION_RATIO.key -> "1.5",
+      GlutenConfig.CANDIDATE_FIRST_EXISTENCE_MODE.key -> "restricted-rowid"
+    ) {
+      MergeSelfCorrelatedExistenceState(spark).apply(afterEarlyDedup)
+    }
+    val afterLateFallback =
+      withConfigValues(GlutenConfig.ENABLE_EXISTENCE_JOIN_RHS_DEDUP.key -> "true") {
+        RewriteExistenceJoinRhsDedup(spark, LateFallback).apply(afterMerge)
+      }
+    val baseline = withConfigValues(
+      GlutenConfig.MERGE_PAIRED_EXISTENCE_STATE_ENABLED.key -> "false",
+      GlutenConfig.ENABLE_EXISTENCE_JOIN_RHS_DEDUP.key -> "false") {
+      spark.sql(canonicalSql).collect().toSeq
+    }
+
+    assert(afterEarlyDedup.fastEquals(raw))
+    assert(
+      restrictedRowStateAggregateCount(afterMerge) == 1 && existenceJoinCount(afterMerge) == 0,
+      s"restricted-rowid must consume the preserved pair:\n${afterMerge.treeString}"
+    )
+    assert(
+      afterLateFallback.fastEquals(afterMerge),
+      s"Late fallback must leave the restricted-rowid result intact:\n" +
+        afterLateFallback.treeString)
+    assert(afterMerge.output.map(_.exprId) == raw.output.map(_.exprId))
+    checkAnswer(ClassicDataset.ofRows(spark, afterLateFallback), baseline)
   }
 
   test("forced candidate-first uses private existence columns and preserves answers") {
@@ -249,7 +394,7 @@ class MergeSelfCorrelatedExistenceStateSuite extends QueryTest with SharedSparkS
 
     val afterGenericDedup =
       withConfigValues(GlutenConfig.ENABLE_EXISTENCE_JOIN_RHS_DEDUP.key -> "true") {
-        RewriteExistenceJoinRhsDedup(spark).apply(rewritten)
+        RewriteExistenceJoinRhsDedup(spark, LateFallback).apply(rewritten)
       }
     assert(
       afterGenericDedup.fastEquals(rewritten),
@@ -515,6 +660,11 @@ class MergeSelfCorrelatedExistenceStateSuite extends QueryTest with SharedSparkS
       val dedupIndex =
         experimental.extraOptimizations.indexWhere(_.isInstanceOf[RewriteExistenceJoinRhsDedup])
       assert(mergeIndex >= 0 && dedupIndex >= 0 && mergeIndex < dedupIndex)
+      assert(
+        experimental
+          .extraOptimizations(dedupIndex)
+          .asInstanceOf[RewriteExistenceJoinRhsDedup]
+          .mode == LateFallback)
       val optimized = withConfigValues(
         GlutenConfig.MERGE_PAIRED_EXISTENCE_STATE_ENABLED.key -> "true",
         GlutenConfig.ENABLE_EXISTENCE_JOIN_RHS_DEDUP.key -> "true",
