@@ -61,7 +61,19 @@ trait ColumnarShuffledJoin extends BaseJoinExec {
 
   override def outputPartitioning: Partitioning = joinType match {
     case _: InnerLike =>
-      PartitioningCollection(Seq(left.outputPartitioning, right.outputPartitioning))
+      val leftPartitioning = left.outputPartitioning
+      val rightPartitioning = right.outputPartitioning
+      if (leftPartitioning.numPartitions == rightPartitioning.numPartitions) {
+        PartitioningCollection(Seq(leftPartitioning, rightPartitioning))
+      } else {
+        // Cross-cut rules may inspect a transient join after inserting an exchange on one side
+        // but before distribution requirements reconcile the other. Spark 4.0.2-amzn rejects a
+        // mixed-size PartitioningCollection at construction time. Report the transient state
+        // conservatively so EnsureRequirements can add the real exchange instead of aborting
+        // planning or trusting a false partitioning claim.
+        UnknownPartitioning(
+          math.max(leftPartitioning.numPartitions, rightPartitioning.numPartitions))
+      }
     case LeftOuter => left.outputPartitioning
     // LeftSingle (Spark 4.0+) has same partitioning as LeftOuter
     case leftSingle if SparkShimLoader.getSparkShims.isLeftSingleJoinType(leftSingle) =>

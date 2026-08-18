@@ -23,7 +23,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference}
 import org.apache.spark.sql.catalyst.optimizer.BuildRight
 import org.apache.spark.sql.catalyst.plans.Inner
-import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, SinglePartition}
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, SinglePartition, UnknownPartitioning}
 import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarShuffleExchangeExec, InputIteratorTransformer, LeafExecNode}
 import org.apache.spark.sql.execution.exchange.ENSURE_REQUIREMENTS
 import org.apache.spark.sql.internal.SQLConf
@@ -112,7 +112,7 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
         .contains("fragment 9 has non-positive inbound partition counts [E5=0]"))
   }
 
-  test("uses finalized topology without reading asymmetric Catalyst metadata") {
+  test("reports asymmetric Catalyst join metadata conservatively") {
     val left = PartitionedLeaf(
       Seq(AttributeReference("left_key", LongType, nullable = false)()),
       numPartitions = 200)
@@ -132,7 +132,7 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
     val exec = FluxNativeQueryExec(join, fragments = Seq.empty, exchanges = Seq.empty)
 
     assert(exec.fragmentDriverPartitionCountForTests(join, Some(4)) === 4)
-    intercept[IllegalArgumentException](join.outputPartitioning)
+    assert(join.outputPartitioning === UnknownPartitioning(200))
   }
 
   test("caps 200/4 HASH fan-in before topology-first driver planning") {
