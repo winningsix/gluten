@@ -107,7 +107,7 @@ jobs:
           export SPARK_HOME=/opt/shims/spark34/spark_home/
           ls -l $SPARK_HOME
           $MVN_CMD clean test -Pspark-3.4 -Pjava-17 -Pbackends-velox -Piceberg -Piceberg-test -Pdelta -Phudi \
-          -DtagsToExclude=org.apache.spark.tags.ExtendedSQLTest,org.apache.gluten.tags.UDFTest,org.apache.gluten.tags.SkipTest \
+          -DtagsToExclude=org.apache.spark.tags.ExtendedSQLTest,org.apache.gluten.tags.UDFTest,org.apache.gluten.tags.SkipTest,org.apache.gluten.tags.GpuTest,org.apache.gluten.tags.FluxTest \
           -DargLine="-Dspark.test.home=$SPARK_HOME"
       - name: Upload test report
         if: always()
@@ -165,7 +165,7 @@ jobs:
           export SPARK_HOME=/opt/shims/spark35/spark_home/
           ls -l $SPARK_HOME
           $MVN_CMD clean test -Pspark-3.5 -Pjava-17 -Pbackends-velox -Piceberg -Pdelta -Phudi \
-          -DtagsToExclude=org.apache.spark.tags.ExtendedSQLTest,org.apache.gluten.tags.UDFTest,org.apache.gluten.tags.SkipTest \
+          -DtagsToExclude=org.apache.spark.tags.ExtendedSQLTest,org.apache.gluten.tags.UDFTest,org.apache.gluten.tags.SkipTest,org.apache.gluten.tags.GpuTest,org.apache.gluten.tags.FluxTest \
           -DargLine="-Dspark.test.home=$SPARK_HOME"
       - name: Upload test report
         if: always()

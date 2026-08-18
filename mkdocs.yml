@@ -29,6 +29,7 @@ nav:
 - ApacheArrowInstallation: ApacheArrowInstallation.md
 - OAP Installation Guide: OAP-Installation-Guide.md
 - OAP Developer Guide: OAP-Developer-Guide.md
+- GPU Test Harness: gpu-test-harness.md
 - Version Selector: "../"
 
 
