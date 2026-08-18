@@ -116,6 +116,11 @@ int envIntOrDefault(const char* name, int defaultValue) {
   return static_cast<int>(parsed);
 }
 
+bool envFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && (std::string_view(value) == "1" || std::string_view(value) == "true");
+}
+
 void removeTaskOutputState(
     const std::shared_ptr<Task>& task,
     const std::shared_ptr<DefaultOutputBufferManager>& bufferManager,
@@ -1077,6 +1082,49 @@ void FluxQueryCoordinator::start() {
   // data is being transferred. Bootstrap those small broadcast chains first,
   // then release the bulk scans. This preserves all producer endpoints and
   // partition ownership; it only changes split delivery order.
+#ifdef GLUTEN_ENABLE_GPU
+  // The complete per-peer assignment is already known here. Publish its size
+  // before entering the per-split registration loop so adaptive readers never
+  // wait behind that loop merely to classify the query.
+  uint64_t expectedRegularCudfS3Splits{0};
+  for (const auto& spec : fragmentSpecs_) {
+    if (fragmentTasks_[spec.id].empty()) {
+      continue;
+    }
+    for (size_t i = 0; i < spec.scanNodeIds.size(); ++i) {
+      const auto& scanInfo = spec.scanInfos[i];
+      const auto& connectorId = (i < spec.scanConnectorIds.size() && !spec.scanConnectorIds[i].empty())
+          ? spec.scanConnectorIds[i]
+          : kHiveConnectorId;
+      if (connectorId != kCudfHiveConnectorId || !scanInfo->canUseCudfConnector()) {
+        continue;
+      }
+      for (size_t j = 0; j < scanInfo->paths.size(); ++j) {
+        if (scanSplitOwners.at(scanInfo.get())[j] != peerIndex_) {
+          continue;
+        }
+        const auto path = cleanedCudfPath(scanInfo->paths[j]);
+        if (path.starts_with("s3://") && j < scanInfo->properties.size() && scanInfo->properties[j].has_value() &&
+            scanInfo->properties[j]->fileSize.has_value()) {
+          ++expectedRegularCudfS3Splits;
+        }
+      }
+    }
+  }
+  if (expectedRegularCudfS3Splits > 0 && queryCtx_->executor() != nullptr) {
+    const auto defaultMinRegisteredSplits = envFlagEnabled("GLUTEN_CUDF_S3_ADAPTIVE_PREFETCH") ? 600 : 0;
+    const auto minRegisteredSplits = std::max(
+        0,
+        envIntOrDefault(
+            "GLUTEN_CUDF_CACHE_HINT_FIRST_LOAD_GROUP_READY_MIN_QUERY_REGISTERED_SPLITS", defaultMinRegisteredSplits));
+    cudf_velox::connector::hive::ExecutorSplitPrefetch::setExpectedSplitCount(
+        queryCtx_->executor(),
+        queryCtx_->queryId(),
+        expectedRegularCudfS3Splits,
+        static_cast<uint64_t>(minRegisteredSplits));
+  }
+#endif
+
   std::vector<bool> scanSplitsWired(fragmentSpecs_.size(), false);
   std::vector<bool> exchangeWired(exchangeSpecs_.size(), false);
 

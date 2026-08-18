@@ -18,6 +18,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
+#include <string_view>
 
 #include "VeloxBackend.h"
 
@@ -208,17 +209,13 @@ void VeloxBackend::init(
 
 #ifdef GLUTEN_ENABLE_GPU
   if (backendConf_->get<bool>(kCudfEnabled, kCudfEnabledDefault)) {
-    const auto fluxEnabled = backendConf_->get<bool>(
-        "spark.gluten.mpp.enabled", false);
-    const auto& orderBySortedRunBytesDefault = fluxEnabled
-        ? kCudfOrderBySortedRunBytesFluxDefault
-        : kCudfOrderBySortedRunBytesDefault;
-    const auto& orderByOutputChunkBytesDefault = fluxEnabled
-        ? kCudfOrderByOutputChunkBytesFluxDefault
-        : kCudfOrderByOutputChunkBytesDefault;
-    const auto& orderByMaxOutputRowsDefault = fluxEnabled
-        ? kCudfOrderByMaxOutputRowsFluxDefault
-        : kCudfOrderByMaxOutputRowsDefault;
+    const auto fluxEnabled = backendConf_->get<bool>("spark.gluten.mpp.enabled", false);
+    const auto& orderBySortedRunBytesDefault =
+        fluxEnabled ? kCudfOrderBySortedRunBytesFluxDefault : kCudfOrderBySortedRunBytesDefault;
+    const auto& orderByOutputChunkBytesDefault =
+        fluxEnabled ? kCudfOrderByOutputChunkBytesFluxDefault : kCudfOrderByOutputChunkBytesDefault;
+    const auto& orderByMaxOutputRowsDefault =
+        fluxEnabled ? kCudfOrderByMaxOutputRowsFluxDefault : kCudfOrderByMaxOutputRowsDefault;
     std::unordered_map<std::string, std::string> options = {
         {velox::cudf_velox::CudfConfig::kCudfEnabled, "true"},
         {velox::cudf_velox::CudfConfig::kCudfDebugEnabled, backendConf_->get(kDebugCudf, kDebugCudfDefault)},
@@ -303,9 +300,7 @@ void VeloxBackend::init(
         // Wide exchange inputs can exhaust the device before reaching the row
         // target. Keep the default large enough to avoid excessive UCX batches.
         {velox::cudf_velox::CudfConfig::kCudfExchangeBatchSizeMinThresholdBytes,
-         backendConf_->get(
-             kCudfExchangeBatchSizeMinThresholdBytes,
-             kCudfExchangeBatchSizeMinThresholdBytesDefault)},
+         backendConf_->get(kCudfExchangeBatchSizeMinThresholdBytes, kCudfExchangeBatchSizeMinThresholdBytesDefault)},
         // Keep the new bounded external-sort implementation. FLUX uses the
         // previously validated 3 GiB run/output bounds so 30 TB Q2/Q11 do not
         // spill or split already materialized local sorts into thousands of
@@ -406,6 +401,19 @@ void VeloxBackend::init(
   // after the memory manager instanced
   initCache();
 
+#ifdef GLUTEN_ENABLE_GPU
+  const auto* eagerNativeS3 = std::getenv("GLUTEN_CPP_S3_EAGER_SCHEDULER_INIT");
+  const auto* adaptiveS3Prefetch = std::getenv("GLUTEN_CUDF_S3_ADAPTIVE_PREFETCH");
+  const auto enabled = [](const char* value) {
+    return value != nullptr && (std::string_view(value) == "1" || std::string_view(value) == "true");
+  };
+  const auto eagerScheduler =
+      eagerNativeS3 == nullptr || *eagerNativeS3 == '\0' ? enabled(adaptiveS3Prefetch) : enabled(eagerNativeS3);
+  if (eagerScheduler) {
+    facebook::velox::cudf_velox::connector::hive::initializeNativeS3Scheduler();
+  }
+#endif
+
   registerShuffleDictionaryWriterFactory([](MemoryManager* memoryManager, arrow::util::Codec* codec) {
     return std::make_unique<ArrowShuffleDictionaryWriter>(memoryManager, codec);
   });
@@ -482,8 +490,23 @@ void VeloxBackend::initCache() {
     const bool nativePinned = nativePinnedValue != nullptr &&
         (std::string_view(nativePinnedValue) == "1" || std::string_view(nativePinnedValue) == "true");
 #ifdef GLUTEN_ENABLE_GPU
+    const auto cachePinnedBytes = backendConf_->get<uint64_t>(kVeloxCachePinnedBytes, kVeloxCachePinnedBytesDefault);
+    const auto cachePinnedPrewarmBytes =
+        backendConf_->get<uint64_t>(kVeloxCachePinnedPrewarmBytes, kVeloxCachePinnedPrewarmBytesDefault);
     if (nativePinned) {
-      cacheAllocator_ = std::make_shared<PinnedCacheAllocator>(options);
+      VELOX_USER_CHECK_LE(
+          cachePinnedPrewarmBytes,
+          cachePinnedBytes,
+          "{} must not exceed {}",
+          kVeloxCachePinnedPrewarmBytes,
+          kVeloxCachePinnedBytes);
+      VELOX_USER_CHECK_LE(
+          cachePinnedPrewarmBytes,
+          memCacheSize,
+          "{} must not exceed {}",
+          kVeloxCachePinnedPrewarmBytes,
+          kVeloxMemCacheSize);
+      cacheAllocator_ = std::make_shared<PinnedCacheAllocator>(options, cachePinnedPrewarmBytes);
     } else {
       cacheAllocator_ = std::make_shared<velox::memory::MmapAllocator>(options);
     }
@@ -500,9 +523,6 @@ void VeloxBackend::initCache() {
 
 #ifdef GLUTEN_ENABLE_GPU
     auto* mmapCacheAllocator = dynamic_cast<velox::memory::MmapAllocator*>(cacheAllocator_.get());
-    const auto cachePinnedBytes = backendConf_->get<uint64_t>(kVeloxCachePinnedBytes, kVeloxCachePinnedBytesDefault);
-    const auto cachePinnedPrewarmBytes =
-        backendConf_->get<uint64_t>(kVeloxCachePinnedPrewarmBytes, kVeloxCachePinnedPrewarmBytesDefault);
     auto cachePageRegistration = velox::cudf_velox::connector::hive::makeBoundedCachePageRegistration(cachePinnedBytes);
     cacheOptions.registerBackingRuns = cachePageRegistration.registerBackingRuns;
 
@@ -547,7 +567,7 @@ void VeloxBackend::initCache() {
 
     LOG(INFO) << "AsyncDataCache contiguous entries: " << cacheOptions.forceContiguousEntries
               << ", CUDA registration limit: " << cachePinnedBytes;
-    if (cachePinnedPrewarmBytes > 0) {
+    if (cachePinnedPrewarmBytes > 0 && !nativePinned) {
       if (mmapCacheAllocator == nullptr || cachePinnedPrewarmBytes > cachePinnedBytes ||
           cachePinnedPrewarmBytes > memCacheSize || !cachePageRegistration.prewarmLargestSizeClass) {
         LOG(WARNING) << "AsyncDataCache pinned prewarm disabled by invalid bounds: "

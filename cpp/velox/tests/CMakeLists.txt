@@ -113,6 +113,9 @@ if(ENABLE_GPU)
     check_overflow_in_table_insert_gpu_test DISCOVERY_MODE PRE_TEST
     PROPERTIES LABELS "cuda_driver"
     TIMEOUT 3000)
+  add_velox_test(pinned_cache_allocator_test SOURCES
+                 PinnedCacheAllocatorTest.cc)
+  target_link_libraries(pinned_cache_allocator_test Folly::folly)
 endif()
 
 set(VELOX_TEST_COMMON_SRCS JsonToProtoConverter.cc FilePathGenerator.cc)

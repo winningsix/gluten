@@ -17,10 +17,18 @@
 
 #include "compute/iceberg/CudfIcebergWriter.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <exception>
+#include <mutex>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include <folly/dynamic.h>
 #include <folly/json.h>
@@ -58,6 +66,8 @@ namespace gluten {
 namespace {
 
 std::atomic<uint64_t> nextFileId{0};
+constexpr std::string_view kIcebergWriterRowGroupRows =
+    "spark.gluten.sql.columnar.backend.velox.cudf.icebergWriterRowGroupRows";
 
 cudf::io::compression_type toCudfCompression(CompressionKind compression) {
   switch (compression) {
@@ -110,27 +120,65 @@ class VeloxFileDataSink final : public cudf::io::data_sink {
     options.pool = pool;
     options.shouldCreateParentDirectories = true;
     file_ = fileSystem_->openFileForWrite(path_, options);
+#ifdef ENABLE_S3
+    asyncS3Writes_ = dynamic_cast<facebook::velox::filesystems::S3WriteFile*>(file_.get()) != nullptr;
+    if (asyncS3Writes_) {
+      uploadThread_ = std::thread([this]() { uploadLoop(); });
+    }
+#endif
+  }
+
+  ~VeloxFileDataSink() override {
+    if (!closed_) {
+      try {
+        abort();
+      } catch (const std::exception& error) {
+        LOG(WARNING) << "Failed to abort libcudf Iceberg sink " << path_ << " during destruction: " << error.what();
+        stopUploadThread(true);
+      }
+    } else {
+      stopUploadThread(false);
+    }
   }
 
   void host_write(const void* data, size_t size) override {
     VELOX_USER_CHECK(
         !closed_, "Cannot write closed Iceberg output file {}", path_);
-    file_->append(
-        std::string_view(static_cast<const char*>(data), size));
+    if (!asyncS3Writes_) {
+      file_->append(std::string_view(static_cast<const char*>(data), size));
+      logicalBytes_.fetch_add(size, std::memory_order_relaxed);
+      return;
+    }
+
+    std::vector<char> payload(size);
+    std::memcpy(payload.data(), data, size);
+    std::unique_lock<std::mutex> lock(uploadMutex_);
+    uploadCv_.wait(lock, [&]() {
+      return uploadError_ || outstandingBytes_ + size <= kMaxOutstandingBytes || outstandingBytes_ == 0;
+    });
+    rethrowUploadErrorLocked();
+    outstandingBytes_ += size;
+    uploadQueue_.push_back(std::move(payload));
+    logicalBytes_.fetch_add(size, std::memory_order_relaxed);
+    lock.unlock();
+    uploadCv_.notify_all();
   }
 
   void flush() override {
     VELOX_USER_CHECK(
         !closed_, "Cannot flush closed Iceberg output file {}", path_);
+    drainUploads();
     file_->flush();
   }
 
   size_t bytes_written() override {
-    return file_->size();
+    return logicalBytes_.load(std::memory_order_relaxed);
   }
 
   void close() {
     if (!closed_) {
+      drainUploads();
+      stopUploadThread(false);
       file_->close();
       closed_ = true;
     }
@@ -140,6 +188,7 @@ class VeloxFileDataSink final : public cudf::io::data_sink {
     if (closed_) {
       return;
     }
+    stopUploadThread(true);
 #ifdef ENABLE_S3
     if (auto* s3File = dynamic_cast<facebook::velox::filesystems::S3WriteFile*>(
             file_.get())) {
@@ -156,9 +205,88 @@ class VeloxFileDataSink final : public cudf::io::data_sink {
   }
 
  private:
+  static constexpr size_t kMaxOutstandingBytes = 512ULL << 20;
+
+  void rethrowUploadErrorLocked() const {
+    if (uploadError_) {
+      std::rethrow_exception(uploadError_);
+    }
+  }
+
+  void uploadLoop() {
+    while (true) {
+      std::vector<char> payload;
+      {
+        std::unique_lock<std::mutex> lock(uploadMutex_);
+        uploadCv_.wait(lock, [&]() { return stopUpload_ || !uploadQueue_.empty(); });
+        if (stopUpload_ && uploadQueue_.empty()) {
+          return;
+        }
+        payload = std::move(uploadQueue_.front());
+        uploadQueue_.pop_front();
+      }
+
+      try {
+        file_->append(std::string_view(payload.data(), payload.size()));
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(uploadMutex_);
+        uploadError_ = std::current_exception();
+        uploadQueue_.clear();
+        outstandingBytes_ = 0;
+        stopUpload_ = true;
+        uploadCv_.notify_all();
+        return;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(uploadMutex_);
+        outstandingBytes_ -= payload.size();
+      }
+      uploadCv_.notify_all();
+    }
+  }
+
+  void drainUploads() {
+    if (!asyncS3Writes_) {
+      return;
+    }
+    std::unique_lock<std::mutex> lock(uploadMutex_);
+    uploadCv_.wait(lock, [&]() { return uploadError_ || outstandingBytes_ == 0; });
+    rethrowUploadErrorLocked();
+  }
+
+  void stopUploadThread(bool discardPending) noexcept {
+    if (!uploadThread_.joinable()) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(uploadMutex_);
+      stopUpload_ = true;
+      if (discardPending) {
+        size_t queuedBytes = 0;
+        for (const auto& payload : uploadQueue_) {
+          queuedBytes += payload.size();
+        }
+        uploadQueue_.clear();
+        outstandingBytes_ -= std::min(outstandingBytes_, queuedBytes);
+      }
+    }
+    uploadCv_.notify_all();
+    uploadThread_.join();
+  }
+
   std::shared_ptr<facebook::velox::filesystems::FileSystem> fileSystem_;
   std::string path_;
   std::unique_ptr<facebook::velox::WriteFile> file_;
+  std::atomic<size_t> logicalBytes_{0};
+  std::mutex uploadMutex_;
+  std::condition_variable uploadCv_;
+  std::deque<std::vector<char>> uploadQueue_;
+  std::thread uploadThread_;
+  std::exception_ptr uploadError_;
+  size_t outstandingBytes_{0};
+  bool asyncS3Writes_{false};
+  bool stopUpload_{false};
   bool closed_{false};
 };
 
@@ -345,6 +473,12 @@ struct CudfIcebergWriter::Impl {
     fileSystem = facebook::velox::filesystems::getFileSystem(
         this->outputDirectory, fileSystemConfig);
 
+    if (const auto it = sparkConfs.find(std::string(kIcebergWriterRowGroupRows)); it != sparkConfs.end()) {
+      icebergWriterRowGroupRows = std::stoll(it->second);
+      VELOX_USER_CHECK(
+          icebergWriterRowGroupRows == 1'000'000 || icebergWriterRowGroupRows == 4'000'000,
+          "libcudf Iceberg writer row-group rows must be 1000000 or 4000000");
+    }
     partitionChannels.reserve(this->spec->fields.size());
     partitionTypes.reserve(this->spec->fields.size());
     for (const auto& partitionField : this->spec->fields) {
@@ -393,11 +527,11 @@ struct CudfIcebergWriter::Impl {
 
     file->sink = std::make_unique<VeloxFileDataSink>(
         fileSystem, file->path, sinkPool.get());
-    auto options = cudf::io::chunked_parquet_writer_options::builder(
-                       cudf::io::sink_info(file->sink.get()))
+    auto options = cudf::io::chunked_parquet_writer_options::builder(cudf::io::sink_info(file->sink.get()))
                        .metadata(metadata)
                        .compression(toCudfCompression(compressionKind))
                        .utc_timestamps(true)
+                       .row_group_size_rows(icebergWriterRowGroupRows)
                        .build();
     file->writer =
         std::make_unique<cudf::io::chunked_parquet_writer>(options, stream);
@@ -445,9 +579,9 @@ struct CudfIcebergWriter::Impl {
 
     if (partitionChannels.empty()) {
       // Keep one batch in flight so the FLUX root can produce the next device
-      // batch while libcudf compresses this one.  The next call reaches this
-      // point only after that new input is already available; wait here before
-      // releasing the previous input buffers and queueing another write.
+      // batch while libcudf compresses this one. The next call reaches this
+      // point only after that new input is available; wait before releasing
+      // the previous input buffers and queueing another write.
       stream.synchronize();
       inFlightInput.reset();
       inFlightConvertedInput.reset();
@@ -592,6 +726,7 @@ struct CudfIcebergWriter::Impl {
   std::vector<facebook::velox::column_index_t> partitionChannels;
   std::vector<TypePtr> partitionTypes;
   rmm::cuda_stream_view stream;
+  int64_t icebergWriterRowGroupRows{1'000'000};
   facebook::velox::RowVectorPtr inFlightInput;
   std::unique_ptr<cudf::table> inFlightConvertedInput;
   std::unordered_map<std::string, std::unique_ptr<OpenFile>> files;

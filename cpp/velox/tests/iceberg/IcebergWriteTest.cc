@@ -71,4 +71,35 @@ TEST_F(VeloxIcebergWriteTest, write) {
   auto commitMessage = writer->commit();
   EXPECT_EQ(commitMessage.size(), 1);
 }
+
+TEST_F(VeloxIcebergWriteTest, rowGroupRowsConfig) {
+  auto vector = makeRowVector({makeFlatVector<int8_t>({1, 2}), makeFlatVector<int16_t>({1, 2})});
+  constexpr auto kRowGroupRows = "spark.gluten.sql.columnar.backend.velox.cudf.icebergWriterRowGroupRows";
+  const auto makeWriter = [&](std::string rowGroupRows) {
+    std::vector<connector::hive::iceberg::IcebergPartitionSpec::Field> fields;
+    auto partitionSpec = std::make_shared<const connector::hive::iceberg::IcebergPartitionSpec>(0, fields);
+
+    gluten::IcebergNestedField root;
+    root.set_id(0);
+    root.add_children()->set_id(1);
+    root.add_children()->set_id(2);
+
+    return std::make_unique<IcebergWriter>(
+        asRowType(vector->type()),
+        1,
+        tmpDir_->getPath() + "/row_group_config_test_table",
+        common::CompressionKind::CompressionKind_ZSTD,
+        0, // partitionId
+        0, // taskId
+        folly::to<std::string>(folly::Random::rand64()), // operationId
+        partitionSpec,
+        root,
+        std::unordered_map<std::string, std::string>{{kRowGroupRows, std::move(rowGroupRows)}},
+        pool_,
+        connectorPool_);
+  };
+
+  EXPECT_NE(makeWriter("4000000"), nullptr);
+  VELOX_ASSERT_THROW(makeWriter("2000000"), "row-group rows must be 1000000 or 4000000");
+}
 } // namespace gluten
