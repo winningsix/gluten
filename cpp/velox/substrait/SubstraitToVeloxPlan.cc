@@ -1682,9 +1682,14 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(
   ::substrait::ReadRel_VirtualTable readVirtualTable = readRel.virtual_table();
   int64_t numVectors = readVirtualTable.values_size();
   int64_t numColumns = type->size();
-  int64_t valueFieldNums = readVirtualTable.values(numVectors - 1).fields_size();
+  int64_t valueFieldNums = 0;
   std::vector<RowVectorPtr> vectors;
-  vectors.reserve(numVectors);
+  if (numVectors == 0) {
+    vectors.emplace_back(BaseVector::create<RowVector>(type, 0, pool_));
+  } else {
+    valueFieldNums = readVirtualTable.values(numVectors - 1).fields_size();
+    vectors.reserve(numVectors);
+  }
 
   int64_t batchSize;
   // For the empty vectors, eg,vectors = makeRowVector(ROW({}, {}), 1).

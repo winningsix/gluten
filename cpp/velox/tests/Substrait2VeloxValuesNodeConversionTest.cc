@@ -59,4 +59,34 @@ TEST_F(Substrait2VeloxValuesNodeConversionTest, valuesNode) {
   assertQuery(veloxPlan, "SELECT * FROM tmp");
 }
 
+TEST_F(Substrait2VeloxValuesNodeConversionTest, emptyVirtualTable) {
+  auto planPath = FilePathGenerator::getDataFilePath("substrait_virtualTable.json");
+
+  ::substrait::Plan substraitPlan;
+  JsonToProtoConverter::readFromFile(planPath, substraitPlan);
+  substraitPlan.mutable_relations(0)
+      ->mutable_root()
+      ->mutable_input()
+      ->mutable_read()
+      ->mutable_virtual_table()
+      ->clear_values();
+
+  auto veloxCfg = std::make_shared<facebook::velox::config::ConfigBase>(std::unordered_map<std::string, std::string>());
+  auto planConverter = std::make_shared<SubstraitToVeloxPlanConverter>(
+      pool_.get(), veloxCfg.get(), std::vector<std::shared_ptr<ResultIterator>>(), std::nullopt, std::nullopt, true);
+  auto veloxPlan = planConverter->toVeloxPlan(substraitPlan);
+
+  ASSERT_EQ(veloxPlan->outputType()->size(), 5);
+  EXPECT_TRUE(veloxPlan->outputType()->equivalent(*ROW({BIGINT(), INTEGER(), DOUBLE(), BOOLEAN(), INTEGER()})));
+
+  auto valuesNode = std::dynamic_pointer_cast<const core::ValuesNode>(veloxPlan);
+  ASSERT_NE(valuesNode, nullptr);
+  ASSERT_EQ(valuesNode->values().size(), 1);
+  ASSERT_NE(valuesNode->values().front(), nullptr);
+  EXPECT_EQ(valuesNode->values().front()->size(), 0);
+  EXPECT_TRUE(valuesNode->values().front()->rowType()->equivalent(*veloxPlan->outputType()));
+
+  assertQueryReturnsEmptyResult(veloxPlan);
+}
+
 } // namespace gluten
