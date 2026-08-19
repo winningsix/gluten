@@ -27,13 +27,26 @@ rm -f "$BUILD_INFO"
 mkdir -p "$EXTRA_RESOURCE_DIR"
 
 function echo_revision_info() {
-  echo branch=$(git rev-parse --abbrev-ref HEAD)
-  echo revision=$(git rev-parse HEAD)
-  echo revision_time=$(git show -s --format=%ci HEAD)
+  local revision=${GLUTEN_BUILD_INFO_REVISION:-}
+  local branch=""
+  local revision_time=""
+  local remote_url=""
+  if [ -z "$revision" ]; then
+    revision=$(git -C "$GLUTEN_ROOT" rev-parse HEAD) || exit 1
+    branch=$(git -C "$GLUTEN_ROOT" rev-parse --abbrev-ref HEAD) || exit 1
+    revision_time=$(git -C "$GLUTEN_ROOT" show -s --format=%ci "$revision") || exit 1
+    remote_url=$(git -C "$GLUTEN_ROOT" config --get remote.origin.url || true)
+  fi
+  if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: Gluten build-info revision must be one full lowercase Git SHA" >&2
+    exit 1
+  fi
+  echo branch="$branch"
+  echo revision="$revision"
+  echo revision_time="$revision_time"
   echo date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   # Never embed credentials from a developer's local Git configuration in a
   # distributable JAR.  Strip URL userinfo while preserving the repository URL.
-  remote_url=$(git config --get remote.origin.url)
   remote_url=$(
     printf '%s' "$remote_url" |
       sed -E 's#^(https?://)[^/@]+(:[^/@]*)?@#\1#; s#[?#].*$##'
@@ -42,11 +55,28 @@ function echo_revision_info() {
 }
 
 function echo_velox_revision_info() {
-  BACKEND_HOME=$1
-  echo gcc_version=$(strings $GLUTEN_ROOT/cpp/build/releases/libgluten.so | grep "GCC:" | head -n 1)
-  echo velox_branch=$(git -C $BACKEND_HOME rev-parse --abbrev-ref HEAD)
-  echo velox_revision=$(git -C $BACKEND_HOME rev-parse HEAD)
-  echo velox_revision_time=$(git -C $BACKEND_HOME show -s --format=%ci HEAD)
+  local backend_home=$1
+  local revision=${GLUTEN_BUILD_INFO_VELOX_REVISION:-}
+  local branch=""
+  local revision_time=""
+  if [ -z "$revision" ]; then
+    revision=$(git -C "$backend_home" rev-parse HEAD) || exit 1
+    branch=$(git -C "$backend_home" rev-parse --abbrev-ref HEAD) || exit 1
+    revision_time=$(git -C "$backend_home" show -s --format=%ci "$revision") || exit 1
+  fi
+  if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: Velox build-info revision must be one full lowercase Git SHA" >&2
+    exit 1
+  fi
+  local libgluten="$GLUTEN_ROOT/cpp/build/releases/libgluten.so"
+  local gcc_version=""
+  if [ -r "$libgluten" ]; then
+    gcc_version=$(strings "$libgluten" | grep "GCC:" | head -n 1)
+  fi
+  echo gcc_version="$gcc_version"
+  echo velox_branch="$branch"
+  echo velox_revision="$revision"
+  echo velox_revision_time="$revision_time"
 }
 
 function echo_clickhouse_revision_info() {
@@ -66,7 +96,7 @@ while (( "$#" )); do
       echo backend_type="$BACKEND_TYPE" >> "$BUILD_INFO"
       # Compute backend home path based on type
       if [ "velox" = "$BACKEND_TYPE" ]; then
-        BACKEND_HOME="$GLUTEN_ROOT/ep/build-velox/build/velox_ep"
+        BACKEND_HOME=${VELOX_HOME:-"$GLUTEN_ROOT/ep/build-velox/build/velox_ep"}
         echo_velox_revision_info "$BACKEND_HOME" >> "$BUILD_INFO"
       elif [ "ch" = "$BACKEND_TYPE" ] || [ "clickhouse" = "$BACKEND_TYPE" ]; then
         echo_clickhouse_revision_info >> "$BUILD_INFO"

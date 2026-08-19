@@ -147,12 +147,20 @@ maven_settings_link="$tmp/maven-settings-link.xml"
 empty_maven_settings="$tmp/empty-maven-settings.xml"
 unreadable_maven_settings="$tmp/unreadable-maven-settings.xml"
 nonregular_maven_settings="$tmp/maven-settings-directory"
+runtime_bundle_output="$tmp/runtime-bundle-output"
+runtime_bundle_output_link="$tmp/runtime-bundle-output-link"
+nonempty_runtime_bundle_output="$tmp/nonempty-runtime-bundle-output"
+nonregular_runtime_bundle_output="$tmp/runtime-bundle-output-file"
 printf '<settings>caller-secret-fixture</settings>\n' > "$maven_settings"
 ln -s "$maven_settings" "$maven_settings_link"
 : > "$empty_maven_settings"
 printf '<settings>unreadable-fixture</settings>\n' > "$unreadable_maven_settings"
 chmod 000 "$unreadable_maven_settings"
 mkdir "$nonregular_maven_settings"
+mkdir "$runtime_bundle_output" "$nonempty_runtime_bundle_output"
+ln -s "$runtime_bundle_output" "$runtime_bundle_output_link"
+touch "$nonempty_runtime_bundle_output/already-present"
+touch "$nonregular_runtime_bundle_output"
 
 : > "$FAKE_DOCKER_LOG"
 expect_failure bad_arrow_java env BUILD_ARROW_JAVA=MAYBE "$ARROW_BUILDER"
@@ -731,6 +739,22 @@ test ! -s "$FAKE_DOCKER_LOG"
 expect_failure smoke_unreadable_maven_settings "${smoke_env[@]}" \
   "${smoke_command[@]}" --maven_settings="$unreadable_maven_settings"
 test ! -s "$FAKE_DOCKER_LOG"
+expect_failure smoke_missing_runtime_bundle_output "${smoke_env[@]}" \
+  "${smoke_command[@]}" \
+  --runtime_bundle_output="$tmp/does-not-exist-output"
+grep -Fq -- '--runtime_bundle_output must name a writable directory' \
+  "$tmp/smoke_missing_runtime_bundle_output.out"
+test ! -s "$FAKE_DOCKER_LOG"
+expect_failure smoke_nonregular_runtime_bundle_output "${smoke_env[@]}" \
+  "${smoke_command[@]}" \
+  --runtime_bundle_output="$nonregular_runtime_bundle_output"
+test ! -s "$FAKE_DOCKER_LOG"
+expect_failure smoke_nonempty_runtime_bundle_output "${smoke_env[@]}" \
+  "${smoke_command[@]}" \
+  --runtime_bundle_output="$nonempty_runtime_bundle_output"
+grep -Fq -- '--runtime_bundle_output directory must be empty' \
+  "$tmp/smoke_nonempty_runtime_bundle_output.out"
+test ! -s "$FAKE_DOCKER_LOG"
 
 expect_failure non_git_gluten_source "${smoke_env[@]}" \
   FAKE_NOT_GIT_SOURCE=gluten "${smoke_command[@]}"
@@ -779,12 +803,42 @@ grep -Fqx \
 grep -Fq 'carrier-base glibc/loader and JDK 17; host-injected NVIDIA driver' \
   "$tmp/smoke.out"
 grep -Fqx 'Smoke HDFS build mode: OFF' "$tmp/smoke.out"
+grep -Fqx "<SMOKE_GLUTEN_REVISION=$TEST_GLUTEN_HEAD>" "$FAKE_DOCKER_LOG"
+grep -Fqx "<SMOKE_VELOX_REVISION=$TEST_VELOX_HEAD>" "$FAKE_DOCKER_LOG"
 grep -Fqx '<SMOKE_ENABLE_HDFS=OFF>' "$FAKE_DOCKER_LOG"
 grep -Fqx '<SMOKE_NUM_THREADS=37>' "$FAKE_DOCKER_LOG"
 if grep -Fq 'dst=/root/.m2/settings.xml' "$FAKE_DOCKER_LOG"; then
   echo "ERROR: canonical smoke unexpectedly mounts Maven settings" >&2
   exit 1
 fi
+if grep -Fqx '<SMOKE_RUNTIME_BUNDLE_OUTPUT=/output/deploy>' \
+    "$FAKE_DOCKER_LOG" \
+    || grep -Fq 'dst=/output/deploy>' "$FAKE_DOCKER_LOG"; then
+  echo "ERROR: canonical dependency-carrier smoke unexpectedly mounts runtime bundle output" >&2
+  exit 1
+fi
+
+: > "$FAKE_DOCKER_LOG"
+"${smoke_env[@]}" "${smoke_command[@]}" \
+  --runtime_bundle_output="$runtime_bundle_output_link" \
+  > "$tmp/smoke-runtime-bundle.out"
+grep -Fqx 'Smoke runtime bundle output: caller-supplied empty directory' \
+  "$tmp/smoke-runtime-bundle.out"
+grep -Fq \
+  "src=$(cd "$runtime_bundle_output" && pwd -P),dst=/output/deploy" \
+  "$FAKE_DOCKER_LOG"
+grep -Fq '<SMOKE_RUNTIME_BUNDLE_OUTPUT=/output/deploy>' "$FAKE_DOCKER_LOG"
+grep -Fq 'python3 /smoke/gluten/dev/build-velox-gpu-runtime-bundle.py' \
+  "$FAKE_DOCKER_LOG"
+grep -Fq -- '--bundle_jar="${bundles[0]}"' "$FAKE_DOCKER_LOG"
+grep -Fq -- '--libgluten="${gluten_library}"' "$FAKE_DOCKER_LOG"
+grep -Fq -- '--gluten_revision="${SMOKE_GLUTEN_REVISION}"' "$FAKE_DOCKER_LOG"
+grep -Fq -- '--velox_revision="${SMOKE_VELOX_REVISION}"' "$FAKE_DOCKER_LOG"
+grep -Fq -- '--output_dir="${SMOKE_RUNTIME_BUNDLE_OUTPUT}"' \
+  "$FAKE_DOCKER_LOG"
+grep -Fq \
+  'Retained Spark-Gluten Velox GPU runtime bundle: ${SMOKE_RUNTIME_BUNDLE_OUTPUT}' \
+  "$FAKE_DOCKER_LOG"
 
 : > "$FAKE_DOCKER_LOG"
 "${smoke_env[@]}" "${smoke_command[@]}" --enable_hdfs=OFF --num_threads=4 \
@@ -852,6 +906,10 @@ grep -Fq 'Smoke Java runtime: ${java_version}; ${javac_version}' \
   "$FAKE_DOCKER_LOG"
 grep -Fq 'export TARGETS="velox velox_cudf_exec"' "$FAKE_DOCKER_LOG"
 grep -Fq 'export GLUTEN_BUNDLE_MAVEN_PROFILES=backends-velox,spark-3.5,java-17' \
+  "$FAKE_DOCKER_LOG"
+grep -Fq 'export GLUTEN_BUILD_INFO_REVISION="${SMOKE_GLUTEN_REVISION}"' \
+  "$FAKE_DOCKER_LOG"
+grep -Fq 'export GLUTEN_BUILD_INFO_VELOX_REVISION="${SMOKE_VELOX_REVISION}"' \
   "$FAKE_DOCKER_LOG"
 grep -Fq 'test "$spark_version" = 3.5.5' "$FAKE_DOCKER_LOG"
 grep -Fq 'test "$scala_binary_version" = 2.12' "$FAKE_DOCKER_LOG"

@@ -45,6 +45,7 @@ IMAGE=""
 VELOX_DIR=""
 CUDA_ARCH=""
 MAVEN_SETTINGS=""
+RUNTIME_BUNDLE_OUTPUT=""
 ENABLE_HDFS=OFF
 NUM_THREADS=$(nproc)
 
@@ -64,6 +65,9 @@ ${NUM_THREADS} threads.
 Optional:
   --enable_hdfs=ON|OFF   Build with HDFS support (default: ${ENABLE_HDFS})
   --maven_settings=PATH  Caller-supplied Maven settings.xml, mounted read-only
+  --runtime_bundle_output=PATH
+                         Existing empty directory that receives one portable
+                         Spark-Gluten Velox GPU runtime bundle
   --num_threads=N        Positive build parallelism (default: ${NUM_THREADS})
 EOF
 }
@@ -106,6 +110,7 @@ for arg in "$@"; do
     --cuda_arch=*|--cuda-arch=*) CUDA_ARCH="${arg#*=}" ;;
     --enable_hdfs=*) ENABLE_HDFS="${arg#*=}" ;;
     --maven_settings=*) MAVEN_SETTINGS="${arg#*=}" ;;
+    --runtime_bundle_output=*) RUNTIME_BUNDLE_OUTPUT="${arg#*=}" ;;
     --num_threads=*|--num-threads=*) NUM_THREADS="${arg#*=}" ;;
     -h|--help) usage; exit 0 ;;
     *) echo "ERROR: unknown option: ${arg}" >&2; usage >&2; exit 2 ;;
@@ -151,6 +156,22 @@ if [ -n "$MAVEN_SETTINGS" ]; then
     exit 2
   fi
 fi
+if [ -n "$RUNTIME_BUNDLE_OUTPUT" ]; then
+  runtime_bundle_output_input=$RUNTIME_BUNDLE_OUTPUT
+  if [ ! -d "$RUNTIME_BUNDLE_OUTPUT" ] || [ ! -w "$RUNTIME_BUNDLE_OUTPUT" ]; then
+    echo "ERROR: --runtime_bundle_output must name a writable directory: ${RUNTIME_BUNDLE_OUTPUT}" >&2
+    exit 2
+  fi
+  if find "$RUNTIME_BUNDLE_OUTPUT" -mindepth 1 -maxdepth 1 -print -quit \
+      | grep -q .; then
+    echo "ERROR: --runtime_bundle_output directory must be empty: ${RUNTIME_BUNDLE_OUTPUT}" >&2
+    exit 2
+  fi
+  if ! RUNTIME_BUNDLE_OUTPUT=$(cd "$runtime_bundle_output_input" && pwd -P); then
+    echo "ERROR: could not resolve --runtime_bundle_output: ${runtime_bundle_output_input}" >&2
+    exit 2
+  fi
+fi
 
 VELOX_DIR=$(cd "$VELOX_DIR" && pwd -P)
 command -v git >/dev/null || { echo "ERROR: git is required" >&2; exit 2; }
@@ -192,6 +213,9 @@ echo "Smoke HDFS build mode: ${ENABLE_HDFS}"
 if [ -n "$MAVEN_SETTINGS" ]; then
   echo "Smoke Maven settings: caller-supplied file mounted read-only"
 fi
+if [ -n "$RUNTIME_BUNDLE_OUTPUT" ]; then
+  echo "Smoke runtime bundle output: caller-supplied empty directory"
+fi
 
 docker_run_mounts=(
   --mount "type=bind,src=${GLUTEN_ARCHIVE},dst=/source/gluten.tar,readonly"
@@ -202,14 +226,28 @@ if [ -n "$MAVEN_SETTINGS" ]; then
     --mount "type=bind,src=${MAVEN_SETTINGS},dst=/root/.m2/settings.xml,readonly"
   )
 fi
+if [ -n "$RUNTIME_BUNDLE_OUTPUT" ]; then
+  docker_run_mounts+=(
+    --mount "type=bind,src=${RUNTIME_BUNDLE_OUTPUT},dst=/output/deploy"
+  )
+fi
+
+docker_run_env=(
+  --env HOME=/root
+  --env "SMOKE_GLUTEN_REVISION=${GLUTEN_HEAD}"
+  --env "SMOKE_VELOX_REVISION=${VELOX_HEAD}"
+  --env "SMOKE_CUDA_ARCH=${CUDA_ARCH}"
+  --env "SMOKE_ENABLE_HDFS=${ENABLE_HDFS}"
+  --env "SMOKE_NUM_THREADS=${NUM_THREADS}"
+)
+if [ -n "$RUNTIME_BUNDLE_OUTPUT" ]; then
+  docker_run_env+=(--env SMOKE_RUNTIME_BUNDLE_OUTPUT=/output/deploy)
+fi
 
 timeout --signal=TERM --kill-after=2m 45m \
   docker run --rm --platform=linux/amd64 --user 0:0 --gpus all \
   "${docker_run_mounts[@]}" \
-  --env HOME=/root \
-  --env "SMOKE_CUDA_ARCH=${CUDA_ARCH}" \
-  --env "SMOKE_ENABLE_HDFS=${ENABLE_HDFS}" \
-  --env "SMOKE_NUM_THREADS=${NUM_THREADS}" \
+  "${docker_run_env[@]}" \
   "$IMAGE_ID" bash -lc '
 set -euo pipefail
 mkdir -p /smoke/gluten /smoke/velox
@@ -232,6 +270,8 @@ export INSTALL_PREFIX=/usr/local
 export TARGETS="velox velox_cudf_exec"
 export NUM_THREADS="${SMOKE_NUM_THREADS}"
 export GLUTEN_BUNDLE_MAVEN_PROFILES=backends-velox,spark-3.5,java-17
+export GLUTEN_BUILD_INFO_REVISION="${SMOKE_GLUTEN_REVISION}"
+export GLUTEN_BUILD_INFO_VELOX_REVISION="${SMOKE_VELOX_REVISION}"
 
 cd /smoke/gluten
 spark_profile=$(sed -n "/<id>spark-3[.]5<\\/id>/,/<\\/profile>/p" pom.xml)
@@ -379,4 +419,14 @@ if [ "${#bundles[@]}" -ne 1 ]; then
 fi
 jar tf "${bundles[0]}" >/dev/null
 echo "Readable Spark 3.5.5/Scala 2.12 Gluten bundle: ${bundles[0]}"
+
+if [ -n "${SMOKE_RUNTIME_BUNDLE_OUTPUT:-}" ]; then
+  python3 /smoke/gluten/dev/build-velox-gpu-runtime-bundle.py \
+    --bundle_jar="${bundles[0]}" \
+    --libgluten="${gluten_library}" \
+    --gluten_revision="${SMOKE_GLUTEN_REVISION}" \
+    --velox_revision="${SMOKE_VELOX_REVISION}" \
+    --output_dir="${SMOKE_RUNTIME_BUNDLE_OUTPUT}"
+  echo "Retained Spark-Gluten Velox GPU runtime bundle: ${SMOKE_RUNTIME_BUNDLE_OUTPUT}"
+fi
 '

@@ -320,6 +320,224 @@ compiler, CUDA, SM, flags, patches, ABI, or binary equivalence. The local image
 and smoke likewise do not qualify arbitrary cross-process incremental CMake
 reuse.
 
+### Spark-Gluten Velox GPU runtime bundle
+
+The dependency carrier above remains a build input rather than a deployable
+runtime. To retain the successfully built Spark 3.5.5/Scala 2.12 output as one
+portable runtime bundle, provide an existing writable empty directory to the
+same full build smoke:
+
+```bash
+mkdir /path/to/deploy
+
+./dev/cudf-dependency-image/smoke-system.sh \
+  --image=gluten-cudf-dependencies:local \
+  --velox_dir=/path/to/velox \
+  --cuda_arch="${CUDA_ARCH_LIST}" \
+  --runtime_bundle_output=/path/to/deploy
+```
+
+After the native and Maven build succeeds, the smoke invokes the source-owned
+packager. The full-bundle layout is independent of the selected source-supported
+Spark shim, but always contains exactly one JVM artifact:
+
+```text
+deploy/
+  gluten-velox-bundle-spark<major.minor>_<scala-binary>-*.jar
+  libs/
+    gluten-native-build-info.properties
+    libgluten.so*
+    <actual DT_NEEDED shared-library closure>
+    libnvrtc.so*
+    libnvrtc-builtins.so*
+    libnvJitLink.so*
+    ucx/
+      <required UCX modules>
+```
+
+The canonical JAR name, its embedded `gluten-build-info.properties`, its Spark
+shim provider, and the source POM must agree on the Spark major/minor and Scala
+binary pairing. Its exact Spark patch or vendor coordinate may vary only within
+that selected shim line. A new major/minor is not accepted until the current
+source contains the corresponding profile and shim. The `libs/` directory
+contains `libgluten.so`, its recursive shared-library closure, and relative
+SONAME symlink families. It also contains the exact `libnvrtc`,
+`libnvrtc-builtins`, and `libnvJitLink` families from the same resolved,
+non-stub CUDA toolkit directory and CUDA major as the `libcudart` selected by
+the completed build. RTCX is statically absorbed into cuDF and opens these JIT
+providers dynamically, so they cannot be discovered from `DT_NEEDED` alone.
+Required UCX modules are under `libs/ucx/`. The packager rejects broken,
+cyclic, absolute, or bundle-escaping symlinks, mixed or ambiguous CUDA
+families, CUDA stubs, and basename collisions. Real ELF files use
+bundle-relative `$ORIGIN` RUNPATHs; UCX modules also search their parent
+`libs/` directory. The native properties file records only `backend_type=velox`
+and the exact Gluten and Velox revisions. A full build or later composition
+must match those revisions to the JAR's existing build information. The output
+includes no Maven repository or source/build tree.
+
+Consumers that produce their JVM artifact separately can invoke the same
+source-owned packager in explicit native-only mode after building a real
+`libgluten.so`. Run it where that library and its dependencies resolve, such as
+the build environment that produced it:
+
+```bash
+mkdir /path/to/native-deploy
+
+python3 dev/build-velox-gpu-runtime-bundle.py \
+  --native_only \
+  --libgluten=/path/to/libgluten.so \
+  --gluten_revision=<exact-40-character-Gluten-revision> \
+  --velox_revision=<exact-40-character-Velox-revision> \
+  --output_dir=/path/to/native-deploy
+```
+
+Native-only output deliberately contains no JAR:
+
+```text
+native-deploy/
+  libs/
+    gluten-native-build-info.properties
+    libgluten.so*
+    <actual DT_NEEDED shared-library closure>
+    libnvrtc.so*
+    libnvrtc-builtins.so*
+    libnvJitLink.so*
+    ucx/
+      <required UCX modules>
+```
+
+Native-only mode uses the same dependency discovery, relative SONAME links,
+`$ORIGIN` relocation, RTCX provider-family checks, and closure validation as direct
+full mode. It takes no Spark or Scala input and does not require, copy, rename,
+or fabricate a JAR. The revision arguments must come from the verified clean
+sources that produced `libgluten.so`.
+
+Build one JVM artifact independently, without rebuilding Arrow C++, Velox, or
+Gluten native artifacts and without invoking the native build scripts:
+
+```bash
+mkdir /path/to/jvm-output
+
+python3 dev/build-velox-jvm-bundle.py \
+  --spark_profile=spark-3.5 \
+  --scala_profile=scala-2.12 \
+  --velox_home=/path/to/the-exact-clean-velox-source \
+  --output_dir=/path/to/jvm-output
+```
+
+The entrypoint discovers supported Spark profiles from the current POM,
+requires the compatible Scala profile and JDK 17, verifies clean exact Gluten
+and Velox source revisions, reuses the existing Maven reactor, and stages
+exactly one validated bundle JAR. To select a non-default exact coordinate in
+the same shim family, add—for example—`--spark_version=3.5.5-vendor-1`. A
+cross-family coordinate or `ALL` build is rejected. Spark 4.0 uses
+`--spark_profile=spark-4.0 --scala_profile=scala-2.13`; the exact qualified
+target also passes `--spark_version=4.0.2`. Producing the artifact does not by
+itself qualify a particular Spark distribution.
+
+Compose the reusable native tree with exactly one independently produced JAR:
+
+```bash
+mkdir /path/to/full-deploy
+
+python3 dev/build-velox-gpu-runtime-bundle.py \
+  --native_bundle=/path/to/native-deploy \
+  --bundle_jar=/path/to/jvm-output/gluten-velox-bundle-spark3.5_2.12-*.jar \
+  --output_dir=/path/to/full-deploy
+```
+
+Composition validates and copies the native tree without repeating native
+dependency discovery or relocation. Relative symlinks are preserved, the
+native and JAR source identities must match, and the completed output is
+revalidated independently. Direct full mode remains available by pairing
+`--libgluten`, `--bundle_jar`, and both exact revision arguments in one call.
+Neither generic assembly nor native-only packaging qualifies JNI compatibility
+or downstream runtime behavior.
+
+The external-provider boundary is intentionally narrow: the runtime supplies
+glibc and the ELF loader, JDK 17, and host-injected NVIDIA driver libraries.
+CUDA toolkit runtimes—including the RTCX JIT provider families—C++ runtimes,
+UCX, and other actual native dependencies are bundle content; CUDA link stubs
+are not. These bundled CUDA libraries remain coupled to the producer's toolkit
+version and architecture. S3 compile/link support is enabled by the producer
+build; the canonical bundle command leaves HDFS at its default `OFF`.
+Selecting HDFS `ON` is build-only; Hadoop, `libhdfs.so`, and live HDFS I/O
+remain downstream and are not qualified here.
+
+Run the disposable clean-runtime smoke outside the carrier and build prefix:
+
+```bash
+python3 dev/velox-gpu-runtime-bundle/runtime-smoke.py \
+  --bundle=/path/to/deploy
+```
+
+The validation image is not an upstream production runtime image. Generic
+assembly accepts any Spark/Scala variant backed by the current source, while
+the smoke admits only an explicit exact-runtime matrix. The qualified targets
+are Spark 3.5.5/Scala 2.12/JDK 17 and Spark 4.0.2/Scala 2.13/JDK 17; each
+target is admitted only after its real clean-runtime run passes. The outer smoke
+derives the target from the JAR and native metadata rather than caller version
+flags.
+Without a bundle `LD_LIBRARY_PATH`, it checks every real ELF with `ldd`, loads
+the bundled NVRTC and nvJitLink providers, compiles a fixed header-free CUDA
+kernel, and requires NVRTC to map the bundled builtins family. It then exposes
+exactly one GPU, verifies the actual Spark, Scala binary, and JDK against the
+embedded JAR metadata, uses `local[1]` and one shuffle partition, disables AQE,
+ANSI mode, and the UI, and executes this fixed zero-asset query.
+ANSI mode is explicit because Spark 4 enables it by default while this native
+query path rejects ANSI execution; caller properties cannot re-enable it:
+
+```sql
+SELECT sum(id) AS total
+FROM range(0, 32, 1, 1)
+WHERE id % 2 = 0
+```
+
+Focused validation runs the fast source and ELF fixtures without building a
+carrier or starting Spark:
+
+```bash
+bash dev/velox-gpu-runtime-bundle/test.sh
+```
+
+Acceptance requires the exact result `240`, a relocated `libgluten.so` mapping
+in the JVM, a project-owned `Cudf...Transformer` executed-plan marker, and at
+least one `CudfReduce*` aggregate operator for this fixed query in Velox's
+post-adaptation debug output. The smoke forces Velox's INFO severity only for
+this diagnostic so the post-adaptation list is observable. Together these
+reject an entirely JVM/CPU execution. This is deliberately smaller than
+consumer-specific operator-by-operator or mixed-plan fallback checks. The smoke
+keeps the backend's CPU fallback enabled for unsupported expressions in this
+fixed query; consumers may apply stricter checks to their own query sets. The
+NVRTC compilation does not launch the generated kernel or prove a cuDF RTCX
+call site, final-image library precedence, driver/SM compatibility, or an
+application workload; those remain consumer runtime qualification.
+
+Trusted callers may optionally supply one standard Spark properties file. For
+example:
+
+```properties
+spark.sql.session.timeZone UTC
+```
+
+```bash
+python3 dev/velox-gpu-runtime-bundle/runtime-smoke.py \
+  --bundle=/path/to/deploy \
+  --spark_conf_file=/secure/path/spark-defaults.conf
+```
+
+The resolved file alone is mounted read-only and passed through Spark's
+standard `--properties-file` option. Caller properties load first; explicit
+smoke-owned correctness settings follow and retain precedence. The file cannot
+replace the bundle, native library, JAR, query, expected result, or native-plan
+gate, and its contents are not logged. Omitting the option preserves the
+canonical smoke.
+
+Each passing exact-runtime smoke proves one local Spark/JNI/native-cuDF path for
+that precise matrix entry. It makes no live AWS or HDFS request and does not
+qualify other patch/vendor distributions, UCX dynamic loading, distributed
+execution, final-image library precedence, or production deployment.
+
 ### Maven build parameters
 The below parameters can be set via `-P` for mvn.
 
