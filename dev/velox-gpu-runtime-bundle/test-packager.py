@@ -16,9 +16,9 @@
 
 """Exercise the packager with a small, compiled ELF dependency graph.
 
-The fixtures cover both content modes plus closure, RTCX provider families,
-aliases, collisions, RUNPATH, and unsafe-symlink behavior without requiring a
-Gluten build.
+The fixtures cover both content modes plus closure, RTCX and cuFile provider
+families, aliases, collisions, RUNPATH, and unsafe-symlink behavior without
+requiring a Gluten build.
 """
 
 from __future__ import annotations
@@ -256,6 +256,30 @@ class Fixture:
             "nvjitlink_fixture",
         )
 
+        self._cuda_family(
+            "libm4gdsdep.so",
+            "libm4gdsdep.so.1",
+            "libm4gdsdep.so.1.0",
+            "m4_gds_dep_fixture",
+        )
+        cufile_source = self.source(
+            "cufile.c",
+            """
+            extern int m4_gds_dep_fixture(void);
+            int cufile_fixture(void) { return m4_gds_dep_fixture(); }
+            """,
+        )
+        cufile = self.cuda / "libcufile.so.1.0.0"
+        self.shared(
+            cufile,
+            "libcufile.so.0",
+            cufile_source,
+            library_dirs=(self.cuda,),
+            libraries=("m4gdsdep",),
+        )
+        os.symlink(cufile.name, self.cuda / "libcufile.so.0")
+        os.symlink("libcufile.so.0", self.cuda / "libcufile.so")
+
     def build(self, *, native_only: bool = False):
         return packager.build_bundle(
             None if native_only else self.jar,
@@ -282,6 +306,24 @@ class PackagerTest(unittest.TestCase):
                 "libnvrtc-builtins.so.12.4.99",
             ),
             ("libnvJitLink.so", "libnvJitLink.so.12", "libnvJitLink.so.12.4.99"),
+        )
+        for unversioned, soname, real_name in families:
+            with self.subTest(family=unversioned):
+                self.assertTrue((libs / real_name).is_file())
+                self.assertEqual(soname, os.readlink(libs / unversioned))
+                self.assertEqual(real_name, os.readlink(libs / soname))
+                self.assertEqual(
+                    "$ORIGIN",
+                    subprocess.check_output(
+                        ["patchelf", "--print-rpath", libs / real_name], text=True
+                    ).strip(),
+                )
+
+    def assert_cufile_bundle_content(self, fixture: Fixture):
+        libs = fixture.output / "libs"
+        families = (
+            ("libcufile.so", "libcufile.so.0", "libcufile.so.1.0.0"),
+            ("libm4gdsdep.so", "libm4gdsdep.so.1", "libm4gdsdep.so.1.0"),
         )
         for unversioned, soname, real_name in families:
             with self.subTest(family=unversioned):
@@ -384,6 +426,7 @@ class PackagerTest(unittest.TestCase):
                 ).strip(),
             )
             self.assert_rtcx_bundle_content(fixture)
+            self.assert_cufile_bundle_content(fixture)
 
     def test_native_only_build_needs_no_jar_and_keeps_native_contract(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -422,6 +465,23 @@ class PackagerTest(unittest.TestCase):
                 ).strip(),
             )
             self.assert_rtcx_bundle_content(fixture)
+            self.assert_cufile_bundle_content(fixture)
+
+    def test_discovers_cufile_dynamic_providers_with_recursive_closure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(Path(temporary))
+            fixture.build()
+
+            self.assertNotIn("libcufile.so.0", packager._needed(fixture.libgluten))
+            self.assert_cufile_bundle_content(fixture)
+
+    def test_compat_mode_environment_does_not_omit_cufile_providers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(Path(temporary))
+            with mock.patch.dict(os.environ, {"KVIKIO_COMPAT_MODE": "ON"}):
+                fixture.build(native_only=True)
+
+            self.assert_cufile_bundle_content(fixture)
 
     def test_composes_validated_native_tree_without_native_discovery(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -941,6 +1001,34 @@ class PackagerTest(unittest.TestCase):
                 with self.assertRaisesRegex(packager.PackagerError, stem):
                     fixture.build()
                 self.assertEqual([], list(fixture.output.iterdir()))
+
+    def test_rejects_missing_cufile_provider_family(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(Path(temporary))
+            for path in fixture.cuda.glob(f"{packager.CUFILE_FAMILY_STEM}*"):
+                path.unlink()
+            with self.assertRaisesRegex(
+                packager.PackagerError, packager.CUFILE_FAMILY_STEM
+            ):
+                fixture.build()
+            self.assertEqual([], list(fixture.output.iterdir()))
+
+    def test_rejects_cufile_provider_without_kvikio_soname(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(Path(temporary))
+            for path in fixture.cuda.glob(f"{packager.CUFILE_FAMILY_STEM}*"):
+                path.unlink()
+            fixture._cuda_family(
+                "libcufile.so",
+                "libcufile.so.1",
+                "libcufile.so.1.0.0",
+                "cufile_wrong_soname_fixture",
+            )
+            with self.assertRaisesRegex(
+                packager.PackagerError, "expected libcufile[.]so[.]0"
+            ):
+                fixture.build()
+            self.assertEqual([], list(fixture.output.iterdir()))
 
     def test_rtcx_discovery_does_not_fall_back_to_another_toolkit(self):
         with tempfile.TemporaryDirectory() as temporary:

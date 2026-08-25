@@ -20,18 +20,18 @@ A normal Gluten build produces ``libgluten.so`` in a build directory where its
 shared dependencies are resolved from the build container or installation
 prefix. Copying that one file is not a deployable result: the dynamic loader
 still needs its recursive ``DT_NEEDED`` closure, applications may open CUDA UCX
-modules and RTCX CUDA JIT providers dynamically, consumers load libraries
-through SONAME aliases, and build-time RPATHs may point back into the build
-environment.
+modules, RTCX CUDA JIT providers, and cuFile providers dynamically, consumers
+load libraries through SONAME aliases, and build-time RPATHs may point back into
+the build environment.
 
 This source-owned packager closes that gap without rebuilding anything. Given
 a real ``libgluten.so``, it discovers the libraries and CUDA UCX modules used
 by the Velox GPU backend, adds the build-toolkit-matched NVRTC, NVRTC builtins,
-and nvJitLink families that RTCX opens outside ``DT_NEEDED``, preserves relative
-symlink families, and rewrites every copied ELF to use bundle-relative
-``$ORIGIN`` search paths. A previously assembled native tree can instead be
-combined with one independently produced compatible Maven bundle without
-repeating native discovery or relocation.
+nvJitLink, and libcufile families that are opened outside ``DT_NEEDED``,
+preserves relative symlink families, and rewrites every copied ELF to use
+bundle-relative ``$ORIGIN`` search paths. A previously assembled native tree
+can instead be combined with one independently produced compatible Maven bundle
+without repeating native discovery or relocation.
 
 The command has three explicit combinations:
 
@@ -101,6 +101,8 @@ RTCX_FAMILY_STEMS = (
     "libnvrtc-builtins.so",
     "libnvJitLink.so",
 )
+CUFILE_FAMILY_STEM = "libcufile.so"
+CUFILE_SONAME = "libcufile.so.0"
 
 # These dependencies are deliberately supplied by the target runtime instead
 # of being copied. Everything else named by DT_NEEDED must become bundle
@@ -425,15 +427,10 @@ def _shared_library_family(directory: Path, stem: str, label: str) -> tuple[Path
     return real, soname
 
 
-def _rtcx_entries(objects: dict[Path, PlannedObject]) -> list[Path]:
-    """Find RTCX dynamic providers beside the selected CUDA runtime.
-
-    RTCX is statically absorbed into cuDF and opens these providers by name, so
-    no ELF ``DT_NEEDED`` edge leads to them. The already resolved libcudart
-    closure member supplies an unambiguous toolkit, CUDA-major, and architecture
-    anchor; selecting a different installed toolkit would produce an incoherent
-    runtime bundle.
-    """
+def _selected_cuda_runtime(
+    objects: dict[Path, PlannedObject],
+) -> tuple[Path, int]:
+    """Return the one deployable CUDA runtime selected by libgluten's closure."""
 
     cuda_runtimes: list[tuple[Path, int]] = []
     for planned in objects.values():
@@ -452,6 +449,20 @@ def _rtcx_entries(objects: dict[Path, PlannedObject]) -> list[Path]:
         raise PackagerError(
             f"CUDA runtime resolved from a non-deployable stubs directory: {cuda_runtime}"
         )
+    return cuda_runtime, cuda_major
+
+
+def _rtcx_entries(objects: dict[Path, PlannedObject]) -> list[Path]:
+    """Find RTCX dynamic providers beside the selected CUDA runtime.
+
+    RTCX is statically absorbed into cuDF and opens these providers by name, so
+    no ELF ``DT_NEEDED`` edge leads to them. The already resolved libcudart
+    closure member supplies an unambiguous toolkit, CUDA-major, and architecture
+    anchor; selecting a different installed toolkit would produce an incoherent
+    runtime bundle.
+    """
+
+    cuda_runtime, cuda_major = _selected_cuda_runtime(objects)
     toolkit_lib = cuda_runtime.parent
 
     entries: list[Path] = []
@@ -469,6 +480,27 @@ def _rtcx_entries(objects: dict[Path, PlannedObject]) -> list[Path]:
             )
         entries.append(real)
     return entries
+
+
+def _cufile_entries(objects: dict[Path, PlannedObject]) -> list[Path]:
+    """Find the cuFile provider beside the selected CUDA runtime.
+
+    KvikIO opens libcufile by name when compatibility mode is disabled, so no
+    dependable ``DT_NEEDED`` edge from libgluten leads to it. Anchoring this
+    explicit root beside the resolved libcudart keeps it in the same CUDA
+    toolkit as the rest of the bundle.
+    """
+
+    cuda_runtime, _ = _selected_cuda_runtime(objects)
+    toolkit_lib = cuda_runtime.parent
+
+    stem = CUFILE_FAMILY_STEM
+    real, soname = _shared_library_family(toolkit_lib, stem, "cuFile provider")
+    if soname != CUFILE_SONAME:
+        raise PackagerError(
+            f"cuFile provider has SONAME {soname}, expected {CUFILE_SONAME}: {real}"
+        )
+    return [real]
 
 
 def _parse_ldd_resolutions(output: str) -> dict[str, Path | None]:
@@ -560,10 +592,10 @@ def _plan_objects(
     cannot silently occupy the same destination name.
 
     The traversal starts with ``libgluten.so`` and drains its complete closure
-    before adding the matching RTCX providers and then UCX modules. If multiple
-    roots can resolve the same SONAME, this deterministic order keeps the object
-    selected by the primary Gluten closure rather than replacing it with a
-    later dynamically loaded root.
+    before adding the matching RTCX providers, cuFile providers, and then UCX
+    modules. If multiple roots can resolve the same SONAME, this deterministic
+    order keeps the object selected by the primary Gluten closure rather than
+    replacing it with a later dynamically loaded root.
     """
 
     objects: dict[Path, PlannedObject] = {}
@@ -631,7 +663,8 @@ def _plan_objects(
                 else:
                     # One process can load only one object for a SONAME. Keep
                     # the first resolution discovered from the ordered roots
-                    # (the full libgluten closure, then each UCX module).
+                    # (the full libgluten closure, then the RTCX, cuFile, and
+                    # UCX dynamic roots).
                     dependency = objects[selected[0]]
                 available_names = {dependency.source.name, *dependency.aliases}
                 if needed_name not in available_names:
@@ -641,10 +674,13 @@ def _plan_objects(
                     )
 
     # Finish the primary closure first so its libcudart resolution selects the
-    # one matching toolkit family used for RTCX's dynamic providers.
+    # one matching toolkit family used for the RTCX and cuFile providers.
     add(libgluten, "top")
     drain_queue()
     for entry in _rtcx_entries(objects):
+        add(entry, "top")
+        drain_queue()
+    for entry in _cufile_entries(objects):
         add(entry, "top")
         drain_queue()
 
@@ -851,6 +887,19 @@ def _validate_output_rtcx(output: Path):
             )
 
 
+def _validate_output_cufile(output: Path):
+    """Require the KvikIO cuFile provider family in the materialized bundle."""
+
+    libs = output / "libs"
+    stem = CUFILE_FAMILY_STEM
+    real, soname = _shared_library_family(libs, stem, "cuFile provider")
+    if soname != CUFILE_SONAME:
+        raise PackagerError(
+            f"bundled cuFile provider has SONAME {soname}, expected "
+            f"{CUFILE_SONAME}: {real}"
+        )
+
+
 def _validate_materialized_bundle(
     output: Path, *, native_only: bool
 ) -> tuple[NativeBuildInfo, BundleJarInfo | None]:
@@ -860,6 +909,7 @@ def _validate_materialized_bundle(
     _validate_output_symlinks(output)
     native_info = _validate_native_layout(output)
     _validate_output_rtcx(output)
+    _validate_output_cufile(output)
     _validate_output_runpaths(output)
     _validate_output_needed(output)
     if native_only:
