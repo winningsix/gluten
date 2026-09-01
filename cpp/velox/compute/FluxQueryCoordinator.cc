@@ -1087,6 +1087,7 @@ void FluxQueryCoordinator::start() {
   // before entering the per-split registration loop so adaptive readers never
   // wait behind that loop merely to classify the query.
   uint64_t expectedRegularCudfS3Splits{0};
+  uint64_t expectedRegularCudfS3ScanNodes{0};
   for (const auto& spec : fragmentSpecs_) {
     if (fragmentTasks_[spec.id].empty()) {
       continue;
@@ -1099,6 +1100,7 @@ void FluxQueryCoordinator::start() {
       if (connectorId != kCudfHiveConnectorId || !scanInfo->canUseCudfConnector()) {
         continue;
       }
+      bool hasLocalS3Split{false};
       for (size_t j = 0; j < scanInfo->paths.size(); ++j) {
         if (scanSplitOwners.at(scanInfo.get())[j] != peerIndex_) {
           continue;
@@ -1107,8 +1109,10 @@ void FluxQueryCoordinator::start() {
         if (path.starts_with("s3://") && j < scanInfo->properties.size() && scanInfo->properties[j].has_value() &&
             scanInfo->properties[j]->fileSize.has_value()) {
           ++expectedRegularCudfS3Splits;
+          hasLocalS3Split = true;
         }
       }
+      expectedRegularCudfS3ScanNodes += hasLocalS3Split ? 1 : 0;
     }
   }
   if (expectedRegularCudfS3Splits > 0 && queryCtx_->executor() != nullptr) {
@@ -1121,7 +1125,8 @@ void FluxQueryCoordinator::start() {
         queryCtx_->executor(),
         queryCtx_->queryId(),
         expectedRegularCudfS3Splits,
-        static_cast<uint64_t>(minRegisteredSplits));
+        static_cast<uint64_t>(minRegisteredSplits),
+        expectedRegularCudfS3ScanNodes);
   }
 #endif
 
