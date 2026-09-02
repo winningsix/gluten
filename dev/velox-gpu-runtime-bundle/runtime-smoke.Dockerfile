@@ -29,7 +29,7 @@ RUN command -v python3 >/dev/null \
     && command -v ldd >/dev/null \
     && java -version 2>&1 | grep -E 'version "17([.]|")' >/dev/null
 
-COPY artifact_metadata.py runtime-smoke.py runtime-query.py /opt/gluten-runtime-smoke/
+COPY artifact_metadata.py host_platform.py runtime-smoke.py runtime-query.py /opt/gluten-runtime-smoke/
 
 ENTRYPOINT ["python3", "/opt/gluten-runtime-smoke/runtime-smoke.py"]
 CMD ["--container-runtime"]

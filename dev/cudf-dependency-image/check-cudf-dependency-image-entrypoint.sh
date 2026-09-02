@@ -36,9 +36,11 @@
 # the caller must provide GPU access, and the check requires cuda_copy and
 # cuda_ipc from /usr/local/bin/ucx_info -d. Image assembly uses OFF because it
 # has no NVIDIA driver injection; the producer then repeats the installed check
-# in strict ON mode with GPU access. The entrypoint also rejects compiled Velox
-# or Gluten artifacts. It does not assess compiler, CUDA, SM, flags, patches,
-# ABI, binary equivalence, publication, or downstream consumer runtime.
+# in strict ON mode with GPU access. The entrypoint also requires the carrier's
+# effective CC, CXX, gcc, and g++ defaults to resolve to GCC 14 and rejects
+# compiled Velox or Gluten artifacts. It does not assess CUDA version, SM,
+# flags, patches, ABI, binary equivalence, publication, or downstream consumer
+# runtime.
 
 set -euo pipefail
 
@@ -79,6 +81,29 @@ UCX_INFO=$(root_path usr/local/bin/ucx_info)
 ARROW_MAVEN_ROOT=$(root_path root/.m2/repository/org/apache/arrow)
 GLUTEN_MAVEN_ROOT=$(root_path root/.m2/repository/org/apache/gluten)
 ARROW_JAVA_VERSION=15.0.0-gluten
+
+if [ "$ROOT" = / ]; then
+  EXPECTED_CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc
+  EXPECTED_CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
+  if [ "${CC:-}" != "$EXPECTED_CC" ] || [ "${CXX:-}" != "$EXPECTED_CXX" ]; then
+    echo "ERROR: carrier CC/CXX must point directly at gcc-toolset-14" >&2
+    exit 1
+  fi
+  if [ ! -x "$CC" ] || [ ! -x "$CXX" ]; then
+    echo "ERROR: carrier CC/CXX are not executable" >&2
+    exit 1
+  fi
+  if [ "$(command -v gcc)" != "$CC" ] || [ "$(command -v g++)" != "$CXX" ]; then
+    echo "ERROR: carrier gcc/g++ defaults do not resolve to CC/CXX" >&2
+    exit 1
+  fi
+  cc_version=$("$CC" -dumpfullversion -dumpversion)
+  cxx_version=$("$CXX" -dumpfullversion -dumpversion)
+  if [[ ! "$cc_version" =~ ^14([.]|$) ]] || [[ ! "$cxx_version" =~ ^14([.]|$) ]]; then
+    echo "ERROR: carrier effective compiler must be GCC 14" >&2
+    exit 1
+  fi
+fi
 
 if [ ! -f "$MARKER" ]; then
   echo "ERROR: installed-cuDF source metadata is missing: ${MARKER}" >&2

@@ -32,9 +32,11 @@
 # and transports, and the absence of compiled Velox or Gluten artifacts. The
 # marker proves cuDF source alignment only; it does not describe Arrow or AWS
 # content or prove compiler, CUDA, SM, flags, patches, ABI, or binary
-# equivalence. This script creates and validates only the requested local tag:
-# registry login, publication, promotion, registration, and downstream consumer
-# builds remain outside its ownership.
+# equivalence. The producer inspects --base_image architecture, pulls it with
+# the native host --platform when it is not local, and refuses qemu or a
+# mismatched base. This script creates and validates only the requested local
+# tag: registry login, publication, promotion, registration, and downstream
+# consumer builds remain outside its ownership.
 
 set -euo pipefail
 
@@ -49,7 +51,10 @@ CUDF_VERSION=""
 CUDA_ARCH=""
 MAVEN_SETTINGS=""
 NUM_THREADS="${NUM_THREADS:-$(nproc)}"
-BASE_IMAGE="ghcr.io/facebookincubator/velox-dev:adapters"
+DEFAULT_BASE_IMAGE="ghcr.io/facebookincubator/velox-dev:adapters"
+BASE_IMAGE="${DEFAULT_BASE_IMAGE}"
+DEFAULT_CUDA_VERSION="13.1"
+CUDA_VERSION="${DEFAULT_CUDA_VERSION}"
 
 usage() {
   cat <<EOF
@@ -72,7 +77,8 @@ Required:
 Optional:
   --maven_settings=PATH     Caller-supplied Maven settings.xml for Arrow Java
   --num_threads=N           Positive build parallelism (default: ${NUM_THREADS})
-  --base_image=IMAGE        Toolchain base (default: ${BASE_IMAGE})
+  --base_image=IMAGE        Native-arch toolchain base (default: ${DEFAULT_BASE_IMAGE})
+  --cuda_version=VERSION    CUDA toolkit installed in the carrier (default: ${DEFAULT_CUDA_VERSION})
   -h, --help                Show this help
 EOF
 }
@@ -102,6 +108,9 @@ for arg in "$@"; do
       ;;
     --base_image=*|--base-image=*)
       BASE_IMAGE="${arg#*=}"
+      ;;
+    --cuda_version=*|--cuda-version=*)
+      CUDA_VERSION="${arg#*=}"
       ;;
     -h|--help)
       usage
@@ -141,6 +150,10 @@ if [[ ! "$CUDF_VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
 fi
 if [[ ! "$CUDA_ARCH" =~ ^[0-9]+(-real|-virtual)?(,[0-9]+(-real|-virtual)?)*$ ]]; then
   echo "ERROR: --cuda_arch must be an explicit comma-separated numeric architecture list" >&2
+  exit 2
+fi
+if [[ ! "$CUDA_VERSION" =~ ^[0-9]+[.][0-9]+$ ]]; then
+  echo "ERROR: --cuda_version must be a major.minor toolkit version" >&2
   exit 2
 fi
 if [[ ! "$NUM_THREADS" =~ ^[1-9][0-9]*$ ]]; then
@@ -190,23 +203,60 @@ fi
 command -v docker >/dev/null || { echo "ERROR: docker is required" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "ERROR: python3 is required" >&2; exit 2; }
 
+HOST_DOCKER_PLATFORM=$(python3 "$SCRIPT_DIR/velox-gpu-runtime-bundle/host_platform.py")
+HOST_ARCH=${HOST_DOCKER_PLATFORM#linux/}
+
 marker_dir=$(mktemp -d)
 trap 'rm -rf "$marker_dir"' EXIT
 marker="$marker_dir/cudf-build-info"
 printf 'CUDF_COMMIT=%s\nCUDF_VERSION=%s\n' "$CUDF_COMMIT" "$CUDF_VERSION" > "$marker"
 
-# Require the source metadata to match before Docker starts so a malformed or
-# mismatched commit cannot trigger an expensive dependency build.
+# Require the source metadata to match before inspecting or building images so
+# a malformed or mismatched commit cannot trigger an expensive dependency build.
 PYTHONDONTWRITEBYTECODE=1 python3 "$SCRIPT_DIR/verify-system-cudf.py" \
   --velox-home "$VELOX_DIR" \
   --version-info "$marker"
 
+normalize_docker_architecture() {
+  case "$1" in
+    amd64|x86_64) printf '%s\n' amd64 ;;
+    arm64|aarch64) printf '%s\n' arm64 ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+if ! BASE_ARCH=$(docker image inspect --format '{{.Architecture}}' "$BASE_IMAGE" 2>/dev/null) \
+    || [ -z "$BASE_ARCH" ]; then
+  echo "Base image not present locally; pulling ${HOST_DOCKER_PLATFORM} ${BASE_IMAGE}"
+  if ! docker pull --platform="${HOST_DOCKER_PLATFORM}" "$BASE_IMAGE"; then
+    echo "ERROR: could not pull --base_image ${BASE_IMAGE} for ${HOST_DOCKER_PLATFORM}" >&2
+    if [ "$HOST_ARCH" = arm64 ]; then
+      echo "On AArch64, pass --base_image with a native arm64 toolchain when the default adapters image is not arm64." >&2
+    fi
+    exit 2
+  fi
+  if ! BASE_ARCH=$(docker image inspect --format '{{.Architecture}}' "$BASE_IMAGE") \
+      || [ -z "$BASE_ARCH" ]; then
+    echo "ERROR: could not inspect --base_image architecture: ${BASE_IMAGE}" >&2
+    exit 2
+  fi
+fi
+BASE_ARCH=$(normalize_docker_architecture "$BASE_ARCH")
+if [ "$BASE_ARCH" != "$HOST_ARCH" ]; then
+  echo "ERROR: --base_image architecture ${BASE_ARCH} does not match host ${HOST_ARCH}; qemu is forbidden" >&2
+  if [ "$HOST_ARCH" = arm64 ]; then
+    echo "On AArch64, pass --base_image with a native arm64 toolchain when the default adapters image is not arm64." >&2
+  fi
+  exit 2
+fi
+
 echo "Building local SYSTEM-cuDF dependency carrier"
 echo "  image        : ${IMAGE}"
+echo "  host platform: ${HOST_DOCKER_PLATFORM}"
 echo "  base image   : ${BASE_IMAGE}"
 echo "  Velox source : ${VELOX_DIR}"
 echo "  CUDF_COMMIT  : ${CUDF_COMMIT}"
 echo "  CUDF_VERSION : ${CUDF_VERSION}"
+echo "  CUDA toolkit : ${CUDA_VERSION}"
 echo "  CUDA arch    : ${CUDA_ARCH}"
 echo "  threads      : ${NUM_THREADS}"
 if [ -n "$MAVEN_SETTINGS" ]; then
@@ -215,10 +265,12 @@ fi
 
 docker_build_args=(
   build
+  --platform="${HOST_DOCKER_PLATFORM}"
   --progress=plain
   --build-context "gluten=${GLUTEN_DIR}"
   --build-context "velox=${VELOX_DIR}"
   --build-arg "BASE_IMAGE=${BASE_IMAGE}"
+  --build-arg "CUDA_VERSION=${CUDA_VERSION}"
   --build-arg "CUDF_COMMIT=${CUDF_COMMIT}"
   --build-arg "CUDF_VERSION=${CUDF_VERSION}"
   --build-arg "CUDA_ARCH=${CUDA_ARCH}"

@@ -45,6 +45,7 @@ from artifact_metadata import (
     read_native_build_info,
     validate_native_jar_identity,
 )
+from host_platform import GLIBC_LOADERS, docker_platform_flag
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DOCKERFILE = SCRIPT_DIR / "runtime-smoke.Dockerfile"
@@ -234,6 +235,21 @@ def _runtime_rtcx_providers(libs: Path) -> RtcxProviders:
     )
 
 
+def _runtime_cufile_family(libs: Path) -> LibraryFamily:
+    """Require the cuFile SONAME KvikIO dlopens, without treating so.0 as CUDA major."""
+
+    soname_link = libs / "libcufile.so.0"
+    if not soname_link.is_symlink():
+        raise SmokeError("bundle is missing required libcufile.so.0 SONAME symlink")
+    target = os.readlink(soname_link)
+    if os.path.isabs(target) or "/" in target:
+        raise SmokeError("bundled libcufile.so.0 must be a relative basename symlink")
+    real = resolve_regular_file(soname_link, "bundle libcufile.so.0", nonempty=True)
+    if real.parent != libs:
+        raise SmokeError("bundled libcufile.so.0 must resolve inside libs/")
+    return LibraryFamily(soname_path=soname_link, real=real, version=(0,))
+
+
 def validate_bundle(value: str | os.PathLike[str]) -> Bundle:
     input_path = Path(value).expanduser()
     try:
@@ -261,6 +277,7 @@ def validate_bundle(value: str | os.PathLike[str]) -> Bundle:
         libs / "libgluten.so", "bundle libs/libgluten.so", nonempty=True
     )
     rtcx = _runtime_rtcx_providers(libs)
+    _runtime_cufile_family(libs)
     try:
         jar_info = read_bundle_jar(jar)
         native_info = read_native_build_info(libs / NATIVE_BUILD_INFO_NAME)
@@ -334,7 +351,7 @@ def build_validation_image(runtime: QualificationTarget) -> str:
             "docker",
             "build",
             "--quiet",
-            "--platform=linux/amd64",
+            docker_platform_flag(),
             "--build-arg",
             f"SPARK_RUNTIME_IMAGE={runtime.image}",
             "--file",
@@ -365,7 +382,7 @@ def build_docker_run_command(
         "docker",
         "run",
         "--rm",
-        "--platform=linux/amd64",
+        docker_platform_flag(),
         "--user",
         "0:0",
         "--gpus",
@@ -439,8 +456,9 @@ def _external_provider(name: str, resolved: Path | None, bundle_root: Path) -> b
     )
     if (
         name in glibc_names
+        or name in GLIBC_LOADERS
         or re.fullmatch(r"libnss_[A-Za-z0-9_-]+[.]so[.]2", name)
-        or re.fullmatch(r"ld-linux[^/]*[.]so[.]2", name)
+        or re.fullmatch(r"ld-linux[^/]*[.]so[.][12]", name)
     ):
         return any(_is_within(resolved, root) for root in system_roots)
 

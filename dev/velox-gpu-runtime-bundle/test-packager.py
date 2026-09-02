@@ -1094,6 +1094,75 @@ class PackagerTest(unittest.TestCase):
             with self.assertRaisesRegex(packager.PackagerError, "exactly one"):
                 packager._validate_output_shape(fixture.output)
 
+    def test_rejects_foreign_elf_machine(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(Path(temporary))
+            observed = packager._elf_machine(fixture.libgluten)
+            foreign = 183 if observed == 62 else 62
+            data = bytearray(fixture.libgluten.read_bytes())
+            data[18:20] = int(foreign).to_bytes(2, "little")
+            fixture.libgluten.write_bytes(data)
+            with self.assertRaisesRegex(packager.PackagerError, "e_machine"):
+                fixture.build()
+
+    def test_patchelf_retries_grace_page_size(self):
+        real_run = packager._run
+        first_attempts: list[list[str]] = []
+
+        def fake_run(command, description, allow_failure=False):
+            argv = list(command)
+            if (
+                argv
+                and argv[0] == "patchelf"
+                and "--set-rpath" in argv
+                and "--page-size" not in argv
+            ):
+                first_attempts.append(argv)
+                return subprocess.CompletedProcess(argv, 1, "", "page size")
+            return real_run(command, description, allow_failure=allow_failure)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = self.fixture(Path(temporary))
+            with mock.patch.object(packager, "_run", side_effect=fake_run):
+                fixture.build()
+            self.assertTrue(first_attempts)
+            libs = fixture.output / "libs"
+            self.assertEqual(
+                "$ORIGIN",
+                subprocess.check_output(
+                    ["patchelf", "--print-rpath", libs / "libgluten.so"], text=True
+                ).strip(),
+            )
+
+    def test_curl_url_api_fail_closed_without_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            libs = output / "libs"
+            libs.mkdir()
+            cudf = libs / "libcudf.so.1"
+            curl = libs / "libcurl.so.4.8.0"
+            cudf.write_bytes(b"cudf")
+            curl.write_bytes(b"curl")
+
+            def fake_family(_directory, stem, label):
+                if stem.startswith("libcudf"):
+                    return cudf, "libcudf.so.1"
+                if stem.startswith("libcurl"):
+                    return curl, "libcurl.so.4"
+                raise packager.PackagerError(label)
+
+            def fake_dynsyms(_path, *, undefined):
+                return {packager.CURL_URL_API_SYMBOL} if undefined else set()
+
+            with mock.patch.object(
+                packager, "_shared_library_family", side_effect=fake_family
+            ), mock.patch.object(
+                packager, "_dynsym_names", side_effect=fake_dynsyms
+            ), self.assertRaisesRegex(
+                packager.PackagerError, "curl_url_strerror"
+            ):
+                packager._validate_curl_url_api(output)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -20,13 +20,15 @@
 # that image. The dependency carrier intentionally stores its prepared Maven
 # repository under /root/.m2, so the wrapper runs one disposable root container
 # with HOME=/root. GPU access is required because UCX exposes cuda_copy and
-# cuda_ipc only when the CUDA driver is visible. The entrypoint owns the source
-# marker, native dependencies, Arrow C++ and Java content, CUDA UCX, semantic
-# AWS compile/link, package-resolution, and forbidden-artifact rules; this
-# wrapper neither duplicates those rules nor performs registry publication.
+# cuda_ipc only when the CUDA driver is visible. The wrapper passes the native
+# host --platform and refuses qemu. The entrypoint owns the source marker,
+# native dependencies, Arrow C++ and Java content, CUDA UCX, semantic AWS
+# compile/link, package-resolution, and forbidden-artifact rules; this wrapper
+# neither duplicates those rules nor performs registry publication.
 
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 IMAGE=""
 EXPECTED_COMMIT=""
 while [ "$#" -gt 0 ]; do
@@ -61,7 +63,10 @@ if [[ ! "$EXPECTED_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
   exit 2
 fi
 
-docker run --rm --user 0:0 --gpus all \
+command -v python3 >/dev/null || { echo "ERROR: python3 is required" >&2; exit 2; }
+HOST_DOCKER_PLATFORM=$(python3 "$SCRIPT_DIR/../velox-gpu-runtime-bundle/host_platform.py")
+
+docker run --rm --platform="${HOST_DOCKER_PLATFORM}" --user 0:0 --gpus all \
   --env HOME=/root \
   --entrypoint /usr/local/bin/check-cudf-dependency-image-entrypoint.sh \
   "$IMAGE" \

@@ -43,6 +43,7 @@ def load_module(name: str, filename: str):
 
 runtime_smoke = load_module("runtime_smoke", "runtime-smoke.py")
 runtime_query = load_module("runtime_query", "runtime-query.py")
+host_platform = load_module("host_platform", "host_platform.py")
 
 GLUTEN_REVISION = "a" * 40
 VELOX_REVISION = "b" * 40
@@ -144,6 +145,7 @@ class RuntimeSmokeTest(unittest.TestCase):
         self._rtcx_family(
             "libnvJitLink.so", "libnvJitLink.so.12", "libnvJitLink.so.12.4.99"
         )
+        self._rtcx_family("libcufile.so", "libcufile.so.0", "libcufile.so.1.14.1")
 
     def tearDown(self):
         self.temp.cleanup()
@@ -227,6 +229,8 @@ class RuntimeSmokeTest(unittest.TestCase):
             docker_build,
         )
         docker_run = calls[-1]
+        self.assertIn(host_platform.docker_platform_flag(), docker_build)
+        self.assertIn(host_platform.docker_platform_flag(), docker_run)
         self.assertEqual(docker_run[docker_run.index("--gpus") + 1], "1")
         self.assertNotIn(
             str(runtime_smoke.CALLER_PROPERTIES_MOUNT), " ".join(docker_run)
@@ -558,7 +562,11 @@ Operators after adapting for cuDF: count [3]
         dockerfile = (HERE / "runtime-smoke.Dockerfile").read_text(encoding="utf-8")
         self.assertIn("ARG SPARK_RUNTIME_IMAGE", dockerfile)
         self.assertIn("FROM ${SPARK_RUNTIME_IMAGE}", dockerfile)
-        self.assertIn("COPY artifact_metadata.py runtime-smoke.py", dockerfile)
+        self.assertIn(
+            "COPY artifact_metadata.py host_platform.py "
+            "runtime-smoke.py runtime-query.py",
+            dockerfile,
+        )
         self.assertIn('ENV PATH="${SPARK_HOME}/bin:${PATH}"', dockerfile)
         self.assertIn("command -v spark-submit", dockerfile)
 

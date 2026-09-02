@@ -90,6 +90,11 @@ from artifact_metadata import (  # noqa: E402
     validate_native_jar_identity,
     write_native_build_info,
 )
+from host_platform import (  # noqa: E402
+    GLIBC_LOADERS,
+    HostPlatformError,
+    host_platform,
+)
 
 ROOT_POM = Path(__file__).resolve().parent.parent / "pom.xml"
 NEEDED_RE = re.compile(r"\(NEEDED\).*Shared library: \[([^]]+)]")
@@ -103,16 +108,16 @@ RTCX_FAMILY_STEMS = (
 )
 CUFILE_FAMILY_STEM = "libcufile.so"
 CUFILE_SONAME = "libcufile.so.0"
+PATCHELF_PAGE_SIZE = "65536"
+CURL_URL_API_SYMBOL = "curl_url_strerror"
 
 # These dependencies are deliberately supplied by the target runtime instead
 # of being copied. Everything else named by DT_NEEDED must become bundle
 # content. The path checks below keep this exception list from accepting an
 # arbitrary library with a familiar basename.
+
 GLIBC_PROVIDERS = {
-    "ld-linux-aarch64.so.1",
-    "ld-linux-x86-64.so.2",
-    "ld64.so.1",
-    "ld64.so.2",
+    *GLIBC_LOADERS,
     "libBrokenLocale.so.1",
     "libanl.so.1",
     "libc.so.6",
@@ -204,6 +209,38 @@ def _is_elf(path: Path) -> bool:
         return False
 
 
+def _elf_machine(path: Path) -> int:
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(20)
+    except OSError as error:
+        raise PackagerError(f"cannot read ELF header: {path}") from error
+    if len(header) < 20 or header[:4] != b"\x7fELF":
+        raise PackagerError(f"shared-library closure member is not ELF: {path}")
+    endian = header[5]
+    raw = header[18:20]
+    if endian == 1:
+        return int.from_bytes(raw, "little")
+    if endian == 2:
+        return int.from_bytes(raw, "big")
+    raise PackagerError(f"ELF {path} has an unsupported ident data encoding")
+
+
+def _require_host_elf(path: Path, label: str):
+    if not _is_elf(path):
+        raise PackagerError(f"{label} is not an ELF file: {path}")
+    try:
+        expected = host_platform().elf_machine
+    except HostPlatformError as error:
+        raise PackagerError(str(error)) from error
+    observed = _elf_machine(path)
+    if observed != expected:
+        raise PackagerError(
+            f"{label} ELF e_machine {observed} does not match host "
+            f"{host_platform().machine} ({expected}): {path}"
+        )
+
+
 def _is_within(path: Path, directory: Path) -> bool:
     try:
         path.relative_to(directory)
@@ -272,8 +309,7 @@ def _validate_libgluten(path: Path) -> Path:
     if path.is_symlink():
         raise PackagerError(f"libgluten must be a real file, not a symlink: {path}")
     resolved = _resolve_source(path, "libgluten")
-    if not _is_elf(resolved):
-        raise PackagerError(f"libgluten is not an ELF file: {path}")
+    _require_host_elf(resolved, "libgluten")
     return resolved
 
 
@@ -340,6 +376,7 @@ def _ucx_entries(ucx_dirs: Iterable[Path]) -> tuple[list[Path], set[Path]]:
             real_files.add(resolved)
             has_uct_cuda = has_uct_cuda or candidate.name.startswith("libuct_cuda.so")
             has_ucm_cuda = has_ucm_cuda or candidate.name.startswith("libucm_cuda.so")
+            _require_host_elf(resolved, "UCX module")
 
     if not has_uct_cuda:
         raise PackagerError("required CUDA UCX module libuct_cuda.so* was not found")
@@ -395,6 +432,26 @@ def _soname(path: Path) -> str:
     return names[0] if names else path.name
 
 
+def _dynsym_names(path: Path, *, undefined: bool) -> set[str]:
+    result = _run(
+        ["readelf", "--wide", "--dyn-syms", str(path)],
+        f"readelf dynsyms on {path}",
+        allow_failure=True,
+    )
+    names: set[str] = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 8 or parts[3] not in {"FUNC", "OBJECT", "IFUNC"}:
+            continue
+        is_undefined = parts[6] == "UND"
+        if is_undefined != undefined:
+            continue
+        name = parts[7].split("@", 1)[0]
+        if name:
+            names.add(name)
+    return names
+
+
 def _shared_library_family(directory: Path, stem: str, label: str) -> tuple[Path, str]:
     """Resolve one coherent ``*.so*`` family from a single directory."""
 
@@ -427,10 +484,10 @@ def _shared_library_family(directory: Path, stem: str, label: str) -> tuple[Path
     return real, soname
 
 
-def _selected_cuda_runtime(
+def _cuda_runtime_anchor(
     objects: dict[Path, PlannedObject],
-) -> tuple[Path, int]:
-    """Return the one deployable CUDA runtime selected by libgluten's closure."""
+) -> tuple[Path, int, Path]:
+    """Return libcudart path, CUDA major, and its toolkit ``lib`` directory."""
 
     cuda_runtimes: list[tuple[Path, int]] = []
     for planned in objects.values():
@@ -449,7 +506,7 @@ def _selected_cuda_runtime(
         raise PackagerError(
             f"CUDA runtime resolved from a non-deployable stubs directory: {cuda_runtime}"
         )
-    return cuda_runtime, cuda_major
+    return cuda_runtime, cuda_major, cuda_runtime.parent
 
 
 def _rtcx_entries(objects: dict[Path, PlannedObject]) -> list[Path]:
@@ -462,9 +519,7 @@ def _rtcx_entries(objects: dict[Path, PlannedObject]) -> list[Path]:
     runtime bundle.
     """
 
-    cuda_runtime, cuda_major = _selected_cuda_runtime(objects)
-    toolkit_lib = cuda_runtime.parent
-
+    _, cuda_major, toolkit_lib = _cuda_runtime_anchor(objects)
     entries: list[Path] = []
     for stem in RTCX_FAMILY_STEMS:
         real, soname = _shared_library_family(toolkit_lib, stem, "RTCX provider")
@@ -491,11 +546,10 @@ def _cufile_entries(objects: dict[Path, PlannedObject]) -> list[Path]:
     toolkit as the rest of the bundle.
     """
 
-    cuda_runtime, _ = _selected_cuda_runtime(objects)
-    toolkit_lib = cuda_runtime.parent
-
-    stem = CUFILE_FAMILY_STEM
-    real, soname = _shared_library_family(toolkit_lib, stem, "cuFile provider")
+    _, _, toolkit_lib = _cuda_runtime_anchor(objects)
+    real, soname = _shared_library_family(
+        toolkit_lib, CUFILE_FAMILY_STEM, "cuFile provider"
+    )
     if soname != CUFILE_SONAME:
         raise PackagerError(
             f"cuFile provider has SONAME {soname}, expected {CUFILE_SONAME}: {real}"
@@ -613,8 +667,7 @@ def _plan_objects(
 
     def add(source: Path, requested_group: str) -> PlannedObject:
         real = _resolve_source(source, "shared library")
-        if not _is_elf(real):
-            raise PackagerError(f"shared-library closure member is not ELF: {source}")
+        _require_host_elf(real, "shared library")
         group = "ucx" if real in ucx_reals else requested_group
         if real in objects:
             existing = objects[real]
@@ -691,6 +744,29 @@ def _plan_objects(
     return objects
 
 
+def _set_bundle_rpath(destination: Path, rpath: str):
+    """Rewrite RUNPATH, retrying with the Grace 64K page size on failure."""
+
+    result = _run(
+        ["patchelf", "--set-rpath", rpath, str(destination)],
+        f"patchelf on {destination}",
+        allow_failure=True,
+    )
+    if result.returncode == 0:
+        return
+    _run(
+        [
+            "patchelf",
+            "--page-size",
+            PATCHELF_PAGE_SIZE,
+            "--set-rpath",
+            rpath,
+            str(destination),
+        ],
+        f"patchelf --page-size {PATCHELF_PAGE_SIZE} on {destination}",
+    )
+
+
 def _copy_and_patch(
     output: Path,
     bundle_jar: Path | None,
@@ -728,10 +804,7 @@ def _copy_and_patch(
         destinations.items(), key=lambda item: str(item[0])
     ):
         rpath = "$ORIGIN:$ORIGIN/.." if objects[source].group == "ucx" else "$ORIGIN"
-        _run(
-            ["patchelf", "--set-rpath", rpath, str(destination)],
-            f"patchelf on {destination}",
-        )
+        _set_bundle_rpath(destination, rpath)
 
 
 def _validate_output_shape(output: Path, *, native_only: bool = False):
@@ -891,13 +964,53 @@ def _validate_output_cufile(output: Path):
     """Require the KvikIO cuFile provider family in the materialized bundle."""
 
     libs = output / "libs"
-    stem = CUFILE_FAMILY_STEM
-    real, soname = _shared_library_family(libs, stem, "cuFile provider")
+    real, soname = _shared_library_family(libs, CUFILE_FAMILY_STEM, "cuFile provider")
     if soname != CUFILE_SONAME:
         raise PackagerError(
             f"bundled cuFile provider has SONAME {soname}, expected "
             f"{CUFILE_SONAME}: {real}"
         )
+    soname_link = libs / soname
+    if not soname_link.is_symlink():
+        raise PackagerError(
+            f"bundled cuFile SONAME {soname} must be a relative symlink: {soname_link}"
+        )
+
+
+def _validate_curl_url_api(output: Path):
+    """If libcudf needs curl_url_strerror, bundled libcurl must export it."""
+
+    libs = output / "libs"
+    try:
+        cudf, _ = _shared_library_family(libs, "libcudf.so", "cuDF")
+    except PackagerError:
+        return
+    if CURL_URL_API_SYMBOL not in _dynsym_names(cudf, undefined=True):
+        return
+    try:
+        curl, _ = _shared_library_family(libs, "libcurl.so.4", "libcurl")
+    except PackagerError as error:
+        raise PackagerError(
+            f"bundled libcudf needs {CURL_URL_API_SYMBOL} but libcurl.so.4 is missing"
+        ) from error
+    if CURL_URL_API_SYMBOL not in _dynsym_names(curl, undefined=False):
+        raise PackagerError(
+            f"bundled libcurl.so.4 does not export {CURL_URL_API_SYMBOL} required "
+            f"by libcudf: {curl}"
+        )
+
+
+def _validate_output_elf_machines(output: Path):
+    libs = output / "libs"
+    expected = host_platform().elf_machine
+    for path in sorted(libs.rglob("*")):
+        if path.is_symlink() or not path.is_file() or not _is_elf(path):
+            continue
+        observed = _elf_machine(path)
+        if observed != expected:
+            raise PackagerError(
+                f"bundled ELF {path} has e_machine {observed}, expected {expected}"
+            )
 
 
 def _validate_materialized_bundle(
@@ -912,6 +1025,8 @@ def _validate_materialized_bundle(
     _validate_output_cufile(output)
     _validate_output_runpaths(output)
     _validate_output_needed(output)
+    _validate_curl_url_api(output)
+    _validate_output_elf_machines(output)
     if native_only:
         return native_info, None
 

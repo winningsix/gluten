@@ -243,13 +243,55 @@ The command creates and checks only a local Docker tag. Registry credentials,
 publication, promotion, and registration remain outside these upstream
 scripts.
 
-The default toolchain base is the Linux/amd64 Velox adapters image used by the
-existing cuDF recipe. That base supplies glibc and the ELF dynamic loader; they
-are not a portable runtime-bundle contract. The producer installs and selects
-JDK 17 in the carrier. NVIDIA driver libraries are not carrier content and are
-injected by the host's NVIDIA container runtime. A `--base_image` override must
-provide a compatible CentOS toolchain with `dnf`, `uv`, CUDA, and GCC toolset
-14, and it requires the same fresh SYSTEM smoke below.
+The default toolchain base is the Velox adapters image used by the existing
+cuDF recipe. GPU packaging and SYSTEM smoke must run on the native host
+architecture (`linux/amd64` or `linux/arm64`); qemu translation is rejected.
+The producer inspects `--base_image` architecture, pulls that image with the
+host `--platform` when it is not local, and fails closed on a mismatch.
+The published adapters index includes `linux/arm64`; try the default first.
+On AArch64, pass `--base_image` only when that arm64 variant is missing dnf,
+CUDA, or gcc-toolset-14. Keep the CentOS
+`JAVA_HOME=/usr/lib/jvm/java-17-openjdk` path; do not copy an Ubuntu
+`java-17-openjdk-arm64` location into the carrier.
+The carrier exposes GCC 14 directly through `CC`, `CXX`, and `PATH`; its
+content checker and protected smoke both reject a different effective compiler.
+The gcc-toolset-12 path remains only as compatibility for older consumers.
+`--cuda_arch` selects SM and is independent of CPU architecture. The JAR
+classifier `linux_aarch64` comes from Maven `os.full.name`, not a packager
+flag. Publication, S3, Pyxis, and NVL72 remain outside these scripts.
+
+The first AArch64 qualification flavor is Spark 3.5.5 / Scala 2.12 / JDK 17 /
+`--cuda_arch=100-real` on a native ARM CUDA host:
+
+```bash
+./dev/build-cudf-dependency-image.sh \
+  --velox_dir=/path/to/velox \
+  --image=gluten-cudf-dependencies:local-aarch64 \
+  --cudf_commit=<velox pin> \
+  --cudf_version=26.08 \
+  --cuda_arch=100-real \
+  --base_image=<if required>
+
+mkdir /path/to/deploy
+
+./dev/cudf-dependency-image/smoke-system.sh \
+  --image=gluten-cudf-dependencies:local-aarch64 \
+  --velox_dir=/path/to/velox \
+  --cuda_arch=100-real \
+  --runtime_bundle_output=/path/to/deploy
+
+python3 dev/velox-gpu-runtime-bundle/runtime-smoke.py \
+  --bundle=/path/to/deploy
+```
+
+After `libgluten.so` and the Spark 3.5 Maven JAR exist, the smoke packages a
+Spark-neutral native tree (`--native_only`) and composes it with that JAR. The
+native tree is not bound to Spark 3.5; Spark 3.5 is the first qualification
+flavor. Spark 4 ARM is not required for this path. The disposable runtime
+smoke image `apache/spark:3.5.5-scala2.12-java17-python3-ubuntu` publishes an
+arm64 manifest; if a host cannot pull it, tag a native ARM Spark 3.5/JDK 17
+image with that name locally. The NVL72 runtime squashfs is not an input to
+this script.
 
 Run the single fresh SYSTEM-cuDF buildbundle smoke separately in protected or
 nightly validation. Premerge validation should run the source/fixture checks in
@@ -289,8 +331,9 @@ dependency carrier does not provide Hadoop, `libhdfs.so`, a Hadoop classpath,
 or HDFS configuration; downstream runtime images supply those components and
 own live HDFS I/O qualification.
 
-The smoke starts a fresh root container with `HOME=/root`, selects JDK 17, and
-builds Spark 3.5.5 for Scala 2.12 with Maven profiles
+The smoke starts a fresh root container with `HOME=/root`, verifies the
+effective GCC 14 `CC`, `CXX`, `gcc`, and `g++` defaults, selects JDK 17,
+verifies Maven, and builds Spark 3.5.5 for Scala 2.12 with Maven profiles
 `backends-velox,spark-3.5,java-17`. It invokes
 `dev/buildbundle-veloxbe.sh` with `--run_setup_script=OFF`,
 `--build_arrow=OFF`, `--enable_s3=ON`, the selected
@@ -315,8 +358,9 @@ live HDFS read/write or downstream-runtime qualification, and the in-carrier
 live S3 or HDFS request, Spark/JNI runtime test, or paid service run and requires
 no AWS credentials or endpoint.
 
-A matching `CUDF_COMMIT` proves source alignment only. It does not prove
-compiler, CUDA, SM, flags, patches, ABI, or binary equivalence. The local image
+A matching `CUDF_COMMIT` marker proves source alignment only. The separate
+carrier content check proves its effective GCC 14 default, but does not prove
+CUDA version, SM, flags, patches, ABI, or binary equivalence. The local image
 and smoke likewise do not qualify arbitrary cross-process incremental CMake
 reuse.
 
@@ -338,8 +382,10 @@ mkdir /path/to/deploy
 ```
 
 After the native and Maven build succeeds, the smoke invokes the source-owned
-packager. The full-bundle layout is independent of the selected source-supported
-Spark shim, but always contains exactly one JVM artifact:
+packager in native-only mode, then composes that Spark-neutral tree with the
+Spark 3.5 qualification JAR. The full-bundle layout is independent of the
+selected source-supported Spark shim, but always contains exactly one JVM
+artifact:
 
 ```text
 deploy/
@@ -351,6 +397,7 @@ deploy/
     libnvrtc.so*
     libnvrtc-builtins.so*
     libnvJitLink.so*
+    libcufile.so*
     ucx/
       <required UCX modules>
 ```
@@ -366,7 +413,11 @@ SONAME symlink families. It also contains the exact `libnvrtc`,
 non-stub CUDA toolkit directory and CUDA major as the `libcudart` selected by
 the completed build. RTCX is statically absorbed into cuDF and opens these JIT
 providers dynamically, so they cannot be discovered from `DT_NEEDED` alone.
-Required UCX modules are under `libs/ucx/`. The packager rejects broken,
+KvikIO likewise `dlopen`s `libcufile.so.0`; the packager copies that SONAME
+family from the same libcudart directory. On AArch64, every copied ELF must
+match `EM_AARCH64` and `patchelf` retries with a 64K page size when the default
+rewrite fails. Required UCX modules are under `libs/ucx/`. The packager rejects
+broken,
 cyclic, absolute, or bundle-escaping symlinks, mixed or ambiguous CUDA
 families, CUDA stubs, and basename collisions. Real ELF files use
 bundle-relative `$ORIGIN` RUNPATHs; UCX modules also search their parent
@@ -402,6 +453,7 @@ native-deploy/
     libnvrtc.so*
     libnvrtc-builtins.so*
     libnvJitLink.so*
+    libcufile.so*
     ucx/
       <required UCX modules>
 ```

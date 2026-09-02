@@ -25,6 +25,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 export PYTHONDONTWRITEBYTECODE=1
 
+python3 "$SCRIPT_DIR/test-host-platform.py"
 python3 "$SCRIPT_DIR/test-packager.py"
 python3 "$SCRIPT_DIR/test-jvm-builder.py"
 python3 "$SCRIPT_DIR/test-runtime-smoke.py"

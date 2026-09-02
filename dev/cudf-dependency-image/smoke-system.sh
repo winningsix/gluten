@@ -30,12 +30,15 @@
 # one /usr/local library directory, resolves AWS SDK from /usr/local, produces
 # libgluten.so with no unresolved shared dependencies, builds Gluten Arrow from
 # the carrier's prepared 15.0.0-gluten artifacts, and produces exactly one
-# readable Spark 3.5.5/Scala 2.12 bundle. This smoke needs no AWS credentials,
-# live S3 service, Hadoop runtime, or live HDFS service and does not validate
-# Spark/JNI runtime, publish the carrier, or qualify arbitrary cross-process
-# build-tree reuse. Trusted callers may
-# supply one standard Maven settings.xml file; the smoke mounts only that
-# resolved file read-only at Maven's root settings path.
+# readable Spark 3.5.5/Scala 2.12 bundle. When --runtime_bundle_output is set,
+# the smoke packages a Spark-neutral native tree first, then composes that
+# tree with the Spark 3.5 JAR. Spark 3.5 is the first qualification flavor;
+# the native tree is not bound to that Spark line. This smoke needs no AWS
+# credentials, live S3 service, Hadoop runtime, or live HDFS service and does
+# not validate Spark/JNI runtime, publish the carrier, or qualify arbitrary
+# cross-process build-tree reuse. Trusted callers may supply one standard
+# Maven settings.xml file; the smoke mounts only that resolved file read-only
+# at Maven's root settings path.
 
 set -euo pipefail
 
@@ -67,7 +70,8 @@ Optional:
   --maven_settings=PATH  Caller-supplied Maven settings.xml, mounted read-only
   --runtime_bundle_output=PATH
                          Existing empty directory that receives one portable
-                         Spark-Gluten Velox GPU runtime bundle
+                         Spark-Gluten Velox GPU runtime bundle composed from
+                         a Spark-neutral native tree and the Spark 3.5 JAR
   --num_threads=N        Positive build parallelism (default: ${NUM_THREADS})
 EOF
 }
@@ -177,6 +181,8 @@ VELOX_DIR=$(cd "$VELOX_DIR" && pwd -P)
 command -v git >/dev/null || { echo "ERROR: git is required" >&2; exit 2; }
 command -v docker >/dev/null || { echo "ERROR: docker is required" >&2; exit 2; }
 command -v timeout >/dev/null || { echo "ERROR: timeout is required" >&2; exit 2; }
+command -v python3 >/dev/null || { echo "ERROR: python3 is required" >&2; exit 2; }
+HOST_DOCKER_PLATFORM=$(python3 "${GLUTEN_DIR}/dev/velox-gpu-runtime-bundle/host_platform.py")
 
 GLUTEN_HEAD=$(require_clean_git_head Gluten "$GLUTEN_DIR")
 VELOX_HEAD=$(require_clean_git_head Velox "$VELOX_DIR")
@@ -202,6 +208,12 @@ if ! IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$IMAGE"); then
 fi
 if [[ ! "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]; then
   echo "ERROR: dependency carrier did not resolve to one full image ID: ${IMAGE_ID}" >&2
+  exit 2
+fi
+IMAGE_ARCH=$(docker image inspect --format '{{.Architecture}}' "$IMAGE_ID")
+HOST_ARCH=${HOST_DOCKER_PLATFORM#linux/}
+if [ "$IMAGE_ARCH" != "$HOST_ARCH" ]; then
+  echo "ERROR: dependency carrier architecture ${IMAGE_ARCH} does not match host ${HOST_ARCH}; qemu is forbidden" >&2
   exit 2
 fi
 
@@ -245,7 +257,8 @@ if [ -n "$RUNTIME_BUNDLE_OUTPUT" ]; then
 fi
 
 timeout --signal=TERM --kill-after=2m 45m \
-  docker run --rm --platform=linux/amd64 --user 0:0 --gpus all \
+  docker run --rm --platform="${HOST_DOCKER_PLATFORM}" \
+  --user 0:0 --gpus all \
   "${docker_run_mounts[@]}" \
   "${docker_run_env[@]}" \
   "$IMAGE_ID" bash -lc '
@@ -257,8 +270,21 @@ tar -C /smoke/velox -xf /source/velox.tar
 if [ -f /opt/rh/gcc-toolset-14/enable ]; then
   source /opt/rh/gcc-toolset-14/enable
 fi
+export CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc
+export CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
 test "$(id -u)" -eq 0
 test "$HOME" = /root
+test "$CC" = /opt/rh/gcc-toolset-14/root/usr/bin/gcc
+test "$CXX" = /opt/rh/gcc-toolset-14/root/usr/bin/g++
+test -x "$CC"
+test -x "$CXX"
+test "$(command -v gcc)" = "$CC"
+test "$(command -v g++)" = "$CXX"
+cc_version=$("$CC" -dumpfullversion -dumpversion)
+cxx_version=$("$CXX" -dumpfullversion -dumpversion)
+grep -Eq "^14([.]|$)" <<< "$cc_version"
+grep -Eq "^14([.]|$)" <<< "$cxx_version"
+echo "Smoke compiler: CC=${CC} ${cc_version}; CXX=${CXX} ${cxx_version}"
 test -x "$JAVA_HOME/bin/java"
 test -x "$JAVA_HOME/bin/javac"
 java_version=$("$JAVA_HOME/bin/java" -version 2>&1 | head -1)
@@ -266,6 +292,11 @@ javac_version=$("$JAVA_HOME/bin/javac" -version 2>&1)
 grep -Eq "version \"17([.]|\")" <<< "$java_version"
 grep -Eq "^javac 17([.]|$)" <<< "$javac_version"
 echo "Smoke Java runtime: ${java_version}; ${javac_version}"
+command -v mvn
+mvn_version=$(mvn --version)
+grep -Eq "^Apache Maven " <<< "$mvn_version"
+mvn_first_line=$(sed -n "1p" <<< "$mvn_version")
+echo "Smoke Maven runtime: ${mvn_first_line}"
 export INSTALL_PREFIX=/usr/local
 export TARGETS="velox velox_cudf_exec"
 export NUM_THREADS="${SMOKE_NUM_THREADS}"
@@ -421,12 +452,18 @@ jar tf "${bundles[0]}" >/dev/null
 echo "Readable Spark 3.5.5/Scala 2.12 Gluten bundle: ${bundles[0]}"
 
 if [ -n "${SMOKE_RUNTIME_BUNDLE_OUTPUT:-}" ]; then
+  native_dir=$(mktemp -d /tmp/gluten-native-bundle.XXXXXX)
   python3 /smoke/gluten/dev/build-velox-gpu-runtime-bundle.py \
-    --bundle_jar="${bundles[0]}" \
+    --native_only \
     --libgluten="${gluten_library}" \
     --gluten_revision="${SMOKE_GLUTEN_REVISION}" \
     --velox_revision="${SMOKE_VELOX_REVISION}" \
+    --output_dir="${native_dir}"
+  python3 /smoke/gluten/dev/build-velox-gpu-runtime-bundle.py \
+    --native_bundle="${native_dir}" \
+    --bundle_jar="${bundles[0]}" \
     --output_dir="${SMOKE_RUNTIME_BUNDLE_OUTPUT}"
-  echo "Retained Spark-Gluten Velox GPU runtime bundle: ${SMOKE_RUNTIME_BUNDLE_OUTPUT}"
+  echo "Retained Spark-neutral native tree: ${native_dir}"
+  echo "Composed Spark 3.5 Velox GPU runtime bundle: ${SMOKE_RUNTIME_BUNDLE_OUTPUT}"
 fi
 '

@@ -42,6 +42,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 PRODUCER=$(cd "$SCRIPT_DIR/.." && pwd -P)/build-cudf-dependency-image.sh
 ARROW_BUILDER=$(cd "$SCRIPT_DIR/.." && pwd -P)/build-arrow.sh
 BUILDDEPS=$(cd "$SCRIPT_DIR/.." && pwd -P)/builddeps-veloxbe.sh
+VELOX_BUILDER="$SCRIPT_DIR/../../ep/build-velox/src/build-velox.sh"
 CHECK_ENTRYPOINT="$SCRIPT_DIR/check-cudf-dependency-image-entrypoint.sh"
 CHECK_HOST_WRAPPER="$SCRIPT_DIR/check-cudf-dependency-image.sh"
 SMOKE="$SCRIPT_DIR/smoke-system.sh"
@@ -51,6 +52,7 @@ PACKAGE_CHECK_DIR="$SCRIPT_DIR/package-check"
 PACKAGE_CHECK="$PACKAGE_CHECK_DIR/CMakeLists.txt"
 PACKAGE_PROBE="$PACKAGE_CHECK_DIR/aws-s3-link-probe.cpp"
 GLUTEN_VELOX_CMAKE="$SCRIPT_DIR/../../cpp/velox/CMakeLists.txt"
+GLUTEN_CMAKE="$SCRIPT_DIR/../../cpp/CMakeLists.txt"
 COMMIT=5beaa5954688fcb12236ffb434e192ea2c77db30
 OTHER_COMMIT=33320d64c94a64c94bccc5e2c522721e4d275858
 TEST_CUDA_ARCH=80-real,90-real
@@ -91,6 +93,15 @@ cat > "$fake_bin/docker" <<'EOF'
   printf '<%s>\n' "$@"
 } >> "${FAKE_DOCKER_LOG:?}"
 if [ "${1:-}" = image ] && [ "${2:-}" = inspect ]; then
+  for argument in "$@"; do
+    if [ "$argument" = '{{.Architecture}}' ]; then
+      case "$(uname -m)" in
+        aarch64|arm64) printf '%s\n' "${FAKE_DOCKER_ARCH:-arm64}" ;;
+        *) printf '%s\n' "${FAKE_DOCKER_ARCH:-amd64}" ;;
+      esac
+      exit 0
+    fi
+  done
   printf '%s\n' "${FAKE_DOCKER_IMAGE_ID:?}"
 fi
 EOF
@@ -176,10 +187,28 @@ test ! -s "$FAKE_DOCKER_LOG"
 expect_failure bad_arch "$PRODUCER" \
   "${common[@]/--cuda_arch=$TEST_CUDA_ARCH/--cuda_arch=native}"
 test ! -s "$FAKE_DOCKER_LOG"
+expect_failure bad_cuda_version "$PRODUCER" "${common[@]}" --cuda_version=latest
+test ! -s "$FAKE_DOCKER_LOG"
 expect_failure bad_threads "$PRODUCER" "${common[@]/--num_threads=4/--num_threads=0}"
 test ! -s "$FAKE_DOCKER_LOG"
 expect_failure empty_base "$PRODUCER" "${common[@]}" --base_image=
 test ! -s "$FAKE_DOCKER_LOG"
+host_docker_platform=$(python3 "$SCRIPT_DIR/../velox-gpu-runtime-bundle/host_platform.py")
+host_docker_arch=${host_docker_platform#linux/}
+if [ "$host_docker_arch" = amd64 ]; then
+  mismatched_base_arch=arm64
+else
+  mismatched_base_arch=amd64
+fi
+expect_failure mismatched_base_arch \
+  env FAKE_DOCKER_ARCH="$mismatched_base_arch" "$PRODUCER" "${common[@]}"
+grep -Fq -- '--base_image architecture' "$tmp/mismatched_base_arch.out"
+grep -Fq 'qemu is forbidden' "$tmp/mismatched_base_arch.out"
+if grep -Fqx '<build>' "$FAKE_DOCKER_LOG"; then
+  echo "ERROR: producer built a mismatched-architecture base image" >&2
+  exit 1
+fi
+: > "$FAKE_DOCKER_LOG"
 expect_failure missing_maven_settings "$PRODUCER" "${common[@]}" \
   --maven_settings="$tmp/does-not-exist.xml"
 grep -Fq -- '--maven_settings must name a readable nonempty regular file' \
@@ -200,15 +229,20 @@ test ! -s "$FAKE_DOCKER_LOG"
 rmdir "$velox/_build"
 
 "$PRODUCER" "${common[@]}" > "$tmp/producer.out"
-test "$(grep -c '^CALL$' "$FAKE_DOCKER_LOG")" -eq 2
+test "$(grep -c '^CALL$' "$FAKE_DOCKER_LOG")" -eq 3
+grep -Fqx "  host platform: ${host_docker_platform}" "$tmp/producer.out"
 if grep -Fqx '<--secret>' "$FAKE_DOCKER_LOG"; then
   echo "ERROR: default producer unexpectedly forwards Maven settings" >&2
   exit 1
 fi
 grep -Fqx '<build>' "$FAKE_DOCKER_LOG"
+grep -Fqx "<--platform=${host_docker_platform}>" "$FAKE_DOCKER_LOG"
+grep -Fqx '<image>' "$FAKE_DOCKER_LOG"
+grep -Fqx '<inspect>' "$FAKE_DOCKER_LOG"
 grep -Fqx "<gluten=$(cd "$SCRIPT_DIR/../.." && pwd -P)>" "$FAKE_DOCKER_LOG"
 grep -Fqx "<velox=$velox>" "$FAKE_DOCKER_LOG"
 grep -Fqx '<BASE_IMAGE=ghcr.io/facebookincubator/velox-dev:adapters>' "$FAKE_DOCKER_LOG"
+grep -Fqx '<CUDA_VERSION=13.1>' "$FAKE_DOCKER_LOG"
 grep -Fqx "<CUDF_COMMIT=$COMMIT>" "$FAKE_DOCKER_LOG"
 grep -Fqx '<CUDF_VERSION=26.08>' "$FAKE_DOCKER_LOG"
 grep -Fqx "<CUDA_ARCH=$TEST_CUDA_ARCH>" "$FAKE_DOCKER_LOG"
@@ -232,8 +266,11 @@ grep -Fqx '<--require-cuda-transports=ON>' "$FAKE_DOCKER_LOG"
 
 : > "$FAKE_DOCKER_LOG"
 "$PRODUCER" "${common[@]}" \
-  --maven_settings="$maven_settings_link" > "$tmp/producer-maven-settings.out"
-test "$(grep -c '^CALL$' "$FAKE_DOCKER_LOG")" -eq 2
+  --cuda_version=13.0 --maven_settings="$maven_settings_link" \
+  > "$tmp/producer-maven-settings.out"
+test "$(grep -c '^CALL$' "$FAKE_DOCKER_LOG")" -eq 3
+grep -Fqx "<--platform=${host_docker_platform}>" "$FAKE_DOCKER_LOG"
+grep -Fqx '<CUDA_VERSION=13.0>' "$FAKE_DOCKER_LOG"
 grep -Fqx '<--secret>' "$FAKE_DOCKER_LOG"
 grep -Fqx \
   "<id=maven_settings,src=$(readlink -f -- "$maven_settings")>" \
@@ -462,8 +499,16 @@ grep -Fqx '!cudf_prebuilt.Dockerfile' "$DOCKERIGNORE"
 grep -Fqx '!package-check/aws-s3-link-probe.cpp' "$DOCKERIGNORE"
 grep -Fq 'export TARGETS="cudf ucxx"' "$RECIPE"
 grep -Fq 'ghcr.io/facebookincubator/velox-dev:adapters' "$RECIPE"
+grep -Fq 'ARG CUDA_VERSION=13.1' "$RECIPE"
+grep -Fq 'ENV CUDA_VERSION=${CUDA_VERSION}' "$RECIPE"
+grep -Fq 'install_cuda "${CUDA_VERSION}"' "$RECIPE"
+grep -Fq '/usr/local/cuda/bin/nvcc --version' "$RECIPE"
 grep -Fq 'ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk' "$RECIPE"
-grep -Fq 'ENV PATH=/usr/lib/jvm/java-17-openjdk/bin:${PATH}' "$RECIPE"
+grep -Fq 'ENV CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc' "$RECIPE"
+grep -Fq 'ENV CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++' "$RECIPE"
+grep -Fq \
+  'ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:/usr/lib/jvm/java-17-openjdk/bin:${PATH}' \
+  "$RECIPE"
 grep -Fq 'java-17-openjdk-devel' "$RECIPE"
 grep -Fq 'maven' "$RECIPE"
 grep -Fq 'mvn --version' "$RECIPE"
@@ -472,6 +517,15 @@ grep -Fq 'patchelf --version' "$RECIPE"
 grep -Fq "grep -Eq 'version \"17([.]|\")'" "$RECIPE"
 grep -Fq "grep -Eq '^javac 17([.]|$)'" "$RECIPE"
 grep -Fq 'ln -s /opt/rh/gcc-toolset-14 /opt/rh/gcc-toolset-12' "$RECIPE"
+grep -Fq 'test "$(command -v gcc)" = "${CC}"' "$RECIPE"
+grep -Fq 'test "$(command -v g++)" = "${CXX}"' "$RECIPE"
+grep -Fq '"${CC}" -dumpfullversion -dumpversion' "$RECIPE"
+grep -Fq '"${CXX}" -dumpfullversion -dumpversion' "$RECIPE"
+grep -Fq 'EXPECTED_CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc' "$CHECK_ENTRYPOINT"
+grep -Fq 'EXPECTED_CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++' "$CHECK_ENTRYPOINT"
+grep -Fq -- '-Wno-error=deprecated-declarations' "$VELOX_BUILDER"
+grep -Fq -- '-flax-vector-conversions' "$VELOX_BUILDER"
+grep -Fq -- '-flax-vector-conversions' "$GLUTEN_CMAKE"
 grep -Fq 'UV_TOOL_DIR=/opt/uv-tools' "$RECIPE"
 grep -Fq 'UV_TOOL_BIN_DIR=/usr/local/bin' "$RECIPE"
 grep -Fq 'chmod -R a+rX /opt/uv-tools' "$RECIPE"
@@ -642,6 +696,7 @@ fi
 grep -Fq -- '--user 0:0' "$CHECK_HOST_WRAPPER"
 grep -Fq -- '--env HOME=/root' "$CHECK_HOST_WRAPPER"
 grep -Fq -- '--gpus all' "$CHECK_HOST_WRAPPER"
+grep -Fq -- '--platform="${HOST_DOCKER_PLATFORM}"' "$CHECK_HOST_WRAPPER"
 grep -Fq -- '--require-cuda-transports=ON' "$CHECK_HOST_WRAPPER"
 if grep -ERn 'docker (login|push)' \
   "$PRODUCER" \
@@ -830,6 +885,9 @@ grep -Fq \
 grep -Fq '<SMOKE_RUNTIME_BUNDLE_OUTPUT=/output/deploy>' "$FAKE_DOCKER_LOG"
 grep -Fq 'python3 /smoke/gluten/dev/build-velox-gpu-runtime-bundle.py' \
   "$FAKE_DOCKER_LOG"
+grep -Fq -- '--native_only' "$FAKE_DOCKER_LOG"
+grep -Fq -- '--native_bundle="${native_dir}"' "$FAKE_DOCKER_LOG"
+grep -Fq -- '--output_dir="${native_dir}"' "$FAKE_DOCKER_LOG"
 grep -Fq -- '--bundle_jar="${bundles[0]}"' "$FAKE_DOCKER_LOG"
 grep -Fq -- '--libgluten="${gluten_library}"' "$FAKE_DOCKER_LOG"
 grep -Fq -- '--gluten_revision="${SMOKE_GLUTEN_REVISION}"' "$FAKE_DOCKER_LOG"
@@ -837,7 +895,10 @@ grep -Fq -- '--velox_revision="${SMOKE_VELOX_REVISION}"' "$FAKE_DOCKER_LOG"
 grep -Fq -- '--output_dir="${SMOKE_RUNTIME_BUNDLE_OUTPUT}"' \
   "$FAKE_DOCKER_LOG"
 grep -Fq \
-  'Retained Spark-Gluten Velox GPU runtime bundle: ${SMOKE_RUNTIME_BUNDLE_OUTPUT}' \
+  'Retained Spark-neutral native tree: ${native_dir}' \
+  "$FAKE_DOCKER_LOG"
+grep -Fq \
+  'Composed Spark 3.5 Velox GPU runtime bundle: ${SMOKE_RUNTIME_BUNDLE_OUTPUT}' \
   "$FAKE_DOCKER_LOG"
 
 : > "$FAKE_DOCKER_LOG"
@@ -875,7 +936,10 @@ fi
 grep -Fqx '<image>' "$FAKE_DOCKER_LOG"
 grep -Fqx '<inspect>' "$FAKE_DOCKER_LOG"
 grep -Fqx '<{{.Id}}>' "$FAKE_DOCKER_LOG"
-test "$(grep -Fxc "<$TEST_IMAGE_ID>" "$FAKE_DOCKER_LOG")" -eq 1
+grep -Fqx '<{{.Architecture}}>' "$FAKE_DOCKER_LOG"
+test "$(grep -Fxc "<$TEST_IMAGE_ID>" "$FAKE_DOCKER_LOG")" -eq 2
+grep -Fq -- "--platform=$(python3 "$SCRIPT_DIR/../velox-gpu-runtime-bundle/host_platform.py")" \
+  "$FAKE_DOCKER_LOG"
 test "$(grep -Fxc '<local/gluten-cudf-dependencies:test>' \
   "$FAKE_DOCKER_LOG")" -eq 1
 grep -Fq -- '--run_setup_script=OFF' "$FAKE_DOCKER_LOG"
@@ -900,10 +964,21 @@ grep -Fq '<--user>' "$FAKE_DOCKER_LOG"
 grep -Fq '<0:0>' "$FAKE_DOCKER_LOG"
 grep -Fq '<HOME=/root>' "$FAKE_DOCKER_LOG"
 grep -Fq 'test "$HOME" = /root' "$FAKE_DOCKER_LOG"
+grep -Fq 'export CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc' "$FAKE_DOCKER_LOG"
+grep -Fq 'export CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++' "$FAKE_DOCKER_LOG"
+grep -Fq 'test "$CC" = /opt/rh/gcc-toolset-14/root/usr/bin/gcc' "$FAKE_DOCKER_LOG"
+grep -Fq 'test "$CXX" = /opt/rh/gcc-toolset-14/root/usr/bin/g++' "$FAKE_DOCKER_LOG"
+grep -Fq 'test "$(command -v gcc)" = "$CC"' "$FAKE_DOCKER_LOG"
+grep -Fq 'test "$(command -v g++)" = "$CXX"' "$FAKE_DOCKER_LOG"
+grep -Fq 'Smoke compiler: CC=${CC} ${cc_version}; CXX=${CXX} ${cxx_version}' \
+  "$FAKE_DOCKER_LOG"
 grep -Fq 'test -x "$JAVA_HOME/bin/java"' "$FAKE_DOCKER_LOG"
 grep -Fq 'test -x "$JAVA_HOME/bin/javac"' "$FAKE_DOCKER_LOG"
 grep -Fq 'Smoke Java runtime: ${java_version}; ${javac_version}' \
   "$FAKE_DOCKER_LOG"
+grep -Fq 'command -v mvn' "$FAKE_DOCKER_LOG"
+grep -Fq 'mvn_first_line=$(sed -n "1p" <<< "$mvn_version")' "$FAKE_DOCKER_LOG"
+grep -Fq 'Smoke Maven runtime: ${mvn_first_line}' "$FAKE_DOCKER_LOG"
 grep -Fq 'export TARGETS="velox velox_cudf_exec"' "$FAKE_DOCKER_LOG"
 grep -Fq 'export GLUTEN_BUNDLE_MAVEN_PROFILES=backends-velox,spark-3.5,java-17' \
   "$FAKE_DOCKER_LOG"

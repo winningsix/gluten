@@ -52,13 +52,14 @@
 # ABI, or binary equivalence.
 #
 # Inputs and validation:
-# BASE_IMAGE selects the compatible CentOS/CUDA toolchain; UCX_VERSION follows
-# the selected Velox adapter pin; CUDF_COMMIT, CUDF_VERSION, CUDA_ARCH, and
-# NUM_THREADS control the dependency build. The selected Velox source owns the
-# AWS SDK pin and installation recipe. Spark-Gluten owns the Arrow 15 C++ and
-# Java recipe and patches. GPU-independent image assembly checks the marker and
-# packages, the complete static Arrow closure, the five required patched Arrow
-# Java artifacts, compiles and links a small S3/S3-CRT consumer against the
+# BASE_IMAGE selects the compatible CentOS toolchain, and CUDA_VERSION defaults
+# the carrier to CUDA 13.1 while retaining an explicit build-argument override.
+# UCX_VERSION follows the selected Velox adapter pin; CUDF_COMMIT, CUDF_VERSION,
+# CUDA_ARCH, and NUM_THREADS control the dependency build. The selected Velox
+# source owns the AWS SDK pin and installation recipe. Spark-Gluten owns the
+# Arrow 15 C++ and Java recipe and patches. GPU-independent image assembly
+# checks the marker and packages, the complete static Arrow closure, the five
+# required patched Arrow Java artifacts, compiles and links a small S3/S3-CRT consumer against the
 # static AWS closure, validates CUDA UCX build configuration and modules, and
 # rejects forbidden artifacts. The producer's GPU-enabled post-build validator
 # then requires cuda_copy and cuda_ipc from `ucx_info -d` before accepting the
@@ -74,6 +75,7 @@
 # or deployment concerns.
 
 ARG BASE_IMAGE=ghcr.io/facebookincubator/velox-dev:adapters
+ARG CUDA_VERSION=13.1
 ARG UCX_VERSION=1.20.1
 ARG UCX_SHA256=545c419a7b5e04643cb8bff5a19b3b5071a8f8f0605f1e8efb36f8f3d7bfb9d3
 
@@ -84,19 +86,27 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # Velox's CMake 4 toolchain contract keeps older dependency policies admissible.
 ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
 ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
-ENV PATH=/usr/lib/jvm/java-17-openjdk/bin:${PATH}
+ENV CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc
+ENV CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
+ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:/usr/lib/jvm/java-17-openjdk/bin:${PATH}
 
 ARG CURL_VERSION=8.12.1
+ARG CUDA_VERSION
 ARG UCX_VERSION
 ARG UCX_SHA256
 ARG NUM_THREADS
+ENV CUDA_VERSION=${CUDA_VERSION}
 
-# Match Spark-Gluten's existing cuDF recipe: the inherited CC/CXX variables
-# name gcc-toolset-12, so keep that path aligned with the selected GCC 14
-# toolchain. UCX is built with CUDA below, and cuDF 26.08 requires CMake 4.
+# Keep the gcc-toolset-12 path as compatibility for older consumers while the
+# carrier's effective compiler contract points directly at GCC 14. Install the
+# selected CUDA toolkit explicitly because the upstream adapters base currently
+# defaults to CUDA 12.9. UCX is built with CUDA below, and cuDF 26.08 requires
+# CMake 4.
 RUN rm -rf /opt/rh/gcc-toolset-12 \
     && ln -s /opt/rh/gcc-toolset-14 /opt/rh/gcc-toolset-12 \
     && dnf install -y java-17-openjdk-devel maven patchelf rdma-core-devel \
+    && source /setup-centos-adapters.sh \
+    && install_cuda "${CUDA_VERSION}" \
     && dnf clean all \
     && UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin \
       uv tool install --force cmake@4.3.2 \
@@ -105,6 +115,13 @@ RUN rm -rf /opt/rh/gcc-toolset-12 \
     && [[ "${cmake_path}" == /opt/uv-tools/* ]] \
     && test -x "${cmake_path}" \
     && cmake --version \
+    && test "${CC}" = /opt/rh/gcc-toolset-14/root/usr/bin/gcc \
+    && test "${CXX}" = /opt/rh/gcc-toolset-14/root/usr/bin/g++ \
+    && test "$(command -v gcc)" = "${CC}" \
+    && test "$(command -v g++)" = "${CXX}" \
+    && "${CC}" -dumpfullversion -dumpversion | grep -Eq '^14([.]|$)' \
+    && "${CXX}" -dumpfullversion -dumpversion | grep -Eq '^14([.]|$)' \
+    && /usr/local/cuda/bin/nvcc --version | grep -Fq "release ${CUDA_VERSION}," \
     && mvn --version \
     && patchelf --version \
     && java -version 2>&1 | grep -Eq 'version "17([.]|")' \
