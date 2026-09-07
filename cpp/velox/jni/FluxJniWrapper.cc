@@ -201,6 +201,39 @@ std::string formatIndices(std::vector<int32_t> indices) {
   return out.str();
 }
 
+constexpr int32_t kMaxKeyedFinalLocalDrivers = 4;
+
+int32_t parallelDirectWriteLanes() {
+  const auto* raw = std::getenv("GLUTEN_CUDF_PARALLEL_DIRECT_WRITE_LANES");
+  if (raw == nullptr || *raw == '\0') {
+    return 1;
+  }
+  char* end = nullptr;
+  const auto requested = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || requested < 1) {
+    LOG(WARNING)
+        << "FluxJniWrapper: ignoring invalid "
+        << "GLUTEN_CUDF_PARALLEL_DIRECT_WRITE_LANES='" << raw << "'";
+    return 1;
+  }
+  return static_cast<int32_t>(
+      std::clamp<long>(requested, 1, kMaxKeyedFinalLocalDrivers));
+}
+
+int32_t resolveKeyedFinalLocalDrivers(
+    const std::shared_ptr<velox::config::ConfigBase>& config) {
+  const auto requested = config->get<int32_t>(
+      kFluxKeyedFinalLocalDrivers, kFluxKeyedFinalLocalDriversDefault);
+  const auto bounded = std::clamp(requested, 1, kMaxKeyedFinalLocalDrivers);
+  if (requested != bounded) {
+    LOG(WARNING) << "FluxJniWrapper: capping "
+                 << kFluxKeyedFinalLocalDrivers << " from " << requested
+                 << " to " << bounded
+                 << " to bound local-exchange and downstream concat memory";
+  }
+  return bounded;
+}
+
 std::shared_ptr<velox::config::ConfigBase> createFluxSessionConfig(
     VeloxRuntime* runtime) {
   auto backendConf = VeloxBackend::get()->getBackendConf();
@@ -1322,6 +1355,57 @@ velox::core::PlanNodePtr insertKeyedFinalLocalRepartitionAfterJoin(
       node->name());
 }
 
+/// Keep a direct-write root single-writer without forcing the whole fragment
+/// to one driver.  A LocalPartition(kGather) is a pipeline boundary: the
+/// keyed FINAL / UNNEST / projection pipeline above the remote exchange can
+/// use keyedFinalLocalDrivers lanes, while the downstream TableWrite pipeline
+/// is single-threaded by LocalPartitionNode::requiresSingleThread().
+///
+/// This is deliberately limited to a root TableWrite.  Partitioned/bucketed
+/// writers and non-root write shapes continue to use their existing planning
+/// rules; widening this rewrite requires preserving their writer routing
+/// semantics explicitly.
+velox::core::PlanNodePtr insertLocalGatherBeforeDirectTableWrite(
+    const velox::core::PlanNodePtr& node,
+    bool& inserted) {
+  auto tableWrite =
+      std::dynamic_pointer_cast<const velox::core::TableWriteNode>(node);
+  if (tableWrite == nullptr || tableWrite->hasPartitioningScheme()) {
+    return node;
+  }
+
+  const auto parallelWriteLanes = parallelDirectWriteLanes();
+  if (parallelWriteLanes > 1) {
+    LOG(WARNING)
+        << "FluxJniWrapper: keeping direct TableWrite " << tableWrite->id()
+        << " in " << parallelWriteLanes
+        << " local driver lanes; cuDF assigns a distinct filename per lane";
+    return node;
+  }
+
+  VELOX_CHECK_EQ(tableWrite->sources().size(), 1);
+  const auto& source = tableWrite->sources().front();
+  if (auto localPartition =
+          std::dynamic_pointer_cast<const velox::core::LocalPartitionNode>(
+              source);
+      localPartition != nullptr &&
+      localPartition->type() ==
+          velox::core::LocalPartitionNode::Type::kGather) {
+    return node;
+  }
+
+  auto gather = velox::core::LocalPartitionNode::gather(
+      tableWrite->id() + "_direct_write_local_gather", {source});
+  inserted = true;
+  LOG(WARNING)
+      << "FluxJniWrapper: inserting local gather before direct TableWrite "
+      << tableWrite->id()
+      << " so upstream keyed FINAL pipelines retain local driver parallelism";
+  return velox::core::TableWriteNode::Builder(*tableWrite)
+      .source(std::move(gather))
+      .build();
+}
+
 bool schemaMatches(const velox::RowTypePtr& a, const velox::RowTypePtr& b) {
   if (a == nullptr || b == nullptr || a->size() != b->size()) {
     return false;
@@ -1812,10 +1896,11 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
 #else
   const bool keepDeviceRootOutput = false;
 #endif
-  const int32_t keyedFinalLocalDrivers = std::max(
-      1,
-      preLoopSessionCfg->get<int32_t>(
-          kFluxKeyedFinalLocalDrivers, kFluxKeyedFinalLocalDriversDefault));
+  const int32_t keyedFinalLocalDrivers =
+      resolveKeyedFinalLocalDrivers(preLoopSessionCfg);
+  const bool keyedFinalDestinationLanes = preLoopSessionCfg->get<bool>(
+      kFluxKeyedFinalDestinationLanes,
+      kFluxKeyedFinalDestinationLanesDefault);
   bool singleTaskMode = singleTaskModeRequested;
   if (singleTaskMode) {
     // All known partition types are supported in single-task mode:
@@ -2059,6 +2144,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
 
     auto veloxPlanNode = converter.toVeloxPlan(substraitPlan, localFiles);
     bool fragmentUsesKeyedFinalLocalRepartition = false;
+    bool fragmentUsesKeyedFinalDestinationLanes = false;
     if (singleTaskMode) {
       // Bump the global id allocator above this fragment's high-water mark
       // so the next fragment's converter doesn't reuse ids.
@@ -2247,13 +2333,18 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
         if (it != producerWireTypes.end()) {
           producerWire = it->second;
         }
-        const bool localRepartition =
+        const bool keyedFinalRemoteHash =
             !singleTaskMode && keyedFinalLocalDrivers > 1 &&
             inboundExchanges[k]->partitionType == "HASH" &&
             hasValidHashKeys(
                 inboundExchanges[k]->partitionKeyIndices, producerWire) &&
             feedsKeyedFinalAggregation(
                 veloxPlanNode, valueStreamNodes[j]->id());
+        const bool destinationLanes =
+            keyedFinalRemoteHash && keyedFinalDestinationLanes;
+        const bool localRepartition =
+            keyedFinalRemoteHash && !destinationLanes;
+        fragmentUsesKeyedFinalDestinationLanes |= destinationLanes;
         fragmentUsesKeyedFinalLocalRepartition |= localRepartition;
         velox::core::PlanNodePtr producerPlanForMerge;
         if (singleTaskMode) {
@@ -2302,11 +2393,22 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
                 << veloxPlanNode->toString(
                        /*detailed=*/true, /*recursive=*/true);
     }
-    if (!singleTaskMode && keyedFinalLocalDrivers > 1) {
+    if (!singleTaskMode && keyedFinalLocalDrivers > 1 &&
+        !fragmentUsesKeyedFinalDestinationLanes) {
       bool insertedAfterJoin = false;
       veloxPlanNode = insertKeyedFinalLocalRepartitionAfterJoin(
           veloxPlanNode, insertedAfterJoin);
       fragmentUsesKeyedFinalLocalRepartition |= insertedAfterJoin;
+    }
+    if (fragmentUsesKeyedFinalLocalRepartition) {
+      bool insertedWriterGather = false;
+      veloxPlanNode = insertLocalGatherBeforeDirectTableWrite(
+          veloxPlanNode, insertedWriterGather);
+      if (insertedWriterGather) {
+        LOG(WARNING) << "FluxJniWrapper: fragment " << i
+                     << " decoupled keyed FINAL local lanes from its "
+                        "single-writer pipeline";
+      }
     }
 
     // Capture the post-rewrite, pre-wrap plan for use by downstream consumer
@@ -2537,15 +2639,24 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
           singleTaskThreadPoolDriverBudget,
           std::max(1, mergedNumDrivers));
     }
-    if (fragmentUsesKeyedFinalLocalRepartition) {
-      mergedNumDrivers = std::max(mergedNumDrivers, keyedFinalLocalDrivers);
-      LOG(WARNING) << "FluxJniWrapper: fragment " << i
-                   << " enabling keyed FINAL local HASH repartition with "
-                   << mergedNumDrivers << " drivers";
+    if (fragmentUsesKeyedFinalLocalRepartition ||
+        fragmentUsesKeyedFinalDestinationLanes) {
+      // LocalPartition hashes rows across task drivers, so the fragment driver
+      // count is the local lane count.  Use the bounded setting exactly; taking
+      // max() with the pre-rewrite fragment budget could silently turn a
+      // requested 4-lane local exchange back into (for example) 16 lanes.
+      mergedNumDrivers = keyedFinalLocalDrivers;
+      LOG(WARNING) << "FluxJniWrapper: fragment " << i << " enabling keyed FINAL "
+                   << (fragmentUsesKeyedFinalDestinationLanes
+                           ? "destination-owner tasks"
+                           : "local HASH repartition")
+                   << " with " << mergedNumDrivers << " lanes";
     }
     fragSpec.numDrivers = mergedNumDrivers;
     fragSpec.keyedFinalLocalRepartition =
         fragmentUsesKeyedFinalLocalRepartition;
+    fragSpec.keyedFinalDestinationLanes =
+        fragmentUsesKeyedFinalDestinationLanes;
     fragSpec.rightSemiProjectMultiDriverSafe =
         rightSemiProjectMultiDriverSafe;
     fragSpec.innerJoinMultiDriverSafe =
@@ -2780,10 +2891,8 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeExplainFluxQuery( //
 
   auto veloxPool = defaultLeafVeloxMemoryPool();
   auto sessionCfg = createFluxSessionConfig(runtime);
-  const int32_t keyedFinalLocalDrivers = std::max(
-      1,
-      sessionCfg->get<int32_t>(
-          kFluxKeyedFinalLocalDrivers, kFluxKeyedFinalLocalDriversDefault));
+  const int32_t keyedFinalLocalDrivers =
+      resolveKeyedFinalLocalDrivers(sessionCfg);
   std::unordered_map<int, velox::RowTypePtr> producerWireTypes;
   std::vector<std::string> finalPlans;
   finalPlans.reserve(numFragments);

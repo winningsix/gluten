@@ -25,12 +25,13 @@ import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.expressions.{Expression, PlanExpression}
 import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.execution.ColumnarWriteFilesExec.NoopLeaf
-import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, AdaptiveSparkPlanHelper, AQEShuffleReadExec, QueryStageExec}
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanCompat, AdaptiveSparkPlanExec, AdaptiveSparkPlanHelper, AQEShuffleReadExec, QueryStageExec}
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
 import org.apache.spark.sql.execution.command.{DataWritingCommandExec, ExecutedCommandExec}
 import org.apache.spark.sql.execution.datasources.WriteFilesExec
 import org.apache.spark.sql.execution.datasources.v2.V2CommandExec
 import org.apache.spark.sql.execution.exchange.{Exchange, ReusedExchangeExec}
+import org.apache.spark.sql.internal.SQLConf
 
 import java.util
 import java.util.Collections.newSetFromMap
@@ -104,7 +105,8 @@ object GlutenExplainUtils extends AdaptiveSparkPlanHelper {
         case _: ReusedExchangeExec =>
         case _: NoopLeaf =>
         case w: WriteFilesExec if w.child.isInstanceOf[NoopLeaf] =>
-        case sub: AdaptiveSparkPlanExec if sub.isSubquery => collect(sub.executedPlan)
+        case sub: AdaptiveSparkPlanExec if AdaptiveSparkPlanCompat.isSubquery(sub) =>
+          collect(sub.executedPlan)
         case _: AdaptiveSparkPlanExec =>
         case p: QueryStageExec => collect(p.plan)
         case p: GlutenPlan =>
@@ -128,6 +130,34 @@ object GlutenExplainUtils extends AdaptiveSparkPlanHelper {
   }
 
   /**
+   * EMR Spark 4.0.2 adds `redactSecurityBoundarySubPlan` to QueryPlan.append. Invoke the helper by
+   * reflection so this bundle remains binary-compatible with both upstream Spark's six-argument
+   * method and EMR's seven-argument method.
+   */
+  private def appendPlanCompat[T <: QueryPlan[T]](plan: T, append: String => Unit): Unit = {
+    val methods = QueryPlan.getClass.getMethods.filter(_.getName == "append")
+    val method = methods
+      .find(_.getParameterCount == 7)
+      .orElse(methods.find(_.getParameterCount == 6))
+      .getOrElse(throw new IllegalStateException(s"Unsupported QueryPlan.append layout: " +
+        methods.map(_.getParameterCount).sorted.mkString("[", ",", "]")))
+    val args = Array[AnyRef](
+      (() => plan).asInstanceOf[AnyRef],
+      append.asInstanceOf[AnyRef],
+      Boolean.box(false),
+      Boolean.box(false),
+      Integer.valueOf(SQLConf.get.maxToStringFields),
+      Boolean.box(true)
+    )
+    val invokeArgs = if (method.getParameterCount == 7) args :+ Boolean.box(true) else args
+    try {
+      method.invoke(QueryPlan, invokeArgs: _*)
+    } catch {
+      case error: java.lang.reflect.InvocationTargetException => throw error.getCause
+    }
+  }
+
+  /**
    * Given a input physical plan, performs the following tasks.
    *   1. Generate the two part explain output for this plan.
    *      1. First part explains the operator tree with each operator tagged with an unique
@@ -148,7 +178,7 @@ object GlutenExplainUtils extends AdaptiveSparkPlanHelper {
       collectedOperators: BitSet): Unit = {
     try {
 
-      QueryPlan.append(plan, append, verbose = false, addSuffix = false, printOperatorId = true)
+      appendPlanCompat(plan, append)
 
       append("\n")
     } catch {

@@ -121,7 +121,10 @@ class VeloxColumnarWriteFilesRDD(
         val outputPath = description.path
 
         // part1=1/part2=1
-        val partitionFragment = metrics.name
+        // Older or connector-specific native writers may omit `name` for an
+        // unpartitioned table. Treat that representation as the canonical
+        // empty partition fragment instead of passing null to Spark's parser.
+        val partitionFragment = Option(metrics.name).getOrElse("")
         // Write a partitioned table
         if (partitionFragment != "") {
           updatedPartitions += partitionFragment
@@ -175,6 +178,50 @@ class VeloxColumnarWriteFilesRDD(
     }
   }
 
+  private def mergeNativeWriteTaskResults(
+      results: Seq[WriteTaskResult]): Option[WriteTaskResult] = {
+    if (results.isEmpty) {
+      return None
+    }
+
+    var addedAbsPathFiles = Map.empty[String, String]
+    var committedPartitions = Set.empty[String]
+    var updatedPartitions = Set.empty[String]
+    var partitionRows = Seq.empty[org.apache.spark.sql.catalyst.InternalRow]
+    var numFiles = 0
+    var numBytes = 0L
+    var numRows = 0L
+
+    results.foreach {
+      result =>
+        val (files, partitions) = result.commitMsg.obj
+          .asInstanceOf[(Map[String, String], Set[String])]
+        addedAbsPathFiles ++= files
+        committedPartitions ++= partitions
+        updatedPartitions ++= result.summary.updatedPartitions
+        result.summary.stats.foreach {
+          case stats: BasicWriteTaskStats =>
+            partitionRows ++= stats.partitions
+            numFiles += stats.numFiles
+            numBytes += stats.numBytes
+            numRows += stats.numRows
+          case stats =>
+            throw new IllegalStateException(
+              s"Unsupported native write stats while merging Flux root tasks: ${stats.getClass}")
+        }
+    }
+
+    val stats = BasicWriteTaskStats(
+      partitions = partitionRows.distinct,
+      numFiles = numFiles,
+      numBytes = numBytes,
+      numRows = numRows)
+    Some(
+      WriteTaskResult(
+        new TaskCommitMessage(addedAbsPathFiles -> committedPartitions),
+        ExecutedWriteSummary(updatedPartitions = updatedPartitions, stats = Seq(stats))))
+  }
+
   private def writeFilesForEmptyIterator(
       commitProtocol: SparkWriteFilesCommitProtocol): WriteTaskResult = {
     val taskAttemptContext = commitProtocol.taskAttemptContext
@@ -217,9 +264,16 @@ class VeloxColumnarWriteFilesRDD(
           // empty file, mirroring the empty-iterator write path below.
           writeTaskResult = writeFilesForEmptyIterator(commitProtocol)
         } else {
-          val resultColumnarBatch = iter.next()
-          assert(resultColumnarBatch != null)
-          val nativeWriteTaskResult = collectNativeWriteFilesMetrics(resultColumnarBatch)
+          // A destination-lane write root has one native TableWrite task per
+          // local lane. Drain every commit batch and fold the per-task write
+          // metrics into Spark's single task commit message.
+          val nativeResults = mutable.ArrayBuffer.empty[WriteTaskResult]
+          while (iter.hasNext) {
+            val resultColumnarBatch = iter.next()
+            assert(resultColumnarBatch != null)
+            collectNativeWriteFilesMetrics(resultColumnarBatch).foreach(nativeResults += _)
+          }
+          val nativeWriteTaskResult = mergeNativeWriteTaskResults(nativeResults.toSeq)
           if (nativeWriteTaskResult.isEmpty) {
             // If we are writing an empty iterator, then velox would do nothing.
             // Here we fallback to use vanilla Spark write files to generate an empty file for

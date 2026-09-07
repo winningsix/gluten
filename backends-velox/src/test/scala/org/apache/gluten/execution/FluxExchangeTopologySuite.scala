@@ -135,24 +135,27 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
     assert(join.outputPartitioning === UnknownPartitioning(200))
   }
 
-  test("caps 200/4 HASH fan-in before topology-first driver planning") {
-    withSQLConf("spark.gluten.mpp.localHashExchangeTasks" -> "4") {
+  test("keeps logical shuffle partitions independent from remote HASH fan-out") {
+    withSQLConf(
+      "spark.sql.shuffle.partitions" -> "32",
+      "spark.gluten.mpp.remoteHashExchangeDestinations" -> "8") {
       val exec = FluxNativeQueryExec(PartitionedLeaf(Seq.empty, 1), Seq.empty, Seq.empty)
-      val capped = exec.capLocalHashExchangeTasksForTests(
+      val capped = exec.capRemoteHashExchangeDestinationsForTests(
         Seq(
-          exchange(1, consumerId = 7, exchangeType = "HASH", numPartitions = 200),
-          exchange(2, consumerId = 7, exchangeType = "HASH", numPartitions = 4)))
+          exchange(1, consumerId = 7, exchangeType = "HASH", numPartitions = 32),
+          exchange(2, consumerId = 7, exchangeType = "HASH", numPartitions = 8)))
 
-      assert(capped.map(_.numPartitions) === Seq(4, 4))
-      assert(FluxExchangeTopology.finalizedHashInboundPartitionCount(capped, 7) === Right(4))
+      assert(exec.fluxSplitHashPartitionsForTests() === 32)
+      assert(capped.map(_.numPartitions) === Seq(8, 8))
+      assert(FluxExchangeTopology.finalizedHashInboundPartitionCount(capped, 7) === Right(8))
       assert(FluxExchangeTopology.inconsistentInboundPartitionCountReason(capped).isEmpty)
     }
   }
 
-  test("fails closed when the HASH cap leaves 1/4 fan-in") {
+  test("supports the legacy localHashExchangeTasks remote fan-out alias") {
     withSQLConf("spark.gluten.mpp.localHashExchangeTasks" -> "4") {
       val exec = FluxNativeQueryExec(PartitionedLeaf(Seq.empty, 1), Seq.empty, Seq.empty)
-      val capped = exec.capLocalHashExchangeTasksForTests(
+      val capped = exec.capRemoteHashExchangeDestinationsForTests(
         Seq(
           exchange(1, consumerId = 7, exchangeType = "HASH", numPartitions = 1),
           exchange(2, consumerId = 7, exchangeType = "HASH", numPartitions = 4)))
@@ -160,6 +163,57 @@ class FluxExchangeTopologySuite extends AnyFunSuite {
       assert(capped.map(_.numPartitions) === Seq(1, 4))
       assert(FluxExchangeTopology.finalizedHashInboundPartitionCount(capped, 7).isLeft)
       assert(FluxExchangeTopology.inconsistentInboundPartitionCountReason(capped).nonEmpty)
+    }
+  }
+
+  test("destination-owner lanes multiply peers into native HASH destinations") {
+    withSQLConf(
+      "spark.gluten.mpp.multiExecutor.enabled" -> "true",
+      "spark.gluten.mpp.multiExecutor.numPartitions" -> "4",
+      "spark.gluten.sql.columnar.backend.velox.flux.keyedFinalLocalDrivers" -> "4",
+      "spark.gluten.sql.columnar.backend.velox.flux.keyedFinalDestinationLanes" -> "true"
+    ) {
+      val exec = FluxNativeQueryExec(PartitionedLeaf(Seq.empty, 1), Seq.empty, Seq.empty)
+      val capped = exec.capRemoteHashExchangeDestinationsForTests(
+        Seq(
+          exchange(1, consumerId = 7, exchangeType = "HASH", numPartitions = 4),
+          exchange(2, consumerId = 8, exchangeType = "HASH", numPartitions = 64)))
+
+      assert(capped.map(_.numPartitions) === Seq(16, 16))
+      assert(FluxExchangeTopology.finalizedHashInboundPartitionCount(capped, 7) === Right(16))
+      assert(FluxExchangeTopology.finalizedHashInboundPartitionCount(capped, 8) === Right(16))
+    }
+  }
+
+  test("local final lanes do not multiply remote HASH destinations") {
+    withSQLConf(
+      "spark.gluten.mpp.multiExecutor.enabled" -> "true",
+      "spark.gluten.mpp.multiExecutor.numPartitions" -> "4",
+      "spark.gluten.sql.columnar.backend.velox.flux.keyedFinalLocalDrivers" -> "4",
+      "spark.gluten.sql.columnar.backend.velox.flux.keyedFinalDestinationLanes" -> "false"
+    ) {
+      val exec = FluxNativeQueryExec(PartitionedLeaf(Seq.empty, 1), Seq.empty, Seq.empty)
+      val capped = exec.capRemoteHashExchangeDestinationsForTests(
+        Seq(
+          exchange(1, consumerId = 7, exchangeType = "HASH", numPartitions = 16),
+          exchange(2, consumerId = 8, exchangeType = "HASH", numPartitions = 64)))
+
+      assert(capped.map(_.numPartitions) === Seq(4, 4))
+      assert(FluxExchangeTopology.finalizedHashInboundPartitionCount(capped, 7) === Right(4))
+      assert(FluxExchangeTopology.finalizedHashInboundPartitionCount(capped, 8) === Right(4))
+    }
+  }
+
+  test("rejects conflicting remote HASH fan-out settings") {
+    withSQLConf(
+      "spark.gluten.mpp.remoteHashExchangeDestinations" -> "8",
+      "spark.gluten.mpp.localHashExchangeTasks" -> "4") {
+      val exec = FluxNativeQueryExec(PartitionedLeaf(Seq.empty, 1), Seq.empty, Seq.empty)
+      val error = intercept[IllegalArgumentException] {
+        exec.capRemoteHashExchangeDestinationsForTests(
+          Seq(exchange(1, consumerId = 7, exchangeType = "HASH", numPartitions = 32)))
+      }
+      assert(error.getMessage.contains("disagree"))
     }
   }
 

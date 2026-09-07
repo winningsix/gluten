@@ -66,7 +66,16 @@ struct FluxFragmentSpec {
   /// or between an upstream join and the FINAL aggregation.
   /// This makes it correct to run the consumer task with numDrivers > 1:
   /// equal group keys are assigned to exactly one local driver lane.
+  /// A direct-write root additionally places a local gather before TableWrite,
+  /// keeping this upstream parallelism while retaining one writer per peer.
   bool keyedFinalLocalRepartition{false};
+
+  /// True when a remote HASH exchange feeding keyed FINAL is consumed by one
+  /// task per local destination lane.  The upstream HASH already establishes
+  /// key ownership, so these tasks must stay single-driver and no second local
+  /// hash is needed.  A write root may therefore have multiple writer tasks;
+  /// the cuDF sink gives each task replica a distinct target filename.
+  bool keyedFinalDestinationLanes{false};
 
   /// True only for a HASH consumer whose native plan is composed of
   /// exchange inputs, inner joins, exactly two non-null-aware RIGHT SEMI

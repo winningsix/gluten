@@ -622,7 +622,9 @@ void FluxQueryCoordinator::start() {
   // consumer task the RANGE/HASH split wiring (dest % 1 == 0) routes every
   // destination this peer owns to that single task, so it gathers the peer's
   // whole slice into one output file.
-  if (rootIsWrite && fragmentReplicaCount_[rootFragmentId_] != 1) {
+  if (rootIsWrite &&
+      !fragmentSpecs_[rootFragmentId_].keyedFinalDestinationLanes &&
+      fragmentReplicaCount_[rootFragmentId_] != 1) {
     LOG(WARNING) << "FluxQueryCoordinator[" << queryId_ << "]: write root fragment " << rootFragmentId_
                  << " replicaCount " << fragmentReplicaCount_[rootFragmentId_] << " -> 1 (single writer per peer)";
     fragmentReplicaCount_[rootFragmentId_] = 1;
@@ -960,7 +962,12 @@ void FluxQueryCoordinator::start() {
     // bounded by the Scala-supplied fragment budget instead of inflating it
     // back to the producer destination count.
     const auto perReplicaDrivers = (bcastN > 0) ? 1
-        : (rootIsWrite && spec.id == rootFragmentId_) ? 1
+        : (rootIsWrite && spec.id == rootFragmentId_)
+            ? (spec.keyedFinalDestinationLanes
+                   ? 1
+                   : spec.keyedFinalLocalRepartition
+                   ? std::max(1, spec.numDrivers)
+                   : 1)
         : isRangeConsumer[spec.id] ? 1
         : isHashConsumer[spec.id]
             ? (spec.keyedFinalLocalRepartition
@@ -1008,6 +1015,8 @@ void FluxQueryCoordinator::start() {
                    << " inboundN=" << inboundN
                    << " keyedFinalLocalRepartition="
                    << spec.keyedFinalLocalRepartition
+                   << " keyedFinalDestinationLanes="
+                   << spec.keyedFinalDestinationLanes
                    << " rightSemiProjectMultiDriverSafe="
                    << spec.rightSemiProjectMultiDriverSafe
                    << " innerJoinMultiDriverSafe="

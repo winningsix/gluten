@@ -884,17 +884,47 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   // Spark's default compression code is snappy.
   const auto& compressionKind =
       writerOptions->compressionKind.value_or(common::CompressionKind::CompressionKind_SNAPPY);
-  std::shared_ptr<core::InsertTableHandle> tableHandle = std::make_shared<core::InsertTableHandle>(
-      kHiveConnectorId,
-      makeHiveInsertTableHandle(
-          tableColumnNames, /*inputType->names() clolumn name is different*/
-          inputType->children(),
-          partitionedKey,
-          bucketProperty,
-          makeLocationHandle(writePath, fileName, fileFormat, compressionKind, bucketProperty != nullptr),
-          writerOptions,
-          fileFormat,
-          compressionKind));
+  std::shared_ptr<core::InsertTableHandle> tableHandle;
+#ifdef GLUTEN_ENABLE_GPU
+  const bool useCudfWriter =
+      veloxCfg_->get<bool>(kCudfEnabled, kCudfEnabledDefault) &&
+      veloxCfg_->get<bool>(kCudfEnableTableWrite, kCudfEnableTableWriteDefault) &&
+      partitionedKey.empty() && bucketProperty == nullptr;
+  if (useCudfWriter) {
+    auto locationHandle =
+        std::make_shared<cudf_velox::connector::hive::LocationHandle>(
+            writePath,
+            cudf_velox::connector::hive::LocationHandle::TableType::kNew,
+            fileName);
+    tableHandle = std::make_shared<core::InsertTableHandle>(
+        kCudfHiveConnectorId,
+        makeCudfHiveInsertTableHandle(
+            tableColumnNames,
+            inputType->children(),
+            locationHandle,
+            compressionKind,
+            std::unordered_map<std::string, std::string>{},
+            writerOptions));
+  } else
+#endif
+  {
+    tableHandle = std::make_shared<core::InsertTableHandle>(
+        kHiveConnectorId,
+        makeHiveInsertTableHandle(
+            tableColumnNames, /* inputType column names differ. */
+            inputType->children(),
+            partitionedKey,
+            bucketProperty,
+            makeLocationHandle(
+                writePath,
+                fileName,
+                fileFormat,
+                compressionKind,
+                bucketProperty != nullptr),
+            writerOptions,
+            fileFormat,
+            compressionKind));
+  }
   return std::make_shared<core::TableWriteNode>(
       nextPlanNodeId(),
       inputType,

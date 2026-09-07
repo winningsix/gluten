@@ -1570,7 +1570,7 @@ case class FluxNativeQueryExec(
 
     // Sort fragments by ID (ensures topological order: producers before consumers)
     val sortedFragments = extractedFragments.sortBy(_.id).toSeq
-    val cappedExchanges = capLocalHashExchangeTasks(extractedExchanges.toSeq)
+    val cappedExchanges = capRemoteHashExchangeDestinations(extractedExchanges.toSeq)
     val topologyResolvedFragments = sortedFragments.map {
       case fragment if topologyParallelismFragmentIds.contains(fragment.id) =>
         val nativePartitionCount = FluxExchangeTopology
@@ -1847,7 +1847,12 @@ case class FluxNativeQueryExec(
           write.child.output,
           None)
         splitCount += 1
-        write.copy(child = exchange)
+        // splitWriteRoot can run inside an already-collapsed WholeStageTransformer. A later
+        // collapse pass deliberately leaves an existing WST untouched, so a raw exchange inserted
+        // here would remain inside the native tree and fail Substrait generation when it is cast to
+        // TransformSupport. Install the stream boundary eagerly; fragment extraction can then see
+        // the exchange through the adapter while the writer fragment transforms an iterator input.
+        write.copy(child = ColumnarCollapseTransformStages.wrapInputIteratorTransformer(exchange))
     }
     if (splitCount > 0) {
       logInfo(
@@ -2084,12 +2089,13 @@ case class FluxNativeQueryExec(
   }
 
   private def fluxSplitHashPartitions(): Int = {
-    val defaultPartitions =
-      math.max(1, SQLConf.get.getConfString("spark.sql.shuffle.partitions", "200").toInt)
-    val configured =
-      fluxNonNegativeIntConf("spark.gluten.mpp.localHashExchangeTasks", defaultPartitions)
-    math.max(1, configured)
+    // This is Catalyst's logical shuffle cardinality. The native remote fan-out
+    // is capped independently after ExchangeSpecs have been extracted; tying
+    // these together made an 8-peer run lose its 32 logical shuffle buckets.
+    math.max(1, SQLConf.get.getConfString("spark.sql.shuffle.partitions", "200").toInt)
   }
+
+  private[execution] def fluxSplitHashPartitionsForTests(): Int = fluxSplitHashPartitions()
 
   private def splitDelta(newPlan: SparkPlan, oldPlan: SparkPlan): Int = {
     if (newPlan eq oldPlan) 0 else 1
@@ -4225,18 +4231,24 @@ case class FluxNativeQueryExec(
       positiveIntConf("spark.gluten.mpp.outerJoinSmallScanMaxEstimatedRows").getOrElse(1000000))
   }
 
-  private def capLocalHashExchangeTasks(exchanges: Seq[ExchangeSpec]): Seq[ExchangeSpec] = {
-    effectiveLocalHashExchangeTasks match {
+  private def capRemoteHashExchangeDestinations(exchanges: Seq[ExchangeSpec]): Seq[ExchangeSpec] = {
+    effectiveRemoteHashExchangeDestinations match {
       case Some((cap, source)) =>
+        val exactHashDestinations =
+          booleanConf(
+            "spark.gluten.sql.columnar.backend.velox.flux.keyedFinalDestinationLanes",
+            defaultValue = false)
         exchanges.map {
           spec =>
             if (
-              (spec.exchangeType == "HASH" ||
-                (spec.exchangeType == "RANGE" && !distributedWriteOutput)) &&
-              spec.numPartitions > cap
+              (spec.exchangeType == "HASH" &&
+                (spec.numPartitions > cap ||
+                  (exactHashDestinations && spec.numPartitions < cap))) ||
+              (spec.exchangeType == "RANGE" && !distributedWriteOutput &&
+                spec.numPartitions > cap)
             ) {
               logDebug(
-                s"FluxNativeQueryExec: capping local ${spec.exchangeType} exchange ${spec.id} " +
+                s"FluxNativeQueryExec: setting remote ${spec.exchangeType} exchange ${spec.id} " +
                   s"F${spec.producerFragmentId}->F${spec.consumerFragmentId} native partitions " +
                   s"from ${spec.numPartitions} to $cap via $source")
               spec.copy(numPartitions = cap)
@@ -4248,9 +4260,9 @@ case class FluxNativeQueryExec(
     }
   }
 
-  private[execution] def capLocalHashExchangeTasksForTests(
+  private[execution] def capRemoteHashExchangeDestinationsForTests(
       exchanges: Seq[ExchangeSpec]): Seq[ExchangeSpec] = {
-    capLocalHashExchangeTasks(exchanges)
+    capRemoteHashExchangeDestinations(exchanges)
   }
 
   private def smallFluxRangeMaxBytes: BigInt = {
@@ -4937,22 +4949,46 @@ case class FluxNativeQueryExec(
     }
   }
 
-  private def localHashExchangeTasks: Option[Int] = {
-    positiveIntConf("spark.gluten.mpp.localHashExchangeTasks")
+  private def configuredRemoteHashExchangeDestinations: Option[(Int, String)] = {
+    val key = "spark.gluten.mpp.remoteHashExchangeDestinations"
+    val legacyKey = "spark.gluten.mpp.localHashExchangeTasks"
+    val configured = positiveIntConf(key)
+    val legacy = positiveIntConf(legacyKey)
+    if (configured.nonEmpty && legacy.nonEmpty && configured != legacy) {
+      throw new IllegalArgumentException(
+        s"$key and deprecated $legacyKey disagree: ${configured.get} != ${legacy.get}")
+    }
+    configured.map(_ -> key).orElse(legacy.map(_ -> legacyKey))
   }
 
-  private def effectiveLocalHashExchangeTasks: Option[(Int, String)] = {
-    localHashExchangeTasks.map(_ -> "spark.gluten.mpp.localHashExchangeTasks").orElse {
+  private def effectiveRemoteHashExchangeDestinations: Option[(Int, String)] = {
+    configuredRemoteHashExchangeDestinations.orElse {
       if (!booleanConf("spark.gluten.mpp.multiExecutor.enabled", defaultValue = false)) {
         None
       } else {
-        val count = fluxNonNegativeIntConf("spark.gluten.mpp.multiExecutor.numPartitions", 2)
-        if (count <= 0) {
-          throw new IllegalArgumentException(
-            "spark.gluten.mpp.multiExecutor.numPartitions must be positive when " +
-              "spark.gluten.mpp.multiExecutor.enabled=true")
-        }
-        Some(count -> "spark.gluten.mpp.multiExecutor.numPartitions")
+        val peerCount =
+          positiveIntConf("spark.gluten.mpp.multiExecutor.numPartitions").getOrElse(2)
+        val destinationLanes =
+          if (
+            booleanConf(
+              "spark.gluten.sql.columnar.backend.velox.flux.keyedFinalDestinationLanes",
+              defaultValue = false)
+          ) {
+            math.min(
+              4,
+              positiveIntConf("spark.gluten.sql.columnar.backend.velox.flux.keyedFinalLocalDrivers")
+                .getOrElse(1))
+          } else {
+            1
+          }
+        val destinations = Math.multiplyExact(peerCount, destinationLanes)
+        Some(
+          destinations ->
+            (if (destinationLanes > 1) {
+               "spark.gluten.mpp.multiExecutor.numPartitions*keyedFinalDestinationLanes"
+             } else {
+               "spark.gluten.mpp.multiExecutor.numPartitions"
+             }))
       }
     }
   }

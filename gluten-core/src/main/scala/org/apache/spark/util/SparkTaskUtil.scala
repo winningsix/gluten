@@ -76,8 +76,32 @@ object SparkTaskUtil {
     val cpus = 1.asInstanceOf[Object] // Added in Spark 3.3.
     val resources = Map.empty.asInstanceOf[Object]
 
+    val ctors = classOf[TaskContextImpl].getDeclaredConstructors
+    if (SparkVersionUtil.gteSpark40) {
+      // EMR Spark 4.0.2 exposes both its full runtime constructor and a shorter constructor for
+      // synthetic task contexts. Gluten previously asserted that TaskContextImpl had exactly one
+      // constructor, so driver-side native validation failed before it could reach Velox/cuDF.
+      val ctor = ctors
+        .find(_.getParameterCount == 9)
+        .getOrElse(
+          throw new IllegalStateException(
+            s"Unsupported Spark 4 TaskContextImpl constructor layout: " +
+              ctors.map(_.getParameterCount).sorted.mkString("[", ",", "]")))
+      return ctor
+        .newInstance(
+          stageId,
+          stageAttemptNumber,
+          partitionId,
+          taskAttemptId,
+          attemptNumber,
+          numPartitions,
+          taskMemoryManager,
+          localProperties,
+          metricsSystem)
+        .asInstanceOf[TaskContext]
+    }
+
     val ctor = {
-      val ctors = classOf[TaskContextImpl].getDeclaredConstructors
       assert(ctors.size == 1)
       ctors.head
     }

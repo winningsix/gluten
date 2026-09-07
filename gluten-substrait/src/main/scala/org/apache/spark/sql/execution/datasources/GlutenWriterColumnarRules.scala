@@ -23,7 +23,7 @@ import org.apache.gluten.execution.datasource.GlutenFormatFactory
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution._
-import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanCompat, AdaptiveSparkPlanExec}
 import org.apache.spark.sql.execution.command.{CreateDataSourceTableAsSelectCommand, DataWritingCommand, DataWritingCommandExec}
 import org.apache.spark.sql.hive.execution.{CreateHiveTableAsSelectCommand, InsertIntoHiveDirCommand, InsertIntoHiveTable}
 import org.apache.spark.sql.sources.DataSourceRegister
@@ -82,13 +82,7 @@ object GlutenWriterColumnarRules {
         command.withNewChildren(
           Array(
             BackendsApiManager.getSparkPlanExecApiInstance.genColumnarToCarrierRow(
-              AdaptiveSparkPlanExec(
-                aqe.inputPlan,
-                aqe.context,
-                aqe.preprocessingRules,
-                aqe.isSubquery,
-                supportsColumnar = true
-              ))))
+              AdaptiveSparkPlanCompat.withSupportsColumnar(aqe, supportsColumnar = true))))
       case other =>
         command.withNewChildren(
           Array(BackendsApiManager.getSparkPlanExecApiInstance.genColumnarToCarrierRow(other)))

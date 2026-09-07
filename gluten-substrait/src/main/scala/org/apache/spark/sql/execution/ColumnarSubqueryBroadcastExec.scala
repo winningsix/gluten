@@ -25,6 +25,7 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.QueryPlan
+import org.apache.spark.sql.execution.exchange.BroadcastExchangeLike
 import org.apache.spark.sql.execution.joins.{BuildSideRelation, HashedRelation, HashJoin, LongHashedRelation}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.types.IntegralType
@@ -141,6 +142,16 @@ case class ColumnarSubqueryBroadcastExec(
 
   override def executeCollect(): Array[InternalRow] = {
     ThreadUtils.awaitResult(relationFuture, Duration.Inf)
+  }
+
+  // EMR Spark 4.0.2 makes BaseSubqueryExec implement Materializable. Keep these methods free of an
+  // `override` modifier so this source remains compatible with upstream Spark, where that contract
+  // is not present. Future is covariant, so the existing result future satisfies Future[Any].
+  private[sql] def materialize(): Future[Any] = relationFuture
+
+  private[sql] def cancel(reason: Option[String]): Unit = child match {
+    case exchange: BroadcastExchangeLike => exchange.cancelBroadcastJob(reason)
+    case _ =>
   }
 
   override def stringArgs: Iterator[Any] = super.stringArgs ++ Iterator(s"[id=#$id]")

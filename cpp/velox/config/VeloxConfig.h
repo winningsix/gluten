@@ -179,6 +179,15 @@ const int32_t kFluxSingleTaskMaxDriversDefault = 2;
 // limits.
 const std::string kFluxKeyedFinalLocalDrivers = "spark.gluten.sql.columnar.backend.velox.flux.keyedFinalLocalDrivers";
 const int32_t kFluxKeyedFinalLocalDriversDefault = 1;
+// Route a distributed HASH exchange that directly feeds keyed FINAL into one
+// single-driver consumer task per local destination lane.  The producer's
+// HASH is then the only repartition pass: each task drains a disjoint set of
+// already-hashed destinations and equal keys cannot cross tasks.  This avoids
+// the fallback CudfLocalPartition hash pass used by keyedFinalLocalDrivers.
+// Kept opt-in while validating multi-root write commit handling and memory.
+const std::string kFluxKeyedFinalDestinationLanes =
+    "spark.gluten.sql.columnar.backend.velox.flux.keyedFinalDestinationLanes";
+const bool kFluxKeyedFinalDestinationLanesDefault = false;
 const std::string kVeloxAsyncTimeoutOnTaskStopping =
     "spark.gluten.sql.columnar.backend.velox.asyncTimeoutOnTaskStopping";
 const int32_t kVeloxAsyncTimeoutOnTaskStoppingDefault = 30000; // 30s
@@ -253,6 +262,11 @@ const std::string kVeloxPreferredBatchBytes = "spark.gluten.sql.columnar.backend
 /// cudf
 const std::string kCudfEnableTableScan = "spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan";
 const bool kCudfEnableTableScanDefault = false;
+// Use the cuDF Hive connector and libcudf Parquet sink for supported table
+// writes. Keep this independent from table scan so write-heavy workloads can
+// select the GPU sink without changing their input path.
+const std::string kCudfEnableTableWrite = "spark.gluten.sql.columnar.backend.velox.cudf.enableTableWrite";
+const bool kCudfEnableTableWriteDefault = false;
 const std::string kCudfHiveConnectorId = "cudf-hive";
 const std::string kCudfIcebergConnectorId = "cudf-iceberg";
 
