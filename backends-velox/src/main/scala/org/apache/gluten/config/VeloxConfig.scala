@@ -702,6 +702,7 @@ object VeloxConfig extends ConfigRegistry {
       .checkValues(
         Set(
           "cuda",
+          "binning",
           "pool",
           "async",
           "arena",

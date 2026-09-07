@@ -65,6 +65,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
+#include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #endif
@@ -1420,6 +1421,13 @@ void FluxQueryCoordinator::start() {
     }
   };
 
+  struct PendingUcxExchangePrime {
+    std::string consumerTaskId;
+    core::PlanNodeId exchangeNodeId;
+    std::vector<std::string> remoteTaskUrls;
+  };
+  std::vector<PendingUcxExchangePrime> pendingUcxExchangePrimes;
+
   const auto wireExchange = [&](size_t exchangeIndex) {
     if (exchangeWired[exchangeIndex]) {
       return;
@@ -1563,6 +1571,7 @@ void FluxQueryCoordinator::start() {
     int32_t splitCount = 0;
     for (size_t cIdx = 0; cIdx < consumerReplicas.size(); ++cIdx) {
       auto& consumerTask = consumerReplicas[cIdx];
+      std::vector<std::string> remoteTaskUrls;
       if (isBroadcast) {
         int32_t destination = static_cast<int32_t>(cIdx);
         for (int32_t peer = 0; peer < peerIndex_; ++peer) {
@@ -1577,9 +1586,12 @@ void FluxQueryCoordinator::start() {
               producerEndpoint.taskId,
               destination);
           consumerTask->addSplit(exchange.exchangeNodeId, Split(std::make_shared<RemoteConnectorSplit>(url)));
+          remoteTaskUrls.push_back(url);
           ++splitCount;
         }
         consumerTask->noMoreSplits(exchange.exchangeNodeId);
+        pendingUcxExchangePrimes.push_back(
+            {consumerTask->taskId(), exchange.exchangeNodeId, std::move(remoteTaskUrls)});
         continue;
       }
 
@@ -1608,10 +1620,13 @@ void FluxQueryCoordinator::start() {
               producerEndpoint.taskId,
               dest);
           consumerTask->addSplit(exchange.exchangeNodeId, Split(std::make_shared<RemoteConnectorSplit>(url)));
+          remoteTaskUrls.push_back(url);
           ++splitCount;
         }
       }
       consumerTask->noMoreSplits(exchange.exchangeNodeId);
+      pendingUcxExchangePrimes.push_back(
+          {consumerTask->taskId(), exchange.exchangeNodeId, std::move(remoteTaskUrls)});
     }
     LOG(WARNING) << "FluxQueryCoordinator[" << queryId_ << "]: exchange " << exchange.id << " wired (" << splitCount
                  << " splits across " << consumerReplicas.size() << " consumer task(s), " << producerEndpoints.size()
@@ -1659,16 +1674,36 @@ void FluxQueryCoordinator::start() {
     wireExchange(i);
   }
 
-  // Fragment ids are emitted in producer-before-consumer order.  At this
-  // point every consumer already has all RemoteConnectorSplits and every scan
-  // already has its Hive splits, so no task starts in an incomplete split
-  // state.  Starting in this order registers producer output buffers before
-  // downstream ExchangeSources begin fetching.
+  // Fragment ids are emitted in producer-before-consumer order. At this point
+  // every consumer already has all RemoteConnectorSplits and every scan has
+  // its Hive splits, so no task starts in an incomplete split state.
   for (const auto& spec : fragmentSpecs_) {
-    for (int32_t i = 0; i < static_cast<int32_t>(fragmentTasks_[spec.id].size()); ++i) {
+    for (int32_t i = 0;
+         i < static_cast<int32_t>(fragmentTasks_[spec.id].size());
+         ++i) {
       startFragmentTask(spec.id, i);
     }
   }
+
+#ifdef GLUTEN_ENABLE_GPU
+  // Start UCX receive progress as soon as the consumer operators exist.
+  // Otherwise a producer can fill its output queue before the consumer driver
+  // reaches UcxExchange::isBlocked(), leaving both sides idle until a later
+  // scheduler wake-up and losing the intended inter-stage overlap.
+  if (envFlagEnabled("GLUTEN_MPP_PRIME_UCX_EXCHANGE_CLIENTS")) {
+    for (const auto& pending : pendingUcxExchangePrimes) {
+      const bool primed = cudf_velox::primeUcxExchangeClient(
+          pending.consumerTaskId,
+          pending.exchangeNodeId,
+          pending.remoteTaskUrls);
+      LOG(WARNING) << "FluxQueryCoordinator[" << queryId_
+                   << "]: UCX client prime task=" << pending.consumerTaskId
+                   << " node=" << pending.exchangeNodeId
+                   << " urls=" << pending.remoteTaskUrls.size()
+                   << " primed=" << primed;
+    }
+  }
+#endif
 
   // Phase 3.5: broadcast producer output buffer fan-out is set inside
   // startFragmentTask() immediately after Task::start(); nothing else to do.
