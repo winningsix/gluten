@@ -62,8 +62,11 @@
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnectorSplit.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
+#include "velox/experimental/cudf/exec/CudfHashJoin.h"
+#include "velox/experimental/cudf/exec/OperatorAdapters.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
+#include "velox/experimental/ucx-exchange/LocalDeviceOutputQueueManager.h"
 #include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
 #endif
 #include "velox/experimental/ucx-exchange/Communicator.h"
@@ -112,6 +115,30 @@ int envIntOrDefault(const char* name, int defaultValue) {
     return defaultValue;
   }
   return static_cast<int>(parsed);
+}
+
+std::unordered_set<int32_t> envFragmentIds(const char* name) {
+  std::unordered_set<int32_t> ids;
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return ids;
+  }
+  std::stringstream stream(value);
+  std::string token;
+  while (std::getline(stream, token, ',')) {
+    if (token.empty()) {
+      continue;
+    }
+    char* end = nullptr;
+    const auto parsed = std::strtol(token.c_str(), &end, 10);
+    if (end == token.c_str() || *end != '\0' || parsed < 0) {
+      LOG(WARNING) << "Ignoring invalid fragment id '" << token
+                   << "' in " << name << "='" << value << "'";
+      continue;
+    }
+    ids.insert(static_cast<int32_t>(parsed));
+  }
+  return ids;
 }
 
 void removeTaskOutputState(
@@ -260,6 +287,13 @@ MppQueryCoordinator::MppQueryCoordinator(
   deviceRootOutput_ = queryCtx_->queryConfig().get<bool>(
       facebook::velox::cudf_velox::CudfConfig::kCudfSkipOutputToVelox,
       false);
+  localDeviceRootOutput_ = queryCtx_->queryConfig().get<bool>(
+      facebook::velox::ucx_exchange::LocalDeviceOutputQueueManager::
+          kEnabledConfig,
+      false);
+  VELOX_CHECK(
+      !localDeviceRootOutput_ || deviceRootOutput_,
+      "Local direct device output requires GPU root output");
 #endif
 }
 
@@ -288,6 +322,7 @@ std::shared_ptr<MppQueryCoordinator> MppQueryCoordinator::create(
 
 MppQueryCoordinator::~MppQueryCoordinator() {
   nvtx3::scoped_range_in<GlutenMppDomain> nvtxRange{"coordinator::~destructor"};
+  deferredScanReleaseStop_.store(true, std::memory_order_release);
   // Stop the watchdog first so it doesn't touch half-destructed state.
   // notify_all wakes the watchdog from its cv.wait_for so join() returns
   // promptly instead of blocking up to 5s for the next tick.
@@ -361,6 +396,16 @@ MppQueryCoordinator::~MppQueryCoordinator() {
         abort();
       } catch (...) {
       }
+    }
+    {
+      nvtx3::scoped_range_in<GlutenMppDomain> r{
+          "coordinator::~destructor:deferredScanReleaseThreads.join"};
+      for (auto& thread : deferredScanReleaseThreads_) {
+        if (thread.joinable()) {
+          thread.join();
+        }
+      }
+      deferredScanReleaseThreads_.clear();
     }
     {
       nvtx3::scoped_range_in<GlutenMppDomain> removeTaskRange{"coordinator::~destructor:removeTaskFromOutputBuffer"};
@@ -994,6 +1039,16 @@ void MppQueryCoordinator::start() {
       fragmentTaskDrivers[spec.id].push_back(perReplicaDrivers);
       fragmentTaskBroadcastFanout[spec.id].push_back(bcastN);
       fragmentTaskStarted[spec.id].push_back(false);
+#ifdef GLUTEN_ENABLE_GPU
+      if (localDeviceRootOutput_ && spec.id == rootFragmentId_) {
+        facebook::velox::ucx_exchange::LocalDeviceOutputQueueManager::
+            getInstanceRef()
+                ->registerDirectOutputTask(taskId);
+        LOG(WARNING) << "[MPP_LOCAL_DEVICE_ROOT_REGISTER] queryId="
+                     << queryId_ << " task=" << taskId
+                     << " fragment=" << spec.id << " replica=" << i;
+      }
+#endif
       LOG(WARNING) << "MppQueryCoordinator[" << queryId_
                    << "]: created fragment " << spec.id << " replica " << i
                    << "/" << replicas << " taskId=" << taskId
@@ -1342,12 +1397,26 @@ void MppQueryCoordinator::start() {
     }
   };
 
+  const bool primeUcxExchangeClients =
+      envIntOrDefault("GLUTEN_MPP_PRIME_UCX_EXCHANGE_CLIENTS", 0) != 0;
+  const auto primeUcxProducerFragments =
+      envFragmentIds("GLUTEN_MPP_PRIME_UCX_PRODUCER_FRAGMENT_IDS");
+  struct PendingUcxExchangePrime {
+    std::string consumerTaskId;
+    core::PlanNodeId exchangeNodeId;
+    std::vector<std::string> remoteTaskUrls;
+  };
+  std::vector<PendingUcxExchangePrime> pendingUcxExchangePrimes;
+
   const auto wireExchange = [&](size_t exchangeIndex) {
     if (exchangeWired[exchangeIndex]) {
       return;
     }
     exchangeWired[exchangeIndex] = true;
     auto& exchange = exchangeSpecs_[exchangeIndex];
+    const bool primeThisExchange =
+        primeUcxExchangeClients ||
+        primeUcxProducerFragments.count(exchange.producerFragmentId) > 0;
     auto& producerReplicas = fragmentTasks_[exchange.producerFragmentId];
     auto& consumerReplicas = fragmentTasks_[exchange.consumerFragmentId];
     if (consumerReplicas.empty()) {
@@ -1485,6 +1554,7 @@ void MppQueryCoordinator::start() {
     int32_t splitCount = 0;
     for (size_t cIdx = 0; cIdx < consumerReplicas.size(); ++cIdx) {
       auto& consumerTask = consumerReplicas[cIdx];
+      std::vector<std::string> remoteTaskUrls;
       if (isBroadcast) {
         int32_t destination = static_cast<int32_t>(cIdx);
         for (int32_t peer = 0; peer < peerIndex_; ++peer) {
@@ -1499,9 +1569,14 @@ void MppQueryCoordinator::start() {
               producerEndpoint.taskId,
               destination);
           consumerTask->addSplit(exchange.exchangeNodeId, Split(std::make_shared<RemoteConnectorSplit>(url)));
+          remoteTaskUrls.push_back(url);
           ++splitCount;
         }
         consumerTask->noMoreSplits(exchange.exchangeNodeId);
+        if (primeThisExchange) {
+          pendingUcxExchangePrimes.push_back(
+              {consumerTask->taskId(), exchange.exchangeNodeId, std::move(remoteTaskUrls)});
+        }
         continue;
       }
 
@@ -1530,10 +1605,15 @@ void MppQueryCoordinator::start() {
               producerEndpoint.taskId,
               dest);
           consumerTask->addSplit(exchange.exchangeNodeId, Split(std::make_shared<RemoteConnectorSplit>(url)));
+          remoteTaskUrls.push_back(url);
           ++splitCount;
         }
       }
       consumerTask->noMoreSplits(exchange.exchangeNodeId);
+      if (primeThisExchange) {
+        pendingUcxExchangePrimes.push_back(
+            {consumerTask->taskId(), exchange.exchangeNodeId, std::move(remoteTaskUrls)});
+      }
     }
     LOG(WARNING) << "MppQueryCoordinator[" << queryId_ << "]: exchange " << exchange.id << " wired (" << splitCount
                  << " splits across " << consumerReplicas.size() << " consumer task(s), " << producerEndpoints.size()
@@ -1581,16 +1661,290 @@ void MppQueryCoordinator::start() {
     wireExchange(i);
   }
 
-  // Fragment ids are emitted in producer-before-consumer order.  At this
-  // point every consumer already has all RemoteConnectorSplits and every scan
-  // already has its Hive splits, so no task starts in an incomplete split
-  // state.  Starting in this order registers producer output buffers before
-  // downstream ExchangeSources begin fetching.
-  for (const auto& spec : fragmentSpecs_) {
+  // Fragment ids are emitted in producer-before-consumer order. Start the
+  // non-bootstrap tasks in the opposite order so every downstream
+  // ExchangeSource has registered its receive path before an upstream scan
+  // can fill a bounded, task-wide output queue. This matters for a deep DAG
+  // with blocking TopN or hash-build pipelines: starting all scan producers
+  // first can fill different destinations of the all-to-all exchanges before
+  // their consumers are ready, leaving producers and consumers in a cyclic
+  // WaitForConsumer/WaitForProducer state. UcxOutputQueue supports a consumer
+  // arriving before Task::start() by creating the destination queue lazily;
+  // initializePartitionOutput() completes that placeholder when the producer
+  // starts.
+  // Diagnostic admission control for deep join DAGs.  A leaf probe scan can
+  // otherwise run long before its consumer's hash build is ready, filling a
+  // bounded exchange queue and retaining decoded device batches while the
+  // critical build chain competes for the same GPU.  Start every consumer and
+  // non-deferred producer first, then release only the explicitly selected
+  // scan leaves after a bounded delay or after their consumer's build-side
+  // JoinBridge is ready. This is deliberately opt-in: the default start order
+  // and lifecycle remain unchanged.
+  const auto requestedDeferredScanFragments = fragmentSpecs_.size() > 1
+      ? envFragmentIds("GLUTEN_MPP_DEFERRED_SCAN_FRAGMENT_IDS")
+      : std::unordered_set<int32_t>{};
+  const auto deferredScanDelayMs = std::max(
+      0,
+      envIntOrDefault("GLUTEN_MPP_DEFERRED_SCAN_DELAY_MS", 0));
+  const bool deferredScanWaitForJoinBuild =
+      envIntOrDefault("GLUTEN_MPP_DEFERRED_SCAN_WAIT_FOR_JOIN_BUILD", 0) != 0;
+  const auto deferredScanBuildWaitTimeoutMs = std::max(
+      1,
+      envIntOrDefault(
+          "GLUTEN_MPP_DEFERRED_SCAN_BUILD_WAIT_TIMEOUT_MS", 180000));
+  std::unordered_set<int32_t> deferredScanFragments;
+  for (const auto fragmentId : requestedDeferredScanFragments) {
+    if (fragmentId < 0 ||
+        fragmentId >= static_cast<int32_t>(fragmentSpecs_.size())) {
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                   << "]: ignoring deferred scan fragment " << fragmentId
+                   << " outside [0," << fragmentSpecs_.size() << ")";
+      continue;
+    }
+    const bool sourceFragment = consumerInboundPartitions[fragmentId] == 0;
+    if (fragmentSpecs_[fragmentId].scanNodeIds.empty() && !sourceFragment) {
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                   << "]: ignoring deferred fragment " << fragmentId
+                   << " because it is neither scan-bearing nor a source fragment";
+      continue;
+    }
+    if (bootstrapBroadcastProducer[fragmentId]) {
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                   << "]: ignoring deferred fragment " << fragmentId
+                   << " because it is a bootstrap broadcast producer";
+      continue;
+    }
+    deferredScanFragments.insert(fragmentId);
+  }
+
+  for (auto it = fragmentSpecs_.rbegin(); it != fragmentSpecs_.rend(); ++it) {
+    const auto& spec = *it;
+    if (deferredScanFragments.count(spec.id) > 0) {
+      continue;
+    }
     for (int32_t i = 0; i < static_cast<int32_t>(fragmentTasks_[spec.id].size()); ++i) {
       startFragmentTask(spec.id, i);
     }
   }
+
+  if (!deferredScanFragments.empty()) {
+    if (deferredScanWaitForJoinBuild) {
+#ifdef GLUTEN_ENABLE_GPU
+      const auto subtreeContains = [](
+                                       const core::PlanNodePtr& root,
+                                       const core::PlanNodeId& target) {
+        std::function<bool(const core::PlanNodePtr&)> visit =
+            [&](const core::PlanNodePtr& node) {
+              if (!node) {
+                return false;
+              }
+              if (node->id() == target) {
+                return true;
+              }
+              for (const auto& source : node->sources()) {
+                if (visit(source)) {
+                  return true;
+                }
+              }
+              return false;
+            };
+        return visit(root);
+      };
+      const auto probeJoinIds = [&](const core::PlanNodePtr& root,
+                                    const core::PlanNodeId& exchangeNodeId) {
+        std::vector<core::PlanNodeId> ids;
+        std::function<void(const core::PlanNodePtr&)> visit =
+            [&](const core::PlanNodePtr& node) {
+              if (!node) {
+                return;
+              }
+              const auto join =
+                  std::dynamic_pointer_cast<const core::HashJoinNode>(node);
+              if (join && !join->sources().empty() &&
+                  subtreeContains(join->sources()[0], exchangeNodeId)) {
+                // Inner probe joins must become ready before their enclosing
+                // joins, so preserve leaf-to-root order.
+                visit(join->sources()[0]);
+                ids.push_back(join->id());
+                return;
+              }
+              for (const auto& source : node->sources()) {
+                visit(source);
+              }
+            };
+        visit(root);
+        return ids;
+      };
+
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                   << "]: deferring " << deferredScanFragments.size()
+                   << " scan fragment(s) until probe JoinBridge build-ready"
+                   << " timeoutMs=" << deferredScanBuildWaitTimeoutMs;
+      deferredScanReleaseThreads_.reserve(deferredScanFragments.size());
+      for (const auto fragmentId : deferredScanFragments) {
+        using DeferredTaskStart = std::tuple<
+            std::shared_ptr<exec::Task>,
+            int32_t,
+            int32_t,
+            int32_t>;
+        std::vector<DeferredTaskStart> taskStarts;
+        taskStarts.reserve(fragmentTasks_[fragmentId].size());
+        for (int32_t i = 0;
+             i < static_cast<int32_t>(fragmentTasks_[fragmentId].size());
+             ++i) {
+          taskStarts.emplace_back(
+              fragmentTasks_[fragmentId][i],
+              i,
+              fragmentTaskDrivers[fragmentId][i],
+              fragmentTaskBroadcastFanout[fragmentId][i]);
+        }
+        const auto inboundN = consumerInboundPartitions[fragmentId];
+        std::vector<std::pair<int32_t, core::PlanNodeId>> waitTargets;
+        for (const auto& exchange : exchangeSpecs_) {
+          if (exchange.producerFragmentId != fragmentId) {
+            continue;
+          }
+          const auto& consumerSpec =
+              fragmentSpecs_[exchange.consumerFragmentId];
+          for (const auto& joinId : probeJoinIds(
+                   consumerSpec.planFragment.planNode,
+                   exchange.exchangeNodeId)) {
+            waitTargets.emplace_back(exchange.consumerFragmentId, joinId);
+          }
+        }
+        deferredScanReleaseThreads_.emplace_back([
+                                                    this,
+                                                    fragmentId,
+                                                    waitTargets =
+                                                        std::move(waitTargets),
+                                                    taskStarts =
+                                                        std::move(taskStarts),
+                                                    inboundN,
+                                                    deferredScanBuildWaitTimeoutMs]() {
+          bool timedOut = false;
+          try {
+            for (const auto& [consumerFragmentId, joinId] : waitTargets) {
+              for (const auto& consumerTask :
+                   fragmentTasks_[consumerFragmentId]) {
+                auto bridge = consumerTask->getCustomJoinBridge(
+                    exec::kUngroupedGroupId, joinId);
+                auto cudfBridge = std::dynamic_pointer_cast<
+                    cudf_velox::CudfHashJoinBridge>(bridge);
+                VELOX_CHECK_NOT_NULL(
+                    cudfBridge,
+                    "Deferred probe fragment {} expected cuDF join bridge {}",
+                    fragmentId,
+                    joinId);
+                ContinueFuture future;
+                if (!cudfBridge->hashOrFuture(&future).has_value() &&
+                    !std::move(future).wait(std::chrono::milliseconds(
+                        deferredScanBuildWaitTimeoutMs))) {
+                  timedOut = true;
+                  LOG(WARNING)
+                      << "MppQueryCoordinator[" << queryId_
+                      << "]: deferred fragment " << fragmentId
+                      << " timed out waiting for consumerF="
+                      << consumerFragmentId << " join=" << joinId;
+                  break;
+                }
+                LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                             << "]: deferred fragment " << fragmentId
+                             << " observed build-ready consumerF="
+                             << consumerFragmentId
+                             << " join=" << joinId;
+              }
+              if (timedOut) {
+                break;
+              }
+            }
+          } catch (const std::exception& error) {
+            timedOut = true;
+            LOG(ERROR) << "MppQueryCoordinator[" << queryId_
+                       << "]: deferred fragment " << fragmentId
+                       << " bridge wait failed; releasing safely: "
+                       << error.what();
+          } catch (...) {
+            timedOut = true;
+            LOG(ERROR) << "MppQueryCoordinator[" << queryId_
+                       << "]: deferred fragment " << fragmentId
+                       << " bridge wait failed with unknown exception; "
+                          "releasing safely";
+          }
+          if (waitTargets.empty()) {
+            LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                         << "]: deferred fragment " << fragmentId
+                         << " is not a hash-join probe producer; releasing immediately";
+          }
+          if (deferredScanReleaseStop_.load(std::memory_order_acquire)) {
+            return;
+          }
+          std::lock_guard<std::mutex> lock(deferredScanStartMutex_);
+          if (deferredScanReleaseStop_.load(std::memory_order_acquire)) {
+            return;
+          }
+          for (const auto& [task, replica, drivers, bcastN] : taskStarts) {
+            if (!task ||
+                deferredScanReleaseStop_.load(std::memory_order_acquire)) {
+              return;
+            }
+            LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                         << "]: build-ready starting deferred fragment "
+                         << fragmentId << " replica " << replica << "/"
+                         << taskStarts.size() << " taskId=" << task->taskId()
+                         << " drivers=" << drivers << " inboundN=" << inboundN
+                         << (bcastN > 0
+                                 ? fmt::format(" bcastFanout={}", bcastN)
+                                 : std::string{});
+            task->start(drivers);
+            if (bcastN > 0) {
+              task->updateOutputBuffers(bcastN, /*noMoreBuffers=*/true);
+            }
+          }
+        });
+      }
+#else
+      VELOX_FAIL(
+          "GLUTEN_MPP_DEFERRED_SCAN_WAIT_FOR_JOIN_BUILD requires GPU build");
+#endif
+    } else {
+      LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                   << "]: deferring " << deferredScanFragments.size()
+                   << " scan fragment(s) for " << deferredScanDelayMs << " ms";
+      if (deferredScanDelayMs > 0) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(deferredScanDelayMs));
+      }
+      for (auto it = fragmentSpecs_.rbegin(); it != fragmentSpecs_.rend(); ++it) {
+        const auto& spec = *it;
+        if (deferredScanFragments.count(spec.id) == 0) {
+          continue;
+        }
+        for (int32_t i = 0;
+             i < static_cast<int32_t>(fragmentTasks_[spec.id].size());
+             ++i) {
+          startFragmentTask(spec.id, i);
+        }
+      }
+    }
+  }
+
+#ifdef GLUTEN_ENABLE_GPU
+  // A join-probe driver may wait for its hash build before it reaches
+  // UcxExchange::isBlocked(). Prime the already-created UCX clients here so
+  // their producers see a consumer request while the build is still running.
+  // RemoteConnectorSplits remain on the Task and keep normal accounting.
+  for (const auto& pending : pendingUcxExchangePrimes) {
+    const bool primed = cudf_velox::primeUcxExchangeClient(
+        pending.consumerTaskId,
+        pending.exchangeNodeId,
+        pending.remoteTaskUrls);
+    LOG(WARNING) << "MppQueryCoordinator[" << queryId_
+                 << "]: UCX client prime task=" << pending.consumerTaskId
+                 << " node=" << pending.exchangeNodeId
+                 << " urls=" << pending.remoteTaskUrls.size()
+                 << " primed=" << primed;
+  }
+#endif
 
   // Phase 3.5: broadcast producer output buffer fan-out is set inside
   // startFragmentTask() immediately after Task::start(); nothing else to do.
@@ -1958,6 +2312,46 @@ RowVectorPtr MppQueryCoordinator::fetchNextDeviceOutput() {
     rootOutputSequence_.assign(rootReplicas, 0);
     rootReplicaAtEnd_.assign(rootReplicas, false);
   }
+  if (!rootDeviceFetchStarted_) {
+    rootDeviceFetchStarted_ = true;
+    rootDeviceFetchLastProgressLog_ = std::chrono::steady_clock::now();
+    rootDeviceFetchNotReadyPolls_.assign(rootReplicas, 0);
+    rootDeviceFetchDequeues_.assign(rootReplicas, 0);
+    rootDeviceFetchRows_.assign(rootReplicas, 0);
+    rootDeviceFetchBytes_.assign(rootReplicas, 0);
+    LOG(WARNING) << "[MPP_DEVICE_ROOT_FETCH_START] queryId=" << queryId_
+                 << " rootFragment=" << rootFragmentId_
+                 << " replicas=" << rootReplicas
+                 << " local=" << localDeviceRootOutput_
+                 << " drain="
+                 << (rootDrainSequential_ ? "sequential" : "roundRobin");
+  }
+
+  const auto maybeLogLocalProgress = [&](int32_t idx, bool force) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!force &&
+        now - rootDeviceFetchLastProgressLog_ < std::chrono::seconds(10)) {
+      return;
+    }
+    uint64_t totalPolls = 0;
+    uint64_t totalDequeues = 0;
+    uint64_t totalRows = 0;
+    uint64_t totalBytes = 0;
+    for (int32_t i = 0; i < rootReplicas; ++i) {
+      totalPolls += rootDeviceFetchNotReadyPolls_[i];
+      totalDequeues += rootDeviceFetchDequeues_[i];
+      totalRows += rootDeviceFetchRows_[i];
+      totalBytes += rootDeviceFetchBytes_[i];
+    }
+    LOG(WARNING) << "[MPP_DEVICE_ROOT_FETCH_PROGRESS] queryId=" << queryId_
+                 << " currentReplica=" << idx
+                 << " sequence="
+                 << (idx >= 0 ? rootOutputSequence_[idx] : -1)
+                 << " notReadyPolls=" << totalPolls
+                 << " dequeues=" << totalDequeues
+                 << " rows=" << totalRows << " bytes=" << totalBytes;
+    rootDeviceFetchLastProgressLog_ = now;
+  };
 
   const auto pickNext = [&]() -> int32_t {
     if (rootDrainSequential_) {
@@ -1980,6 +2374,8 @@ RowVectorPtr MppQueryCoordinator::fetchNextDeviceOutput() {
 
   auto queueManager =
       facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+  auto localQueueManager = facebook::velox::ucx_exchange::
+      LocalDeviceOutputQueueManager::getInstanceRef();
   while (!noMoreData_) {
     const int32_t idx = pickNext();
     if (idx < 0) {
@@ -1999,6 +2395,52 @@ RowVectorPtr MppQueryCoordinator::fetchNextDeviceOutput() {
 
     const auto rootTaskId = makeTaskId(rootFragmentId_, idx);
     const auto requestedSequence = rootOutputSequence_[idx];
+
+    if (localDeviceRootOutput_) {
+      auto local = localQueueManager->tryGetData(
+          rootTaskId, kDestination, requestedSequence);
+      if (!local.ready) {
+        ++rootDeviceFetchNotReadyPolls_[idx];
+        maybeLogLocalProgress(idx, false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        rethrowFirstTaskError();
+        continue;
+      }
+      VELOX_CHECK_EQ(local.sequence, requestedSequence);
+      if (local.atEnd) {
+        rootReplicaAtEnd_[idx] = true;
+        maybeLogLocalProgress(idx, true);
+        LOG(WARNING) << "[MPP_DEVICE_ROOT_FETCH_REPLICA_END] queryId="
+                     << queryId_ << " replica=" << idx
+                     << " dequeues=" << rootDeviceFetchDequeues_[idx]
+                     << " rows=" << rootDeviceFetchRows_[idx]
+                     << " bytes=" << rootDeviceFetchBytes_[idx]
+                     << " notReadyPolls="
+                     << rootDeviceFetchNotReadyPolls_[idx];
+        localQueueManager->deleteResults(rootTaskId, kDestination);
+        noMoreData_ = std::all_of(
+            rootReplicaAtEnd_.begin(),
+            rootReplicaAtEnd_.end(),
+            [](bool atEnd) { return atEnd; });
+        continue;
+      }
+      VELOX_CHECK_NOT_NULL(local.data);
+      const auto rows = static_cast<uint64_t>(local.data->size());
+      const auto bytes = local.data->estimateFlatSize();
+      ++rootDeviceFetchDequeues_[idx];
+      rootDeviceFetchRows_[idx] += rows;
+      rootDeviceFetchBytes_[idx] += bytes;
+      rootOutputSequence_[idx] = local.sequence + 1;
+      if (rootDeviceFetchDequeues_[idx] == 1) {
+        LOG(WARNING) << "[MPP_DEVICE_ROOT_FETCH_FIRST_DEQUEUE] queryId="
+                     << queryId_ << " replica=" << idx
+                     << " sequence=" << local.sequence << " rows=" << rows
+                     << " bytes=" << bytes;
+      }
+      maybeLogLocalProgress(idx, false);
+      return std::move(local.data);
+    }
+
     auto state = std::make_shared<DeviceFetchState>();
     state->sequence = requestedSequence;
 
@@ -2354,7 +2796,7 @@ void MppQueryCoordinator::logOperatorMetrics() const {
                   (name.starts_with("cudf") || name == "totalScanTime");
               const bool includeExchangeMetric =
                   includeExchangeRuntimeStats &&
-                  (name.starts_with("ucxExchangeSource.") ||
+                  (name.starts_with("ucx") ||
                    name == "peakBytes" || name == "numReceivedPages" ||
                    name == "averageReceivedPageBytes");
               if (!includeScanMetric && !includeExchangeMetric &&

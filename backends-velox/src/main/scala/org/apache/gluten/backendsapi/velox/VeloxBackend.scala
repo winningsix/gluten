@@ -43,6 +43,7 @@ import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
 import org.apache.spark.sql.execution.command.CreateDataSourceTableAsSelectCommand
 import org.apache.spark.sql.execution.datasources.{FileFormat, InsertIntoHadoopFsRelationCommand}
+import org.apache.spark.sql.execution.datasources.orc.OrcFileFormat
 import org.apache.spark.sql.execution.datasources.parquet.{ParquetFileFormat, ParquetOptions}
 import org.apache.spark.sql.hive.execution.HiveFileFormat
 import org.apache.spark.sql.internal.SQLConf
@@ -309,7 +310,7 @@ object VeloxBackendSettings extends BackendSettingsApi {
 
     def validateCompressionCodec(): Option[String] = {
       val unSupportedCompressions = Set("brotli", "lzo", "lz4raw", "lz4_raw")
-      val compressionCodec = WriteFilesExecTransformer.getCompressionCodec(options)
+      val compressionCodec = WriteFilesExecTransformer.getCompressionCodec(format, options)
       if (unSupportedCompressions.contains(compressionCodec)) {
         Some(s"$compressionCodec compression codec is unsupported in Velox backend.")
       } else {
@@ -356,7 +357,7 @@ object VeloxBackendSettings extends BackendSettingsApi {
 
     def validateFileFormat(): Option[String] = {
       format match {
-        case _: ParquetFileFormat => None // Parquet is directly supported
+        case _: ParquetFileFormat | _: OrcFileFormat => None
         case h: HiveFileFormat if GlutenConfig.get.enableHiveFileFormatWriter =>
           validateHiveFileFormat(h) // Parquet via Hive SerDe
         case _ =>

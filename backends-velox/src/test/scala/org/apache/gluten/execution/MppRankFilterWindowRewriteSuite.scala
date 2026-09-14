@@ -72,6 +72,68 @@ class MppRankFilterWindowRewriteSuite extends AnyFunSuite {
     assert(stats.insertedHashExchanges == 0)
   }
 
+  test("cuDF exact row_number one elides redundant Window and Filter but retains Sort") {
+    val filter = rankFilterBranch("cudf_elide", includeExchange = true)
+      .asInstanceOf[FilterExecTransformer]
+    val window = filter.child.asInstanceOf[WindowExecTransformer]
+    val rankAttribute = window.windowExpression.head.toAttribute
+    val projectList = filter.output.filterNot(_.exprId == rankAttribute.exprId)
+    val plan = ProjectExecTransformer(projectList, filter)
+    val originalOutputExprIds = plan.output.map(_.exprId)
+
+    val (rewritten, stats) =
+      CudfRankOneTopNElisionRule.rewrite(plan, enabled = true)
+
+    assert(stats.elidedWindows == 1)
+    assert(rewritten.collect { case _: WindowExecTransformer => 1 }.isEmpty)
+    assert(rewritten.collect { case _: SortExecTransformer => 1 }.size == 1)
+    assert(rewritten.collect { case _: FilterExecTransformer => 1 }.isEmpty)
+    val groupLimits = rewritten.collect { case node: WindowGroupLimitExecTransformer => node }
+    assert(groupLimits.size == 2)
+    assert(groupLimits.exists(_.mode == GlutenFinal))
+    assert(groupLimits.exists(_.mode == GlutenPartial))
+    assert(rewritten.output.map(_.exprId) == originalOutputExprIds)
+  }
+
+  test("cuDF exact row_number one can elide the redundant local Sort") {
+    val filter = rankFilterBranch("cudf_elide_sort", includeExchange = true)
+      .asInstanceOf[FilterExecTransformer]
+    val window = filter.child.asInstanceOf[WindowExecTransformer]
+    val rankAttribute = window.windowExpression.head.toAttribute
+    val plan =
+      ProjectExecTransformer(filter.output.filterNot(_.exprId == rankAttribute.exprId), filter)
+
+    val (rewritten, stats) =
+      CudfRankOneTopNElisionRule.rewrite(plan, enabled = true, preserveSort = false)
+
+    assert(stats.elidedWindows == 1)
+    assert(rewritten.collect { case _: WindowExecTransformer => 1 }.isEmpty)
+    assert(rewritten.collect { case _: FilterExecTransformer => 1 }.isEmpty)
+    assert(rewritten.collect { case _: SortExecTransformer => 1 }.isEmpty)
+    assert(rewritten.collect { case node: WindowGroupLimitExecTransformer => node }.size == 2)
+  }
+
+  test("cuDF rank-one elision retains rank semantics and referenced rank output") {
+    val rankFilter = rankFilterBranch(
+      "cudf_rank",
+      includeExchange = true,
+      options = BranchOptions(rankKind = "rank"))
+      .asInstanceOf[FilterExecTransformer]
+    val rankProject = ProjectExecTransformer(rankFilter.output.dropRight(1), rankFilter)
+    val (rankRewritten, rankStats) =
+      CudfRankOneTopNElisionRule.rewrite(rankProject, enabled = true)
+    assert(rankStats.elidedWindows == 0)
+    assert(rankRewritten.collect { case _: WindowExecTransformer => 1 }.size == 1)
+
+    val rowNumberFilter = rankFilterBranch("cudf_rank_output", includeExchange = true)
+      .asInstanceOf[FilterExecTransformer]
+    val rankOutputProject = ProjectExecTransformer(rowNumberFilter.output, rowNumberFilter)
+    val (outputRewritten, outputStats) =
+      CudfRankOneTopNElisionRule.rewrite(rankOutputProject, enabled = true)
+    assert(outputStats.elidedWindows == 0)
+    assert(outputRewritten.collect { case _: WindowExecTransformer => 1 }.size == 1)
+  }
+
   test("three rank-filter branches preserve Window Filter and local Sort without TopN") {
     val plan = UnionExec(
       Seq(

@@ -41,7 +41,7 @@ import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeSet, Expression, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, Literal, NamedExpression}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeSet, Expression, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, Literal, NamedExpression, Rank, RowNumber, WindowExpression}
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.expressions.aggregate.{Complete, Final, Partial}
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
@@ -1472,6 +1472,7 @@ case class MppNativeQueryExec(
     // Sort fragments by ID (ensures topological order: producers before consumers)
     val sortedFragments = extractedFragments.sortBy(_.id).toSeq
     val cappedExchanges = capLocalHashExchangeTasks(extractedExchanges.toSeq)
+    val topNFannedExchanges = fanoutRankTopNConsumers(sortedFragments, cappedExchanges)
     // Experimental escape hatch for small globally sorted outputs. A SINGLE exchange still
     // preserves total ordering, while avoiding the Spark-side RANGE sampling pre-action. Reduce
     // the corresponding consumer fragment to one task as well so all rows are sorted by the same
@@ -1479,7 +1480,7 @@ case class MppNativeQueryExec(
     val forceSingleRange = booleanConf("spark.gluten.mpp.forceSingleRange", defaultValue = false)
     val forcedRangeConsumerIds =
       if (forceSingleRange) {
-        cappedExchanges.iterator
+        topNFannedExchanges.iterator
           .filter(_.exchangeType == "RANGE")
           .map(_.consumerFragmentId)
           .toSet
@@ -1513,10 +1514,10 @@ case class MppNativeQueryExec(
         // fragment does not contain WriteFilesExecTransformer. MppCollapseRule marks that exact
         // boundary explicitly. A terminal fragment has no outgoing exchange and is consumed once
         // per pinned Spark peer by the V2 writer.
-        val producerFragmentIds = cappedExchanges.iterator.map(_.producerFragmentId).toSet
+        val producerFragmentIds = topNFannedExchanges.iterator.map(_.producerFragmentId).toSet
         val externalV2WriteConsumerIds =
           if (distributedWriteOutput) {
-            cappedExchanges.iterator
+            topNFannedExchanges.iterator
               .filter(
                 spec =>
                   spec.exchangeType == "RANGE" &&
@@ -1535,11 +1536,11 @@ case class MppNativeQueryExec(
                 s"F$fragmentId (one writer per peer)")
         }
         MppRangeTopology.collapseRangesForSingleDriverConsumers(
-          cappedExchanges,
+          topNFannedExchanges,
           rangePlanningFragments,
           distributedWriteConsumerIds)
       }
-    cappedExchanges.zip(singleDriverExchanges).foreach {
+    topNFannedExchanges.zip(singleDriverExchanges).foreach {
       case (before, after) if before.exchangeType == "RANGE" && after.exchangeType == "SINGLE" =>
         logInfo(
           s"MppNativeQueryExec: planning RANGE exchange ${before.id} " +
@@ -1730,7 +1731,11 @@ case class MppNativeQueryExec(
           write.child.output,
           None)
         splitCount += 1
-        write.copy(child = exchange)
+        // This rewrite runs after the normal columnar transition pass. Make the newly-created
+        // exchange an explicit iterator boundary so the writer's WholeStageTransformer serializes
+        // a ReadRel instead of trying to cast the raw Spark exchange to TransformSupport.
+        write.copy(
+          child = ColumnarCollapseTransformStages.wrapInputIteratorTransformer(exchange))
     }
     if (splitCount > 0) {
       logInfo(
@@ -4125,6 +4130,50 @@ case class MppNativeQueryExec(
             }
         }
       case None => exchanges
+    }
+  }
+
+  /**
+   * Give rank/row-number TopN consumers more than one local destination without multiplying every
+   * HASH join in the query. A global localHashExchangeTasks increase doubles all HASH fragments and
+   * can exhaust a 32GB GPU before the TopN tail is reached. This targeted fanout changes only HASH
+   * edges entering a fragment that contains a rank TopN, so each peer can finish one bounded lane
+   * and release downstream work while the sibling lane is still finalizing.
+   */
+  private def fanoutRankTopNConsumers(
+      fragments: Seq[NativeFragment],
+      exchanges: Seq[ExchangeSpec]): Seq[ExchangeSpec] = {
+    val requested = positiveIntConf("spark.gluten.mpp.rankTopNHashExchangeTasks")
+    if (requested.isEmpty) {
+      return exchanges
+    }
+
+    val rankTopNConsumerIds = fragments.iterator.filter {
+      fragment =>
+        fragment.rootOperator != null && fragment.rootOperator.find {
+          case _: WindowGroupLimitExecTransformer => true
+          case window: WindowExecTransformer =>
+            window.windowExpression.exists {
+              case Alias(WindowExpression(_: RowNumber, _), _) => true
+              case Alias(WindowExpression(_: Rank, _), _) => true
+              case _ => false
+            }
+          case _ => false
+        }.isDefined
+    }.map(_.id).toSet
+
+    exchanges.map {
+      case spec
+          if spec.exchangeType == "HASH" &&
+            rankTopNConsumerIds.contains(spec.consumerFragmentId) &&
+            spec.numPartitions < requested.get =>
+        logWarning(
+          s"MppNativeQueryExec: selectively fanning rank TopN consumer " +
+            s"F${spec.consumerFragmentId} exchange ${spec.id} " +
+            s"F${spec.producerFragmentId}->F${spec.consumerFragmentId} from " +
+            s"${spec.numPartitions} to ${requested.get} HASH destinations")
+        spec.copy(numPartitions = requested.get)
+      case spec => spec
     }
   }
 

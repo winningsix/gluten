@@ -32,6 +32,7 @@ import org.apache.spark.sql.execution.datasources.WriteFilesExec
 import org.apache.spark.sql.execution.datasources.v2.V2CommandExec
 import org.apache.spark.sql.execution.exchange.{Exchange, ReusedExchangeExec}
 
+import java.lang.reflect.InvocationTargetException
 import java.util
 import java.util.Collections.newSetFromMap
 
@@ -148,12 +149,44 @@ object GlutenExplainUtils extends AdaptiveSparkPlanHelper {
       append: String => Unit,
       collectedOperators: BitSet): Unit = {
     try {
-
-      QueryPlan.append(plan, append, verbose = false, addSuffix = false, printOperatorId = true)
+      appendQueryPlan(plan, append)
 
       append("\n")
     } catch {
       case e: AnalysisException => append(e.toString)
+    }
+  }
+
+  /**
+   * Call QueryPlan.append across upstream Spark and EMR Spark 4.0 runtimes.
+   *
+   * EMR adds the redactSecurityBoundarySubPlan argument to this private Spark utility. Calling the
+   * upstream six-argument signature directly therefore causes a NoSuchMethodError when a Gluten jar
+   * compiled against upstream Spark is loaded by EMR. Keep the compatibility boundary here rather
+   * than leaking the vendor-specific signature into the rest of the explain/fallback code.
+   */
+  private def appendQueryPlan[T <: QueryPlan[T]](plan: T, append: String => Unit): Unit = {
+    val appendMethod = QueryPlan.getClass.getMethods
+      .filter(_.getName == "append")
+      .find(method => method.getParameterCount == 7 || method.getParameterCount == 6)
+      .getOrElse {
+        throw new NoSuchMethodException("No compatible QueryPlan.append method found")
+      }
+
+    val arguments = Array[AnyRef](
+      (() => plan).asInstanceOf[AnyRef],
+      append.asInstanceOf[AnyRef],
+      Boolean.box(false),
+      Boolean.box(false),
+      Int.box(org.apache.spark.sql.internal.SQLConf.get.maxToStringFields),
+      Boolean.box(true))
+    val runtimeArguments =
+      if (appendMethod.getParameterCount == 7) arguments :+ Boolean.box(true) else arguments
+
+    try {
+      appendMethod.invoke(QueryPlan, runtimeArguments: _*)
+    } catch {
+      case e: InvocationTargetException => throw e.getCause
     }
   }
 

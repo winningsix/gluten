@@ -34,6 +34,7 @@ import org.apache.spark.sql.catalyst.plans.logical.Project
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.datasources.FileFormat
+import org.apache.spark.sql.execution.datasources.orc.OrcFileFormat
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.internal.SQLConf
@@ -277,6 +278,17 @@ case class WriteFilesExecTransformer(
 }
 
 object WriteFilesExecTransformer {
+  def getCompressionCodec(fileFormat: FileFormat, options: Map[String, String]): String = {
+    fileFormat match {
+      case _: OrcFileFormat =>
+        options
+          .get("compression")
+          .getOrElse(SQLConf.get.getConfString("spark.sql.orc.compression.codec", "snappy"))
+          .toLowerCase(Locale.ROOT)
+      case _ => getCompressionCodec(options)
+    }
+  }
+
   def getCompressionCodec(options: Map[String, String]): String = {
     // From `ParquetOptions`
     val parquetCompressionConf = options.get(ParquetOutputFormat.COMPRESSION)

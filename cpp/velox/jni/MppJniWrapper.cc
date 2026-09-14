@@ -62,8 +62,11 @@
 #ifdef GLUTEN_ENABLE_GPU
 #include "operators/plannodes/CudfVectorStream.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
+#include "velox/experimental/ucx-exchange/UcxQueues.h"
+#include "velox/common/memory/CustomMemoryResourceRegistry.h"
 #endif
 
 using namespace gluten;
@@ -131,6 +134,137 @@ struct MppQueryHandle {
     }
   }
 };
+
+std::optional<std::unordered_set<int32_t>> parallelMppFragmentIds() {
+  constexpr const char* kEnv = "GLUTEN_MPP_PARALLEL_FRAGMENT_IDS";
+  const char* value = std::getenv(kEnv);
+  // Treat an explicitly empty value the same as an unset policy. Kubernetes
+  // pod templates commonly materialize optional env vars as NAME=""; an
+  // empty allow-list must not silently force every MPP fragment to one driver.
+  if (value == nullptr || *value == '\0') {
+    return std::nullopt;
+  }
+
+  std::unordered_set<int32_t> ids;
+  std::stringstream values(value);
+  std::string token;
+  while (std::getline(values, token, ',')) {
+    if (token.empty()) {
+      continue;
+    }
+    try {
+      size_t parsedCharacters = 0;
+      const auto parsed = std::stol(token, &parsedCharacters);
+      if (parsedCharacters != token.size() || parsed < 0 ||
+          parsed > std::numeric_limits<int32_t>::max()) {
+        throw std::invalid_argument("fragment id is out of range");
+      }
+      ids.insert(static_cast<int32_t>(parsed));
+    } catch (const std::exception& error) {
+      VELOX_FAIL("Invalid {} token '{}': {}", kEnv, token, error.what());
+    }
+  }
+  return ids;
+}
+
+std::optional<std::unordered_set<int32_t>> parallelMppScanFragmentIds() {
+  constexpr const char* kEnv = "GLUTEN_MPP_PARALLEL_SCAN_FRAGMENT_IDS";
+  const char* value = std::getenv(kEnv);
+  if (value == nullptr || *value == '\0') {
+    return std::nullopt;
+  }
+
+  std::unordered_set<int32_t> ids;
+  std::stringstream values(value);
+  std::string token;
+  while (std::getline(values, token, ',')) {
+    if (token.empty()) {
+      continue;
+    }
+    try {
+      size_t parsedCharacters = 0;
+      const auto parsed = std::stol(token, &parsedCharacters);
+      if (parsedCharacters != token.size() || parsed < 0 ||
+          parsed > std::numeric_limits<int32_t>::max()) {
+        throw std::invalid_argument("fragment id is out of range");
+      }
+      ids.insert(static_cast<int32_t>(parsed));
+    } catch (const std::exception& error) {
+      VELOX_FAIL("Invalid {} token '{}': {}", kEnv, token, error.what());
+    }
+  }
+  return ids;
+}
+
+int32_t parallelMppScanDrivers() {
+  constexpr const char* kEnv = "GLUTEN_MPP_PARALLEL_SCAN_DRIVERS";
+  const char* value = std::getenv(kEnv);
+  if (value == nullptr || *value == '\0') {
+    return 0;
+  }
+  try {
+    size_t parsedCharacters = 0;
+    const auto parsed = std::stol(value, &parsedCharacters);
+    if (parsedCharacters != std::strlen(value) || parsed <= 0 ||
+        parsed > std::numeric_limits<int32_t>::max()) {
+      throw std::invalid_argument("driver count is out of range");
+    }
+    return static_cast<int32_t>(parsed);
+  } catch (const std::exception& error) {
+    VELOX_FAIL("Invalid {}='{}': {}", kEnv, value, error.what());
+  }
+}
+
+std::unordered_map<int32_t, int32_t> parallelMppScanDriverOverrides() {
+  constexpr const char* kEnv =
+      "GLUTEN_MPP_PARALLEL_SCAN_DRIVER_OVERRIDES";
+  const char* value = std::getenv(kEnv);
+  std::unordered_map<int32_t, int32_t> overrides;
+  if (value == nullptr || *value == '\0') {
+    return overrides;
+  }
+
+  std::stringstream entries(value);
+  std::string entry;
+  while (std::getline(entries, entry, ',')) {
+    if (entry.empty()) {
+      continue;
+    }
+    const auto separator = entry.find(':');
+    if (separator == std::string::npos || separator == 0 ||
+        separator + 1 == entry.size() ||
+        entry.find(':', separator + 1) != std::string::npos) {
+      VELOX_FAIL(
+          "Invalid {} entry '{}': expected fragmentId:drivers", kEnv, entry);
+    }
+    try {
+      size_t fragmentCharacters = 0;
+      size_t driverCharacters = 0;
+      const auto fragment =
+          std::stol(entry.substr(0, separator), &fragmentCharacters);
+      const auto drivers =
+          std::stol(entry.substr(separator + 1), &driverCharacters);
+      if (fragmentCharacters != separator ||
+          driverCharacters != entry.size() - separator - 1 || fragment < 0 ||
+          fragment > std::numeric_limits<int32_t>::max() || drivers <= 0 ||
+          drivers > std::numeric_limits<int32_t>::max()) {
+        throw std::invalid_argument("fragment id or driver count is out of range");
+      }
+      const auto insertResult = overrides.emplace(
+          static_cast<int32_t>(fragment), static_cast<int32_t>(drivers));
+      if (!insertResult.second) {
+        VELOX_FAIL(
+            "Invalid {} entry '{}': duplicate fragment id {}",
+            kEnv,
+            entry,
+            fragment);
+      }
+    } catch (const std::exception& error) {
+      VELOX_FAIL("Invalid {} entry '{}': {}", kEnv, entry, error.what());
+    }
+  }
+  return overrides;
+}
 
 bool tryGetIteratorIndex(const ::substrait::ReadRel& readRel, int32_t* index) {
   if (!readRel.has_local_files() || readRel.local_files().items_size() == 0) {
@@ -433,6 +567,17 @@ std::unordered_map<std::string, std::string> buildMppQueryConfig(
       std::to_string(mppMaxOutputBufferSize);
   configs[velox::core::QueryConfig::kMaxPartitionedOutputBufferSize] =
       std::to_string(mppMaxOutputBufferSize);
+  configs["ucx.output_buffer_adaptive_burst_size"] =
+      std::to_string(veloxCfg->get<uint64_t>(
+          kMppAdaptiveOutputBurstBytes, kMppAdaptiveOutputCreditDefault));
+  configs["ucx.output_buffer_adaptive_global_burst_size"] =
+      std::to_string(veloxCfg->get<uint64_t>(
+          kMppAdaptiveOutputGlobalBurstBytes,
+          kMppAdaptiveOutputCreditDefault));
+  configs["ucx.output_buffer_adaptive_min_device_headroom"] =
+      std::to_string(veloxCfg->get<uint64_t>(
+          kMppAdaptiveOutputMinDeviceHeadroomBytes,
+          kMppAdaptiveOutputCreditDefault));
   return configs;
 }
 
@@ -643,13 +788,26 @@ bool isRightSemiProjectMultiDriverSafePlan(
       hasNestedRightSemiProjectPartialShape(node);
 }
 
+bool parallelGraceProbeDrainEnabled() {
+  const auto* value =
+      std::getenv("GLUTEN_CUDF_HASH_JOIN_PARALLEL_GRACE_DRAIN");
+  if (value == nullptr) {
+    return false;
+  }
+  return std::string_view(value) == "1" || std::string_view(value) == "true" ||
+      std::string_view(value) == "TRUE";
+}
+
 bool isInnerJoinMultiDriverSafePlan(
     const velox::core::PlanNodePtr& node,
     int32_t& innerJoinCount) {
   if (auto join =
           std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node)) {
-    if (join->joinType() != velox::core::JoinType::kInner ||
-        join->isNullAware()) {
+    const bool supportedJoin =
+        join->joinType() == velox::core::JoinType::kInner ||
+        (parallelGraceProbeDrainEnabled() &&
+         join->joinType() == velox::core::JoinType::kLeft);
+    if (!supportedJoin || join->isNullAware()) {
       return false;
     }
     ++innerJoinCount;
@@ -1820,6 +1978,12 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       1,
       preLoopSessionCfg->get<int32_t>(
           kMppKeyedFinalLocalDrivers, kMppKeyedFinalLocalDriversDefault));
+  const auto configuredParallelFragmentIds = parallelMppFragmentIds();
+  const auto configuredParallelScanFragmentIds =
+      parallelMppScanFragmentIds();
+  const auto configuredParallelScanDrivers = parallelMppScanDrivers();
+  const auto configuredParallelScanDriverOverrides =
+      parallelMppScanDriverOverrides();
   bool singleTaskMode = singleTaskModeRequested;
   if (singleTaskMode) {
     // All known partition types are supported in single-task mode:
@@ -2492,7 +2656,6 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
                    << " is a pure INNER HASH-join shape that is safe for "
                       "intra-task multi-driver execution";
     }
-
     MppFragmentSpec fragSpec;
     // In single-task mode, merged producers are skipped (continue) above, so
     // fragment IDs in the surviving fragmentSpecs would be non-contiguous
@@ -2547,6 +2710,48 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
                    << " enabling keyed FINAL local HASH repartition with "
                    << mergedNumDrivers << " drivers";
     }
+    const auto scanDriverOverride =
+        configuredParallelScanDriverOverrides.find(static_cast<int32_t>(i));
+    const bool hasPerFragmentScanDriverOverride =
+        scanDriverOverride != configuredParallelScanDriverOverrides.end();
+    const bool hasLegacyScanDriverOverride =
+        configuredParallelScanDrivers > 0 &&
+        configuredParallelScanFragmentIds.has_value() &&
+        configuredParallelScanFragmentIds->count(static_cast<int32_t>(i)) > 0;
+    const bool explicitlyParallelScanFragment =
+        hasPerFragmentScanDriverOverride || hasLegacyScanDriverOverride;
+    if (!singleTaskMode && numFragments > 1 && !fragScanInfos.empty() &&
+        explicitlyParallelScanFragment) {
+      mergedNumDrivers = hasPerFragmentScanDriverOverride
+          ? scanDriverOverride->second
+          : configuredParallelScanDrivers;
+      LOG(WARNING) << "MppJniWrapper: fragment " << i
+                   << " selectively enabling " << mergedNumDrivers
+                   << " scan drivers in multi-fragment query"
+                   << (hasPerFragmentScanDriverOverride
+                           ? " (per-fragment override)"
+                           : "");
+    }
+    // A multi-fragment GPU query starts all leaf producers together. Giving
+    // every scan fragment multiple drivers therefore multiplies the number of
+    // decoded cuDF batches resident across the DAG and can exhaust a GPU even
+    // though each individual scan is within its operator admission limit.
+    // Scan-bearing fragments are always single-driver in that topology. When
+    // an explicit parallel-fragment set is configured, also narrow every
+    // unlisted fragment; this lets high-value HASH consumers be widened
+    // without duplicating operator state across the entire DAG. Single-
+    // fragment cache fills retain their configured parallelism.
+    const bool unlistedByParallelFragmentPolicy =
+        configuredParallelFragmentIds.has_value() &&
+        configuredParallelFragmentIds->count(static_cast<int32_t>(i)) == 0;
+    if (!singleTaskMode && numFragments > 1 && mergedNumDrivers > 1 &&
+        ((!fragScanInfos.empty() && !explicitlyParallelScanFragment) ||
+         unlistedByParallelFragmentPolicy)) {
+      LOG(WARNING) << "MppJniWrapper: fragment " << i
+                   << " capping multi-fragment query from "
+                   << mergedNumDrivers << " to 1 driver";
+      mergedNumDrivers = 1;
+    }
     fragSpec.numDrivers = mergedNumDrivers;
     fragSpec.keyedFinalLocalRepartition =
         fragmentUsesKeyedFinalLocalRepartition;
@@ -2570,6 +2775,80 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
     fragmentSpecs.push_back(std::move(fragSpec));
 
     env->DeleteLocalRef(planByteArray);
+  }
+
+  // Split only HASH inputs to rank TopN consumers. Raising Spark's global
+  // localHashExchangeTasks multiplies every join fragment and can OOM a 32GB
+  // GPU before the TopN tail. At this point all Velox fragments are available,
+  // so identify the exact TopN consumers and rebuild only their producers'
+  // PartitionedOutput roots with the larger destination count.
+  int32_t rankTopNHashDestinations = 0;
+  if (const auto* configured =
+          std::getenv("GLUTEN_MPP_RANK_TOPN_HASH_DESTINATIONS")) {
+    try {
+      rankTopNHashDestinations = std::stoi(configured);
+    } catch (const std::exception& error) {
+      VELOX_FAIL(
+          "Invalid GLUTEN_MPP_RANK_TOPN_HASH_DESTINATIONS='{}': {}",
+          configured,
+          error.what());
+    }
+  }
+  if (rankTopNHashDestinations > 0) {
+    VELOX_CHECK_GE(
+        rankTopNHashDestinations,
+        peerSpec.peerCount,
+        "Rank TopN HASH destinations must be at least peerCount");
+    VELOX_CHECK_EQ(
+        rankTopNHashDestinations % peerSpec.peerCount,
+        0,
+        "Rank TopN HASH destinations must be a multiple of peerCount");
+    std::function<bool(const velox::core::PlanNodePtr&)> containsRankTopN =
+        [&](const velox::core::PlanNodePtr& node) {
+          if (std::dynamic_pointer_cast<
+                  const velox::core::TopNRowNumberNode>(node)) {
+            return true;
+          }
+          for (const auto& source : node->sources()) {
+            if (containsRankTopN(source)) {
+              return true;
+            }
+          }
+          return false;
+        };
+
+    std::unordered_set<int32_t> rewrittenProducers;
+    for (auto& exchange : exchangeSpecs) {
+      if (exchange.partitionType != "HASH" ||
+          exchange.numPartitions >= rankTopNHashDestinations ||
+          !containsRankTopN(
+              fragmentSpecs[exchange.consumerFragmentId]
+                  .planFragment.planNode)) {
+        continue;
+      }
+      auto& producerPlan =
+          fragmentSpecs[exchange.producerFragmentId].planFragment.planNode;
+      auto output = std::dynamic_pointer_cast<
+          const velox::core::PartitionedOutputNode>(producerPlan);
+      VELOX_CHECK_NOT_NULL(
+          output,
+          "Rank TopN HASH producer fragment {} has no PartitionedOutput root",
+          exchange.producerFragmentId);
+      VELOX_CHECK(
+          rewrittenProducers.insert(exchange.producerFragmentId).second,
+          "Rank TopN HASH producer fragment {} has multiple outbound exchanges",
+          exchange.producerFragmentId);
+      LOG(WARNING)
+          << "MppJniWrapper: selectively fanning rank TopN HASH exchange "
+          << exchange.id << " F" << exchange.producerFragmentId << "->F"
+          << exchange.consumerFragmentId << " from "
+          << exchange.numPartitions << " to " << rankTopNHashDestinations
+          << " destinations";
+      exchange.numPartitions = rankTopNHashDestinations;
+      producerPlan = velox::core::PartitionedOutputNode::Builder(*output)
+                         .numPartitions(rankTopNHashDestinations)
+                         .build();
+    }
   }
 
   // --- Create execution resources ---
@@ -2670,6 +2949,26 @@ Java_org_apache_gluten_vectorized_MppQueryJniWrapper_nativeCreateMppQuery( // NO
       mppPool,
       spillExecutor.get(),
       mppPoolName);
+#ifdef GLUTEN_ENABLE_GPU
+  // Attach one query root to the executor-wide device-state resource. Every
+  // fragment Task then receives a mirrored task/node/operator hierarchy, so
+  // Velox can choose a victim across the entire MPP graph rather than applying
+  // unrelated per-operator byte thresholds.
+  if (auto deviceResource =
+          velox::memory::CustomMemoryResourceRegistry::global().find(
+              std::string(
+                  velox::cudf_velox::kCudfDeviceMemoryResourceTag))) {
+    auto deviceRoot = velox::memory::memoryManager()->addCustomRootPool(
+        fmt::format(
+            "{}.{}",
+            mppPoolName,
+            velox::cudf_velox::kCudfDeviceMemoryResourceTag),
+        deviceResource);
+    queryCtx->addCustomPool(
+        std::string(velox::cudf_velox::kCudfDeviceMemoryResourceTag),
+        std::move(deviceRoot));
+  }
+#endif
 
   std::optional<velox::common::SpillDiskOptions> spillDiskOpts;
   const auto spillStrategy =

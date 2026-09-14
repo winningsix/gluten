@@ -656,6 +656,15 @@ if(ENABLE_GPU)
 
   find_package(cudf CONFIG REQUIRED)
 
+  # A separately-built GPU Velox tree can contain its S3 filesystem even when
+  # Gluten itself was configured with ENABLE_S3=OFF. Its static archives then
+  # carry AWS SDK references into libgluten.so, so resolve that closure for all
+  # GPU builds instead of relying on an unrelated Gluten option.
+  if(NOT ENABLE_S3)
+    find_package(ZLIB REQUIRED)
+    find_awssdk()
+  endif()
+
   import_library(
     facebook::velox::velox_cudf_expression
     ${VELOX_BUILD_PATH}/velox/experimental/cudf/expression/libvelox_cudf_expression.a
@@ -746,9 +755,7 @@ if(ENABLE_GPU)
   # The cuDF connector archives above contain S3 callers. Repeat the static AWS
   # SDK closure after those archives so one-pass GNU linking retains the
   # corresponding S3/S3 CRT objects in libgluten.so itself.
-  if(ENABLE_S3)
-    target_link_libraries(velox PRIVATE ${AWSSDK_LIBRARIES})
-  endif()
+  target_link_libraries(velox PRIVATE ${AWSSDK_LIBRARIES})
   # Shared libs consumers need at link time (cudf::cudf, libcurl): PUBLIC.
   target_link_libraries(velox PUBLIC cudf::cudf velox_curl)
   target_link_libraries(velox PUBLIC ${GLUTEN_APACHE_THRIFT_LIBRARY})

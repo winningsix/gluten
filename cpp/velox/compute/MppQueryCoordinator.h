@@ -339,6 +339,12 @@ class MppQueryCoordinator {
   /// is stalling. Runs until destructor.
   std::thread watchdogThread_;
   std::atomic<bool> watchdogStop_{false};
+  /// Optional feature-gated admission workers wait for the consumer join's
+  /// build result without blocking start() or root-output draining. They are
+  /// joined during teardown after task abort wakes any pending bridge future.
+  std::vector<std::thread> deferredScanReleaseThreads_;
+  std::atomic<bool> deferredScanReleaseStop_{false};
+  std::mutex deferredScanStartMutex_;
   /// Used to wake the watchdog thread immediately on shutdown instead of
   /// blocking until the current 5-second sleep_for finishes. Without this
   /// the destructor's join() routinely waits 1-3s on average just for the

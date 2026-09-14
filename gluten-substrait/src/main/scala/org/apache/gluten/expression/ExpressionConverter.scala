@@ -991,11 +991,16 @@ object ExpressionConverter extends Logging {
     if (!root.isInstanceOf[AttributeReference]) {
       return BoundReference(structField.ordinal, structField.dataType, structField.nullable)
     }
-    names += root.asInstanceOf[AttributeReference].name
+    val rootAttribute = root.asInstanceOf[AttributeReference]
+    names += rootAttribute.name
     input.attrs.foreach(
       attribute => {
         var level = names.size - 1
-        if (names(level) == attribute.name) {
+        // PullOutProject may rename a generated struct (for example `edge` to
+        // `_post_5`) while deliberately preserving its ExprId. Spark resolves
+        // the reference by ExprId, so bind the same way and retain the name
+        // comparison only for plans whose attributes were reconstructed.
+        if (rootAttribute.exprId == attribute.exprId || names(level) == attribute.name) {
           var candidateFields: Array[StructField] = null
           var dtType = attribute.dataType
           while (dtType.isInstanceOf[StructType] && level >= 1) {

@@ -157,6 +157,17 @@ const bool kMppSingleTaskModeDefault = true;
 const std::string kMppMaxOutputBufferSize = "spark.gluten.sql.columnar.backend.velox.mpp.maxOutputBufferSize";
 const uint64_t kMppMaxOutputBufferSizeDefault = 1L << 30;
 
+// Optional executor-wide elastic credit above the ordinary per-fragment MPP
+// output-buffer limit. Disabled by default so local/single-worker behavior is
+// unchanged.
+const std::string kMppAdaptiveOutputBurstBytes =
+    "spark.gluten.sql.columnar.backend.velox.ucx.output_buffer_adaptive_burst_size";
+const std::string kMppAdaptiveOutputGlobalBurstBytes =
+    "spark.gluten.sql.columnar.backend.velox.ucx.output_buffer_adaptive_global_burst_size";
+const std::string kMppAdaptiveOutputMinDeviceHeadroomBytes =
+    "spark.gluten.sql.columnar.backend.velox.ucx.output_buffer_adaptive_min_device_headroom";
+const uint64_t kMppAdaptiveOutputCreditDefault = 0;
+
 // Cap on per-task driver count (= local-partition lane count) when single-
 // task mode is active. Mirrors IBM's pbench GPU deployment choice
 // (velox-testing/.../generate_presto_config.sh sets VCPU_PER_WORKER=2 for
@@ -253,6 +264,11 @@ const std::string kVeloxPreferredBatchBytes = "spark.gluten.sql.columnar.backend
 /// cudf
 const std::string kCudfEnableTableScan = "spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan";
 const bool kCudfEnableTableScanDefault = false;
+// Use the cuDF Hive connector and libcudf Parquet sink for supported table
+// writes. This is separate from table scan so write-heavy queries can opt in
+// without changing their scan path.
+const std::string kCudfEnableTableWrite = "spark.gluten.sql.columnar.backend.velox.cudf.enableTableWrite";
+const bool kCudfEnableTableWriteDefault = false;
 const std::string kCudfHiveConnectorId = "cudf-hive";
 const std::string kCudfIcebergConnectorId = "cudf-iceberg";
 
@@ -286,6 +302,24 @@ const std::string kCudfExchangeConcatOptimizationEnabled =
     "spark.gluten.sql.columnar.backend.velox.cudf.exchange_concat_optimization_enabled";
 const std::string kCudfExchangeConcatOptimizationEnabledDefault = "true";
 
+// Host-first, partitioned GPU hash join. Small joins retain the regular
+// device-resident path; eligible joins switch after this threshold.
+const std::string kCudfHashJoinGraceBuildBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.hashJoinGraceBuildBytes";
+const std::string kCudfHashJoinGraceBuildBytesDefault = "0";
+const std::string kCudfHashJoinGracePartitions =
+    "spark.gluten.sql.columnar.backend.velox.cudf.hashJoinGracePartitions";
+const std::string kCudfHashJoinGracePartitionsDefault = "8";
+const std::string kCudfHashJoinGraceHostBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.hashJoinGraceHostBytes";
+const std::string kCudfHashJoinGraceHostBytesDefault = "0";
+const std::string kCudfHashJoinGraceRestoreBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.hashJoinGraceRestoreBytes";
+const std::string kCudfHashJoinGraceRestoreBytesDefault = "4294967296";
+const std::string kCudfHashJoinGraceProbeRestoreBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.hashJoinGraceProbeRestoreBytes";
+const std::string kCudfHashJoinGraceProbeRestoreBytesDefault = "1073741824";
+
 // Enables cuDF's persistent FINAL streaming groupby with a fixed distinct-key
 // capacity. Zero keeps the all-GPU levelled aggregation path.
 const std::string kCudfGroupbyStreamingMaxDistinctKeys =
@@ -298,6 +332,42 @@ const std::string kCudfPartialIdentityAggregationDefault = "false";
 const std::string kCudfOrderBySortedRunBytes = "spark.gluten.sql.columnar.backend.velox.cudf.orderBySortedRunBytes";
 const std::string kCudfOrderBySortedRunBytesDefault = "268435456";
 const std::string kCudfOrderBySortedRunBytesMppDefault = "3221225472";
+
+const std::string kCudfOrderByHostSpillBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.orderByHostSpillBytes";
+const std::string kCudfOrderByHostSpillBytesDefault = "68719476736";
+
+const std::string kCudfWindowSortedRunBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.windowSortedRunBytes";
+const std::string kCudfWindowSortedRunBytesDefault = "134217728";
+
+const std::string kCudfTopNRowNumberCandidateRunBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.topNRowNumberCandidateRunBytes";
+const std::string kCudfTopNRowNumberCandidateRunBytesDefault = "1073741824";
+const std::string kCudfTopNRowNumberHostPartitions =
+    "spark.gluten.sql.columnar.backend.velox.cudf.topNRowNumberHostPartitions";
+const std::string kCudfTopNRowNumberHostPartitionsDefault = "16";
+const std::string kCudfTopNRowNumberFinalizeInputBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.topNRowNumberFinalizeInputBytes";
+const std::string kCudfTopNRowNumberFinalizeInputBytesDefault = "536870912";
+const std::string kCudfTopNRowNumberDeviceResidentBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.topNRowNumberDeviceResidentBytes";
+const std::string kCudfTopNRowNumberDeviceResidentBytesDefault = "0";
+const std::string kCudfTopNRowNumberOutputChunkBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.topNRowNumberOutputChunkBytes";
+const std::string kCudfTopNRowNumberOutputChunkBytesDefault = "33554432";
+const std::string kCudfTopNRowNumberMaxOutputRows =
+    "spark.gluten.sql.columnar.backend.velox.cudf.topNRowNumberMaxOutputRows";
+const std::string kCudfTopNRowNumberMaxOutputRowsDefault = "262144";
+const std::string kCudfDeviceResidentCapacityBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.deviceResidentCapacityBytes";
+const std::string kCudfDeviceResidentCapacityBytesDefault = "0";
+const std::string kCudfDeviceMemoryMinHeadroomBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.deviceMemoryMinHeadroomBytes";
+const std::string kCudfDeviceMemoryMinHeadroomBytesDefault = "6442450944";
+const std::string kCudfDeviceMemoryMinReclaimBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.deviceMemoryMinReclaimBytes";
+const std::string kCudfDeviceMemoryMinReclaimBytesDefault = "2147483648";
 
 const std::string kCudfOrderByMergeFanIn = "spark.gluten.sql.columnar.backend.velox.cudf.orderByMergeFanIn";
 const std::string kCudfOrderByMergeFanInDefault = "8";

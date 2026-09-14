@@ -104,6 +104,12 @@ class ValueStreamNode final : public facebook::velox::core::PlanNode {
 
 class CudfVectorStream : public CudfVectorStreamBase {
  public:
+  enum class PreparedInput {
+    kDirectDevice,
+    kNeedsWorkspace,
+    kFinished,
+  };
+
   CudfVectorStream(
       facebook::velox::exec::DriverCtx* driverCtx,
       facebook::velox::memory::MemoryPool* pool,
@@ -118,7 +124,63 @@ class CudfVectorStream : public CudfVectorStreamBase {
   }
 
   bool hasPending() const {
-    return !pendingRows_.empty() || !pendingGpuBatches_.empty() || stashedCudf_ != nullptr;
+    return preparedBatch_ != nullptr || preparedCudf_ != nullptr ||
+        !pendingRows_.empty() || !pendingGpuBatches_.empty() ||
+        stashedCudf_ != nullptr;
+  }
+
+  bool preparedInputNeedsWorkspace() const {
+    return preparedBatch_ != nullptr || !pendingRows_.empty() ||
+        !pendingGpuBatches_.empty();
+  }
+
+  // Pull one iterator batch far enough to distinguish the MPP device-owned
+  // fast path from a real CPU/GpuBuffer conversion. Re-wrapping a CudfVector
+  // transfers ownership and launches no allocation, so reserving the generic
+  // 512-MiB H2D workspace for every concurrently-ready ValueStream creates
+  // large phantom pressure and can evict an otherwise healthy join build.
+  // Conversion inputs remain stashed until the caller acquires the original
+  // workspace reservation.
+  PreparedInput prepareNext() {
+    if (preparedCudf_ != nullptr ||
+        (stashedCudf_ != nullptr && pendingRows_.empty() &&
+         pendingGpuBatches_.empty())) {
+      return PreparedInput::kDirectDevice;
+    }
+    if (preparedBatch_ != nullptr || !pendingRows_.empty() ||
+        !pendingGpuBatches_.empty()) {
+      return PreparedInput::kNeedsWorkspace;
+    }
+
+    while (hasNext()) {
+      auto cb = nextInternal();
+      if (cb == nullptr) {
+        break;
+      }
+      if (cb->getType() == "velox") {
+        auto vb = std::dynamic_pointer_cast<VeloxColumnarBatch>(cb);
+        VELOX_CHECK_NOT_NULL(vb);
+        auto vp = vb->getRowVector();
+        VELOX_CHECK_NOT_NULL(vp);
+        if (vp->size() == 0) {
+          continue;
+        }
+        auto cudfVector = std::dynamic_pointer_cast<
+            facebook::velox::cudf_velox::CudfVector>(vp);
+        if (cudfVector != nullptr) {
+          preparedCudf_ = std::move(cudfVector);
+          return PreparedInput::kDirectDevice;
+        }
+      }
+#ifdef GLUTEN_ENABLE_GPU
+      if (cb->getType() == "gpu" && cb->numRows() == 0) {
+        continue;
+      }
+#endif
+      preparedBatch_ = std::move(cb);
+      return PreparedInput::kNeedsWorkspace;
+    }
+    return PreparedInput::kFinished;
   }
 
   // Convert columnar batch to a CudfVector for downstream GPU operators.
@@ -129,6 +191,25 @@ class CudfVectorStream : public CudfVectorStreamBase {
   //   3. GpuBufferColumnarBatch (shuffle read) -> accumulated then batched upload
   facebook::velox::RowVectorPtr next() override {
     using VD = facebook::velox::cudf_velox::VeloxDomain;
+
+    if (preparedCudf_ != nullptr) {
+      auto cudf = std::move(preparedCudf_);
+      GpuLockGuard gpuLock;
+      if (auto packed = cudf->releasePacked()) {
+        return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
+            cudf->pool(),
+            outputType_,
+            cudf->size(),
+            std::move(packed),
+            cudf->stream());
+      }
+      return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
+          cudf->pool(),
+          outputType_,
+          cudf->size(),
+          cudf->release(),
+          cudf->stream());
+    }
 
     auto belowThreshold = [&]() {
       if (targetBatchBytes_ > 0) {
@@ -143,7 +224,8 @@ class CudfVectorStream : public CudfVectorStreamBase {
     {
       nvtx3::scoped_range_in<VD> accRange(nvtx3::event_attributes{"ShuffleRead::accumulate", nvtx3::rgb{70, 130, 180}});
       while (belowThreshold()) {
-        auto cb = nextInternal();
+        auto cb = preparedBatch_ != nullptr ? std::move(preparedBatch_)
+                                            : nextInternal();
         if (cb == nullptr) {
           break;
         }
@@ -316,6 +398,8 @@ class CudfVectorStream : public CudfVectorStreamBase {
   int64_t targetBatchRows_;
   std::vector<facebook::velox::RowVectorPtr> pendingRows_;
   std::vector<std::shared_ptr<GpuBufferColumnarBatch>> pendingGpuBatches_;
+  std::shared_ptr<ColumnarBatch> preparedBatch_;
+  std::shared_ptr<facebook::velox::cudf_velox::CudfVector> preparedCudf_;
   int64_t pendingBytes_ = 0;
   int64_t pendingRowCount_ = 0;
   int64_t numCoalescedBatches_ = 0;
@@ -398,7 +482,18 @@ class CudfValueStream : public facebook::velox::exec::SourceOperator, public fac
     if (finished_) {
       return nullptr;
     }
-    while (rvStream_->hasNext() || rvStream_->hasPending()) {
+    VELOX_CHECK(
+        rvStream_->hasPending(),
+        "CudfValueStream getOutput requires isBlocked to prepare input");
+    VELOX_CHECK(
+        !rvStream_->preparedInputNeedsWorkspace() ||
+            workspaceAdmission_.has_value(),
+        "CudfValueStream conversion requires workspace admission");
+    // Only conversion inputs need transient allocation headroom. A prepared
+    // device-owned CudfVector is re-wrapped without allocating.
+    auto activeWorkspace = std::move(workspaceAdmission_);
+    workspaceAdmission_.reset();
+    while (rvStream_->hasPending() || rvStream_->hasNext()) {
       auto result = rvStream_->next();
       if (result == nullptr) {
         finished_ = true;
@@ -418,7 +513,57 @@ class CudfValueStream : public facebook::velox::exec::SourceOperator, public fac
     return nullptr;
   }
 
-  facebook::velox::exec::BlockingReason isBlocked(facebook::velox::ContinueFuture* /* unused */) override {
+  facebook::velox::exec::BlockingReason isBlocked(
+      facebook::velox::ContinueFuture* future) override {
+    using namespace facebook::velox::cudf_velox;
+    if (finished_ || workspaceAdmission_.has_value()) {
+      return facebook::velox::exec::BlockingReason::kNotBlocked;
+    }
+
+    VELOX_CHECK_NOT_NULL(future);
+    const auto prepared = rvStream_->prepareNext();
+    if (prepared == CudfVectorStream::PreparedInput::kFinished) {
+      finished_ = true;
+      reportCoalescedBatches();
+      return facebook::velox::exec::BlockingReason::kNotBlocked;
+    }
+    if (prepared == CudfVectorStream::PreparedInput::kDirectDevice) {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "valueStreamDirectWorkspaceBypasses",
+          facebook::velox::RuntimeCounter(1));
+      return facebook::velox::exec::BlockingReason::kNotBlocked;
+    }
+
+    // Cached Parquet pages are bounded near 200 MiB; the Job 144 high-pressure
+    // decode requested 187 MiB. A 512-MiB reservation covers source plus
+    // deserialize scratch without making the reservation itself consume the
+    // final 0.5 GiB needed to reach the configured 6-GiB steady-state
+    // watermark. Larger CPU/GPU compositions remain protected by that
+    // physical watermark and are split by their existing stream bounds.
+    constexpr uint64_t kInputWorkspaceBytes = uint64_t{512} << 20;
+    facebook::velox::ContinueFuture workspaceFuture;
+    auto workspace = tryAcquireDeviceMemoryWorkspace(
+        customPool(kCudfDeviceMemoryResourceTag),
+        this,
+        kInputWorkspaceBytes,
+        CudfConfig::getInstance().deviceMemoryMinHeadroomBytes,
+        DeviceMemoryWorkspacePriority::kInput,
+        &workspaceRequest_,
+        &workspaceFuture);
+    if (!workspace.has_value()) {
+      *future = std::move(workspaceFuture);
+      return facebook::velox::exec::BlockingReason::kWaitForArbitration;
+    }
+    workspaceAdmission_.emplace(std::move(workspace.value()));
+    {
+      auto lockedStats = stats_.wlock();
+      lockedStats->addRuntimeStat(
+          "valueStreamWorkspaceBytes",
+          facebook::velox::RuntimeCounter(
+              kInputWorkspaceBytes,
+              facebook::velox::RuntimeCounter::Unit::kBytes));
+    }
     return facebook::velox::exec::BlockingReason::kNotBlocked;
   }
 
@@ -438,6 +583,11 @@ class CudfValueStream : public facebook::velox::exec::SourceOperator, public fac
 
   bool finished_ = false;
   std::unique_ptr<CudfVectorStream> rvStream_;
+  facebook::velox::cudf_velox::DeviceMemoryWorkspaceRequest
+      workspaceRequest_;
+  std::optional<
+      facebook::velox::cudf_velox::DeviceMemoryWorkspaceReservation>
+      workspaceAdmission_;
 };
 
 class CudfVectorStreamOperatorTranslator : public facebook::velox::exec::Operator::PlanNodeTranslator {

@@ -121,7 +121,9 @@ class VeloxColumnarWriteFilesRDD(
         val outputPath = description.path
 
         // part1=1/part2=1
-        val partitionFragment = metrics.name
+        // Native writers omit the partition name for unpartitioned output. Jackson maps the
+        // missing JSON field to null, so normalize it before deciding whether to parse it.
+        val partitionFragment = Option(metrics.name).getOrElse("")
         // Write a partitioned table
         if (partitionFragment != "") {
           updatedPartitions += partitionFragment

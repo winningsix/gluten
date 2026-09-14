@@ -45,8 +45,13 @@
 #include "velox/experimental/cudf/connectors/hive/ExecutorReadBroker.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/common/memory/CustomMemoryResource.h"
+#include "velox/common/memory/CustomMemoryResourceRegistry.h"
+#include "velox/common/memory/MallocAllocator.h"
+#include "velox/common/memory/SharedArbitrator.h"
 #endif
 
 #include "compute/VeloxRuntime.h"
@@ -116,6 +121,7 @@ void VeloxBackend::init(
   backendConf_ =
       std::make_shared<facebook::velox::config::ConfigBase>(std::unordered_map<std::string, std::string>(conf));
 
+  uint64_t cudfDeviceStateCapacityBytes = 0;
 #ifdef GLUTEN_ENABLE_GPU
   // UCX reads its global options while libucs is loaded, before this method
   // can update the process environment. Override the parsed default directly
@@ -287,6 +293,26 @@ void VeloxBackend::init(
          backendConf_->get(kCudfPartialIdentityAggregation, kCudfPartialIdentityAggregationDefault)},
         {velox::cudf_velox::CudfConfig::kCudfExchangeConcatOptimizationEnabled,
          backendConf_->get(kCudfExchangeConcatOptimizationEnabled, kCudfExchangeConcatOptimizationEnabledDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfHashJoinGraceBuildBytes,
+         backendConf_->get(
+             kCudfHashJoinGraceBuildBytes,
+             kCudfHashJoinGraceBuildBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfHashJoinGracePartitions,
+         backendConf_->get(
+             kCudfHashJoinGracePartitions,
+             kCudfHashJoinGracePartitionsDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfHashJoinGraceHostBytes,
+         backendConf_->get(
+             kCudfHashJoinGraceHostBytes,
+             kCudfHashJoinGraceHostBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfHashJoinGraceRestoreBytes,
+         backendConf_->get(
+             kCudfHashJoinGraceRestoreBytes,
+             kCudfHashJoinGraceRestoreBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfHashJoinGraceProbeRestoreBytes,
+         backendConf_->get(
+             kCudfHashJoinGraceProbeRestoreBytes,
+             kCudfHashJoinGraceProbeRestoreBytesDefault)},
         {velox::cudf_velox::CudfConfig::kCudfBatchSizeMinThreshold,
          backendConf_->get(kCudfBatchSizeMinThreshold, kCudfBatchSizeMinThresholdDefault)},
         {velox::cudf_velox::CudfConfig::kCudfBatchSizeMaxThreshold,
@@ -306,6 +332,50 @@ void VeloxBackend::init(
         // batches; non-MPP execution retains the native conservative limits.
         {velox::cudf_velox::CudfConfig::kCudfOrderBySortedRunBytes,
          backendConf_->get(kCudfOrderBySortedRunBytes, orderBySortedRunBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfOrderByHostSpillBytes,
+         backendConf_->get(
+             kCudfOrderByHostSpillBytes,
+             kCudfOrderByHostSpillBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfWindowSortedRunBytes,
+         backendConf_->get(
+             kCudfWindowSortedRunBytes,
+             kCudfWindowSortedRunBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfTopNRowNumberCandidateRunBytes,
+         backendConf_->get(
+             kCudfTopNRowNumberCandidateRunBytes,
+             kCudfTopNRowNumberCandidateRunBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfTopNRowNumberHostPartitions,
+         backendConf_->get(
+             kCudfTopNRowNumberHostPartitions,
+             kCudfTopNRowNumberHostPartitionsDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfTopNRowNumberFinalizeInputBytes,
+         backendConf_->get(
+             kCudfTopNRowNumberFinalizeInputBytes,
+             kCudfTopNRowNumberFinalizeInputBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfTopNRowNumberDeviceResidentBytes,
+         backendConf_->get(
+             kCudfTopNRowNumberDeviceResidentBytes,
+             kCudfTopNRowNumberDeviceResidentBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfDeviceResidentCapacityBytes,
+         backendConf_->get(
+             kCudfDeviceResidentCapacityBytes,
+             kCudfDeviceResidentCapacityBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfTopNRowNumberOutputChunkBytes,
+         backendConf_->get(
+             kCudfTopNRowNumberOutputChunkBytes,
+             kCudfTopNRowNumberOutputChunkBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfTopNRowNumberMaxOutputRows,
+         backendConf_->get(
+             kCudfTopNRowNumberMaxOutputRows,
+             kCudfTopNRowNumberMaxOutputRowsDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfDeviceMemoryMinHeadroomBytes,
+         backendConf_->get(
+             kCudfDeviceMemoryMinHeadroomBytes,
+             kCudfDeviceMemoryMinHeadroomBytesDefault)},
+        {velox::cudf_velox::CudfConfig::kCudfDeviceMemoryMinReclaimBytes,
+         backendConf_->get(
+             kCudfDeviceMemoryMinReclaimBytes,
+             kCudfDeviceMemoryMinReclaimBytesDefault)},
         {velox::cudf_velox::CudfConfig::kCudfOrderByMergeFanIn,
          backendConf_->get(kCudfOrderByMergeFanIn, kCudfOrderByMergeFanInDefault)},
         {velox::cudf_velox::CudfConfig::kCudfOrderByOutputChunkBytes,
@@ -324,6 +394,7 @@ void VeloxBackend::init(
              "spark.gluten.sql.columnar.backend.velox.cudf.exchange_log_level", std::string("0"))}};
     auto& cudfConfig = velox::cudf_velox::CudfConfig::getInstance();
     cudfConfig.initialize(std::move(options));
+    cudfDeviceStateCapacityBytes = cudfConfig.deviceResidentCapacityBytes;
     velox::cudf_velox::registerCudf();
     registerCheckOverflowInTableInsertCudfFunction(cudfConfig.functionNamePrefix);
     velox::exec::Operator::registerOperator(std::make_unique<CudfVectorStreamOperatorTranslator>());
@@ -395,6 +466,42 @@ void VeloxBackend::init(
   facebook::velox::memory::MemoryManager::Options options;
   options.allocatorCapacity = memoryManagerCapacity;
   facebook::velox::memory::initializeMemoryManager(options);
+
+#ifdef GLUTEN_ENABLE_GPU
+  if (cudfDeviceStateCapacityBytes > 0) {
+    facebook::velox::memory::MemoryAllocator::Options allocatorOptions;
+    allocatorOptions.capacity = cudfDeviceStateCapacityBytes;
+    auto allocator =
+        std::make_shared<facebook::velox::memory::MallocAllocator>(
+            allocatorOptions);
+    facebook::velox::memory::MemoryArbitrator::Config arbitratorConfig;
+    arbitratorConfig.kind = "SHARED";
+    arbitratorConfig.capacity = cudfDeviceStateCapacityBytes;
+    arbitratorConfig.extraConfigs = {
+        {"memory-pool-initial-capacity", "64MB"},
+        {"memory-pool-min-reclaim-bytes", "128MB"},
+        {"memory-pool-spill-capacity-limit", "1GB"},
+        {"max-memory-arbitration-time", "60s"}};
+    auto arbitrator =
+        std::make_shared<facebook::velox::memory::SharedArbitrator>(
+            arbitratorConfig);
+    auto resource =
+        std::make_shared<facebook::velox::memory::CustomMemoryResource>(
+            std::string(
+                facebook::velox::cudf_velox::kCudfDeviceMemoryResourceTag),
+            std::move(allocator),
+            std::move(arbitrator),
+            []() {
+              return facebook::velox::memory::MemoryReclaimer::create();
+            },
+            cudfDeviceStateCapacityBytes);
+    facebook::velox::memory::CustomMemoryResourceRegistry::global().insert(
+        resource->tag(), resource);
+    LOG(WARNING) << "VeloxBackend: registered shared cuDF device-state "
+                    "arbitrator capacity="
+                 << cudfDeviceStateCapacityBytes;
+  }
+#endif
 
   // local cache persistent relies on the cache pool from root memory pool so we need to init this
   // after the memory manager instanced
@@ -597,7 +704,8 @@ void VeloxBackend::initConnector(const std::shared_ptr<velox::config::ConfigBase
   velox::connector::registerConnector(std::make_shared<ValueStreamConnector>(kIteratorConnectorId, hiveConf));
 
 #ifdef GLUTEN_ENABLE_GPU
-  if (backendConf_->get<bool>(kCudfEnableTableScan, kCudfEnableTableScanDefault) &&
+  if ((backendConf_->get<bool>(kCudfEnableTableScan, kCudfEnableTableScanDefault) ||
+       backendConf_->get<bool>(kCudfEnableTableWrite, kCudfEnableTableWriteDefault)) &&
       backendConf_->get<bool>(kCudfEnabled, kCudfEnabledDefault)) {
     facebook::velox::cudf_velox::connector::hive::CudfHiveConnectorFactory factory;
     auto hiveConnector = factory.newConnector(kCudfHiveConnectorId, hiveConf, ioExecutor_.get());

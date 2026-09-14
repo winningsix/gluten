@@ -809,7 +809,8 @@ std::shared_ptr<CudfHiveInsertTableHandle> makeCudfHiveInsertTableHandle(
     std::shared_ptr<cudf_velox::connector::hive::LocationHandle> locationHandle,
     const std::optional<common::CompressionKind> compressionKind,
     const std::unordered_map<std::string, std::string>& serdeParameters,
-    const std::shared_ptr<dwio::common::WriterOptions>& writerOptions) {
+    const std::shared_ptr<dwio::common::WriterOptions>& writerOptions,
+    const dwio::common::FileFormat fileFormat) {
   std::vector<std::shared_ptr<const CudfHiveColumnHandle>> columnHandles;
   columnHandles.reserve(tableColumnNames.size());
 
@@ -821,7 +822,7 @@ std::shared_ptr<CudfHiveInsertTableHandle> makeCudfHiveInsertTableHandle(
   }
 
   return std::make_shared<CudfHiveInsertTableHandle>(
-      columnHandles, locationHandle, compressionKind, serdeParameters, writerOptions);
+      columnHandles, locationHandle, compressionKind, serdeParameters, writerOptions, fileFormat);
 }
 #endif
 
@@ -909,26 +910,50 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
     writeConfs.emplace(item.first, item.second);
   }
 
-  // Currently only support parquet format.
   const std::string& formatShortName = writeConfs["format"];
-  GLUTEN_CHECK(formatShortName == "parquet", "Unsupported file write format: " + formatShortName);
-  dwio::common::FileFormat fileFormat = dwio::common::FileFormat::PARQUET;
+  GLUTEN_CHECK(
+      formatShortName == "parquet" || formatShortName == "orc",
+      "Unsupported file write format: " + formatShortName);
+  const auto fileFormat = formatShortName == "orc" ? dwio::common::FileFormat::ORC
+                                                    : dwio::common::FileFormat::PARQUET;
 
   const std::shared_ptr<dwio::common::WriterOptions> writerOptions = makeParquetWriteOption(writeConfs);
   // Spark's default compression code is snappy.
   const auto& compressionKind =
       writerOptions->compressionKind.value_or(common::CompressionKind::CompressionKind_SNAPPY);
-  std::shared_ptr<core::InsertTableHandle> tableHandle = std::make_shared<core::InsertTableHandle>(
-      kHiveConnectorId,
-      makeHiveInsertTableHandle(
-          tableColumnNames, /*inputType->names() clolumn name is different*/
-          inputType->children(),
-          partitionedKey,
-          bucketProperty,
-          makeLocationHandle(writePath, fileName, fileFormat, compressionKind, bucketProperty != nullptr),
-          writerOptions,
-          fileFormat,
-          compressionKind));
+  std::shared_ptr<core::InsertTableHandle> tableHandle;
+#ifdef GLUTEN_ENABLE_GPU
+  const bool useCudfWriter = veloxCfg_->get<bool>(kCudfEnabled, kCudfEnabledDefault) &&
+      veloxCfg_->get<bool>(kCudfEnableTableWrite, kCudfEnableTableWriteDefault) && partitionedKey.empty() &&
+      bucketProperty == nullptr;
+  if (useCudfWriter) {
+    auto locationHandle = std::make_shared<cudf_velox::connector::hive::LocationHandle>(
+        writePath, cudf_velox::connector::hive::LocationHandle::TableType::kNew, fileName);
+    tableHandle = std::make_shared<core::InsertTableHandle>(
+        kCudfHiveConnectorId,
+        makeCudfHiveInsertTableHandle(
+            tableColumnNames,
+            inputType->children(),
+            locationHandle,
+            compressionKind,
+            std::unordered_map<std::string, std::string>{},
+            writerOptions,
+            fileFormat));
+  } else
+#endif
+  {
+    tableHandle = std::make_shared<core::InsertTableHandle>(
+        kHiveConnectorId,
+        makeHiveInsertTableHandle(
+            tableColumnNames, /* inputType column names differ. */
+            inputType->children(),
+            partitionedKey,
+            bucketProperty,
+            makeLocationHandle(writePath, fileName, fileFormat, compressionKind, bucketProperty != nullptr),
+            writerOptions,
+            fileFormat,
+            compressionKind));
+  }
   return std::make_shared<core::TableWriteNode>(
       nextPlanNodeId(),
       inputType,
