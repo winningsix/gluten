@@ -49,7 +49,7 @@ import org.apache.spark.sql.catalyst.plans.{ExistenceJoin, FullOuter, Inner, Inn
 import org.apache.spark.sql.catalyst.plans.logical.{Join, LeafNode, Statistics}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastPartitioning, HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, SinglePartition}
 import org.apache.spark.sql.connector.read.SupportsReportStatistics
-import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCachedBatchSerializer, ColumnarCollapseTransformStages, ColumnarInputAdapter, ColumnarShuffleExchangeExec, ExecSubqueryExpression, ExternalRDDScanExec, FilterExec, InputAdapter, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
+import org.apache.spark.sql.execution.{ColumnarBroadcastExchangeExec, ColumnarCachedBatchSerializer, ColumnarCollapseTransformStages, ColumnarInputAdapter, ColumnarRangeBaseExec, ColumnarShuffleExchangeExec, ExecSubqueryExpression, ExternalRDDScanExec, FilterExec, InputAdapter, InputIteratorTransformer, LeafExecNode, LocalTableScanExec, ProjectExec, RDDScanExec, SerializeFromObjectExec, SortExec, SparkPlan, SQLExecution, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
@@ -293,6 +293,21 @@ private[execution] object FluxHashJoinInputSortRewrite {
  * compatibility guard rather than a relaxation.
  */
 private[gluten] object FluxJvmStreamInputMatcher {
+
+  /**
+   * Match an executor-local iterator source that FLUX can hand to a native ValueStream. Keep the
+   * existing row-ingress rules fail-closed, while also admitting Gluten's bounded columnar Range
+   * leaf. ColumnarRangeBaseExec already owns a partitioned RDD[ColumnarBatch], so routing it
+   * through the same iterator bridge does not add a new execution or transport path.
+   */
+  def localInput(plan: SparkPlan): Option[SparkPlan] = plan match {
+    case range: ColumnarRangeBaseExec => Some(range)
+    case cia: ColumnarInputAdapter => localInput(cia.child)
+    case c2c: ColumnarToColumnarExec => localInput(c2c.child)
+    case r2c: RowToColumnarExecBase => localInput(r2c.child)
+    case r2c: org.apache.spark.sql.execution.RowToColumnarExec => localInput(r2c.child)
+    case _ => rowInput(plan)
+  }
 
   private case class ObjectIngressGuardOutcome(
       childShape: String,
@@ -2290,18 +2305,26 @@ case class FluxNativeQueryExec(
   }
 
   private def isJvmBackedStreamInput(plan: SparkPlan): Boolean = {
-    FluxJvmStreamInputMatcher.rowInput(plan).isDefined
+    FluxJvmStreamInputMatcher.localInput(plan).isDefined
   }
 
   private def executeJvmBackedStreamColumnar(plan: SparkPlan): RDD[ColumnarBatch] = {
-    val rowInput = FluxJvmStreamInputMatcher.rowInput(plan).getOrElse {
+    val localInput = FluxJvmStreamInputMatcher.localInput(plan).getOrElse {
       throw new IllegalArgumentException(
         s"Expected an exact JVM-backed stream input, got ${plan.getClass.getSimpleName}")
     }
-    if (rowInput.supportsColumnar) {
-      rowInput.executeColumnar()
-    } else {
-      RowToVeloxColumnarExec(rowInput).executeColumnar()
+    localInput match {
+      // ColumnarRangeExec advertises ArrowJavaBatchType.  The JNI ValueStream bridge accepts only
+      // offloaded native batches, so preserve the normal ArrowJava -> ArrowNative -> Velox
+      // transition chain that collapsing the whole query would otherwise remove.  Do this only for
+      // the explicitly admitted local columnar leaf; the existing row-ingress paths retain their
+      // established conversion.
+      case range: ColumnarRangeBaseExec =>
+        ArrowColumnarToVeloxColumnarExec(OffloadArrowDataExec(range)).executeColumnar()
+      case _ if localInput.supportsColumnar =>
+        localInput.executeColumnar()
+      case _ =>
+        RowToVeloxColumnarExec(localInput).executeColumnar()
     }
   }
 

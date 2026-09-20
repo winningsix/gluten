@@ -81,24 +81,24 @@ object SparkTaskUtil {
       // EMR Spark 4.0.2 exposes both its full runtime constructor and a shorter constructor for
       // synthetic task contexts. Gluten previously asserted that TaskContextImpl had exactly one
       // constructor, so driver-side native validation failed before it could reach Velox/cuDF.
-      val ctor = ctors
-        .find(_.getParameterCount == 9)
-        .getOrElse(
-          throw new IllegalStateException(
-            s"Unsupported Spark 4 TaskContextImpl constructor layout: " +
-              ctors.map(_.getParameterCount).sorted.mkString("[", ",", "]")))
-      return ctor
-        .newInstance(
-          stageId,
-          stageAttemptNumber,
-          partitionId,
-          taskAttemptId,
-          attemptNumber,
-          numPartitions,
-          taskMemoryManager,
-          localProperties,
-          metricsSystem)
-        .asInstanceOf[TaskContext]
+      ctors.find(_.getParameterCount == 9).foreach {
+        ctor =>
+          return ctor
+            .newInstance(
+              stageId,
+              stageAttemptNumber,
+              partitionId,
+              taskAttemptId,
+              attemptNumber,
+              numPartitions,
+              taskMemoryManager,
+              localProperties,
+              metricsSystem)
+            .asInstanceOf[TaskContext]
+      }
+      // Apache Spark 4.0.0 has the same single 12-argument constructor as
+      // Spark 3.4-3.5. Fall through to that path when the EMR short
+      // constructor is absent.
     }
 
     val ctor = {

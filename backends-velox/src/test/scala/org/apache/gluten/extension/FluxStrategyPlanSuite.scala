@@ -17,10 +17,10 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
-import org.apache.gluten.execution.{ColumnarShuffledJoin, FluxExchangeSourceTransformer, FluxNativeQueryExec, FluxPreparedChildExec, LocalTableScanExecTransformer, VeloxWholeStageTransformerSuite, WholeStageTransformer}
+import org.apache.gluten.execution.{ColumnarShuffledJoin, FluxExchangeSourceTransformer, FluxJvmStreamInputMatcher, FluxNativeQueryExec, FluxPreparedChildExec, LocalTableScanExecTransformer, VeloxWholeStageTransformerSuite, WholeStageTransformer}
 import org.apache.gluten.metrics.MetricsUpdater
 
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.{ColumnarInputAdapter, ColumnarRangeBaseExec, SparkPlan}
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeLike
 
 import org.apache.commons.io.FileUtils
@@ -113,6 +113,22 @@ class FluxStrategyPlanSuite extends VeloxWholeStageTransformerSuite {
     assert(localScan.metricsUpdater() eq MetricsUpdater.Terminate)
     assert(source.children.isEmpty)
     assert(source.metricsUpdater() eq MetricsUpdater.Terminate)
+  }
+
+  test("FluxStrategy: ColumnarRange is admitted as an executor-local stream input") {
+    val range = spark
+      .range(0, 32, 1, 4)
+      .queryExecution
+      .executedPlan
+      .collectFirst { case node: ColumnarRangeBaseExec => node }
+      .getOrElse {
+        fail("Expected Gluten to plan spark.range as ColumnarRangeBaseExec")
+      }
+    val iteratorChild = ColumnarInputAdapter(range)
+
+    assert(FluxJvmStreamInputMatcher.rowInput(iteratorChild).isEmpty)
+    assert(FluxJvmStreamInputMatcher.localInput(iteratorChild).contains(range))
+    assert(range.supportsColumnar)
   }
 
   test("FluxStrategy: simple agg query produces correct result") {
