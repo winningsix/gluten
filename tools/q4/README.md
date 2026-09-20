@@ -15,6 +15,12 @@ live monitor. Blue is cuDF-Spark; green is Flux.
   contemporaneous, fully tuned A/B. The chart is not an engine speedup claim.
 - True DCGM SM Active and NVML duty use GPU 0/1, equally weighted, in 250 ms
   bins. A missing GPU sample leaves a gap, not an imputed zero.
+- Spark stage intervals come directly from `SparkListenerStageSubmitted` and
+  `SparkListenerStageCompleted` event-log timestamps and are clipped to the
+  measured body. cuDF-Spark stages 1/2 overlap as independent shuffle
+  producers. Flux has one Spark wrapper stage; its F0/F1 -> F2 diagram is the
+  native three-fragment/two-exchange structure, not three invented wall-time
+  intervals. Exact per-fragment start/end timestamps were not retained.
 - Throughput cards are output file bytes / job-body seconds. They are **not**
   instantaneous operator throughput. The storage curve is one explicitly
   selected cgroup device's write-counter delta; it can include other job I/O
@@ -32,6 +38,8 @@ live monitor. Blue is cuDF-Spark; green is Flux.
 python3 tools/q4/build_timeline.py \
   --cudf /path/to/cudf-primary-160m-h32-warm-r01 \
   --flux /path/to/flux-primary-160m-parallel-fill-candidate-r01-p1 \
+  --cudf-eventlog /path/to/cudf/events/app-id \
+  --flux-eventlog /path/to/flux/events/app-id \
   --write-device 259:2 \
   --output tools/q4/finra-local-timeline.html
 python3 -m unittest discover -s tools/q4 -v
@@ -44,10 +52,11 @@ The embedded data includes SHA-256 digests of the original inputs.
 ## Additional measured transports
 
 The JSON under the chart's provenance expander is the import schema:
-`schema_version=1`, `title`, `notes`, and `runs`. Each run includes `engine`
+`schema_version=2`, `title`, `notes`, and `runs`. Each run includes `engine`
 (`cuDF-Spark` or `Flux`), `transport` (`local`, `efa`, or `tcp`), `run`,
 `body_s`, `files`, `output_gbps`, `mean_sm`, `mean_duty`, `provenance`, and
-`metrics`. Series are `[seconds_from_body_start, value_or_null]` pairs.
+`metrics`, `spark_stages`, and optional `native_topology`. Series are
+`[seconds_from_body_start, value_or_null]` pairs.
 Metric keys: `sm`, `duty` (percent); `storage_write`, `efa_tx`, `tcp_tx`
 (decimal GB/s). Supply TX-only network totals, not TX+RX double counting.
 Retain hardware, workload, runtime, sampling and transport proof in provenance.

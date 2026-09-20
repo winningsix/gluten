@@ -4,7 +4,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Q4 · GPU supply timeline</title>
 <style>
-:root{color-scheme:dark;font:15px system-ui;background:#0b1220;color:#dde6f5}body{max-width:1250px;margin:32px auto;padding:0 20px}h1{font-size:29px;margin:5px 0}.eyebrow{letter-spacing:3px;color:#7fa8ce}p{line-height:1.6;color:#9fadc2}.controls,.cards{display:flex;gap:12px;flex-wrap:wrap;margin:20px 0}button,select,input::file-selector-button{background:#23314a;color:#eef5ff;border:1px solid #425370;padding:9px;border-radius:6px;cursor:pointer}input[type=range]{flex:1;min-width:180px}.card{flex:1;min-width:240px;padding:16px;background:#141f31;border-top:3px solid var(--color);border-radius:8px}.card strong{font-size:22px}.chart{background:#111c2d;padding:12px;margin:12px 0;border-radius:10px}.chart h3{font-size:15px;margin:0 0 8px}.chart svg{width:100%;height:auto}.warning{border-left:3px solid #e3ae61;padding:12px;background:#251f1b}.legend{font-size:13px}footer{font-size:12px;color:#91a1b9}a{color:#5ce0c4}#clock{min-width:105px}#message{color:#edbd7c}details{margin:18px 0}pre{overflow:auto}
+:root{color-scheme:dark;font:15px system-ui;background:#0b1220;color:#dde6f5}body{max-width:1250px;margin:32px auto;padding:0 20px}h1{font-size:29px;margin:5px 0}.eyebrow{letter-spacing:3px;color:#7fa8ce}p{line-height:1.6;color:#9fadc2}.controls,.cards{display:flex;gap:12px;flex-wrap:wrap;margin:20px 0}button,select,input::file-selector-button{background:#23314a;color:#eef5ff;border:1px solid #425370;padding:9px;border-radius:6px;cursor:pointer}input[type=range]{flex:1;min-width:180px}.card{flex:1;min-width:240px;padding:16px;background:#141f31;border-top:3px solid var(--color);border-radius:8px}.card strong{font-size:22px}.chart{background:#111c2d;padding:12px;margin:12px 0;border-radius:10px}.chart h3{font-size:15px;margin:0 0 8px}.chart svg{width:100%;height:auto}.warning{border-left:3px solid #e3ae61;padding:12px;background:#251f1b}.topology{margin:8px 4px;padding:10px 12px;background:#0d1727;border-left:3px solid #52e0b0;color:#b9c7da;font-size:13px}.topology code{color:#74ead1}.legend{font-size:13px}footer{font-size:12px;color:#91a1b9}a{color:#5ce0c4}#clock{min-width:105px}#message{color:#edbd7c}details{margin:18px 0}pre{overflow:auto}
 </style>
 <div class="eyebrow">Q4 / MEASURED TELEMETRY REPLAY</div>
 <h1 id="title"></h1>
@@ -41,8 +41,40 @@ function rebuild(){
  }
  $('provenance').textContent=JSON.stringify(data,null,2);draw();
 }
+function drawStages(){
+ const runs=selected(),div=document.createElement('section');div.className='chart';
+ const title=document.createElement('h3');title.textContent='Execution stages · measured body wall time';div.append(title);
+ const rows=runs.flatMap(r=>(r.spark_stages||[]).map(stage=>({r,stage})));
+ if(!rows.length){const p=document.createElement('p');p.textContent='N/A — 没有 stage event-log intervals。';div.append(p);$('charts').append(div);return;}
+ const height=48+rows.length*31,svg=node('svg',{viewBox:`0 0 1160 ${height}`,role:'img','aria-label':'Spark stage timeline'});
+ const x=t=>300+t/maxTime()*830;
+ for(let i=0;i<=4;i++){const t=maxTime()*i/4;svg.append(node('line',{x1:x(t),x2:x(t),y1:10,y2:height-20,stroke:'#2a384e'}),node('text',{x:x(t),y:height-4,fill:'#9baac0','font-size':11,'text-anchor':'middle'},t.toFixed(1)+'s'));}
+ rows.forEach(({r,stage},index)=>{
+  const y=16+index*31,color=colors[r.engine]||'#fff',width=Math.max(1,x(stage.end_s)-x(stage.start_s));
+  const label=`${r.engine} · S${stage.id} · ${stage.tasks} tasks`;
+  svg.append(node('text',{x:4,y:y+16,fill:color,'font-size':12},label));
+  const outline=node('rect',{x:x(stage.start_s),y,width,height:21,rx:3,fill:color,opacity:.13,stroke:color,'stroke-width':1});
+  outline.append(node('title',{},`${label}: ${stage.label} [${stage.start_s.toFixed(3)}–${stage.end_s.toFixed(3)}s]`));svg.append(outline);
+  const visible=Math.max(0,Math.min(time,stage.end_s)-stage.start_s);
+  if(visible>0)svg.append(node('rect',{x:x(stage.start_s),y,width:visible/(stage.end_s-stage.start_s)*width,height:21,rx:3,fill:color,opacity:.62}));
+  if(width>185)svg.append(node('text',{x:x(stage.start_s)+7,y:y+15,fill:'#07111e','font-size':11,'font-weight':650},`S${stage.id} ${stage.label}`));
+ });
+ svg.append(node('line',{x1:x(time),x2:x(time),y1:7,y2:height-20,stroke:'#fff',opacity:.75}));div.append(svg);
+ for(const r of runs.filter(r=>r.native_topology)){
+  const t=r.native_topology;
+  const producers=t.fragments.filter(f=>t.exchanges.some(e=>e.producer===f.id));
+  const consumers=t.fragments.filter(f=>t.exchanges.some(e=>e.consumer===f.id));
+  const p=document.createElement('div');p.className='topology';
+  const left=producers.map(f=>`F${f.id} ${f.role} (parallelism ${f.parallelism})`).join('  +  ');
+  const right=consumers.map(f=>`F${f.id} ${f.role} (parallelism ${f.parallelism})`).join(' + ');
+  p.textContent=`Flux native topology（位于 Spark wrapper 内；结构关系，不是独立 wall-time bar）：${left}  →  ${t.exchanges.length}× HASH exchange  →  ${right}`;
+  div.append(p);
+ }
+ $('charts').append(div);
+}
 function draw(){
  $('clock').textContent=time.toFixed(2)+' / '+maxTime().toFixed(2)+' s';$('seek').value=time;$('charts').replaceChildren();
+ drawStages();
  for(const [metric,label,fixed,target]of specs){
   const div=document.createElement('section');div.className='chart';const title=document.createElement('h3');title.textContent=label;div.append(title);
   const series=selected().map(r=>({r,points:r.metrics[metric]||[]}));
@@ -60,8 +92,10 @@ function draw(){
  }
 }
 function validate(d){
- if(d.schema_version!==1||!Array.isArray(d.runs)||d.runs.length>12||typeof d.title!=='string'||typeof d.notes!=='string')throw Error('Invalid schema');
+ if(![1,2].includes(d.schema_version)||!Array.isArray(d.runs)||d.runs.length>12||typeof d.title!=='string'||typeof d.notes!=='string')throw Error('Invalid schema');
  for(const r of d.runs){if(!['local','efa','tcp'].includes(r.transport)||!['cuDF-Spark','Flux'].includes(r.engine)||!Number.isFinite(r.body_s)||r.body_s<=0||!r.metrics)throw Error('Invalid run');
+  const stages=r.spark_stages||[];if(!Array.isArray(stages)||stages.length>100)throw Error('Invalid stages');
+  for(const s of stages)if(!Number.isInteger(s.id)||!Number.isFinite(s.start_s)||!Number.isFinite(s.end_s)||s.start_s<0||s.end_s<=s.start_s||s.end_s>r.body_s||typeof s.label!=='string')throw Error('Invalid stage');
   for(const [key,,maximum]of specs){const points=r.metrics[key]||[];if(!Array.isArray(points)||points.length>100000)throw Error('Invalid series');let prev=-1;for(const p of points){if(!Array.isArray(p)||p.length!==2||!Number.isFinite(p[0])||p[0]<0||p[0]<prev||p[0]>r.body_s||(p[1]!==null&&(!Number.isFinite(p[1])||p[1]<0||(maximum&&p[1]>maximum))))throw Error('Invalid sample');prev=p[0];}}
  }
 }
