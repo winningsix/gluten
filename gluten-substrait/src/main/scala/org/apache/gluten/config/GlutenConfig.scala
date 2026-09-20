@@ -448,6 +448,16 @@ object GlutenConfig extends ConfigRegistry {
   val SPARK_S3_CONNECTION_MAXIMUM: String = HADOOP_PREFIX + S3_CONNECTION_MAXIMUM
   val S3_ENDPOINT_REGION = "fs.s3a.endpoint.region"
   val SPARK_S3_ENDPOINT_REGION: String = HADOOP_PREFIX + S3_ENDPOINT_REGION
+  val S3_MULTIPART_MIN_PART_SIZE = "fs.s3a.multipart.size"
+  val SPARK_S3_MULTIPART_MIN_PART_SIZE: String = HADOOP_PREFIX + S3_MULTIPART_MIN_PART_SIZE
+  // Velox-specific extension under the fs.s3a namespace. Hadoop's own
+  // fs.s3a.threads.max is a global transfer-pool limit and is not equivalent
+  // to the number of concurrent UploadPart requests for one output file.
+  val S3_MULTIPART_UPLOAD_THREADS = "fs.s3a.multipart-upload-threads"
+  val SPARK_S3_MULTIPART_UPLOAD_THREADS: String = HADOOP_PREFIX + S3_MULTIPART_UPLOAD_THREADS
+  val LEGACY_SPARK_S3_MULTIPART_MIN_PART_SIZE = "spark.hadoop.hive.s3.min-part-size"
+  val LEGACY_SPARK_S3_MULTIPART_UPLOAD_THREADS =
+    "spark.hadoop.hive.s3.multipart-upload-threads"
 
   // ABFS config
   val ABFS_PREFIX = "fs.azure."
@@ -512,6 +522,10 @@ object GlutenConfig extends ConfigRegistry {
     SPARK_S3_RETRY_MAX_ATTEMPTS,
     SPARK_S3_CONNECTION_MAXIMUM,
     SPARK_S3_ENDPOINT_REGION,
+    SPARK_S3_MULTIPART_MIN_PART_SIZE,
+    SPARK_S3_MULTIPART_UPLOAD_THREADS,
+    LEGACY_SPARK_S3_MULTIPART_MIN_PART_SIZE,
+    LEGACY_SPARK_S3_MULTIPART_UPLOAD_THREADS,
     "spark.gluten.velox.fs.s3a.connect.timeout",
     "spark.gluten.velox.fs.s3a.retry.mode",
     "spark.gluten.velox.awsSdkLogLevel",
@@ -662,7 +676,11 @@ object GlutenConfig extends ConfigRegistry {
       // Velox initializes process-wide cuDF operator limits before any FLUX
       // fragment exists. Preserve the top-level FLUX switch in the static
       // native config so that initialization can select its FLUX defaults.
-      "spark.gluten.mpp.enabled"
+      "spark.gluten.mpp.enabled",
+      // Compatibility for already-generated AWS submissions. New jobs should
+      // use spark.gluten.velox.hive.s3.* or spark.hadoop.fs.s3a.* instead.
+      LEGACY_SPARK_S3_MULTIPART_MIN_PART_SIZE,
+      LEGACY_SPARK_S3_MULTIPART_UPLOAD_THREADS
     )
 
     nativeConfMap ++= conf.filter { case (k, _) => keys.contains(k) }

@@ -77,6 +77,16 @@ struct FluxFragmentSpec {
   /// the cuDF sink gives each task replica a distinct target filename.
   bool keyedFinalDestinationLanes{false};
 
+  /// True for an unpartitioned TableWrite root whose cuDF sink assigns a
+  /// distinct target filename to every local Velox driver. This permits one
+  /// native writer task per peer to run numDrivers writer pipelines safely.
+  bool parallelDirectWrite{false};
+
+  /// An eligible INNER-join write root with a local gather immediately before
+  /// TableWrite. Upstream join drivers may run concurrently, while the gather
+  /// keeps the explicit Spark target filename owned by exactly one writer.
+  bool parallelJoinSingleWriter{false};
+
   /// True only for a HASH consumer whose native plan is composed of
   /// exchange inputs, inner joins, exactly two non-null-aware RIGHT SEMI
   /// PROJECT joins, projections, filters and one keyed PARTIAL aggregation.

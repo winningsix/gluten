@@ -40,6 +40,7 @@
 #include "velox/common/file/FileSystems.h"
 
 #ifdef GLUTEN_ENABLE_GPU
+#include <cuda_runtime.h>
 #include <cudf/copying.hpp>
 #include <rmm/device_uvector.hpp>
 #include "cudf/CudfPlanValidator.h"
@@ -50,7 +51,6 @@
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
-#include <cuda_runtime.h>
 #endif
 
 #include "IcebergNestedField.pb.h"
@@ -97,8 +97,7 @@ jint JNI_OnLoad(JavaVM* vm, void*) {
       createGlobalClassReferenceOrError(env, "Lorg/apache/spark/sql/execution/datasources/BlockStripes;");
   blockStripesConstructor = getMethodIdOrError(env, blockStripesClass, "<init>", "(J[J[II[[B)V");
 
-  batchWriteMetricsClass =
-    createGlobalClassReferenceOrError(env, "Lorg/apache/gluten/metrics/BatchWriteMetrics;");
+  batchWriteMetricsClass = createGlobalClassReferenceOrError(env, "Lorg/apache/gluten/metrics/BatchWriteMetrics;");
   batchWriteMetricsConstructor = getMethodIdOrError(env, batchWriteMetricsClass, "<init>", "(JIJJ)V");
 
   DLOG(INFO) << "Loaded Velox backend.";
@@ -161,12 +160,10 @@ JNIEXPORT jstring JNICALL Java_org_apache_gluten_init_NativeBackendInitializer_g
       return nullptr;
     }
     const auto host = jStringToCString(env, advertisedHost);
-    const auto endpoint =
-        fmt::format("ucx://{}:{}", host, comm->getListenerPort());
+    const auto endpoint = fmt::format("ucx://{}:{}", host, comm->getListenerPort());
     return env->NewStringUTF(endpoint.c_str());
   } catch (const std::exception& e) {
-    LOG(WARNING) << "Unable to get process UCX listener endpoint: "
-                 << e.what();
+    LOG(WARNING) << "Unable to get process UCX listener endpoint: " << e.what();
     return nullptr;
   }
 #else
@@ -224,8 +221,7 @@ Java_org_apache_gluten_vectorized_PlanEvaluatorJniWrapper_nativeValidateWithFail
   JNI_METHOD_END(nullptr)
 }
 
-JNIEXPORT jboolean JNICALL
-Java_org_apache_gluten_vectorized_PlanEvaluatorJniWrapper_nativeValidateExpression( // NOLINT
+JNIEXPORT jboolean JNICALL Java_org_apache_gluten_vectorized_PlanEvaluatorJniWrapper_nativeValidateExpression( // NOLINT
     JNIEnv* env,
     jobject wrapper,
     jbyteArray exprArray,
@@ -290,6 +286,52 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_columnarbatch_VeloxColumnarBatchJ
   auto newBatch = VeloxColumnarBatch::from(runtime->memoryManager()->getLeafMemoryPool().get(), batch);
   return ctx->saveObject(newBatch);
   JNI_METHOD_END(kInvalidObjectHandle)
+}
+
+JNIEXPORT jobjectArray JNICALL
+Java_org_apache_gluten_columnarbatch_VeloxColumnarBatchJniWrapper_getWriteFilesMetrics( // NOLINT
+    JNIEnv* env,
+    jclass,
+    jlong handle) {
+  JNI_METHOD_START
+  auto batch = ObjectStore::retrieve<ColumnarBatch>(handle);
+  auto veloxBatch = std::dynamic_pointer_cast<VeloxColumnarBatch>(batch);
+  GLUTEN_CHECK(veloxBatch != nullptr, "TableWrite metrics batch is not a Velox batch");
+  auto rowVector = veloxBatch->getRowVector();
+  GLUTEN_CHECK(rowVector != nullptr, "TableWrite metrics RowVector is null");
+  GLUTEN_CHECK(rowVector->childrenSize() == 3, "TableWrite metrics must contain three columns");
+  GLUTEN_CHECK(rowVector->size() > 0, "TableWrite metrics batch is empty");
+
+  auto rowCounts = rowVector->childAt(0)->as<SimpleVector<int64_t>>();
+  auto fragments = rowVector->childAt(1)->as<SimpleVector<StringView>>();
+  GLUTEN_CHECK(rowCounts != nullptr, "TableWrite row-count column is not BIGINT");
+  GLUTEN_CHECK(fragments != nullptr, "TableWrite fragments column is not VARCHAR/VARBINARY");
+  GLUTEN_CHECK(!rowCounts->isNullAt(0), "TableWrite written-row count is null");
+
+  auto byteArrayClass = env->FindClass("[B");
+  GLUTEN_CHECK(byteArrayClass != nullptr, "Could not resolve byte[] JNI class");
+  auto result = env->NewObjectArray(rowVector->size(), byteArrayClass, nullptr);
+  env->DeleteLocalRef(byteArrayClass);
+
+  const auto addBytes = [&](jsize index, const char* data, jsize size) {
+    auto bytes = env->NewByteArray(size);
+    GLUTEN_CHECK(bytes != nullptr, "Could not allocate TableWrite metrics byte array");
+    if (size > 0) {
+      env->SetByteArrayRegion(bytes, 0, size, reinterpret_cast<const jbyte*>(data));
+    }
+    env->SetObjectArrayElement(result, index, bytes);
+    env->DeleteLocalRef(bytes);
+  };
+
+  const auto writtenRows = std::to_string(rowCounts->valueAt(0));
+  addBytes(0, writtenRows.data(), static_cast<jsize>(writtenRows.size()));
+  for (vector_size_t row = 1; row < rowVector->size(); ++row) {
+    VELOX_CHECK(!fragments->isNullAt(row), "TableWrite file fragment is null at row {}", row);
+    const auto fragment = fragments->valueAt(row);
+    addBytes(static_cast<jsize>(row), fragment.data(), static_cast<jsize>(fragment.size()));
+  }
+  return result;
+  JNI_METHOD_END(nullptr)
 }
 
 JNIEXPORT jlong JNICALL Java_org_apache_gluten_columnarbatch_VeloxColumnarBatchJniWrapper_compose( // NOLINT
@@ -480,8 +522,8 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_utils_VeloxBatchResizerJniWrapper
   auto ctx = getRuntime(env, wrapper);
   auto pool = dynamic_cast<VeloxMemoryManager*>(ctx->memoryManager())->getLeafMemoryPool();
   auto iter = makeJniColumnarBatchIterator(env, jIter, ctx);
-  auto appender = std::make_shared<ResultIterator>(
-      std::make_unique<VeloxBatchResizer>(pool.get(), minOutputBatchSize, maxOutputBatchSize, preferredBatchBytes, std::move(iter)));
+  auto appender = std::make_shared<ResultIterator>(std::make_unique<VeloxBatchResizer>(
+      pool.get(), minOutputBatchSize, maxOutputBatchSize, preferredBatchBytes, std::move(iter)));
   return ctx->saveObject(appender);
   JNI_METHOD_END(kInvalidObjectHandle)
 }
@@ -625,12 +667,15 @@ Java_org_apache_gluten_datasource_VeloxDataSourceJniWrapper_splitBlockByPartitio
   const auto numRows = inputRowVector->size();
 
   connector::hive::PartitionIdGenerator idGen(
-      asRowType(inputRowVector->type()), partitionColIndicesVec, 65536, pool.get()
+      asRowType(inputRowVector->type()),
+      partitionColIndicesVec,
+      65536,
+      pool.get()
 #ifdef GLUTEN_ENABLE_ENHANCED_FEATURES
-      ,
+          ,
       true
-#endif    
-    );
+#endif
+  );
   raw_vector<uint64_t> partitionIds{};
   idGen.run(inputRowVector, partitionIds);
   GLUTEN_CHECK(partitionIds.size() == numRows, "Mismatched number of partition ids");
@@ -743,8 +788,7 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_columnarbatch_VeloxColumnarBatchJ
   auto runtime = dynamic_cast<VeloxRuntime*>(ctx);
   auto batch = ObjectStore::retrieve<ColumnarBatch>(veloxBatchHandle);
   auto veloxBatch = std::dynamic_pointer_cast<VeloxColumnarBatch>(batch);
-  VELOX_CHECK_NOT_NULL(
-      veloxBatch, "Expected VeloxColumnarBatch but got a different type");
+  VELOX_CHECK_NOT_NULL(veloxBatch, "Expected VeloxColumnarBatch but got a different type");
 
   auto safeColumns = getIntArrayElementsSafe(env, columnIndices);
   auto safeRows = getIntArrayElementsSafe(env, rowIndices);
@@ -779,19 +823,13 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_columnarbatch_VeloxColumnarBatchJ
   }
 
 #ifdef GLUTEN_ENABLE_GPU
-  if (auto cudfVector = std::dynamic_pointer_cast<
-          facebook::velox::cudf_velox::CudfVector>(input)) {
+  if (auto cudfVector = std::dynamic_pointer_cast<facebook::velox::cudf_velox::CudfVector>(input)) {
     GpuLockGuard gpuLock;
     auto stream = cudfVector->stream();
     rmm::device_uvector<cudf::size_type> deviceRows(numRows, stream);
     CUDF_CUDA_TRY(cudaMemcpyAsync(
-        deviceRows.data(),
-        rows.data(),
-        numRows * sizeof(cudf::size_type),
-        cudaMemcpyHostToDevice,
-        stream.value()));
-    auto gatherMap = cudf::column_view{
-        cudf::device_span<cudf::size_type const>{deviceRows}};
+        deviceRows.data(), rows.data(), numRows * sizeof(cudf::size_type), cudaMemcpyHostToDevice, stream.value()));
+    auto gatherMap = cudf::column_view{cudf::device_span<cudf::size_type const>{deviceRows}};
     auto gathered = cudf::gather(
         cudfVector->getTableView().select(columns),
         gatherMap,
@@ -812,17 +850,16 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_columnarbatch_VeloxColumnarBatchJ
 #endif
 
   auto pool = runtime->memoryManager()->getLeafMemoryPool();
-  auto indices = facebook::velox::AlignedBuffer::allocate<
-      facebook::velox::vector_size_t>(numRows, pool.get());
+  auto indices = facebook::velox::AlignedBuffer::allocate<facebook::velox::vector_size_t>(numRows, pool.get());
   std::copy(rows.begin(), rows.end(), indices->asMutable<facebook::velox::vector_size_t>());
   std::vector<facebook::velox::VectorPtr> children;
   children.reserve(numColumns);
   for (const auto column : columns) {
-    children.push_back(facebook::velox::BaseVector::wrapInDictionary(
-        nullptr, indices, numRows, input->childAt(column)));
+    children.push_back(
+        facebook::velox::BaseVector::wrapInDictionary(nullptr, indices, numRows, input->childAt(column)));
   }
-  auto selected = std::make_shared<facebook::velox::RowVector>(
-      pool.get(), outputType, nullptr, numRows, std::move(children));
+  auto selected =
+      std::make_shared<facebook::velox::RowVector>(pool.get(), outputType, nullptr, numRows, std::move(children));
   return ctx->saveObject(std::make_shared<VeloxColumnarBatch>(selected));
 
   JNI_METHOD_END(kInvalidObjectHandle)
@@ -1053,8 +1090,7 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_gpu_GpuMemoryTrackerJniWrapper_ge
   size_t propTotalMem = 0;
   if (propErr == cudaSuccess) {
     propTotalMem = prop.totalGlobalMem;
-    LOG(INFO) << "GPU device " << deviceId << ": " << prop.name
-              << ", totalGlobalMem=" << (propTotalMem >> 20) << "MB"
+    LOG(INFO) << "GPU device " << deviceId << ": " << prop.name << ", totalGlobalMem=" << (propTotalMem >> 20) << "MB"
               << ", unifiedAddressing=" << prop.unifiedAddressing
               << ", pageableMemoryAccess=" << prop.pageableMemoryAccess
               << ", concurrentManagedAccess=" << prop.concurrentManagedAccess;
@@ -1073,14 +1109,12 @@ JNIEXPORT jlong JNICALL Java_org_apache_gluten_gpu_GpuMemoryTrackerJniWrapper_ge
     return 0;
   }
 
-  LOG(INFO) << "cudaMemGetInfo: total=" << (totalMem >> 20)
-            << "MB, free=" << (freeMem >> 20) << "MB";
+  LOG(INFO) << "cudaMemGetInfo: total=" << (totalMem >> 20) << "MB, free=" << (freeMem >> 20) << "MB";
 
   // On GH200 and other unified memory architectures, cudaMemGetInfo may
   // report only the device-local portion. Use the larger of the two values.
   if (propTotalMem > totalMem) {
-    LOG(WARNING) << "cudaMemGetInfo total (" << (totalMem >> 20)
-                 << "MB) < cudaGetDeviceProperties totalGlobalMem ("
+    LOG(WARNING) << "cudaMemGetInfo total (" << (totalMem >> 20) << "MB) < cudaGetDeviceProperties totalGlobalMem ("
                  << (propTotalMem >> 20) << "MB). "
                  << "Using device properties value (likely unified memory arch).";
     return static_cast<jlong>(propTotalMem);
@@ -1187,12 +1221,12 @@ JNIEXPORT jobject JNICALL Java_org_apache_gluten_execution_IcebergWriteJniWrappe
   auto writer = ObjectStore::retrieve<IcebergWriter>(writerHandle);
   auto writeStats = writer->writeStats();
   jobject writeMetrics = env->NewObject(
-    batchWriteMetricsClass,
-    batchWriteMetricsConstructor,
-    writeStats.numWrittenBytes,
-    writeStats.numWrittenFiles,
-    writeStats.writeIOTimeNs,
-    writeStats.writeWallNs);
+      batchWriteMetricsClass,
+      batchWriteMetricsConstructor,
+      writeStats.numWrittenBytes,
+      writeStats.numWrittenFiles,
+      writeStats.writeIOTimeNs,
+      writeStats.writeWallNs);
   return writeMetrics;
 
   JNI_METHOD_END(nullptr)

@@ -32,6 +32,7 @@ import org.apache.spark.Partition
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
 import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, PartitionDirectory}
+import org.apache.spark.sql.execution.datasources.orc.OrcFileFormat
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.hive.execution.HiveFileFormat
 import org.apache.spark.sql.types._
@@ -126,6 +127,19 @@ class VeloxTransformerApi extends TransformerApi with Logging {
         // Only Parquet is supported. It's safe to set a fixed "parquet" here
         // because others already fell back by WriteFilesExecTransformer's validation.
         val shortName = "parquet"
+        val nativeConf =
+          GlutenFormatFactory(shortName)
+            .nativeConf(
+              write.caseInsensitiveOptions,
+              WriteFilesExecTransformer.getCompressionCodec(write.caseInsensitiveOptions))
+        packPBMessage(
+          ConfigMap
+            .newBuilder()
+            .putAllConfigs(nativeConf)
+            .putConfigs("format", shortName)
+            .build())
+      case _: OrcFileFormat =>
+        val shortName = "orc"
         val nativeConf =
           GlutenFormatFactory(shortName)
             .nativeConf(

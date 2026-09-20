@@ -17,9 +17,8 @@
 package org.apache.spark.sql.execution
 
 import org.apache.gluten.backendsapi.BackendsApiManager
-import org.apache.gluten.columnarbatch.ColumnarBatches
+import org.apache.gluten.columnarbatch.{ColumnarBatches, VeloxColumnarBatchJniWrapper}
 import org.apache.gluten.execution.{ValidationResult, WriteFilesExecTransformer}
-import org.apache.gluten.memory.arrow.alloc.ArrowBufferAllocators
 import org.apache.gluten.sql.shims.SparkShimLoader
 
 import org.apache.spark.{Partition, TaskContext, TaskOutputFileAlreadyExistException}
@@ -40,6 +39,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.scala.DefaultScalaModule
 import org.apache.hadoop.fs.FileAlreadyExistsException
 
+import java.nio.charset.StandardCharsets
 import java.util.Date
 
 import scala.collection.mutable
@@ -97,20 +97,20 @@ class VeloxColumnarWriteFilesRDD(
     // Currently, the cb contains three columns: row, fragments, and context.
     // The first row in the row column contains the number of written numRows.
     // The fragments column contains detailed information about the file writes.
-    val loadedCb = ColumnarBatches.load(ArrowBufferAllocators.contextInstance, cb)
-    try {
-      assert(loadedCb.numCols() == 3)
-      val numWrittenRows = loadedCb.column(0).getLong(0)
+    assert(cb.numCols() == 3)
+    val batchHandle = ColumnarBatches.getNativeHandle(BackendsApiManager.getBackendName, cb)
+    val nativeMetrics = VeloxColumnarBatchJniWrapper.getWriteFilesMetrics(batchHandle)
+    assert(nativeMetrics.nonEmpty)
+    val numWrittenRows = new String(nativeMetrics.head, StandardCharsets.US_ASCII).toLong
 
-      var updatedPartitions = Set.empty[String]
-      val addedAbsPathFiles: mutable.Map[String, String] = mutable.Map[String, String]()
-      var numBytes = 0L
-      val objectMapper = new ObjectMapper()
-      objectMapper.registerModule(DefaultScalaModule)
-      for (i <- 0 until loadedCb.numRows() - 1) {
-        val fragments = loadedCb.column(1).getUTF8String(i + 1)
-        val metrics = objectMapper
-          .readValue(fragments.toString.getBytes("UTF-8"), classOf[VeloxWriteFilesMetrics])
+    var updatedPartitions = Set.empty[String]
+    val addedAbsPathFiles: mutable.Map[String, String] = mutable.Map[String, String]()
+    var numBytes = 0L
+    val objectMapper = new ObjectMapper()
+    objectMapper.registerModule(DefaultScalaModule)
+    nativeMetrics.drop(1).foreach {
+      fragmentBytes =>
+        val metrics = objectMapper.readValue(fragmentBytes, classOf[VeloxWriteFilesMetrics])
         logDebug(s"Velox write files metrics: $metrics")
 
         val fileWriteInfos = metrics.fileWriteInfos
@@ -135,34 +135,31 @@ class VeloxColumnarWriteFilesRDD(
             addedAbsPathFiles(tmpOutputPath) = customOutputPath.get + "/" + targetFileName
           }
         }
-      }
+    }
 
-      val numFiles = loadedCb.numRows() - 1
-      val partitionsInternalRows = updatedPartitions.map {
-        part =>
-          val parts = new Array[Any](1)
-          parts(0) = part
-          new GenericInternalRow(parts)
-      }.toSeq
-      val stats = BasicWriteTaskStats(
-        partitions = partitionsInternalRows,
-        numFiles = numFiles,
-        numBytes = numBytes,
-        numRows = numWrittenRows)
-      val summary =
-        ExecutedWriteSummary(updatedPartitions = updatedPartitions, stats = Seq(stats))
+    val numFiles = nativeMetrics.length - 1
+    val partitionsInternalRows = updatedPartitions.map {
+      part =>
+        val parts = new Array[Any](1)
+        parts(0) = part
+        new GenericInternalRow(parts)
+    }.toSeq
+    val stats = BasicWriteTaskStats(
+      partitions = partitionsInternalRows,
+      numFiles = numFiles,
+      numBytes = numBytes,
+      numRows = numWrittenRows)
+    val summary =
+      ExecutedWriteSummary(updatedPartitions = updatedPartitions, stats = Seq(stats))
 
-      // Write an empty iterator
-      if (numFiles == 0) {
-        None
-      } else {
-        Some(
-          WriteTaskResult(
-            new TaskCommitMessage(addedAbsPathFiles.toMap -> updatedPartitions),
-            summary))
-      }
-    } finally {
-      loadedCb.close()
+    // Write an empty iterator
+    if (numFiles == 0) {
+      None
+    } else {
+      Some(
+        WriteTaskResult(
+          new TaskCommitMessage(addedAbsPathFiles.toMap -> updatedPartitions),
+          summary))
     }
   }
 

@@ -368,6 +368,14 @@ const int32_t kCudfIcebergMultiFileMaxFilesDefault = 256;
 const std::string kCudfIcebergMultiFileMaxFileBytes =
     "spark.gluten.sql.columnar.backend.velox.cudf.iceberg.multi_file.max_file_bytes";
 const uint64_t kCudfIcebergMultiFileMaxFileBytesDefault = 64UL << 20;
+const std::string kCudfHiveMultiFileTargetBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.hive.multi_file.target_bytes";
+const uint64_t kCudfHiveMultiFileTargetBytesDefault = 0;
+const std::string kCudfHiveMultiFileMaxFiles = "spark.gluten.sql.columnar.backend.velox.cudf.hive.multi_file.max_files";
+const int32_t kCudfHiveMultiFileMaxFilesDefault = 8;
+const std::string kCudfHiveMultiFileMaxFileBytes =
+    "spark.gluten.sql.columnar.backend.velox.cudf.hive.multi_file.max_file_bytes";
+const uint64_t kCudfHiveMultiFileMaxFileBytesDefault = 512UL << 20;
 const std::string kCudfHiveUseExperimentalReader =
     "spark.gluten.sql.columnar.backend.velox.cudf.hive.use_experimental_reader";
 const std::string kCudfHiveSelectivePreloadEnabled =

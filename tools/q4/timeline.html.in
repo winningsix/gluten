@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Q4 · GPU supply timeline</title>
+<style>
+:root{color-scheme:dark;font:15px system-ui;background:#0b1220;color:#dde6f5}body{max-width:1250px;margin:32px auto;padding:0 20px}h1{font-size:29px;margin:5px 0}.eyebrow{letter-spacing:3px;color:#7fa8ce}p{line-height:1.6;color:#9fadc2}.controls,.cards{display:flex;gap:12px;flex-wrap:wrap;margin:20px 0}button,select,input::file-selector-button{background:#23314a;color:#eef5ff;border:1px solid #425370;padding:9px;border-radius:6px;cursor:pointer}input[type=range]{flex:1;min-width:180px}.card{flex:1;min-width:240px;padding:16px;background:#141f31;border-top:3px solid var(--color);border-radius:8px}.card strong{font-size:22px}.chart{background:#111c2d;padding:12px;margin:12px 0;border-radius:10px}.chart h3{font-size:15px;margin:0 0 8px}.chart svg{width:100%;height:auto}.warning{border-left:3px solid #e3ae61;padding:12px;background:#251f1b}.legend{font-size:13px}footer{font-size:12px;color:#91a1b9}a{color:#5ce0c4}#clock{min-width:105px}#message{color:#edbd7c}details{margin:18px 0}pre{overflow:auto}
+</style>
+<div class="eyebrow">Q4 / MEASURED TELEMETRY REPLAY</div>
+<h1 id="title"></h1>
+<p>按各自 job body 起点对齐 · 实测时间，不拉伸到相同进度 · 结束后不补零</p>
+<div class="warning" id="notes"></div>
+<div class="controls">
+<button id="play">▶ 播放</button><button id="reset">重播</button>
+<select id="transport" aria-label="Transport"><option value="local">本地 · 已测</option><option value="efa">EFA · 导入实测</option><option value="tcp">TCP · 导入实测</option></select>
+<select id="speed" aria-label="Replay speed"><option value="1">1×</option><option value="0.5">0.5×</option><option value="2">2×</option></select>
+<input id="seek" aria-label="Time" type="range" min="0" step="0.01"><span id="clock"></span>
+<label>导入 JSON <input id="import" type="file" accept="application/json,.json"></label>
+</div>
+<div id="message"></div><div class="cards" id="cards"></div><div id="charts"></div>
+<details><summary>数据来源 / SHA-256 / 导入格式</summary><pre id="provenance"></pre></details>
+<footer>SM = DCGM SMACT；duty = NVML GPU utilization，两者不可相除当作活跃期 kernel 效率。存储 GB/s 与网络 GB/s 分开；不把全任务平均吞吐伪造成瞬时曲线。缺失不补零、不跨缺样插值。</footer>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+'use strict';
+let data=JSON.parse(document.getElementById('data').textContent), time=0, playing=false,last=null;
+const $=id=>document.getElementById(id), colors={'cuDF-Spark':'#55b8ff','Flux':'#52e0b0'};
+const specs=[['sm','True SM Active · %',100,40],['duty','GPU duty cycle · %',100,80],['storage_write','存储写吞吐 · GB/s（cgroup 单设备；非逻辑输出）',null,null],['efa_tx','EFA TX · GB/s（仅 EFA 实测）',null,null],['tcp_tx','TCP TX · GB/s（需 TCP 专属计数器）',null,null]];
+const selected=()=>data.runs.filter(r=>r.transport===$('transport').value);
+const maxTime=()=>Math.max(1,...selected().map(r=>r.body_s));
+const fmt=n=>n==null?'N/A':n.toFixed(2);
+function node(name,attrs={},text=''){const n=document.createElementNS('http://www.w3.org/2000/svg',name);for(const [k,v]of Object.entries(attrs))n.setAttribute(k,v);n.textContent=text;return n;}
+function rebuild(){
+ $('title').textContent=data.title;$('notes').textContent=data.notes;$('seek').max=maxTime();time=Math.min(time,maxTime());
+ $('message').textContent=selected().length?'':'没有该 transport 的已验证样本；未从本地或其他 workload 外推。';
+ $('cards').replaceChildren();
+ for(const r of selected()){
+  const c=document.createElement('div');c.className='card';c.style.setProperty('--color',colors[r.engine]||'#ddd');
+  const title=document.createElement('strong');title.textContent=r.engine;c.append(title);
+  for(const text of [`${r.body_s.toFixed(3)} s · ${r.files} output files`,`整段 SM ${fmt(r.mean_sm)}% · duty ${fmt(r.mean_duty)}%`,`输出/整段时间 ${fmt(r.output_gbps)} GB/s（非瞬时）`,r.run]){const p=document.createElement('p');p.textContent=text;c.append(p);} $('cards').append(c);
+ }
+ $('provenance').textContent=JSON.stringify(data,null,2);draw();
+}
+function draw(){
+ $('clock').textContent=time.toFixed(2)+' / '+maxTime().toFixed(2)+' s';$('seek').value=time;$('charts').replaceChildren();
+ for(const [metric,label,fixed,target]of specs){
+  const div=document.createElement('section');div.className='chart';const title=document.createElement('h3');title.textContent=label;div.append(title);
+  const series=selected().map(r=>({r,points:r.metrics[metric]||[]}));
+  if(!series.some(s=>s.points.some(p=>p[1]!=null))){const p=document.createElement('p');p.textContent='N/A — 没有实测时间序列；不是 0。';div.append(p);$('charts').append(div);continue;}
+  const svg=node('svg',{viewBox:'0 0 1160 170',role:'img','aria-label':label});
+  const top=fixed||Math.max(1,...series.flatMap(s=>s.points.map(p=>p[1]||0)))*1.1;
+  const x=t=>55+t/maxTime()*1075,y=v=>140-v/top*125;
+  for(let i=0;i<=4;i++){let v=top*i/4;svg.append(node('line',{x1:55,x2:1130,y1:y(v),y2:y(v),stroke:'#2a384e'}),node('text',{x:3,y:y(v)+4,fill:'#9baac0','font-size':11},v.toFixed(1)));}
+  for(let i=0;i<=4;i++){let t=maxTime()*i/4;svg.append(node('text',{x:x(t),y:160,fill:'#9baac0','font-size':11},t.toFixed(1)+'s'));}
+  if(target!=null)svg.append(node('line',{x1:55,x2:1130,y1:y(target),y2:y(target),stroke:'#bd934a','stroke-dasharray':'5 5'}));
+  for(const {r,points}of series){let path='',open=false,prev=null;for(const [t,v]of points){if(t>time)break;if(v==null||t>r.body_s){open=false;prev=null;continue;}if(prev!=null&&t-prev>0.8)open=false;path+=(open?'L':'M')+x(t)+','+y(v);open=true;prev=t;}svg.append(node('path',{d:path,fill:'none',stroke:colors[r.engine]||'#fff','stroke-width':2}));
+   svg.append(node('line',{x1:x(r.body_s),x2:x(r.body_s),y1:15,y2:140,stroke:colors[r.engine]||'#fff','stroke-dasharray':'2 5',opacity:.4}));
+  }
+  svg.append(node('line',{x1:x(time),x2:x(time),y1:10,y2:140,stroke:'#fff',opacity:.7}));div.append(svg);$('charts').append(div);
+ }
+}
+function validate(d){
+ if(d.schema_version!==1||!Array.isArray(d.runs)||d.runs.length>12||typeof d.title!=='string'||typeof d.notes!=='string')throw Error('Invalid schema');
+ for(const r of d.runs){if(!['local','efa','tcp'].includes(r.transport)||!['cuDF-Spark','Flux'].includes(r.engine)||!Number.isFinite(r.body_s)||r.body_s<=0||!r.metrics)throw Error('Invalid run');
+  for(const [key,,maximum]of specs){const points=r.metrics[key]||[];if(!Array.isArray(points)||points.length>100000)throw Error('Invalid series');let prev=-1;for(const p of points){if(!Array.isArray(p)||p.length!==2||!Number.isFinite(p[0])||p[0]<0||p[0]<prev||p[0]>r.body_s||(p[1]!==null&&(!Number.isFinite(p[1])||p[1]<0||(maximum&&p[1]>maximum))))throw Error('Invalid sample');prev=p[0];}}
+ }
+}
+$('play').onclick=()=>{playing=!playing;if(playing&&time>=maxTime())time=0;$('play').textContent=playing?'❚❚ 暂停':'▶ 播放';};
+$('reset').onclick=()=>{time=0;draw();};$('seek').oninput=()=>{time=Number($('seek').value);draw();};$('transport').onchange=()=>{time=0;rebuild();};
+$('import').onchange=async e=>{try{const file=e.target.files[0];if(!file)return;if(file.size>20e6)throw Error('Maximum 20 MB');const d=JSON.parse(await file.text());validate(d);data=d;time=0;rebuild();}catch(err){$('message').textContent='导入失败：'+err.message;}};
+function frame(now){if(last!==null&&playing){time=Math.min(maxTime(),time+(now-last)/1000*Number($('speed').value));draw();if(time>=maxTime()){playing=false;$('play').textContent='▶ 播放';}}last=now;requestAnimationFrame(frame);}
+time=maxTime();rebuild();requestAnimationFrame(frame);
+</script>
+</html>

@@ -35,6 +35,7 @@ import org.apache.spark.task.TaskResources
 
 import io.substrait.proto.SimpleExtensionDeclaration
 
+import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.{LinkedHashMap, Map => JMap, WeakHashMap}
@@ -114,19 +115,53 @@ object VeloxValidatorApi {
   private val MaxCachedValidationsPerConf = 4096
   private val validationCaches =
     new WeakHashMap[SQLConf, LinkedHashMap[String, ValidationResult]]()
+  // One immutable configuration snapshot per live SQLConf. Never retain the SQLConf
+  // in a value: that would defeat the weak keys. Configuration changes still affect
+  // every validation key, including changes made between validations in one query.
+  private val validationConfigBytes =
+    new WeakHashMap[SQLConf, (Map[String, String], Array[Byte])]()
+
+  private def configBytes(conf: SQLConf): Array[Byte] = {
+    val snapshot = conf.getAllConfs
+    validationCaches.synchronized {
+      val previous = validationConfigBytes.get(conf)
+      if (previous != null && previous._1 == snapshot) {
+        previous._2
+      } else {
+        val bytes = new ByteArrayOutputStream()
+        snapshot.toSeq.sortBy(_._1).foreach {
+          case (key, value) =>
+            bytes.write(key.getBytes(StandardCharsets.UTF_8))
+            bytes.write(0)
+            bytes.write(value.getBytes(StandardCharsets.UTF_8))
+            bytes.write(0)
+        }
+        val serialized = bytes.toByteArray
+        validationConfigBytes.put(conf, (snapshot, serialized))
+        serialized
+      }
+    }
+  }
+
+  private def hexDigest(bytes: Array[Byte]): String = {
+    val digits = "0123456789abcdef"
+    val result = new Array[Char](bytes.length * 2)
+    var i = 0
+    while (i < bytes.length) {
+      val value = bytes(i) & 0xff
+      result(2 * i) = digits.charAt(value >>> 4)
+      result(2 * i + 1) = digits.charAt(value & 0xf)
+      i += 1
+    }
+    new String(result)
+  }
 
   private def cachedPlanValidation(conf: SQLConf, plan: Array[Byte])(
       validate: => ValidationResult): ValidationResult = {
     val digest = MessageDigest.getInstance("SHA-256")
-    conf.getAllConfs.toSeq.sortBy(_._1).foreach {
-      case (key, value) =>
-        digest.update(key.getBytes(StandardCharsets.UTF_8))
-        digest.update(0.toByte)
-        digest.update(value.getBytes(StandardCharsets.UTF_8))
-        digest.update(0.toByte)
-    }
+    digest.update(configBytes(conf))
     digest.update(plan)
-    val cacheKey = digest.digest().map(b => f"${b & 0xff}%02x").mkString
+    val cacheKey = hexDigest(digest.digest())
     val cached = validationCaches.synchronized {
       cacheFor(conf).get(cacheKey)
     }

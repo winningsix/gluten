@@ -65,6 +65,7 @@ object VeloxRuleApi {
   private def injectSpark(injector: SparkInjector): Unit = {
     // Inject the regular Spark rules directly.
     injector.injectOptimizerRule(CollectRewriteRule.apply)
+    injector.injectOptimizerRule(PushProjectionIntoCollectList.apply)
     injector.injectOptimizerRule(HLLRewriteRule.apply)
     injector.injectOptimizerRule(CollapseGetJsonObjectExpressionRule.apply)
     // Register the paired-existence rules in Spark's post-RewriteSubquery optimizer batch before

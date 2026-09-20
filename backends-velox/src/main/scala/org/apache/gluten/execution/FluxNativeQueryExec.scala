@@ -646,7 +646,27 @@ case class FluxNativeQueryExec(
     executeColumnarInternal(keepDeviceOutput = true)
 
   private def executeColumnarInternal(keepDeviceOutput: Boolean): RDD[ColumnarBatch] = {
+    val driverTimingProbeEnabled = FluxNativeQueryRDD.runtimeTimingProbeEnabled
+    val driverTimingStartNs = System.nanoTime()
+    var driverTimingLastNs = driverTimingStartNs
+    def recordDriverTiming(phase: String): Unit = {
+      if (driverTimingProbeEnabled) {
+        val nowNs = System.nanoTime()
+        val deltaMs = (nowNs - driverTimingLastNs) / 1000000.0
+        val totalMs = (nowNs - driverTimingStartNs) / 1000000.0
+        logWarning(
+          FluxNativeQueryRDD.runtimeTimingProbeLine(
+            "driver_plan_phase",
+            Seq(
+              "phase" -> FluxNativeQueryRDD.quotedJson(phase),
+              "deltaMs" -> f"$deltaMs%.3f",
+              "totalMs" -> f"$totalMs%.3f")))
+        driverTimingLastNs = nowNs
+      }
+    }
+
     val executionChild = preparedChildPlan
+    recordDriverTiming("prepared_child")
     // The final columnar rule normally marks these exchanges before Spark prepares the plan. Keep
     // an execution-entry guard as well: FLUX cross-cut rewrites can introduce or rebuild a
     // broadcast
@@ -666,6 +686,7 @@ case class FluxNativeQueryExec(
       Option(sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY))
         .filter(_.nonEmpty)
         .getOrElse(s"untracked-${UUID.randomUUID()}"))
+    recordDriverTiming("defer_broadcast_and_range_cache")
     logDebug(
       s"FluxNativeQueryExec: executing with ${fragments.size} fragments " +
         s"and ${exchanges.size} exchanges")
@@ -685,6 +706,7 @@ case class FluxNativeQueryExec(
             s"because $scalarSubqueryRewriteDisabledReason")
         executionChild
       }
+    recordDriverTiming("rewrite_scalar_subqueries")
 
     // Materialize any remaining ScalarSubquery results in the child plan before driver-side
     // Substrait generation. ScalarSubqueryTransformer.doTransform calls
@@ -694,6 +716,7 @@ case class FluxNativeQueryExec(
     // If the inline scalar rewrite stays enabled, uncorrelated scalar subqueries should have been
     // rewritten above and will flow through native BROADCAST exchanges instead.
     materializeScalarSubqueries(childForFlux)
+    recordDriverTiming("materialize_scalar_subqueries")
 
     // Plan D: child is the original BSP plan (with ShuffleExchange intact).
     // Phase 1: delegate to child BSP execution to prove the wrap chain works.
@@ -713,6 +736,7 @@ case class FluxNativeQueryExec(
               s"FluxNativeQueryExec: delegating to BSP because FLUX fragment extraction failed: " +
                 exceptionSummary(e))
         }
+      recordDriverTiming("extract_fragments")
       val (
         extractedFragments,
         extractedExchanges,
@@ -774,6 +798,7 @@ case class FluxNativeQueryExec(
               executionChild,
               s"FluxNativeQueryExec: RANGE exchange preparation failed: ${exceptionSummary(e)}")
         }
+      recordDriverTiming("prepare_exchange_topology")
 
       FluxExchangeTopology
         .inconsistentInboundPartitionCountReason(preparedExtractedExchanges)
@@ -809,6 +834,7 @@ case class FluxNativeQueryExec(
               s"FluxNativeQueryExec: delegating to BSP because FLUX Substrait generation failed: " +
                 exceptionSummary(e))
         }
+      recordDriverTiming("generate_substrait")
 
       logDebug(
         s"FluxNativeQueryExec: generated ${fragmentSubstraitPlans.size} Substrait plans " +
@@ -826,6 +852,7 @@ case class FluxNativeQueryExec(
             s"FluxNativeQueryExec: delegating to BSP because extracted FLUX plan is unsafe: " +
               reason)
       }
+      recordDriverTiming("validate_and_commit")
 
       // Plan C extracts fragments dynamically, so account for them here instead of relying on the
       // pre-extracted Plan D metrics path below.
@@ -861,12 +888,14 @@ case class FluxNativeQueryExec(
       val peerEndpointsJson = peerResolution.peerEndpointsJson
       metrics("numSparkPartitions") += sparkPartitionCount
       val alignedLocalStreamInputs = alignLocalStreamInputs(localStreamInputs, sparkPartitionCount)
+      recordDriverTiming("resolve_peers")
 
       // Extract scan split infos only after endpoint discovery. Some Spark exchange
       // wrappers can lazily start shuffle work while split metadata is inspected; probing first
       // keeps the UCX endpoint job from racing those regular Spark stages.
       val fragmentSplitInfos: Array[Array[Array[Byte]]] =
         extractedFragments.map(extractSplitInfosForFragment).toArray
+      recordDriverTiming("extract_split_infos")
 
       logDebug(
         s"FluxNativeQueryExec: split infos per fragment: " +
@@ -910,6 +939,7 @@ case class FluxNativeQueryExec(
         longMetric("outputRows"),
         longMetric("outputBatches")
       )
+      recordDriverTiming("build_flux_rdd")
       return fluxRdd
     }
 
@@ -1280,16 +1310,24 @@ case class FluxNativeQueryExec(
 
           val fragId = fragmentCounter.getAndIncrement()
           val containsShuffledJoin = containsFragmentLocalShuffledJoin(fragmentWst)
-          // Write-in-FLUX: a fragment whose WST contains a WriteFilesExecTransformer must run
-          // single-writer per Spark task attempt dir. With parallelism>1, multiple native
-          // TableWrite drivers in one task emit the same part-NNNNN-<uuid> filename and the
-          // second hits LocalWriteFile "File exists" (Spark's per-task write model is inherently
-          // single-writer; local/BSP write never has >1 writer per attempt dir).
+          // Write-in-FLUX historically forced one native writer per Spark task because parallel
+          // TableWrite drivers emitted the same part-NNNNN-<uuid> filename. The cuDF sink now
+          // appends a driver-specific flux-lane suffix whenever parallel direct-write lanes are
+          // enabled. Keep the single-writer safety default, but allow an explicitly configured
+          // scan/write pipeline to use those collision-free lanes. This is particularly important
+          // for scan -> sortWithinPartitions -> write: one driver otherwise serializes all file
+          // reads and leaves the GPU idle while it waits for the next input batch.
           val parallelism =
             if (fragmentWst.find(_.isInstanceOf[WriteFilesExecTransformer]).isDefined) {
+              val writeDrivers = inferWriteFragmentParallelism(fragmentWst)
               logInfo(
-                s"FluxNativeQueryExec: write fragment $fragId -> parallelism=1 (1 writer/task)")
-              1
+                s"FluxNativeQueryExec: write fragment $fragId -> parallelism=$writeDrivers " +
+                  (if (writeDrivers == 1) {
+                     "(1 writer/task)"
+                   } else {
+                     s"(collision-free cuDF writer lanes=$writeDrivers/task)"
+                   }))
+              writeDrivers
             } else if (containsShuffledJoin) {
               // A shuffled join's Catalyst outputPartitioning can be stale after the FLUX
               // correctness rewrites that run after EnsureRequirements. Resolve its local driver
@@ -5546,6 +5584,27 @@ case class FluxNativeQueryExec(
         }
         capped
       case None => coreCapped
+    }
+  }
+
+  /**
+   * Preserve the one-writer-per-task default unless the complete collision-free cuDF path is
+   * explicitly enabled. `scanDriversIgnoreOutputPartitioning` is deliberately part of the gate:
+   * without it, a SINGLE/RANGE write root is authoritative and must continue to clamp the scan.
+   */
+  private def inferWriteFragmentParallelism(plan: SparkPlan): Int = {
+    val parallelCudfWriteEnabled =
+      plan.find(_.isInstanceOf[BasicScanExecTransformer]).isDefined &&
+        booleanConf(
+          "spark.gluten.sql.columnar.backend.velox.cudf.enableTableWrite",
+          defaultValue = false) &&
+        booleanConf("spark.gluten.mpp.scanDriversIgnoreOutputPartitioning", defaultValue = false)
+    if (!parallelCudfWriteEnabled) {
+      1
+    } else {
+      val writerLanes =
+        positiveIntConf("spark.executorEnv.GLUTEN_CUDF_PARALLEL_DIRECT_WRITE_LANES").getOrElse(1)
+      math.max(1, math.min(writerLanes, inferParallelism(plan)))
     }
   }
 

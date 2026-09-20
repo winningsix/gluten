@@ -53,4 +53,19 @@ class SparkConfigUtilSuite extends AnyFunSuiteLike {
     assert(nativeConf.get(fluxEnabled) === "true")
     assert(!nativeConf.containsKey("spark.unrelated.config"))
   }
+
+  test("GlutenConfig preserves S3 multipart writer configuration") {
+    val canonical = "spark.gluten.velox.hive.s3.multipart-upload-threads"
+    val s3aPartSize = GlutenConfig.SPARK_S3_MULTIPART_MIN_PART_SIZE
+    val s3aThreads = GlutenConfig.SPARK_S3_MULTIPART_UPLOAD_THREADS
+    val legacyThreads = GlutenConfig.LEGACY_SPARK_S3_MULTIPART_UPLOAD_THREADS
+    val nativeConf = GlutenConfig.getNativeBackendConf(
+      "velox",
+      Map(canonical -> "8", s3aPartSize -> "64MB", s3aThreads -> "8", legacyThreads -> "8"))
+
+    assert(nativeConf.get(canonical) === "8")
+    assert(nativeConf.get(s3aPartSize) === "64MB")
+    assert(nativeConf.get(s3aThreads) === "8")
+    assert(nativeConf.get(legacyThreads) === "8")
+  }
 }

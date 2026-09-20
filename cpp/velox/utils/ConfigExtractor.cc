@@ -18,6 +18,8 @@
 // This File includes common helper functions with Arrow dependency.
 
 #include "ConfigExtractor.h"
+#include <algorithm>
+#include <cctype>
 #include <stdexcept>
 
 #include "config/VeloxConfig.h"
@@ -35,6 +37,37 @@ namespace {
 // cudf::type_id::TIMESTAMP_MICROSECONDS. Keep this in sync with
 // spark.gluten.sql.columnar.backend.velox.cudf.timestampUnit's "us" default.
 constexpr const char* kCudfTimestampMicrosecondsTypeId = "15";
+
+// These keys predate the canonical spark.hadoop.fs.s3a.* and
+// spark.gluten.velox.hive.s3.* forms used below. Keep accepting them so that
+// existing AWS submissions do not silently fall back to Velox's single
+// multipart upload thread.
+constexpr const char* kLegacySparkHadoopS3MinPartSize = "spark.hadoop.hive.s3.min-part-size";
+constexpr const char* kLegacySparkHadoopS3MultipartUploadThreads = "spark.hadoop.hive.s3.multipart-upload-threads";
+
+// Hadoop byte-size configurations accept compact binary suffixes such as
+// "64m" and bare byte counts. Velox's capacity parser requires an explicit
+// B suffix (for example, "64MB" or "67108864B"). Normalize at the config
+// boundary so ordinary fs.s3a.multipart.size values remain compatible.
+std::string normalizeHadoopByteSize(std::string value) {
+  const auto first = value.find_first_not_of(" \t\n\r");
+  if (first == std::string::npos) {
+    return value;
+  }
+  const auto last = value.find_last_not_of(" \t\n\r");
+  value = value.substr(first, last - first + 1);
+
+  if (std::all_of(value.begin(), value.end(), [](unsigned char c) { return std::isdigit(c); })) {
+    return value + "B";
+  }
+
+  const auto suffix = static_cast<char>(std::tolower(static_cast<unsigned char>(value.back())));
+  if (suffix == 'k' || suffix == 'm' || suffix == 'g' || suffix == 't' || suffix == 'p') {
+    value.back() = static_cast<char>(std::toupper(static_cast<unsigned char>(value.back())));
+    return value + "B";
+  }
+  return value;
+}
 
 void getS3HiveConfig(
     std::shared_ptr<facebook::velox::config::ConfigBase> conf,
@@ -75,6 +108,8 @@ void getS3HiveConfig(
       {S3Config::Keys::kIamRole, std::make_pair("iam.role", std::nullopt)},
       {S3Config::Keys::kIamRoleSessionName, std::make_pair("iam.role.session.name", "gluten-session")},
       {S3Config::Keys::kEndpointRegion, std::make_pair("endpoint.region", std::nullopt)},
+      {S3Config::Keys::kMultipartMinPartSize, std::make_pair("multipart.size", std::nullopt)},
+      {S3Config::Keys::kMultipartUploadThreads, std::make_pair("multipart-upload-threads", std::nullopt)},
   };
 
   // get Velox S3 config key from Spark Suffix.
@@ -102,7 +137,9 @@ void getS3HiveConfig(
   auto setConfigIfPresent = [&](S3Config::Keys key) {
     auto sparkConfig = sparkBaseConfigValue(key);
     if (sparkConfig.has_value()) {
-      hiveConfMap[S3Config::baseConfigKey(key)] = sparkConfig.value();
+      hiveConfMap[S3Config::baseConfigKey(key)] = key == S3Config::Keys::kMultipartMinPartSize
+          ? normalizeHadoopByteSize(sparkConfig.value())
+          : sparkConfig.value();
     }
   };
 
@@ -129,6 +166,18 @@ void getS3HiveConfig(
   setConfigIfPresent(S3Config::Keys::kSocketTimeout);
   setConfigIfPresent(S3Config::Keys::kConnectTimeout);
   setConfigIfPresent(S3Config::Keys::kEndpointRegion);
+  setConfigIfPresent(S3Config::Keys::kMultipartMinPartSize);
+  setConfigIfPresent(S3Config::Keys::kMultipartUploadThreads);
+
+  const auto setLegacyConfigIfPresent = [&](const char* sparkKey, S3Config::Keys key) {
+    const auto value = conf->get<std::string>(sparkKey);
+    if (value.has_value() && !value->empty()) {
+      hiveConfMap[S3Config::baseConfigKey(key)] =
+          key == S3Config::Keys::kMultipartMinPartSize ? normalizeHadoopByteSize(value.value()) : value.value();
+    }
+  };
+  setLegacyConfigIfPresent(kLegacySparkHadoopS3MinPartSize, S3Config::Keys::kMultipartMinPartSize);
+  setLegacyConfigIfPresent(kLegacySparkHadoopS3MultipartUploadThreads, S3Config::Keys::kMultipartUploadThreads);
 
   hiveConfMap[S3Config::kS3LogLevel] = conf->get<std::string>(kVeloxAwsSdkLogLevel, kVeloxAwsSdkLogLevelDefault);
   hiveConfMap[S3Config::baseConfigKey(S3Config::Keys::kUseProxyFromEnv)] =
@@ -240,29 +289,16 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorSessionC
     // connector reads the session property with underscores. Dynamic prefix
     // stripping alone therefore leaves the connector on its default (true).
     configs["cudf.hive.use_buffered_input"] =
-        conf->get<bool>(
-            "spark.gluten.sql.columnar.backend.velox.cudf.hive.use-buffered-input",
-            true)
-        ? "true"
-        : "false";
+        conf->get<bool>("spark.gluten.sql.columnar.backend.velox.cudf.hive.use-buffered-input", true) ? "true"
+                                                                                                      : "false";
     configs["cudf.hive.selective_preload_enabled"] =
-        conf->get<bool>(
-            kCudfHiveSelectivePreloadEnabled,
-            kCudfHiveSelectivePreloadEnabledDefault)
-        ? "true"
-        : "false";
+        conf->get<bool>(kCudfHiveSelectivePreloadEnabled, kCudfHiveSelectivePreloadEnabledDefault) ? "true" : "false";
     configs["cudf.hive.prefetch_max_inflight_bytes"] = std::to_string(
-        conf->get<uint64_t>(
-            kCudfHivePrefetchMaxInFlightBytes,
-            kCudfHivePrefetchMaxInFlightBytesDefault));
-    configs["cudf.hive.prefetch_threads"] = std::to_string(
-        conf->get<uint32_t>(
-            kCudfHivePrefetchThreads,
-            kCudfHivePrefetchThreadsDefault));
-    configs["cudf.hive.executor_split_prefetch_concurrency"] =
-        std::to_string(conf->get<uint32_t>(
-            kCudfHiveExecutorSplitPrefetchConcurrency,
-            kCudfHiveExecutorSplitPrefetchConcurrencyDefault));
+        conf->get<uint64_t>(kCudfHivePrefetchMaxInFlightBytes, kCudfHivePrefetchMaxInFlightBytesDefault));
+    configs["cudf.hive.prefetch_threads"] =
+        std::to_string(conf->get<uint32_t>(kCudfHivePrefetchThreads, kCudfHivePrefetchThreadsDefault));
+    configs["cudf.hive.executor_split_prefetch_concurrency"] = std::to_string(conf->get<uint32_t>(
+        kCudfHiveExecutorSplitPrefetchConcurrency, kCudfHiveExecutorSplitPrefetchConcurrencyDefault));
   }
   configs[facebook::velox::connector::hive::HiveConfig::kMaxPartitionsPerWritersSession] =
       conf->get<std::string>(kMaxPartitions, "10000");
@@ -341,12 +377,9 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorConfig(
   // and replaced by per-format speculative-IO-size keys. Apply the same
   // value to both Parquet and ORC keys so callers configuring the legacy
   // Spark "footerEstimatedSize" still affect IBM Hive's tail-read sizing.
-  auto footerSize =
-      conf->get<std::string>(kFooterEstimatedSize, footerEstimatedSize); // 32K
-  hiveConfMap[facebook::velox::parquet::ParquetConfig::
-                  kFooterSpeculativeIoSizeSession] = footerSize;
-  hiveConfMap[facebook::velox::connector::hive::HiveConfig::
-                  kOrcFooterSpeculativeIoSizeSession] = footerSize;
+  auto footerSize = conf->get<std::string>(kFooterEstimatedSize, footerEstimatedSize); // 32K
+  hiveConfMap[facebook::velox::parquet::ParquetConfig::kFooterSpeculativeIoSizeSession] = footerSize;
+  hiveConfMap[facebook::velox::connector::hive::HiveConfig::kOrcFooterSpeculativeIoSizeSession] = footerSize;
   hiveConfMap[facebook::velox::connector::hive::HiveConfig::kFilePreloadThreshold] =
       conf->get<std::string>(kFilePreloadThreshold, "1048576"); // 1M
 
@@ -363,11 +396,9 @@ std::shared_ptr<facebook::velox::config::ConfigBase> createHiveConnectorConfig(
     }
   };
   forwardDynamicToHive(
-      "spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk-read-limit",
-      "parquet.reader.chunk-read-limit");
+      "spark.gluten.sql.columnar.backend.velox.parquet.reader.chunk-read-limit", "parquet.reader.chunk-read-limit");
   forwardDynamicToHive(
-      "spark.gluten.sql.columnar.backend.velox.parquet.reader.pass-read-limit",
-      "parquet.reader.pass-read-limit");
+      "spark.gluten.sql.columnar.backend.velox.parquet.reader.pass-read-limit", "parquet.reader.pass-read-limit");
 
   overwriteVeloxConf(conf.get(), hiveConfMap, kStaticBackendConfPrefix);
   return std::make_shared<facebook::velox::config::ConfigBase>(std::move(hiveConfMap));

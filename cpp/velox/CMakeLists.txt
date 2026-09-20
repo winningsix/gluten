@@ -334,6 +334,7 @@ target_include_directories(
          # path through their Velox targets. SYSTEM uses only installed package
          # targets and must not inherit these build-tree paths.
          ${GLUTEN_CUDF_BUILD_TREE_INCLUDE_DIRS}
+         ${VELOX_BUILD_PATH}/_deps/ucxx-src/cpp/include
          ${VELOX_BUILD_PATH}/_deps/fmt-src/include
          ${VELOX_BUILD_PATH}/_deps/xsimd-src/include
          ${VELOX_BUILD_PATH}/_deps/re2-src
@@ -838,7 +839,21 @@ if(ENABLE_GPU)
 
   set(GLUTEN_EXPLICIT_RAPIDS_LIBRARIES)
   if(cudf_SOURCE STREQUAL "SYSTEM")
-    set(GLUTEN_UCXX_LIBRARY ucxx::ucxx)
+    # A Velox build can resolve cuDF from the system while still building UCXX
+    # through FetchContent.  In that mixed layout the installed UCXX package
+    # does not necessarily export the ucxx::ucxx CMake target, but the Velox
+    # build artifact is available and is the ABI-matched library we need.
+    set(_gluten_ucxx_bundled "${VELOX_BUILD_PATH}/_deps/ucxx-build/libucxx.so")
+    if(EXISTS "${_gluten_ucxx_bundled}")
+      set(GLUTEN_UCXX_LIBRARY "${_gluten_ucxx_bundled}")
+    else()
+      find_library(
+        _gluten_ucxx_system
+        NAMES ucxx
+        PATHS /usr/local/lib64 /usr/local/lib
+        NO_DEFAULT_PATH)
+      set(GLUTEN_UCXX_LIBRARY "${_gluten_ucxx_system}")
+    endif()
   else()
     set(_gluten_rmm_shared "${VELOX_BUILD_PATH}/_deps/rmm-build/librmm.so")
     if(EXISTS "${_gluten_rmm_shared}")

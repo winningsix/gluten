@@ -33,6 +33,7 @@
 #endif
 #ifdef GLUTEN_ENABLE_GPU
 #include <cuda_runtime_api.h>
+#include <cudf/utilities/pinned_memory.hpp>
 
 #include "compute/PinnedCacheAllocator.h"
 #include "cudf/CheckOverflowInTableInsertCudf.h"
@@ -42,12 +43,15 @@
 #include "ucs/debug/debug.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveDataSink.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorReadBroker.h"
 #include "velox/experimental/cudf/connectors/hive/ExecutorSplitPrefetch.h"
+#include "velox/experimental/cudf/connectors/hive/PinnedHostBuffer.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeProtocol.h"
 #endif
 
 #include "compute/VeloxRuntime.h"
@@ -326,6 +330,65 @@ void VeloxBackend::init(
     auto& cudfConfig = velox::cudf_velox::CudfConfig::getInstance();
     cudfConfig.initialize(std::move(options));
     velox::cudf_velox::registerCudf();
+
+    // libcudf initializes its process-wide pinned host memory resource on
+    // first use. If the first user is an AST literal created by a scan
+    // driver, that initialization serializes the beginning of the query and
+    // leaves the GPU idle. Pay the fixed cost during executor startup.
+    (void)cudf::get_pinned_memory_resource();
+
+    // cudaHostAlloc is process-global and serializes the first concurrent
+    // Parquet readers. Optionally pay that one-time cost during executor
+    // backend initialization, then retain the buffers in the executor-wide
+    // pool for scan and S3 staging. This is an initialization policy rather
+    // than a query batch-size knob.
+    const auto* pinnedPrewarmBytes = std::getenv("GLUTEN_CPP_PINNED_POOL_PREWARM_BYTES");
+    const auto* pinnedPrewarmCount = std::getenv("GLUTEN_CPP_PINNED_POOL_PREWARM_COUNT");
+    if (pinnedPrewarmBytes != nullptr && pinnedPrewarmCount != nullptr) {
+      char* bytesEnd = nullptr;
+      char* countEnd = nullptr;
+      const auto bytes = std::strtoull(pinnedPrewarmBytes, &bytesEnd, 10);
+      const auto count = std::strtoull(pinnedPrewarmCount, &countEnd, 10);
+      if (bytesEnd != pinnedPrewarmBytes && *bytesEnd == '\0' && countEnd != pinnedPrewarmCount && *countEnd == '\0' &&
+          bytes != 0 && count != 0) {
+        const auto warmed = velox::cudf_velox::connector::hive::detail::prewarmPinnedHostBufferPool(bytes, count);
+        LOG(WARNING) << "VeloxBackend: prewarmed " << warmed << "/" << count << " pinned host buffers of at least "
+                     << bytes << " bytes";
+      }
+    }
+
+    // KvikIO's direct-I/O device path uses a distinct pool of page-aligned,
+    // CUDA-registered host buffers.  A parallel writer can otherwise make all
+    // of its first cudaHostRegister calls at the beginning of the measured
+    // write phase.  Acquire the requested number together during executor
+    // initialization and then return them to KvikIO's process-wide pool.
+    if (const auto* kvikioPrewarmCount = std::getenv("GLUTEN_KVIKIO_BOUNCE_POOL_PREWARM_COUNT")) {
+      char* countEnd = nullptr;
+      const auto count = std::strtoull(kvikioPrewarmCount, &countEnd, 10);
+      if (countEnd != kvikioPrewarmCount && *countEnd == '\0' && count != 0) {
+        const auto bytes = velox::cudf_velox::connector::hive::prewarmKvikioCudaPageAlignedBounceBufferPool(count);
+        LOG(WARNING) << "VeloxBackend: prewarmed " << count << " KvikIO CUDA page-aligned bounce buffers (" << bytes
+                     << " bytes)";
+      }
+    }
+
+    // UCX otherwise registers pageable metadata buffers on its progress
+    // thread during every exchange. Prewarm the two architecture-defined size
+    // classes: one fixed 1 MiB receive buffer per source and one 64 KiB send
+    // buffer per concurrent server. The runtime path remains opt-in via
+    // GLUTEN_UCX_PINNED_METADATA=1.
+    if (const auto* metadataPrewarmCount = std::getenv("GLUTEN_UCX_PINNED_METADATA_PREWARM_COUNT")) {
+      char* countEnd = nullptr;
+      const auto count = std::strtoull(metadataPrewarmCount, &countEnd, 10);
+      if (countEnd != metadataPrewarmCount && *countEnd == '\0' && count != 0) {
+        const auto recvBytes =
+            velox::ucx_exchange::prewarmUcxMetadataBufferPool(velox::ucx_exchange::kMaxMetaBufSize, count);
+        const auto sendBytes =
+            velox::ucx_exchange::prewarmUcxMetadataBufferPool(velox::ucx_exchange::kMinPinnedMetaBufSize, count);
+        LOG(WARNING) << "VeloxBackend: prewarmed UCX metadata pool with " << recvBytes << " receive bytes and "
+                     << sendBytes << " send bytes across " << count << " buffers/class";
+      }
+    }
     registerCheckOverflowInTableInsertCudfFunction(cudfConfig.functionNamePrefix);
     velox::exec::Operator::registerOperator(std::make_unique<CudfVectorStreamOperatorTranslator>());
 
@@ -707,16 +770,35 @@ void VeloxBackend::tearDown() {
     // dump cache stats on exit if enabled
     if (dynamic_cast<facebook::velox::cache::AsyncDataCache*>(asyncDataCache_.get())) {
       LOG(INFO) << asyncDataCache_->toString();
-      for (const auto& entry : std::filesystem::directory_iterator(cachePathPrefix_)) {
-        if (entry.path().filename().string().find(cacheFilePrefix_) != std::string::npos) {
-          LOG(INFO) << "Removing cache file " << entry.path().filename().string();
-          std::filesystem::remove(cachePathPrefix_ + "/" + entry.path().filename().string());
-        }
-      }
+      // Release cache pages while their allocator is alive. Optional SSD-file
+      // cleanup must not prevent this, including in memory-only cache mode,
+      // where initSsdCache() never initializes either path or file prefix.
       asyncDataCache_->shutdown();
       cachePinnedPersistentLifetime_.reset();
       cachePinnedPrewarmLifetime_.reset();
+      if (!cachePathPrefix_.empty() && !cacheFilePrefix_.empty()) {
+        try {
+          for (const auto& entry : std::filesystem::directory_iterator(cachePathPrefix_)) {
+            if (entry.path().filename().string().find(cacheFilePrefix_) != std::string::npos) {
+              LOG(INFO) << "Removing cache file " << entry.path().filename().string();
+              std::filesystem::remove(entry.path());
+            }
+          }
+        } catch (const std::filesystem::filesystem_error& e) {
+          LOG(WARNING) << "Unable to clean up terminal SSD cache files: " << e.what();
+        }
+      }
     }
+
+#ifdef GLUTEN_ENABLE_GPU
+    // The native S3 scheduler owns S3CrtClient instances whose event-loop
+    // threads consult the AWS SDK logger. Destroy those clients before
+    // finalizeS3FileSystem() shuts down the process-global CRT/logger state.
+    facebook::velox::cudf_velox::connector::hive::shutdownNativeS3Scheduler();
+#endif
+#ifdef ENABLE_S3
+    facebook::velox::filesystems::finalizeS3FileSystem();
+#endif
   } catch (const std::exception& e) {
     LOG(ERROR) << "Ignoring terminal VeloxBackend teardown failure: " << e.what();
   } catch (...) {

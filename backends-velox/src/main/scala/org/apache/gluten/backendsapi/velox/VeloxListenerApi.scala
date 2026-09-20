@@ -45,7 +45,7 @@ import org.apache.spark.shuffle.{ColumnarShuffleDependency, LookupKey, ShuffleMa
 import org.apache.spark.shuffle.sort.ColumnarShuffleManager
 import org.apache.spark.sql.execution.ColumnarCachedBatchSerializer
 import org.apache.spark.sql.execution.datasources.GlutenWriterColumnarRules
-import org.apache.spark.sql.execution.datasources.velox.{VeloxParquetWriterInjects, VeloxRowSplitter}
+import org.apache.spark.sql.execution.datasources.velox.{VeloxOrcWriterInjects, VeloxParquetWriterInjects, VeloxRowSplitter}
 import org.apache.spark.sql.expression.UDFResolver
 import org.apache.spark.sql.internal.{GlutenConfigUtil, StaticSQLConf}
 import org.apache.spark.sql.internal.SparkConfigUtil._
@@ -252,7 +252,7 @@ class VeloxListenerApi extends ListenerApi with Logging {
       .initialize(newGlobalOffHeapMemoryListener(), parseConf(conf, isDriver))
 
     // Inject backend-specific implementations to override spark classes.
-    GlutenFormatFactory.register(new VeloxParquetWriterInjects)
+    GlutenFormatFactory.register(new VeloxParquetWriterInjects, new VeloxOrcWriterInjects)
     GlutenFormatFactory.injectPostRuleFactory(
       session => GlutenWriterColumnarRules.NativeWritePostRule(session))
     GlutenFormatFactory.register(new VeloxRowSplitter())

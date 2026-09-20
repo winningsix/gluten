@@ -34,7 +34,6 @@
 #endif
 #include "operators/plannodes/RowVectorStream.h"
 
-
 using namespace facebook;
 
 namespace gluten {
@@ -190,63 +189,45 @@ WholeStageResultIterator::WholeStageResultIterator(
           connectorId = kCudfIcebergConnectorId;
         }
 #endif
-        std::vector<velox::connector::hive::iceberg::IcebergCoalescedFile>
-            coalescedFiles;
+        std::vector<velox::connector::hive::iceberg::IcebergCoalescedFile> coalescedFiles;
 #ifdef GLUTEN_ENABLE_GPU
         const bool useCudfIceberg = connectorId == kCudfIcebergConnectorId;
-        const bool useExperimentalReader = veloxCfg_->get<bool>(
-            kCudfHiveUseExperimentalReader, false);
-        const auto configuredMultiFileTarget = veloxCfg_->get<uint64_t>(
-            kCudfIcebergMultiFileTargetBytes,
-            kCudfIcebergMultiFileTargetBytesDefault);
+        const bool useExperimentalReader = veloxCfg_->get<bool>(kCudfHiveUseExperimentalReader, false);
+        const auto configuredMultiFileTarget =
+            veloxCfg_->get<uint64_t>(kCudfIcebergMultiFileTargetBytes, kCudfIcebergMultiFileTargetBytesDefault);
         const uint64_t targetBytes = configuredMultiFileTarget > 0
             ? configuredMultiFileTarget
             : veloxCfg_->get<uint64_t>(kCudfGpuTargetBatchBytes, 0);
-        const int32_t maxFiles = veloxCfg_->get<int32_t>(
-            kCudfIcebergMultiFileMaxFiles,
-            kCudfIcebergMultiFileMaxFilesDefault);
-        const uint64_t maxFileBytes = veloxCfg_->get<uint64_t>(
-            kCudfIcebergMultiFileMaxFileBytes,
-            kCudfIcebergMultiFileMaxFileBytesDefault);
+        const int32_t maxFiles =
+            veloxCfg_->get<int32_t>(kCudfIcebergMultiFileMaxFiles, kCudfIcebergMultiFileMaxFilesDefault);
+        const uint64_t maxFileBytes =
+            veloxCfg_->get<uint64_t>(kCudfIcebergMultiFileMaxFileBytes, kCudfIcebergMultiFileMaxFileBytesDefault);
         // Iceberg represents a complete Parquet file as [4, fileSize): the
         // leading four bytes are the PAR1 magic. A real range split does not
         // reach fileSize and remains ineligible.
         const auto isWholeFile = [&](size_t fileIndex) {
-          return starts[fileIndex] <= 4 &&
-              properties[fileIndex].has_value() &&
+          return starts[fileIndex] <= 4 && properties[fileIndex].has_value() &&
               properties[fileIndex]->fileSize.has_value() &&
-              starts[fileIndex] <= static_cast<uint64_t>(
-                  *properties[fileIndex]->fileSize) &&
-              lengths[fileIndex] >= static_cast<uint64_t>(
-                  *properties[fileIndex]->fileSize) - starts[fileIndex];
+              starts[fileIndex] <= static_cast<uint64_t>(*properties[fileIndex]->fileSize) &&
+              lengths[fileIndex] >= static_cast<uint64_t>(*properties[fileIndex]->fileSize) - starts[fileIndex];
         };
-        const bool primaryCanCoalesce = useCudfIceberg &&
-            !useExperimentalReader && targetBytes > 0 && maxFiles > 1 &&
+        const bool primaryCanCoalesce = useCudfIceberg && !useExperimentalReader && targetBytes > 0 && maxFiles > 1 &&
             deleteFiles.empty() && isWholeFile(idx) &&
             static_cast<uint64_t>(*properties[idx]->fileSize) <= targetBytes &&
             static_cast<uint64_t>(*properties[idx]->fileSize) <= maxFileBytes;
-        uint64_t accumulatedBytes = primaryCanCoalesce
-            ? static_cast<uint64_t>(*properties[idx]->fileSize)
-            : 0;
+        uint64_t accumulatedBytes = primaryCanCoalesce ? static_cast<uint64_t>(*properties[idx]->fileSize) : 0;
         size_t next = idx + 1;
-        while (primaryCanCoalesce && next < paths.size() &&
-               coalescedFiles.size() + 1 < static_cast<size_t>(maxFiles) &&
+        while (primaryCanCoalesce && next < paths.size() && coalescedFiles.size() + 1 < static_cast<size_t>(maxFiles) &&
                accumulatedBytes < targetBytes) {
           const bool hasDeletes =
-              next < icebergSplitInfo->deleteFilesVec.size() &&
-              !icebergSplitInfo->deleteFilesVec[next].empty();
-          if (hasDeletes || !isWholeFile(next) ||
-              static_cast<uint64_t>(*properties[next]->fileSize) >
-                  maxFileBytes ||
-              (!partitionColumns.empty() &&
-               partitionColumns[next] != partitionColumns[idx]) ||
+              next < icebergSplitInfo->deleteFilesVec.size() && !icebergSplitInfo->deleteFilesVec[next].empty();
+          if (hasDeletes || !isWholeFile(next) || static_cast<uint64_t>(*properties[next]->fileSize) > maxFileBytes ||
+              (!partitionColumns.empty() && partitionColumns[next] != partitionColumns[idx]) ||
               metadataColumns[next] != metadataColumns[idx]) {
             break;
           }
-          const auto fileSize =
-              static_cast<uint64_t>(*properties[next]->fileSize);
-          if (accumulatedBytes >= targetBytes ||
-              fileSize > targetBytes - accumulatedBytes) {
+          const auto fileSize = static_cast<uint64_t>(*properties[next]->fileSize);
+          if (accumulatedBytes >= targetBytes || fileSize > targetBytes - accumulatedBytes) {
             break;
           }
           coalescedFiles.push_back({paths[next], fileSize});
@@ -273,9 +254,8 @@ WholeStageResultIterator::WholeStageResultIterator(
         connectorSplits.emplace_back(split);
 #ifdef GLUTEN_ENABLE_GPU
         if (next > static_cast<size_t>(idx + 1)) {
-          VLOG(1) << "Coalesced " << (next - idx)
-                  << " Iceberg files into one cuDF split ("
-                  << accumulatedBytes << " bytes)";
+          VLOG(1) << "Coalesced " << (next - idx) << " Iceberg files into one cuDF split (" << accumulatedBytes
+                  << " bytes)";
           idx = static_cast<int>(next - 1);
         }
 #endif
@@ -296,8 +276,7 @@ WholeStageResultIterator::WholeStageResultIterator(
           } else if (cleanedPath.compare(0, kS3APrefix.size(), kS3APrefix) == 0) {
             cleanedPath.erase(kS3APrefix.size() - 2, 1);
           }
-          cudfFileInfos.push_back(
-              {std::move(cleanedPath), starts[idx], lengths[idx], metadataColumn});
+          cudfFileInfos.push_back({std::move(cleanedPath), starts[idx], lengths[idx], metadataColumn});
         } else {
 #endif
           split = std::make_shared<velox::connector::hive::HiveConnectorSplit>(
@@ -330,20 +309,51 @@ WholeStageResultIterator::WholeStageResultIterator(
     // which the cuDF Parquet reader would treat as a complete file, failing
     // the header/footer magic check.
     if (!cudfFileInfos.empty()) {
-      // IBM baseline drops CoalescedFileRange + the 7-arg ctor. Per ferd:
-      // IO coalescing optimization not needed; one split per file is fine.
-      for (const auto& f : cudfFileInfos) {
-        auto cudfSplit = std::make_shared<
-            velox::cudf_velox::connector::hive::CudfHiveConnectorSplit>(
+      const auto targetBytes =
+          veloxCfg_->get<uint64_t>(kCudfHiveMultiFileTargetBytes, kCudfHiveMultiFileTargetBytesDefault);
+      const auto maxFiles = veloxCfg_->get<int32_t>(kCudfHiveMultiFileMaxFiles, kCudfHiveMultiFileMaxFilesDefault);
+      const auto maxFileBytes =
+          veloxCfg_->get<uint64_t>(kCudfHiveMultiFileMaxFileBytes, kCudfHiveMultiFileMaxFileBytesDefault);
+      const auto canCoalesce = [&](const CudfFileInfo& file) {
+        return format == dwio::common::FileFormat::PARQUET && targetBytes > 0 && maxFiles > 1 && file.start == 0 &&
+            file.length != std::numeric_limits<uint64_t>::max() && file.length <= maxFileBytes &&
+            file.length <= targetBytes;
+      };
+
+      for (size_t index = 0; index < cudfFileInfos.size();) {
+        const auto& primary = cudfFileInfos[index];
+        std::vector<velox::cudf_velox::connector::hive::CudfCoalescedFile> coalescedFiles;
+        uint64_t accumulatedBytes = canCoalesce(primary) ? primary.length : 0;
+        size_t next = index + 1;
+        while (canCoalesce(primary) && next < cudfFileInfos.size() &&
+               coalescedFiles.size() + 1 < static_cast<size_t>(maxFiles)) {
+          const auto& candidate = cudfFileInfos[next];
+          if (!canCoalesce(candidate) || candidate.infoColumns != primary.infoColumns ||
+              candidate.length > targetBytes - accumulatedBytes) {
+            break;
+          }
+          coalescedFiles.push_back({candidate.path, candidate.length});
+          accumulatedBytes += candidate.length;
+          ++next;
+        }
+
+        auto cudfSplit = std::make_shared<velox::cudf_velox::connector::hive::CudfHiveConnectorSplit>(
             kCudfHiveConnectorId,
-            f.path,
-            f.start,
-            f.length,
+            primary.path,
+            primary.start,
+            primary.length,
             /*splitWeight=*/0,
-            f.infoColumns);
+            primary.infoColumns,
+            std::move(coalescedFiles),
+            format);
         connectorSplits.emplace_back(std::move(cudfSplit));
+        if (next > index + 1) {
+          VLOG(1) << "Coalesced " << (next - index) << " Hive files into one cuDF split (" << accumulatedBytes
+                  << " bytes)";
+        }
+        index = next;
       }
-      VLOG(1) << "Built " << connectorSplits.size() << " CUDF splits (one per file)";
+      VLOG(1) << "Built " << connectorSplits.size() << " CUDF Hive splits";
     }
 #endif
 
@@ -387,8 +397,7 @@ std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
 
   if (task_->isFinished()) {
     auto nextEnd = std::chrono::steady_clock::now();
-    totalNextNanos_ += std::chrono::duration_cast<
-        std::chrono::nanoseconds>(nextEnd - nextStart).count();
+    totalNextNanos_ += std::chrono::duration_cast<std::chrono::nanoseconds>(nextEnd - nextStart).count();
     return nullptr;
   }
   velox::RowVectorPtr vector;
@@ -409,19 +418,14 @@ std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
     auto veloxStart = std::chrono::steady_clock::now();
     auto out = task_->next(&future);
     auto veloxEnd = std::chrono::steady_clock::now();
-    totalVeloxNextNanos_ += std::chrono::duration_cast<
-        std::chrono::nanoseconds>(veloxEnd - veloxStart).count();
+    totalVeloxNextNanos_ += std::chrono::duration_cast<std::chrono::nanoseconds>(veloxEnd - veloxStart).count();
     if (!future.valid()) {
       vector = std::move(out);
       break;
     }
-    GLUTEN_CHECK(
-        out == nullptr,
-        "Expected to wait but still got non-null output");
-    VLOG(2) << "Velox task " << task_->taskId()
-            << " is busy when ::next() is called. "
-            << "Will wait and try again. Task state: "
-            << taskStateString(task_->state());
+    GLUTEN_CHECK(out == nullptr, "Expected to wait but still got non-null output");
+    VLOG(2) << "Velox task " << task_->taskId() << " is busy when ::next() is called. "
+            << "Will wait and try again. Task state: " << taskStateString(task_->state());
     // GPU thread-region tracking dropped in IBM-baseline switch
     // (endGpuRegion removed). cuDF operators are stream-safe and RMM is
     // thread-safe, so blocking on the future without releasing a permit
@@ -429,12 +433,9 @@ std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
     future.wait();
   }
 
-  auto recordAndReturn =
-      [&](std::shared_ptr<ColumnarBatch> result)
-      -> std::shared_ptr<ColumnarBatch> {
+  auto recordAndReturn = [&](std::shared_ptr<ColumnarBatch> result) -> std::shared_ptr<ColumnarBatch> {
     auto nextEnd = std::chrono::steady_clock::now();
-    totalNextNanos_ += std::chrono::duration_cast<
-        std::chrono::nanoseconds>(nextEnd - nextStart).count();
+    totalNextNanos_ += std::chrono::duration_cast<std::chrono::nanoseconds>(nextEnd - nextStart).count();
     return result;
   };
 
@@ -447,11 +448,9 @@ std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
   }
 
 #ifdef GLUTEN_ENABLE_GPU
-  if (auto cudfVec = std::dynamic_pointer_cast<
-          velox::cudf_velox::CudfVector>(vector)) {
+  if (auto cudfVec = std::dynamic_pointer_cast<velox::cudf_velox::CudfVector>(vector)) {
     auto numCols = cudfVec->getTableView().num_columns();
-    return recordAndReturn(
-        std::make_shared<VeloxColumnarBatch>(vector, numCols));
+    return recordAndReturn(std::make_shared<VeloxColumnarBatch>(vector, numCols));
   }
 #endif
 
@@ -462,8 +461,7 @@ std::shared_ptr<ColumnarBatch> WholeStageResultIterator::next() {
     }
   }
 
-  return recordAndReturn(
-      std::make_shared<VeloxColumnarBatch>(vector));
+  return recordAndReturn(std::make_shared<VeloxColumnarBatch>(vector));
 }
 
 int64_t WholeStageResultIterator::spillFixedSize(int64_t size) {
@@ -557,14 +555,15 @@ void WholeStageResultIterator::constructPartitionColumns(
 }
 
 void WholeStageResultIterator::addIteratorSplits(const std::vector<std::shared_ptr<ResultIterator>>& inputIterators) {
-  GLUTEN_CHECK(!allSplitsAdded_, "Method addIteratorSplits should not be called since all splits has been added to the Velox task.");
+  GLUTEN_CHECK(
+      !allSplitsAdded_,
+      "Method addIteratorSplits should not be called since all splits has been added to the Velox task.");
   // Create IteratorConnectorSplit for each iterator
   for (size_t i = 0; i < streamIds_.size() && i < inputIterators.size(); ++i) {
     if (inputIterators[i] == nullptr) {
       continue;
     }
-    auto connectorSplit = std::make_shared<IteratorConnectorSplit>(
-        kIteratorConnectorId, inputIterators[i]);
+    auto connectorSplit = std::make_shared<IteratorConnectorSplit>(kIteratorConnectorId, inputIterators[i]);
     exec::Split split(folly::copy(connectorSplit), -1);
     task_->addSplit(streamIds_[i], std::move(split));
   }
@@ -584,7 +583,7 @@ void WholeStageResultIterator::noMoreSplits() {
   for (const auto& scanNodeId : scanNodeIds_) {
     task_->noMoreSplits(scanNodeId);
   }
-  
+
   // Mark no more splits for all stream nodes
   for (const auto& streamId : streamIds_) {
     task_->noMoreSplits(streamId);
@@ -597,15 +596,11 @@ void WholeStageResultIterator::collectMetrics() {
     return;
   }
 
-  LOG(WARNING) << "collectMetrics() called, task state="
-               << static_cast<int>(task_->state());
+  LOG(WARNING) << "collectMetrics() called, task state=" << static_cast<int>(task_->state());
 
-  LOG(WARNING) << "[TIMING] " << taskInfo_
-               << " totalNextNanos=" << totalNextNanos_
+  LOG(WARNING) << "[TIMING] " << taskInfo_ << " totalNextNanos=" << totalNextNanos_
                << " veloxNextNanos=" << totalVeloxNextNanos_
-               << " wrapperNanos="
-               << (totalNextNanos_ - totalVeloxNextNanos_)
-               << " nextCalls=" << nextCallCount_;
+               << " wrapperNanos=" << (totalNextNanos_ - totalVeloxNextNanos_) << " nextCalls=" << nextCallCount_;
 
   const auto& taskStats = task_->taskStats();
   if (taskStats.executionStartTimeMs == 0) {
@@ -730,15 +725,11 @@ void WholeStageResultIterator::collectMetrics() {
           runtimeMetric("sum", second->customStats, kPinnedAllocBytes);
       metrics_->get(Metrics::kPageableAllocBytes)[metricIndex] =
           runtimeMetric("sum", second->customStats, kPageableAllocBytes);
-      auto gpuVal =
-          runtimeMetric("sum", second->customStats, kGpuComputeNanos);
+      auto gpuVal = runtimeMetric("sum", second->customStats, kGpuComputeNanos);
       metrics_->get(Metrics::kGpuComputeTime)[metricIndex] = gpuVal;
       if (gpuVal > 0 || second->customStats.count(kGpuComputeNanos)) {
-        LOG(WARNING) << "collectMetrics opType="
-                     << entry.first
-                     << " gpuComputeNanos=" << gpuVal
-                     << " present="
-                     << second->customStats.count(kGpuComputeNanos);
+        LOG(WARNING) << "collectMetrics opType=" << entry.first << " gpuComputeNanos=" << gpuVal
+                     << " present=" << second->customStats.count(kGpuComputeNanos);
       }
 
       metricIndex += 1;
@@ -874,8 +865,7 @@ std::unordered_map<std::string, std::string> WholeStageResultIterator::getQueryC
     configs[velox::core::QueryConfig::kMaxSplitPreloadPerDriver] =
         std::to_string(veloxCfg_->get<int32_t>(kVeloxSplitPreloadPerDriver, 2));
     configs[velox::core::QueryConfig::kMaxSplitPreloadPerTask] =
-        std::to_string(veloxCfg_->get<int32_t>(
-            kVeloxSplitPreloadPerTask, kVeloxSplitPreloadPerTaskDefault));
+        std::to_string(veloxCfg_->get<int32_t>(kVeloxSplitPreloadPerTask, kVeloxSplitPreloadPerTaskDefault));
 
     // hashtable build optimizations
     configs[velox::core::QueryConfig::kAbandonDedupHashMapMinRows] =
@@ -912,8 +902,7 @@ std::unordered_map<std::string, std::string> WholeStageResultIterator::getQueryC
         std::to_string(veloxCfg_->get<int32_t>(kExprMaxCompiledRegexes, 100));
 
 #ifdef GLUTEN_ENABLE_GPU
-    configs[velox::cudf_velox::CudfConfig::kCudfEnabled] =
-        std::to_string(veloxCfg_->get<bool>(kCudfEnabled, false));
+    configs[velox::cudf_velox::CudfConfig::kCudfEnabled] = std::to_string(veloxCfg_->get<bool>(kCudfEnabled, false));
     // IBM baseline removed kCudfSkipOutputToVelox. Output-to-Velox is
     // unconditional now; gluten consumers always materialize to RowVector.
 #endif

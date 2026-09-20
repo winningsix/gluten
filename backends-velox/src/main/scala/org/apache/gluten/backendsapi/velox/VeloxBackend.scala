@@ -43,6 +43,7 @@ import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
 import org.apache.spark.sql.execution.command.CreateDataSourceTableAsSelectCommand
 import org.apache.spark.sql.execution.datasources.{FileFormat, InsertIntoHadoopFsRelationCommand}
+import org.apache.spark.sql.execution.datasources.orc.OrcFileFormat
 import org.apache.spark.sql.execution.datasources.parquet.{ParquetFileFormat, ParquetOptions}
 import org.apache.spark.sql.hive.execution.HiveFileFormat
 import org.apache.spark.sql.internal.SQLConf
@@ -357,11 +358,12 @@ object VeloxBackendSettings extends BackendSettingsApi {
     def validateFileFormat(): Option[String] = {
       format match {
         case _: ParquetFileFormat => None // Parquet is directly supported
+        case _: OrcFileFormat => None // ORC is directly supported by the cuDF writer
         case h: HiveFileFormat if GlutenConfig.get.enableHiveFileFormatWriter =>
           validateHiveFileFormat(h) // Parquet via Hive SerDe
         case _ =>
           Some(
-            "Only ParquetFileFormat and HiveFileFormat are supported."
+            "Only ParquetFileFormat, OrcFileFormat and HiveFileFormat are supported."
           ) // Unsupported format
       }
     }

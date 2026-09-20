@@ -362,10 +362,16 @@ object ExpressionMappings {
 
   private def partitionExpressionMapByBlacklist: (Map[Class[_], String], Map[Class[_], String]) = {
     val blacklist = GlutenConfig.get.expressionBlacklist
-    val (blacklistedExpr, filteredExpr) = (defaultExpressionsMap ++ toMap(
-      BackendsApiManager.getSparkPlanExecApiInstance.extraExpressionMappings)).partition(
-      kv => blacklist.contains(kv._2))
-    (blacklistedExpr, filteredExpr)
+    val expressions = defaultExpressionsMap ++ toMap(
+      BackendsApiManager.getSparkPlanExecApiInstance.extraExpressionMappings)
+    // Still resolve the current SQLConf and backend mappings on every call.
+    // With no blacklist, partition would traverse/rebuild the entire allowed map
+    // for each expression visited during plan validation.
+    if (blacklist.isEmpty) {
+      (Map.empty, expressions)
+    } else {
+      expressions.partition(kv => blacklist.contains(kv._2))
+    }
   }
 
   // This is needed when generating function support status documentation for Spark built-in

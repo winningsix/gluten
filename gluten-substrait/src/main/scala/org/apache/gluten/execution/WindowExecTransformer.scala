@@ -46,6 +46,24 @@ case class WindowExecTransformer(
   extends WindowExecBase
   with UnaryTransformSupport {
 
+  // EMR 8.0's Spark 4.0.2 adds a private lazy tag to WindowExecBase.  Gluten is
+  // intentionally compiled against upstream Spark 4.0, where that member does
+  // not exist, so the Scala compiler cannot synthesize its ABI methods.  Keep
+  // the two exact JVM entry points here: EMR's WindowExecBase.$init$ initializes
+  // the tag through the setter, while upstream Spark simply leaves this
+  // compatibility field unused.
+  @transient private var emrWindowTopKDistinctCountTag: TreeNodeTag[Attribute] = _
+
+  // scalastyle:off line.size.limit
+  def `org$apache$spark$sql$execution$window$WindowExecBase$$ATTR_NEED_DISTINCT_COUNT_FOR_WINDOW_TOP_K_TAG`()
+      : TreeNodeTag[Attribute] = emrWindowTopKDistinctCountTag
+
+  def `org$apache$spark$sql$execution$window$WindowExecBase$_setter_$org$apache$spark$sql$execution$window$WindowExecBase$$ATTR_NEED_DISTINCT_COUNT_FOR_WINDOW_TOP_K_TAG_$eq`(
+      tag: TreeNodeTag[Attribute]): Unit = {
+    emrWindowTopKDistinctCountTag = tag
+  }
+  // scalastyle:on line.size.limit
+
   // Note: "metrics" is made transient to avoid sending driver-side metrics to tasks.
   @transient override lazy val metrics =
     BackendsApiManager.getMetricsApiInstance.genWindowTransformerMetrics(sparkContext)

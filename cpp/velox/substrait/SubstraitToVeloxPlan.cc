@@ -84,10 +84,8 @@ core::TopNRowNumberNode::RankFunction windowGroupLimitRankFunction(
         if (start != std::string::npos) {
           const auto valueStart = start + kWindowFunctionPrefix.size();
           const auto valueEnd = msg.value().find('\n', valueStart);
-          functionName = msg.value().substr(
-              valueStart,
-              valueEnd == std::string::npos ? std::string::npos
-                                             : valueEnd - valueStart);
+          functionName =
+              msg.value().substr(valueStart, valueEnd == std::string::npos ? std::string::npos : valueEnd - valueStart);
         }
       }
     }
@@ -237,12 +235,28 @@ std::string collectSetTemplateMergeExtractName(const std::string& baseName, cons
 } // namespace
 
 bool SplitInfo::canUseCudfConnector() {
-  if (format != dwio::common::FileFormat::PARQUET) {
+  if (format != dwio::common::FileFormat::PARQUET && format != dwio::common::FileFormat::ORC) {
     return false;
   }
 
   if (isIceberg) {
-    return true;
+    return format == dwio::common::FileFormat::PARQUET;
+  }
+
+  // cuDF's ORC reader selects stripes rather than arbitrary byte ranges. Keep
+  // the GPU path correctness-preserving until the split planner carries stripe
+  // IDs by accepting only splits proven to cover complete physical files.
+  if (format == dwio::common::FileFormat::ORC) {
+    if (paths.empty() || starts.size() != paths.size() || lengths.size() != paths.size() ||
+        properties.size() != paths.size()) {
+      return false;
+    }
+    for (size_t index = 0; index < paths.size(); ++index) {
+      if (starts[index] != 0 || !properties[index].has_value() || !properties[index]->fileSize.has_value() ||
+          lengths[index] < static_cast<uint64_t>(*properties[index]->fileSize)) {
+        return false;
+      }
+    }
   }
 
   bool isEmpty = partitionColumns.empty();
@@ -538,7 +552,8 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
     for (uint32_t idx = 0; idx < inputType->size(); ++idx) {
       const auto& fieldName = inputType->nameOf(idx);
       groupingProjectNames.emplace_back(fieldName);
-      groupingProjectExprs.emplace_back(std::make_shared<core::FieldAccessTypedExpr>(inputType->childAt(idx), fieldName));
+      groupingProjectExprs.emplace_back(
+          std::make_shared<core::FieldAccessTypedExpr>(inputType->childAt(idx), fieldName));
     }
   };
 
@@ -775,19 +790,18 @@ std::shared_ptr<CudfHiveInsertTableHandle> makeCudfHiveInsertTableHandle(
     std::shared_ptr<cudf_velox::connector::hive::LocationHandle> locationHandle,
     const std::optional<common::CompressionKind> compressionKind,
     const std::unordered_map<std::string, std::string>& serdeParameters,
-    const std::shared_ptr<dwio::common::WriterOptions>& writerOptions) {
+    const std::shared_ptr<dwio::common::WriterOptions>& writerOptions,
+    dwio::common::FileFormat storageFormat) {
   std::vector<std::shared_ptr<const CudfHiveColumnHandle>> columnHandles;
   columnHandles.reserve(tableColumnNames.size());
 
   for (int i = 0; i < tableColumnNames.size(); ++i) {
     columnHandles.push_back(std::make_shared<CudfHiveColumnHandle>(
-        tableColumnNames.at(i),
-        tableColumnTypes.at(i),
-        cudf_velox::veloxToCudfDataType(tableColumnTypes.at(i))));
+        tableColumnNames.at(i), tableColumnTypes.at(i), cudf_velox::veloxToCudfDataType(tableColumnTypes.at(i))));
   }
 
   return std::make_shared<CudfHiveInsertTableHandle>(
-      columnHandles, locationHandle, compressionKind, serdeParameters, writerOptions);
+      columnHandles, locationHandle, compressionKind, serdeParameters, writerOptions, storageFormat);
 }
 #endif
 
@@ -875,27 +889,37 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
     writeConfs.emplace(item.first, item.second);
   }
 
-  // Currently only support parquet format.
   const std::string& formatShortName = writeConfs["format"];
-  GLUTEN_CHECK(formatShortName == "parquet", "Unsupported file write format: " + formatShortName);
-  dwio::common::FileFormat fileFormat = dwio::common::FileFormat::PARQUET;
+  GLUTEN_CHECK(
+      formatShortName == "parquet" || formatShortName == "orc", "Unsupported file write format: " + formatShortName);
+  const auto fileFormat = formatShortName == "orc" ? dwio::common::FileFormat::ORC : dwio::common::FileFormat::PARQUET;
 
+  // The generic WriterOptions supplies the compression kind to the cuDF
+  // writer. Parquet-specific fields are ignored by the ORC path.
   const std::shared_ptr<dwio::common::WriterOptions> writerOptions = makeParquetWriteOption(writeConfs);
   // Spark's default compression code is snappy.
   const auto& compressionKind =
       writerOptions->compressionKind.value_or(common::CompressionKind::CompressionKind_SNAPPY);
   std::shared_ptr<core::InsertTableHandle> tableHandle;
 #ifdef GLUTEN_ENABLE_GPU
-  const bool useCudfWriter =
-      veloxCfg_->get<bool>(kCudfEnabled, kCudfEnabledDefault) &&
-      veloxCfg_->get<bool>(kCudfEnableTableWrite, kCudfEnableTableWriteDefault) &&
-      partitionedKey.empty() && bucketProperty == nullptr;
+  const bool useCudfWriter = veloxCfg_->get<bool>(kCudfEnabled, kCudfEnabledDefault) &&
+      veloxCfg_->get<bool>(kCudfEnableTableWrite, kCudfEnableTableWriteDefault) && partitionedKey.empty() &&
+      bucketProperty == nullptr;
   if (useCudfWriter) {
-    auto locationHandle =
-        std::make_shared<cudf_velox::connector::hive::LocationHandle>(
-            writePath,
-            cudf_velox::connector::hive::LocationHandle::TableType::kNew,
-            fileName);
+    auto locationHandle = std::make_shared<cudf_velox::connector::hive::LocationHandle>(
+        writePath, cudf_velox::connector::hive::LocationHandle::TableType::kNew, fileName);
+    // The cuDF sink consumes CudfHiveWriterOptions. Passing the generic
+    // WriterOptions produced for the CPU parquet writer makes the sink's
+    // dynamic_cast fail and silently falls back to libcudf defaults. Preserve
+    // Spark's parquet row-group contract explicitly for the GPU writer.
+    auto cudfWriterOptions = std::make_shared<CudfHiveWriterOptions>();
+    cudfWriterOptions->compressionKind = writerOptions->compressionKind;
+    if (const auto it = writeConfs.find(kParquetBlockSize); it != writeConfs.end()) {
+      cudfWriterOptions->rowGroupSizeBytes = std::stoull(it->second);
+    }
+    if (const auto it = writeConfs.find(kParquetBlockRows); it != writeConfs.end()) {
+      cudfWriterOptions->rowGroupSizeRows = std::stoll(it->second);
+    }
     tableHandle = std::make_shared<core::InsertTableHandle>(
         kCudfHiveConnectorId,
         makeCudfHiveInsertTableHandle(
@@ -904,7 +928,8 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
             locationHandle,
             compressionKind,
             std::unordered_map<std::string, std::string>{},
-            writerOptions));
+            cudfWriterOptions,
+            fileFormat));
   } else
 #endif
   {
@@ -915,12 +940,7 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
             inputType->children(),
             partitionedKey,
             bucketProperty,
-            makeLocationHandle(
-                writePath,
-                fileName,
-                fileFormat,
-                compressionKind,
-                bucketProperty != nullptr),
+            makeLocationHandle(writePath, fileName, fileFormat, compressionKind, bucketProperty != nullptr),
             writerOptions,
             fileFormat,
             compressionKind));
@@ -1053,10 +1073,8 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
       // unrelated helper column.
       auto generatorFunc = generator.scalar_function();
       if (generatorFunc.arguments_size() > 0 && generatorFunc.arguments(0).has_value()) {
-        auto unnestExpr =
-            exprConverter_->toVeloxExpr(generatorFunc.arguments(0).value(), inputType);
-        if (auto unnestFieldExpr =
-                std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(unnestExpr)) {
+        auto unnestExpr = exprConverter_->toVeloxExpr(generatorFunc.arguments(0).value(), inputType);
+        if (auto unnestFieldExpr = std::dynamic_pointer_cast<const core::FieldAccessTypedExpr>(unnestExpr)) {
           if (unnestFieldExpr->type()->isArray() || unnestFieldExpr->type()->isMap()) {
             unnest.emplace_back(unnestFieldExpr);
           }
@@ -1069,8 +1087,7 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
           for (int32_t i = 0; i < childType->size(); ++i) {
             const auto name = childType->nameOf(i);
             projectNames.emplace_back(name);
-            projectExpressions.emplace_back(
-                std::make_shared<core::FieldAccessTypedExpr>(childType->childAt(i), name));
+            projectExpressions.emplace_back(std::make_shared<core::FieldAccessTypedExpr>(childType->childAt(i), name));
           }
           const auto unnestInputName = "__gluten_unnest_" + std::to_string(planNodeId_);
           const auto unnestType = unnestExpr->type();
@@ -1213,8 +1230,7 @@ detail::WindowInputOrdering detail::selectWindowInputOrdering(
       if (std::dynamic_pointer_cast<const core::OrderByNode>(current)) {
         return true;
       }
-      if (!std::dynamic_pointer_cast<const core::ProjectNode>(current) ||
-          current->sources().size() != 1) {
+      if (!std::dynamic_pointer_cast<const core::ProjectNode>(current) || current->sources().size() != 1) {
         return false;
       }
       current = current->sources().front();
@@ -1224,13 +1240,11 @@ detail::WindowInputOrdering detail::selectWindowInputOrdering(
 
   if (preserveSortedInput) {
     VELOX_CHECK(
-        hasOrderByInput(input),
-        "Window inputsSorted contract requires an OrderBy input, optionally through Projects.");
+        hasOrderByInput(input), "Window inputsSorted contract requires an OrderBy input, optionally through Projects.");
     return {input, true};
   }
 
-  if (auto orderBy =
-          std::dynamic_pointer_cast<const core::OrderByNode>(input)) {
+  if (auto orderBy = std::dynamic_pointer_cast<const core::OrderByNode>(input)) {
     VELOX_CHECK_EQ(orderBy->sources().size(), 1);
     return {orderBy->sources().front(), false};
   }
@@ -1311,12 +1325,9 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   // Spark's physical plan owns the ordering decision. Substrait transports
   // only the verified contract; native conversion does not re-derive Window
   // function, frame, or sort eligibility.
-  const auto preserveSortedInput =
-      windowRel.has_advanced_extension() &&
-      SubstraitParser::configSetInOptimization(
-          windowRel.advanced_extension(), "inputsSorted=");
-  const auto windowInput = detail::selectWindowInputOrdering(
-      childNode, preserveSortedInput);
+  const auto preserveSortedInput = windowRel.has_advanced_extension() &&
+      SubstraitParser::configSetInOptimization(windowRel.advanced_extension(), "inputsSorted=");
+  const auto windowInput = detail::selectWindowInputOrdering(childNode, preserveSortedInput);
 
   return std::make_shared<core::WindowNode>(
       nextPlanNodeId(),
@@ -1497,7 +1508,8 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
 }
 
 core::PlanNodePtr SubstraitToVeloxPlanConverter::constructValueStreamNode(
-    const ::substrait::ReadRel& readRel, int32_t streamIdx) {
+    const ::substrait::ReadRel& readRel,
+    int32_t streamIdx) {
   // Use TableScanNode with iterator connector for runtime iterator inputs
   // Get output schema from ReadRel
   uint64_t colNum = 0;
@@ -1530,11 +1542,7 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::constructValueStreamNode(
   }
 
   // Create TableScanNode
-  auto tableScanNode = std::make_shared<core::TableScanNode>(
-      nodeId,
-      outputType,
-      tableHandle,
-      assignments);
+  auto tableScanNode = std::make_shared<core::TableScanNode>(nodeId, outputType, tableHandle, assignments);
 
   // Mark this as a stream-based split
   auto splitInfo = std::make_shared<SplitInfo>();
@@ -1572,8 +1580,7 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::constructCudfValueStreamNode(
     VELOX_CHECK_LT(streamIdx, inputIters_.size(), "Could not find stream index {} in input iterator list.", streamIdx);
     iterator = std::move(inputIters_[streamIdx]);
   }
-  auto node = std::make_shared<CudfValueStreamNode>(
-      nextPlanNodeId(), outputType, std::move(iterator), streamIdx);
+  auto node = std::make_shared<CudfValueStreamNode>(nextPlanNodeId(), outputType, std::move(iterator), streamIdx);
 
   auto splitInfo = std::make_shared<SplitInfo>();
   splitInfo->leafType = SplitInfo::LeafType::TRIVIAL_LEAF;
@@ -1667,7 +1674,10 @@ core::PlanNodePtr SubstraitToVeloxPlanConverter::toVeloxPlan(const ::substrait::
   connector::ConnectorTableHandlePtr tableHandle;
   auto remainingFilter = readRel.has_filter() ? exprConverter_->toVeloxExpr(readRel.filter(), baseSchema) : nullptr;
   auto connectorId = kHiveConnectorId;
-  if (useCudfTableHandle(splitInfo) && veloxCfg_->get<bool>(kCudfEnableTableScan, kCudfEnableTableScanDefault) &&
+  const bool canUseCudfTableScan = useCudfTableHandle(splitInfo) &&
+      (splitInfo->format != dwio::common::FileFormat::ORC ||
+       veloxCfg_->get<bool>("spark.gluten.sql.columnar.backend.velox.cudf.enableOrcScan", true));
+  if (canUseCudfTableScan && veloxCfg_->get<bool>(kCudfEnableTableScan, kCudfEnableTableScanDefault) &&
       veloxCfg_->get<bool>(kCudfEnabled, kCudfEnabledDefault)) {
 #ifdef GLUTEN_ENABLE_GPU
     connectorId = splitInfo->isIceberg ? kCudfIcebergConnectorId : kCudfHiveConnectorId;

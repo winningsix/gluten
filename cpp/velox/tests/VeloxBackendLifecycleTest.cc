@@ -18,11 +18,51 @@
 #include "compute/VeloxBackend.h"
 
 #include <gtest/gtest.h>
+#include <cstdlib>
 
 #include "memory/VeloxMemoryManager.h"
 #include "utils/Exception.h"
+#include "velox/common/caching/FileIds.h"
 
 namespace gluten {
+
+TEST(VeloxBackendLifecycleTest, MemoryOnlyCacheReleasesPagesWithoutSsdDirectory) {
+  // Backend factories are process-global and can only be registered once.
+  ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+  ASSERT_EXIT(
+      {
+        const std::string prefix = "spark.gluten.sql.columnar.backend.velox.";
+        VeloxBackend::create(
+            AllocationListener::noop(),
+            {{prefix + "cacheEnabled", "true"},
+             {prefix + "memCacheSize", "67108864"},
+             {prefix + "ssdCacheSize", "0"},
+             {prefix + "cacheContiguousEntries", "true"},
+             {prefix + "cachePinnedBytes", "0"},
+             {prefix + "cachePinnedPrewarmBytes", "0"}});
+        auto* cache = VeloxBackend::get()->getAsyncDataCache();
+        ASSERT_NE(cache, nullptr);
+        auto* allocator = cache->allocator();
+        facebook::velox::StringIdLease file(facebook::velox::fileIds(), "memory-only-cache-teardown");
+        for (const auto bytes : {16 << 10, 2 << 20}) {
+          auto pin = cache->findOrCreate(
+              facebook::velox::cache::RawFileCacheKey{file.id(), static_cast<uint64_t>(bytes)}, bytes, true);
+          pin.checkedEntry()->setExclusiveToShared();
+          pin.clear();
+        }
+        ASSERT_GT(allocator->numAllocated(), 0);
+        ASSERT_GT(allocator->numExternalMapped(), 0);
+
+        VeloxBackend::get()->tearDown();
+
+        EXPECT_EQ(allocator->numAllocated(), 0);
+        EXPECT_EQ(allocator->numExternalMapped(), 0);
+        EXPECT_NO_THROW(VeloxBackend::get()->tearDown());
+        std::exit(::testing::Test::HasFailure() ? 1 : 0);
+      },
+      ::testing::ExitedWithCode(0),
+      "");
+}
 
 TEST(VeloxBackendLifecycleTest, RejectsMemoryManagerAccessAfterTerminalTearDown) {
   VeloxBackend::create(AllocationListener::noop(), {});

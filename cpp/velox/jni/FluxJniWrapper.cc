@@ -24,18 +24,20 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "compute/GatheredJoinDrivers.h"
 
 #include <fmt/format.h>
-#include <glog/logging.h>
 #include <folly/dynamic.h>
-#include <folly/json.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
-#include <nvtx3/nvtx3.hpp>
+#include <folly/json.h>
+#include <glog/logging.h>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
+#include <nvtx3/nvtx3.hpp>
 
 #include <jni/JniCommon.h>
 #include <jni/JniError.h>
@@ -53,15 +55,17 @@
 #include "utils/ObjectStore.h"
 
 // Plan node types for tree rewriting.
+#include "operators/plannodes/RowVectorStream.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/ExchangeSource.h"
-#include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/HashPartitionFunction.h"
+#include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/RoundRobinPartitionFunction.h"
-#include "operators/plannodes/RowVectorStream.h"
 #ifdef GLUTEN_ENABLE_GPU
 #include "operators/plannodes/CudfVectorStream.h"
 #include "velox/experimental/cudf/CudfConfig.h"
+#include "velox/experimental/cudf/exec/CudfConversion.h"
+#include "velox/experimental/cudf/exec/PruneJoinOutputs.h"
 #include "velox/experimental/ucx-exchange/Communicator.h"
 #include "velox/experimental/ucx-exchange/RangePartitionFunction.h"
 #endif
@@ -105,28 +109,23 @@ struct FluxQueryHandle {
   std::shared_ptr<velox::memory::MemoryPool> memoryPool;
 
   ~FluxQueryHandle() {
-    nvtx3::scoped_range_in<GlutenFluxDomain> nvtxRange{
-        "jni::~FluxQueryHandle"};
+    nvtx3::scoped_range_in<GlutenFluxDomain> nvtxRange{"jni::~FluxQueryHandle"};
     // Ensure coordinator is destroyed first (aborts any running tasks),
     // then queryCtx, then spillExecutor, then executor.
     {
-      nvtx3::scoped_range_in<GlutenFluxDomain> r{
-          "jni::~FluxQueryHandle:coordinator.reset"};
+      nvtx3::scoped_range_in<GlutenFluxDomain> r{"jni::~FluxQueryHandle:coordinator.reset"};
       coordinator.reset();
     }
     {
-      nvtx3::scoped_range_in<GlutenFluxDomain> r{
-          "jni::~FluxQueryHandle:queryCtx.reset"};
+      nvtx3::scoped_range_in<GlutenFluxDomain> r{"jni::~FluxQueryHandle:queryCtx.reset"};
       queryCtx.reset();
     }
     {
-      nvtx3::scoped_range_in<GlutenFluxDomain> r{
-          "jni::~FluxQueryHandle:spillExecutor.reset"};
+      nvtx3::scoped_range_in<GlutenFluxDomain> r{"jni::~FluxQueryHandle:spillExecutor.reset"};
       spillExecutor.reset();
     }
     {
-      nvtx3::scoped_range_in<GlutenFluxDomain> r{
-          "jni::~FluxQueryHandle:executor.reset"};
+      nvtx3::scoped_range_in<GlutenFluxDomain> r{"jni::~FluxQueryHandle:executor.reset"};
       executor.reset();
     }
   }
@@ -148,17 +147,12 @@ bool tryGetIteratorIndex(const ::substrait::ReadRel& readRel, int32_t* index) {
   try {
     *index = std::stoi(indexString);
   } catch (const std::exception& e) {
-    VELOX_FAIL(
-        "Invalid FLUX iterator URI '{}' in Substrait ReadRel: {}",
-        uri,
-        e.what());
+    VELOX_FAIL("Invalid FLUX iterator URI '{}' in Substrait ReadRel: {}", uri, e.what());
   }
   return true;
 }
 
-void collectIteratorIndices(
-    const ::google::protobuf::Message& message,
-    std::vector<int32_t>& indices) {
+void collectIteratorIndices(const ::google::protobuf::Message& message, std::vector<int32_t>& indices) {
   if (message.GetDescriptor() == ::substrait::ReadRel::descriptor()) {
     const auto& readRel = static_cast<const ::substrait::ReadRel&>(message);
     int32_t index = -1;
@@ -171,15 +165,13 @@ void collectIteratorIndices(
   std::vector<const ::google::protobuf::FieldDescriptor*> fields;
   reflection->ListFields(message, &fields);
   for (const auto* field : fields) {
-    if (field->cpp_type() !=
-        ::google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
+    if (field->cpp_type() != ::google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE) {
       continue;
     }
     if (field->is_repeated()) {
       const int fieldSize = reflection->FieldSize(message, field);
       for (int i = 0; i < fieldSize; ++i) {
-        collectIteratorIndices(
-            reflection->GetRepeatedMessage(message, field, i), indices);
+        collectIteratorIndices(reflection->GetRepeatedMessage(message, field, i), indices);
       }
     } else {
       collectIteratorIndices(reflection->GetMessage(message, field), indices);
@@ -211,31 +203,39 @@ int32_t parallelDirectWriteLanes() {
   char* end = nullptr;
   const auto requested = std::strtol(raw, &end, 10);
   if (end == raw || *end != '\0' || requested < 1) {
-    LOG(WARNING)
-        << "FluxJniWrapper: ignoring invalid "
-        << "GLUTEN_CUDF_PARALLEL_DIRECT_WRITE_LANES='" << raw << "'";
+    LOG(WARNING) << "FluxJniWrapper: ignoring invalid "
+                 << "GLUTEN_CUDF_PARALLEL_DIRECT_WRITE_LANES='" << raw << "'";
     return 1;
   }
-  return static_cast<int32_t>(
-      std::clamp<long>(requested, 1, kMaxKeyedFinalLocalDrivers));
+  return static_cast<int32_t>(std::clamp<long>(requested, 1, kMaxKeyedFinalLocalDrivers));
 }
 
-int32_t resolveKeyedFinalLocalDrivers(
-    const std::shared_ptr<velox::config::ConfigBase>& config) {
-  const auto requested = config->get<int32_t>(
-      kFluxKeyedFinalLocalDrivers, kFluxKeyedFinalLocalDriversDefault);
+int32_t parallelJoinSingleWriterDrivers() {
+  const auto* raw = std::getenv("GLUTEN_CUDF_PARALLEL_JOIN_SINGLE_WRITER_DRIVERS");
+  const auto drivers = gluten::parseGatheredJoinDrivers(raw ? raw : "");
+  VELOX_USER_CHECK(drivers != 0, "GLUTEN_CUDF_PARALLEL_JOIN_SINGLE_WRITER_DRIVERS must be 1, 2 or 4");
+  return drivers;
+}
+
+bool writeDestinationTasksEnabled() {
+  const auto* raw = std::getenv("GLUTEN_CUDF_WRITE_DESTINATION_TASKS");
+  if (raw == nullptr || *raw == '\0') {
+    return false;
+  }
+  return std::string_view(raw) == "1" || std::string_view(raw) == "true" || std::string_view(raw) == "TRUE";
+}
+
+int32_t resolveKeyedFinalLocalDrivers(const std::shared_ptr<velox::config::ConfigBase>& config) {
+  const auto requested = config->get<int32_t>(kFluxKeyedFinalLocalDrivers, kFluxKeyedFinalLocalDriversDefault);
   const auto bounded = std::clamp(requested, 1, kMaxKeyedFinalLocalDrivers);
   if (requested != bounded) {
-    LOG(WARNING) << "FluxJniWrapper: capping "
-                 << kFluxKeyedFinalLocalDrivers << " from " << requested
-                 << " to " << bounded
-                 << " to bound local-exchange and downstream concat memory";
+    LOG(WARNING) << "FluxJniWrapper: capping " << kFluxKeyedFinalLocalDrivers << " from " << requested << " to "
+                 << bounded << " to bound local-exchange and downstream concat memory";
   }
   return bounded;
 }
 
-std::shared_ptr<velox::config::ConfigBase> createFluxSessionConfig(
-    VeloxRuntime* runtime) {
+std::shared_ptr<velox::config::ConfigBase> createFluxSessionConfig(VeloxRuntime* runtime) {
   auto backendConf = VeloxBackend::get()->getBackendConf();
   auto mergedMap = backendConf->rawConfigsCopy();
   for (const auto& [key, val] : runtime->getConfMap()) {
@@ -260,86 +260,73 @@ std::unordered_map<std::string, std::string> buildFluxQueryConfig(
   // The FLUX coordinator constructs scan splits after planning. Preserve the
   // scan batching knobs in QueryConfig so it can build multi-file Iceberg
   // splits using the same byte target as the regular execution path.
-  configs[kCudfGpuTargetBatchBytes] = std::to_string(veloxCfg->get<uint64_t>(
-      kCudfGpuTargetBatchBytes,
-      std::stoull(kCudfGpuTargetBatchBytesDefault)));
+  configs[kCudfGpuTargetBatchBytes] =
+      std::to_string(veloxCfg->get<uint64_t>(kCudfGpuTargetBatchBytes, std::stoull(kCudfGpuTargetBatchBytesDefault)));
+  // CudfFromVelox is the CPU-scan -> GPU boundary used by formats such as
+  // ORC.  Its IBM QueryConfig key is separate from Gluten's public GPU batch
+  // target.  Without this bridge it silently falls back to 100K rows, so a
+  // wide HASH exchange emits ten times as many parent and destination batches
+  // even though Spark configured the documented 1M-row target.
+  configs[velox::cudf_velox::CudfFromVelox::kGpuBatchSizeRows] =
+      std::to_string(veloxCfg->get<uint32_t>(kCudfGpuTargetBatchRows, std::stoul(kCudfGpuTargetBatchRowsDefault)));
   configs[kCudfIcebergMultiFileTargetBytes] = std::to_string(
-      veloxCfg->get<uint64_t>(
-          kCudfIcebergMultiFileTargetBytes,
-          kCudfIcebergMultiFileTargetBytesDefault));
-  configs[kCudfIcebergMultiFileMaxFiles] = std::to_string(
-      veloxCfg->get<int32_t>(
-          kCudfIcebergMultiFileMaxFiles,
-          kCudfIcebergMultiFileMaxFilesDefault));
+      veloxCfg->get<uint64_t>(kCudfIcebergMultiFileTargetBytes, kCudfIcebergMultiFileTargetBytesDefault));
+  configs[kCudfIcebergMultiFileMaxFiles] =
+      std::to_string(veloxCfg->get<int32_t>(kCudfIcebergMultiFileMaxFiles, kCudfIcebergMultiFileMaxFilesDefault));
   configs[kCudfIcebergMultiFileMaxFileBytes] = std::to_string(
-      veloxCfg->get<uint64_t>(
-          kCudfIcebergMultiFileMaxFileBytes,
-          kCudfIcebergMultiFileMaxFileBytesDefault));
-  configs[kCudfHiveUseExperimentalReader] = std::to_string(
-      veloxCfg->get<bool>(kCudfHiveUseExperimentalReader, false));
+      veloxCfg->get<uint64_t>(kCudfIcebergMultiFileMaxFileBytes, kCudfIcebergMultiFileMaxFileBytesDefault));
+  configs[kCudfHiveMultiFileTargetBytes] =
+      std::to_string(veloxCfg->get<uint64_t>(kCudfHiveMultiFileTargetBytes, kCudfHiveMultiFileTargetBytesDefault));
+  configs[kCudfHiveMultiFileMaxFiles] =
+      std::to_string(veloxCfg->get<int32_t>(kCudfHiveMultiFileMaxFiles, kCudfHiveMultiFileMaxFilesDefault));
+  configs[kCudfHiveMultiFileMaxFileBytes] =
+      std::to_string(veloxCfg->get<uint64_t>(kCudfHiveMultiFileMaxFileBytes, kCudfHiveMultiFileMaxFileBytesDefault));
+  configs[kCudfHiveUseExperimentalReader] = std::to_string(veloxCfg->get<bool>(kCudfHiveUseExperimentalReader, false));
 
   // These groupby controls may be supplied by a query-scoped Spark SQLConf.
   // Flux builds its own QueryCtx, so values merged into the runtime session
   // config must be copied explicitly into QueryConfig for cuDF operators to
   // observe the per-query override instead of the executor-global default.
   configs[velox::cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys] =
-      veloxCfg->get<std::string>(
-          kCudfGroupbyStreamingMaxDistinctKeys,
-          kCudfGroupbyStreamingMaxDistinctKeysDefault);
+      veloxCfg->get<std::string>(kCudfGroupbyStreamingMaxDistinctKeys, kCudfGroupbyStreamingMaxDistinctKeysDefault);
   configs[velox::cudf_velox::CudfConfig::kCudfPartialIdentityAggregation] =
-      veloxCfg->get<std::string>(
-          kCudfPartialIdentityAggregation,
-          kCudfPartialIdentityAggregationDefault);
+      veloxCfg->get<std::string>(kCudfPartialIdentityAggregation, kCudfPartialIdentityAggregationDefault);
   LOG(INFO) << "MppJniWrapper: query-scoped cuDF groupby config "
-            << velox::cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys
-            << "="
-            << configs[velox::cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys]
-            << " "
-            << velox::cudf_velox::CudfConfig::kCudfPartialIdentityAggregation
-            << "="
+            << velox::cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys << "="
+            << configs[velox::cudf_velox::CudfConfig::kCudfGroupbyStreamingMaxDistinctKeys] << " "
+            << velox::cudf_velox::CudfConfig::kCudfPartialIdentityAggregation << "="
             << configs[velox::cudf_velox::CudfConfig::kCudfPartialIdentityAggregation];
 
   // Keep the UCX exchange byte bound independently configurable. Partial
   // identity can emit one state per input row, so its default is bounded at
   // 64 MiB. Regular queries retain the historical GPU compute-batch default;
   // applying the smaller window globally regresses exchange-heavy queries.
-  const auto partialIdentityAggregation = veloxCfg->get<bool>(
-      kCudfPartialIdentityAggregation,
-      false);
+  const auto partialIdentityAggregation = veloxCfg->get<bool>(kCudfPartialIdentityAggregation, false);
   const auto partitionedOutputBatchBytesDefault = partialIdentityAggregation
       ? kCudfPartitionedOutputBatchBytesPartialIdentityDefault
-      : veloxCfg->get<uint64_t>(
-            kCudfGpuTargetBatchBytes,
-            std::stoull(kCudfGpuTargetBatchBytesDefault));
+      : veloxCfg->get<uint64_t>(kCudfGpuTargetBatchBytes, std::stoull(kCudfGpuTargetBatchBytesDefault));
   configs[velox::core::QueryConfig::kUcxPartitionedOutputBatchBytes] =
-      std::to_string(veloxCfg->get<uint64_t>(
-          kCudfPartitionedOutputBatchBytes,
-          partitionedOutputBatchBytesDefault));
+      std::to_string(veloxCfg->get<uint64_t>(kCudfPartitionedOutputBatchBytes, partitionedOutputBatchBytesDefault));
 #endif
 
   try {
-    configs[velox::core::QueryConfig::kSparkAnsiEnabled] =
-        veloxCfg->get<std::string>(kAnsiEnabled, "false");
-    configs[velox::core::QueryConfig::kSessionTimezone] =
-        veloxCfg->get<std::string>(kSessionTimezone, "");
+    configs[velox::core::QueryConfig::kSparkAnsiEnabled] = veloxCfg->get<std::string>(kAnsiEnabled, "false");
+    configs[velox::core::QueryConfig::kSessionTimezone] = veloxCfg->get<std::string>(kSessionTimezone, "");
     configs[velox::core::QueryConfig::kAdjustTimestampToTimezone] = "true";
 
-    auto offHeapMemory =
-        veloxCfg->get<int64_t>(kSparkTaskOffHeapMemory, facebook::velox::memory::kMaxMemory);
+    auto offHeapMemory = veloxCfg->get<int64_t>(kSparkTaskOffHeapMemory, facebook::velox::memory::kMaxMemory);
     auto maxPartialAggregationMemory = std::max<int64_t>(
         1 << 24,
         veloxCfg->get<int64_t>(kMaxPartialAggregationMemory).has_value()
             ? veloxCfg->get<int64_t>(kMaxPartialAggregationMemory).value()
-            : static_cast<int64_t>(
-                  veloxCfg->get<double>(kMaxPartialAggregationMemoryRatio, 0.1) * offHeapMemory));
+            : static_cast<int64_t>(veloxCfg->get<double>(kMaxPartialAggregationMemoryRatio, 0.1) * offHeapMemory));
     auto maxExtendedPartialAggregationMemory = std::max<int64_t>(
         1 << 26,
         veloxCfg->get<int64_t>(kMaxExtendedPartialAggregationMemory).has_value()
             ? veloxCfg->get<int64_t>(kMaxExtendedPartialAggregationMemory).value()
             : static_cast<int64_t>(
                   veloxCfg->get<double>(kMaxExtendedPartialAggregationMemoryRatio, 0.15) * offHeapMemory));
-    configs[velox::core::QueryConfig::kMaxPartialAggregationMemory] =
-        std::to_string(maxPartialAggregationMemory);
+    configs[velox::core::QueryConfig::kMaxPartialAggregationMemory] = std::to_string(maxPartialAggregationMemory);
     configs[velox::core::QueryConfig::kMaxExtendedPartialAggregationMemory] =
         std::to_string(maxExtendedPartialAggregationMemory);
     configs[velox::core::QueryConfig::kAbandonPartialAggregationMinPct] =
@@ -347,20 +334,16 @@ std::unordered_map<std::string, std::string> buildFluxQueryConfig(
     configs[velox::core::QueryConfig::kAbandonPartialAggregationMinRows] =
         std::to_string(veloxCfg->get<int32_t>(kAbandonPartialAggregationMinRows, 100000));
 
-    const auto spillStrategy =
-        veloxCfg->get<std::string>(kSpillStrategy, kSpillStrategyDefaultValue);
-    configs[velox::core::QueryConfig::kSpillEnabled] =
-        spillStrategy == "none" ? "false" : "true";
+    const auto spillStrategy = veloxCfg->get<std::string>(kSpillStrategy, kSpillStrategyDefaultValue);
+    configs[velox::core::QueryConfig::kSpillEnabled] = spillStrategy == "none" ? "false" : "true";
     configs[velox::core::QueryConfig::kAggregationSpillEnabled] =
         std::to_string(veloxCfg->get<bool>(kAggregationSpillEnabled, true));
-    configs[velox::core::QueryConfig::kJoinSpillEnabled] =
-        std::to_string(veloxCfg->get<bool>(kJoinSpillEnabled, true));
+    configs[velox::core::QueryConfig::kJoinSpillEnabled] = std::to_string(veloxCfg->get<bool>(kJoinSpillEnabled, true));
     configs[velox::core::QueryConfig::kOrderBySpillEnabled] =
         std::to_string(veloxCfg->get<bool>(kOrderBySpillEnabled, true));
     configs[velox::core::QueryConfig::kWindowSpillEnabled] =
         std::to_string(veloxCfg->get<bool>(kWindowSpillEnabled, true));
-    configs[velox::core::QueryConfig::kMaxSpillLevel] =
-        std::to_string(veloxCfg->get<int32_t>(kMaxSpillLevel, 4));
+    configs[velox::core::QueryConfig::kMaxSpillLevel] = std::to_string(veloxCfg->get<int32_t>(kMaxSpillLevel, 4));
     configs[velox::core::QueryConfig::kMaxSpillFileSize] =
         std::to_string(veloxCfg->get<uint64_t>(kMaxSpillFileSize, 1L * 1024 * 1024 * 1024));
     configs[velox::core::QueryConfig::kMaxSpillRunRows] =
@@ -381,9 +364,7 @@ std::unordered_map<std::string, std::string> buildFluxQueryConfig(
         veloxCfg->get<std::string>(kSpillPrefixSortEnabled, "false");
     if (veloxCfg->get<bool>(kSparkShuffleSpillCompress, true)) {
       configs[velox::core::QueryConfig::kSpillCompressionKind] =
-          veloxCfg->get<std::string>(
-              kSpillCompressionKind,
-              veloxCfg->get<std::string>(kCompressionKind, "lz4"));
+          veloxCfg->get<std::string>(kSpillCompressionKind, veloxCfg->get<std::string>(kCompressionKind, "lz4"));
     } else {
       configs[velox::core::QueryConfig::kSpillCompressionKind] = "none";
     }
@@ -401,8 +382,7 @@ std::unordered_map<std::string, std::string> buildFluxQueryConfig(
     configs[velox::core::QueryConfig::kMaxSplitPreloadPerDriver] =
         std::to_string(veloxCfg->get<int32_t>(kVeloxSplitPreloadPerDriver, 2));
     configs[velox::core::QueryConfig::kMaxSplitPreloadPerTask] =
-        std::to_string(veloxCfg->get<int32_t>(
-            kVeloxSplitPreloadPerTask, kVeloxSplitPreloadPerTaskDefault));
+        std::to_string(veloxCfg->get<int32_t>(kVeloxSplitPreloadPerTask, kVeloxSplitPreloadPerTaskDefault));
 
     configs[velox::core::QueryConfig::kAbandonDedupHashMapMinRows] =
         std::to_string(veloxCfg->get<int32_t>(kAbandonDedupHashMapMinRows, 100000));
@@ -422,12 +402,9 @@ std::unordered_map<std::string, std::string> buildFluxQueryConfig(
         std::to_string(veloxCfg->get<int32_t>(kExprMaxCompiledRegexes, 100));
 
 #ifdef GLUTEN_ENABLE_GPU
-    configs[velox::cudf_velox::CudfConfig::kCudfEnabled] =
-        std::to_string(veloxCfg->get<bool>(kCudfEnabled, false));
+    configs[velox::cudf_velox::CudfConfig::kCudfEnabled] = std::to_string(veloxCfg->get<bool>(kCudfEnabled, false));
     configs[velox::cudf_velox::CudfConfig::kCudfSkipOutputToVelox] =
-        std::to_string(veloxCfg->get<bool>(
-            kCudfSkipOutputToVelox,
-            kCudfSkipOutputToVeloxDefault));
+        std::to_string(veloxCfg->get<bool>(kCudfSkipOutputToVelox, kCudfSkipOutputToVeloxDefault));
     if (replicatedCartesianMaxBuildBytes > 0) {
       configs[velox::cudf_velox::CudfConfig::kCudfNestedLoopJoinMaxBuildBytes] =
           std::to_string(replicatedCartesianMaxBuildBytes);
@@ -456,12 +433,10 @@ std::unordered_map<std::string, std::string> buildFluxQueryConfig(
   // dynamic config copy so both Velox output-buffer limits use one explicit
   // value.  The previous fixed 1 GiB per fragment allowed a 72-fragment query
   // to retain far more than a single GPU's memory.
-  const auto fluxMaxOutputBufferSize = veloxCfg->get<uint64_t>(
-      kFluxMaxOutputBufferSize, kFluxMaxOutputBufferSizeDefault);
-  configs[velox::core::QueryConfig::kMaxOutputBufferSize] =
-      std::to_string(fluxMaxOutputBufferSize);
-  configs[velox::core::QueryConfig::kMaxPartitionedOutputBufferSize] =
-      std::to_string(fluxMaxOutputBufferSize);
+  const auto fluxMaxOutputBufferSize =
+      veloxCfg->get<uint64_t>(kFluxMaxOutputBufferSize, kFluxMaxOutputBufferSizeDefault);
+  configs[velox::core::QueryConfig::kMaxOutputBufferSize] = std::to_string(fluxMaxOutputBufferSize);
+  configs[velox::core::QueryConfig::kMaxPartitionedOutputBufferSize] = std::to_string(fluxMaxOutputBufferSize);
   return configs;
 }
 
@@ -471,11 +446,8 @@ std::unordered_map<std::string, std::string> buildFluxQueryConfig(
 
 /// Find a TableScanNode by plan node ID and return its connector ID.
 /// Returns empty string if not found.
-std::string getTableScanConnectorId(
-    const velox::core::PlanNodePtr& plan,
-    const velox::core::PlanNodeId& nodeId) {
-  if (auto tableScan =
-          std::dynamic_pointer_cast<const velox::core::TableScanNode>(plan)) {
+std::string getTableScanConnectorId(const velox::core::PlanNodePtr& plan, const velox::core::PlanNodeId& nodeId) {
+  if (auto tableScan = std::dynamic_pointer_cast<const velox::core::TableScanNode>(plan)) {
     if (tableScan->id() == nodeId && tableScan->tableHandle()) {
       return tableScan->tableHandle()->connectorId();
     }
@@ -503,10 +475,8 @@ bool isValueStreamNode(const velox::core::PlanNodePtr& node) {
   }
 #endif
   // Check for CPU ValueStream: TableScanNode with "value-stream" connector.
-  if (auto tableScan =
-          std::dynamic_pointer_cast<const velox::core::TableScanNode>(node)) {
-    if (tableScan->tableHandle() &&
-        tableScan->tableHandle()->connectorId() == kIteratorConnectorId) {
+  if (auto tableScan = std::dynamic_pointer_cast<const velox::core::TableScanNode>(node)) {
+    if (tableScan->tableHandle() && tableScan->tableHandle()->connectorId() == kIteratorConnectorId) {
       return true;
     }
   }
@@ -515,9 +485,7 @@ bool isValueStreamNode(const velox::core::PlanNodePtr& node) {
 
 /// Collect all ValueStream leaf nodes from a plan tree in depth-first order.
 /// The order matches the stream index assignment in SubstraitToVeloxPlanConverter.
-void collectValueStreamNodes(
-    const velox::core::PlanNodePtr& node,
-    std::vector<velox::core::PlanNodePtr>& result) {
+void collectValueStreamNodes(const velox::core::PlanNodePtr& node, std::vector<velox::core::PlanNodePtr>& result) {
   if (isValueStreamNode(node)) {
     result.push_back(node);
     return;
@@ -533,33 +501,23 @@ void collectValueStreamNodes(
 /// FINAL aggregation is not sufficient proof that the exchange keys equal the
 /// aggregation keys. The TPC-H Q17/Q21 problem inputs are direct (optionally
 /// Project/Filter wrapped) FINAL inputs.
-bool unaryPathToValueStream(
-    const velox::core::PlanNodePtr& node,
-    const std::string& targetNodeId) {
+bool unaryPathToValueStream(const velox::core::PlanNodePtr& node, const std::string& targetNodeId) {
   if (isValueStreamNode(node)) {
     return node->id() == targetNodeId;
   }
   if (node->sources().size() != 1) {
     return false;
   }
-  const bool allowedUnary =
-      std::dynamic_pointer_cast<const velox::core::ProjectNode>(node) != nullptr ||
+  const bool allowedUnary = std::dynamic_pointer_cast<const velox::core::ProjectNode>(node) != nullptr ||
       std::dynamic_pointer_cast<const velox::core::FilterNode>(node) != nullptr;
-  return allowedUnary &&
-      unaryPathToValueStream(node->sources().front(), targetNodeId);
+  return allowedUnary && unaryPathToValueStream(node->sources().front(), targetNodeId);
 }
 
-bool feedsKeyedFinalAggregation(
-    const velox::core::PlanNodePtr& node,
-    const std::string& targetNodeId) {
-  if (auto aggregation =
-          std::dynamic_pointer_cast<const velox::core::AggregationNode>(node)) {
-    if ((aggregation->step() ==
-             velox::core::AggregationNode::Step::kFinal ||
-         aggregation->step() ==
-             velox::core::AggregationNode::Step::kSingle) &&
-        !aggregation->groupingKeys().empty() &&
-        unaryPathToValueStream(aggregation->sources().front(), targetNodeId)) {
+bool feedsKeyedFinalAggregation(const velox::core::PlanNodePtr& node, const std::string& targetNodeId) {
+  if (auto aggregation = std::dynamic_pointer_cast<const velox::core::AggregationNode>(node)) {
+    if ((aggregation->step() == velox::core::AggregationNode::Step::kFinal ||
+         aggregation->step() == velox::core::AggregationNode::Step::kSingle) &&
+        !aggregation->groupingKeys().empty() && unaryPathToValueStream(aggregation->sources().front(), targetNodeId)) {
       return true;
     }
   }
@@ -584,72 +542,50 @@ struct RightSemiProjectMultiDriverShape {
 bool isRightSemiProjectMultiDriverSafePlan(
     const velox::core::PlanNodePtr& node,
     RightSemiProjectMultiDriverShape& shape) {
-  if (auto join =
-          std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node)) {
-    if (join->joinType() == velox::core::JoinType::kRightSemiProject &&
-        !join->isNullAware()) {
+  if (auto join = std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node)) {
+    if (join->joinType() == velox::core::JoinType::kRightSemiProject && !join->isNullAware()) {
       ++shape.rightSemiProjectCount;
     } else if (join->joinType() != velox::core::JoinType::kInner) {
       return false;
     }
-  } else if (auto aggregation =
-                 std::dynamic_pointer_cast<const velox::core::AggregationNode>(
-                     node)) {
-    if (aggregation->step() !=
-            velox::core::AggregationNode::Step::kPartial ||
-        aggregation->groupingKeys().empty()) {
+  } else if (auto aggregation = std::dynamic_pointer_cast<const velox::core::AggregationNode>(node)) {
+    if (aggregation->step() != velox::core::AggregationNode::Step::kPartial || aggregation->groupingKeys().empty()) {
       return false;
     }
     ++shape.partialAggregationCount;
   } else if (
-      std::dynamic_pointer_cast<const velox::core::ProjectNode>(node) ==
-          nullptr &&
-      std::dynamic_pointer_cast<const velox::core::FilterNode>(node) ==
-          nullptr &&
-      std::dynamic_pointer_cast<const velox::core::ExchangeNode>(node) ==
-          nullptr &&
-      std::dynamic_pointer_cast<const velox::core::TableScanNode>(node) ==
-          nullptr) {
+      std::dynamic_pointer_cast<const velox::core::ProjectNode>(node) == nullptr &&
+      std::dynamic_pointer_cast<const velox::core::FilterNode>(node) == nullptr &&
+      std::dynamic_pointer_cast<const velox::core::ExchangeNode>(node) == nullptr &&
+      std::dynamic_pointer_cast<const velox::core::TableScanNode>(node) == nullptr) {
     return false;
   }
 
-  return std::all_of(
-      node->sources().begin(),
-      node->sources().end(),
-      [&](const auto& source) {
-        return isRightSemiProjectMultiDriverSafePlan(source, shape);
-      });
+  return std::all_of(node->sources().begin(), node->sources().end(), [&](const auto& source) {
+    return isRightSemiProjectMultiDriverSafePlan(source, shape);
+  });
 }
 
-velox::core::PlanNodePtr stripProjectAndFilter(
-    velox::core::PlanNodePtr node) {
-  while (
-      node->sources().size() == 1 &&
-      (std::dynamic_pointer_cast<const velox::core::ProjectNode>(node) !=
-           nullptr ||
-       std::dynamic_pointer_cast<const velox::core::FilterNode>(node) !=
-           nullptr)) {
+velox::core::PlanNodePtr stripProjectAndFilter(velox::core::PlanNodePtr node) {
+  while (node->sources().size() == 1 &&
+         (std::dynamic_pointer_cast<const velox::core::ProjectNode>(node) != nullptr ||
+          std::dynamic_pointer_cast<const velox::core::FilterNode>(node) != nullptr)) {
     node = node->sources().front();
   }
   return node;
 }
 
-bool hasNestedRightSemiProjectPartialShape(
-    const velox::core::PlanNodePtr& root) {
+bool hasNestedRightSemiProjectPartialShape(const velox::core::PlanNodePtr& root) {
   auto node = stripProjectAndFilter(root);
-  auto aggregation =
-      std::dynamic_pointer_cast<const velox::core::AggregationNode>(node);
-  if (aggregation == nullptr ||
-      aggregation->step() != velox::core::AggregationNode::Step::kPartial ||
+  auto aggregation = std::dynamic_pointer_cast<const velox::core::AggregationNode>(node);
+  if (aggregation == nullptr || aggregation->step() != velox::core::AggregationNode::Step::kPartial ||
       aggregation->groupingKeys().empty()) {
     return false;
   }
 
   node = stripProjectAndFilter(aggregation->sources().front());
   auto outer = std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node);
-  if (outer == nullptr ||
-      outer->joinType() != velox::core::JoinType::kRightSemiProject ||
-      outer->isNullAware()) {
+  if (outer == nullptr || outer->joinType() != velox::core::JoinType::kRightSemiProject || outer->isNullAware()) {
     return false;
   }
 
@@ -658,64 +594,44 @@ bool hasNestedRightSemiProjectPartialShape(
   // joins must not accidentally enable this capability.
   node = stripProjectAndFilter(outer->sources().at(1));
   auto inner = std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node);
-  return inner != nullptr &&
-      inner->joinType() == velox::core::JoinType::kRightSemiProject &&
-      !inner->isNullAware();
+  return inner != nullptr && inner->joinType() == velox::core::JoinType::kRightSemiProject && !inner->isNullAware();
 }
 
-bool isRightSemiProjectMultiDriverSafePlan(
-    const velox::core::PlanNodePtr& node) {
+bool isRightSemiProjectMultiDriverSafePlan(const velox::core::PlanNodePtr& node) {
   RightSemiProjectMultiDriverShape shape;
-  return isRightSemiProjectMultiDriverSafePlan(node, shape) &&
-      shape.rightSemiProjectCount == 2 &&
-      shape.partialAggregationCount == 1 &&
-      hasNestedRightSemiProjectPartialShape(node);
+  return isRightSemiProjectMultiDriverSafePlan(node, shape) && shape.rightSemiProjectCount == 2 &&
+      shape.partialAggregationCount == 1 && hasNestedRightSemiProjectPartialShape(node);
 }
 
-bool isInnerJoinMultiDriverSafePlan(
-    const velox::core::PlanNodePtr& node,
-    int32_t& innerJoinCount) {
-  if (auto join =
-          std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node)) {
-    if (join->joinType() != velox::core::JoinType::kInner ||
-        join->isNullAware()) {
+bool isInnerJoinMultiDriverSafePlan(const velox::core::PlanNodePtr& node, int32_t& innerJoinCount) {
+  if (auto join = std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node)) {
+    if (join->joinType() != velox::core::JoinType::kInner || join->isNullAware()) {
       return false;
     }
     ++innerJoinCount;
   } else if (
-      std::dynamic_pointer_cast<const velox::core::ProjectNode>(node) ==
-          nullptr &&
-      std::dynamic_pointer_cast<const velox::core::FilterNode>(node) ==
-          nullptr &&
-      std::dynamic_pointer_cast<const velox::core::ExchangeNode>(node) ==
-          nullptr) {
+      std::dynamic_pointer_cast<const velox::core::ProjectNode>(node) == nullptr &&
+      std::dynamic_pointer_cast<const velox::core::FilterNode>(node) == nullptr &&
+      std::dynamic_pointer_cast<const velox::core::ExchangeNode>(node) == nullptr) {
     return false;
   }
-  return std::all_of(
-      node->sources().begin(),
-      node->sources().end(),
-      [&](const auto& source) {
-        return isInnerJoinMultiDriverSafePlan(source, innerJoinCount);
-      });
+  return std::all_of(node->sources().begin(), node->sources().end(), [&](const auto& source) {
+    return isInnerJoinMultiDriverSafePlan(source, innerJoinCount);
+  });
 }
 
-bool isInnerJoinMultiDriverSafePlan(
-    const velox::core::PlanNodePtr& node) {
+bool isInnerJoinMultiDriverSafePlan(const velox::core::PlanNodePtr& node) {
   int32_t innerJoinCount = 0;
-  return isInnerJoinMultiDriverSafePlan(node, innerJoinCount) &&
-      innerJoinCount > 0;
+  return isInnerJoinMultiDriverSafePlan(node, innerJoinCount) && innerJoinCount > 0;
 }
 
-bool hasValidHashKeys(
-    const std::vector<int32_t>& keyIndices,
-    const velox::RowTypePtr& wireType) {
+bool hasValidHashKeys(const std::vector<int32_t>& keyIndices, const velox::RowTypePtr& wireType) {
   if (wireType == nullptr || keyIndices.empty()) {
     return false;
   }
-  return std::all_of(
-      keyIndices.begin(), keyIndices.end(), [&](const auto index) {
-        return index >= 0 && index < static_cast<int32_t>(wireType->size());
-      });
+  return std::all_of(keyIndices.begin(), keyIndices.end(), [&](const auto index) {
+    return index >= 0 && index < static_cast<int32_t>(wireType->size());
+  });
 }
 
 /// Build a PartitionFunctionSpec from an exchange's partitionType + key
@@ -754,8 +670,7 @@ PartitionSpecAndExprs buildPartitionFunctionSpec(
 #endif
   }
 
-  if ((partitionType == "HASH" || partitionType == "RANGE") &&
-      !keyIndices.empty()) {
+  if ((partitionType == "HASH" || partitionType == "RANGE") && !keyIndices.empty()) {
     std::vector<velox::column_index_t> keyChannels;
     keyChannels.reserve(keyIndices.size());
     for (auto idx : keyIndices) {
@@ -768,42 +683,32 @@ PartitionSpecAndExprs buildPartitionFunctionSpec(
               idx,
               numFields);
         }
-        LOG(WARNING) << "FluxJniWrapper: fragment " << fragmentIdForLogging
-                     << " partition key index " << idx
-                     << " out of range (output has " << numFields
-                     << " fields); falling back to round-robin";
+        LOG(WARNING) << "FluxJniWrapper: fragment " << fragmentIdForLogging << " partition key index " << idx
+                     << " out of range (output has " << numFields << " fields); falling back to round-robin";
         keyChannels.clear();
         result.partitionExprs.clear();
         break;
       }
       keyChannels.push_back(static_cast<velox::column_index_t>(idx));
       result.partitionExprs.push_back(
-          std::make_shared<velox::core::FieldAccessTypedExpr>(
-              outputType->childAt(idx), outputType->nameOf(idx)));
+          std::make_shared<velox::core::FieldAccessTypedExpr>(outputType->childAt(idx), outputType->nameOf(idx)));
     }
     if (!keyChannels.empty()) {
       if (partitionType == "RANGE") {
 #ifdef GLUTEN_ENABLE_GPU
-        result.funcSpec =
-            std::make_shared<velox::ucx_exchange::RangePartitionFunctionSpec>(
-                outputType, std::move(keyChannels), rangeBoundsJson);
+        result.funcSpec = std::make_shared<velox::ucx_exchange::RangePartitionFunctionSpec>(
+            outputType, std::move(keyChannels), rangeBoundsJson);
 #endif
       } else {
-        result.funcSpec =
-            std::make_shared<velox::exec::HashPartitionFunctionSpec>(
-                outputType, std::move(keyChannels));
+        result.funcSpec = std::make_shared<velox::exec::HashPartitionFunctionSpec>(outputType, std::move(keyChannels));
       }
     }
   }
 
   if (result.funcSpec == nullptr) {
-    VELOX_CHECK_NE(
-        partitionType,
-        "RANGE",
-        "FLUX RANGE partition spec construction failed; refusing fallback");
+    VELOX_CHECK_NE(partitionType, "RANGE", "FLUX RANGE partition spec construction failed; refusing fallback");
     result.partitionExprs.clear();
-    result.funcSpec =
-        std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>();
+    result.funcSpec = std::make_shared<velox::exec::RoundRobinPartitionFunctionSpec>();
   }
 
   return result;
@@ -830,8 +735,7 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
   // Base case: this IS the target ValueStream leaf - replace it.
   if (isValueStreamNode(node) && node->id() == targetNodeId) {
     const auto& consumerType = node->outputType();
-    const auto& wireType =
-        producerWireType != nullptr ? producerWireType : consumerType;
+    const auto& wireType = producerWireType != nullptr ? producerWireType : consumerType;
     velox::core::PlanNodePtr exchange;
     if (producerPlanForMerge != nullptr) {
       // Single-task merge mode: replace ValueStream with a LocalPartitionNode
@@ -849,33 +753,29 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
       //                   actually reach here for BROADCAST.
       const std::string localId = exchangeNodeId + "_local";
       if (mergePartitionType == "SINGLE") {
-        LOG(WARNING) << "FluxJniWrapper: replacing ValueStream node '"
-                     << node->id() << "' -> LocalPartition::gather "
-                     << "(single-task merge SINGLE) consumerType="
-                     << consumerType->toString();
-        exchange = velox::core::LocalPartitionNode::gather(
-            localId, {producerPlanForMerge});
-      } else if (
-          mergePartitionType == "BROADCAST") {
+        LOG(WARNING) << "FluxJniWrapper: replacing ValueStream node '" << node->id() << "' -> LocalPartition::gather "
+                     << "(single-task merge SINGLE) consumerType=" << consumerType->toString();
+        exchange = velox::core::LocalPartitionNode::gather(localId, {producerPlanForMerge});
+      } else if (mergePartitionType == "BROADCAST") {
         // BROADCAST in single-task mode: just inline the producer plan tree
         // as-is. Velox HashJoinBridge will cross-link build and probe sides
         // of the consumer's HashJoinNode without needing a LocalPartition.
-        LOG(WARNING) << "FluxJniWrapper: replacing ValueStream node '"
-                     << node->id()
+        LOG(WARNING) << "FluxJniWrapper: replacing ValueStream node '" << node->id()
                      << "' -> producer plan (single-task merge BROADCAST, "
                         "no LocalPartition wrap)";
         exchange = producerPlanForMerge;
       } else {
         // HASH / RANGE / ROUND_ROBIN -> kRepartition + appropriate spec.
         auto specPair = buildPartitionFunctionSpec(
-            mergePartitionType, mergeKeyIndices, wireType,
-            /*fragmentIdForLogging=*/-1, mergeRangeBoundsJson);
-        LOG(WARNING) << "FluxJniWrapper: replacing ValueStream node '"
-                     << node->id() << "' -> LocalPartition::kRepartition "
+            mergePartitionType,
+            mergeKeyIndices,
+            wireType,
+            /*fragmentIdForLogging=*/-1,
+            mergeRangeBoundsJson);
+        LOG(WARNING) << "FluxJniWrapper: replacing ValueStream node '" << node->id()
+                     << "' -> LocalPartition::kRepartition "
                      << "(single-task merge " << mergePartitionType
-                     << ") spec="
-                     << (specPair.funcSpec ? specPair.funcSpec->toString()
-                                           : "null");
+                     << ") spec=" << (specPair.funcSpec ? specPair.funcSpec->toString() : "null");
         exchange = velox::core::LocalPartitionNode::Builder()
                        .id(localId)
                        .type(velox::core::LocalPartitionNode::Type::kRepartition)
@@ -885,9 +785,8 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
                        .build();
       }
     } else {
-      LOG(WARNING) << "FluxJniWrapper: replacing ValueStream node '"
-                   << node->id() << "' -> Exchange '" << exchangeNodeId
-                   << "' wireType=" << wireType->toString()
+      LOG(WARNING) << "FluxJniWrapper: replacing ValueStream node '" << node->id() << "' -> Exchange '"
+                   << exchangeNodeId << "' wireType=" << wireType->toString()
                    << " consumerType=" << consumerType->toString();
       // ExchangeNode advertises the WIRE schema (producer's outputType, may
       // include a synthetic hash_partition_key:int prefix or other Spark-
@@ -895,16 +794,10 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
       // declared the consumer's narrower type here, cuDF would silently
       // truncate columns and we'd see "Cannot change vector type" /
       // null-row corruption downstream (Q17 v9s, Q18 hang).
-      exchange = velox::core::ExchangeNode::Builder()
-                     .id(exchangeNodeId)
-                     .outputType(wireType)
-                     .serdeKind("Presto")
-                     .build();
+      exchange =
+          velox::core::ExchangeNode::Builder().id(exchangeNodeId).outputType(wireType).serdeKind("Presto").build();
       if (repartitionRemoteHashLocally) {
-        VELOX_CHECK_EQ(
-            mergePartitionType,
-            "HASH",
-            "Local repartition is only valid for remote HASH exchanges");
+        VELOX_CHECK_EQ(mergePartitionType, "HASH", "Local repartition is only valid for remote HASH exchanges");
         VELOX_CHECK(
             hasValidHashKeys(mergeKeyIndices, wireType),
             "Remote HASH exchange {} has no valid local repartition keys",
@@ -914,8 +807,7 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
             mergeKeyIndices,
             wireType,
             /*fragmentIdForLogging=*/-1);
-        LOG(WARNING) << "FluxJniWrapper: wrapping remote HASH exchange '"
-                     << exchangeNodeId
+        LOG(WARNING) << "FluxJniWrapper: wrapping remote HASH exchange '" << exchangeNodeId
                      << "' with LocalPartition::kRepartition for keyed FINAL "
                      << "spec=" << specPair.funcSpec->toString();
         exchange = velox::core::LocalPartitionNode::Builder()
@@ -954,8 +846,7 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
       if (namesEqual) {
         return exchange;
       }
-      if (producerPlanForMerge == nullptr &&
-          !repartitionRemoteHashLocally) {
+      if (producerPlanForMerge == nullptr && !repartitionRemoteHashLocally) {
         // UCX exchange payloads are positional.  When width and child types
         // already match, expose the consumer names directly on ExchangeNode
         // instead of inserting an identity Project solely to rename fields.
@@ -981,17 +872,12 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
       projectionNames.reserve(consumerType->size());
       for (size_t i = 0; i < consumerType->size(); ++i) {
         projections.push_back(
-            std::make_shared<velox::core::FieldAccessTypedExpr>(
-                wireType->childAt(i), wireType->nameOf(i)));
+            std::make_shared<velox::core::FieldAccessTypedExpr>(wireType->childAt(i), wireType->nameOf(i)));
         projectionNames.push_back(consumerType->nameOf(i));
       }
-      LOG(WARNING) << "FluxJniWrapper: renaming wire->consumer cols at "
-                   << exchangeNodeId;
+      LOG(WARNING) << "FluxJniWrapper: renaming wire->consumer cols at " << exchangeNodeId;
       return std::make_shared<velox::core::ProjectNode>(
-          exchangeNodeId + "_rename",
-          std::move(projectionNames),
-          std::move(projections),
-          std::move(exchange));
+          exchangeNodeId + "_rename", std::move(projectionNames), std::move(projections), std::move(exchange));
     }
 
     // Wire wider than consumer - the Spark-side FluxCollapseRule injected
@@ -1000,9 +886,8 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
     // and rename the remaining cols to the consumer's expected names so
     // downstream FieldAccessTypedExpr name lookups resolve.
     if (wireType->size() < consumerType->size()) {
-      LOG(WARNING) << "FluxJniWrapper: wire " << wireType->toString()
-                   << " NARROWER than consumer " << consumerType->toString()
-                   << " for " << exchangeNodeId
+      LOG(WARNING) << "FluxJniWrapper: wire " << wireType->toString() << " NARROWER than consumer "
+                   << consumerType->toString() << " for " << exchangeNodeId
                    << " -- emitting bare Exchange (downstream may fail)";
       return exchange;
     }
@@ -1014,17 +899,12 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
     for (size_t i = 0; i < consumerType->size(); ++i) {
       const auto wireIdx = i + skip;
       projections.push_back(
-          std::make_shared<velox::core::FieldAccessTypedExpr>(
-              wireType->childAt(wireIdx), wireType->nameOf(wireIdx)));
+          std::make_shared<velox::core::FieldAccessTypedExpr>(wireType->childAt(wireIdx), wireType->nameOf(wireIdx)));
       projectionNames.push_back(consumerType->nameOf(i));
     }
-    LOG(WARNING) << "FluxJniWrapper: stripping " << skip
-                 << " prefix col(s) at " << exchangeNodeId;
+    LOG(WARNING) << "FluxJniWrapper: stripping " << skip << " prefix col(s) at " << exchangeNodeId;
     return std::make_shared<velox::core::ProjectNode>(
-        exchangeNodeId + "_strip",
-        std::move(projectionNames),
-        std::move(projections),
-        std::move(exchange));
+        exchangeNodeId + "_strip", std::move(projectionNames), std::move(projections), std::move(exchange));
   }
 
   // If this is a leaf node (no children) that is NOT ValueStream, keep it.
@@ -1074,166 +954,118 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
   // union is translated to a gather LocalPartition, and single-task FLUX merge
   // inserts repartition LocalPartitions, so ValueStream replacement must be
   // able to preserve these nodes while rewriting descendants.
-  if (auto localPartitionNode =
-          std::dynamic_pointer_cast<const velox::core::LocalPartitionNode>(
-              node)) {
-    return velox::core::LocalPartitionNode::Builder(*localPartitionNode)
-        .sources(std::move(newSources))
-        .build();
+  if (auto localPartitionNode = std::dynamic_pointer_cast<const velox::core::LocalPartitionNode>(node)) {
+    return velox::core::LocalPartitionNode::Builder(*localPartitionNode).sources(std::move(newSources)).build();
   }
 
   // FilterNode
-  if (auto filterNode =
-          std::dynamic_pointer_cast<const velox::core::FilterNode>(node)) {
-    return velox::core::FilterNode::Builder(*filterNode)
-        .source(newSources[0])
-        .build();
+  if (auto filterNode = std::dynamic_pointer_cast<const velox::core::FilterNode>(node)) {
+    return velox::core::FilterNode::Builder(*filterNode).source(newSources[0]).build();
   }
 
   // ProjectNode
-  if (auto projectNode =
-          std::dynamic_pointer_cast<const velox::core::ProjectNode>(node)) {
-    return velox::core::ProjectNode::Builder(*projectNode)
-        .source(newSources[0])
-        .build();
+  if (auto projectNode = std::dynamic_pointer_cast<const velox::core::ProjectNode>(node)) {
+    auto rewritten = velox::core::ProjectNode::Builder(*projectNode).source(newSources[0]).build();
+#ifdef GLUTEN_ENABLE_GPU
+    const auto* prune = std::getenv("GLUTEN_CUDF_PRUNE_JOIN_OUTPUTS");
+    if (prune != nullptr && std::strcmp(prune, "1") == 0) {
+      auto pruned = velox::cudf_velox::pruneJoinOutputs(rewritten);
+      if (pruned.get() != rewritten.get()) {
+        velox::core::PlanNodePtr before = rewritten;
+        auto after = pruned;
+        while (std::dynamic_pointer_cast<const velox::core::ProjectNode>(before)) {
+          before = before->sources()[0];
+          after = after->sources()[0];
+        }
+        LOG(WARNING) << "CUDF_PRUNE_JOIN_OUTPUTS node=" << before->id() << " before=" << before->outputType()->size()
+                     << " after=" << after->outputType()->size() << " project=" << projectNode->id();
+      }
+      return pruned;
+    }
+#endif
+    return rewritten;
   }
 
   // AggregationNode
-  if (auto aggNode =
-          std::dynamic_pointer_cast<const velox::core::AggregationNode>(
-              node)) {
-    return velox::core::AggregationNode::Builder(*aggNode)
-        .source(newSources[0])
-        .build();
+  if (auto aggNode = std::dynamic_pointer_cast<const velox::core::AggregationNode>(node)) {
+    return velox::core::AggregationNode::Builder(*aggNode).source(newSources[0]).build();
   }
 
   // OrderByNode
-  if (auto orderByNode =
-          std::dynamic_pointer_cast<const velox::core::OrderByNode>(node)) {
-    return velox::core::OrderByNode::Builder(*orderByNode)
-        .source(newSources[0])
-        .build();
+  if (auto orderByNode = std::dynamic_pointer_cast<const velox::core::OrderByNode>(node)) {
+    return velox::core::OrderByNode::Builder(*orderByNode).source(newSources[0]).build();
   }
 
   // TopNNode
-  if (auto topNNode =
-          std::dynamic_pointer_cast<const velox::core::TopNNode>(node)) {
-    return velox::core::TopNNode::Builder(*topNNode)
-        .source(newSources[0])
-        .build();
+  if (auto topNNode = std::dynamic_pointer_cast<const velox::core::TopNNode>(node)) {
+    return velox::core::TopNNode::Builder(*topNNode).source(newSources[0]).build();
   }
 
   // LimitNode
-  if (auto limitNode =
-          std::dynamic_pointer_cast<const velox::core::LimitNode>(node)) {
-    return velox::core::LimitNode::Builder(*limitNode)
-        .source(newSources[0])
-        .build();
+  if (auto limitNode = std::dynamic_pointer_cast<const velox::core::LimitNode>(node)) {
+    return velox::core::LimitNode::Builder(*limitNode).source(newSources[0]).build();
   }
 
   // HashJoinNode (2 sources: left, right)
-  if (auto hashJoinNode =
-          std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node)) {
-    return velox::core::HashJoinNode::Builder(*hashJoinNode)
-        .left(newSources[0])
-        .right(newSources[1])
-        .build();
+  if (auto hashJoinNode = std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node)) {
+    return velox::core::HashJoinNode::Builder(*hashJoinNode).left(newSources[0]).right(newSources[1]).build();
   }
 
   // MergeJoinNode (2 sources: left, right)
-  if (auto mergeJoinNode =
-          std::dynamic_pointer_cast<const velox::core::MergeJoinNode>(node)) {
-    return velox::core::MergeJoinNode::Builder(*mergeJoinNode)
-        .left(newSources[0])
-        .right(newSources[1])
-        .build();
+  if (auto mergeJoinNode = std::dynamic_pointer_cast<const velox::core::MergeJoinNode>(node)) {
+    return velox::core::MergeJoinNode::Builder(*mergeJoinNode).left(newSources[0]).right(newSources[1]).build();
   }
 
   // NestedLoopJoinNode (2 sources: left, right)
-  if (auto nlJoinNode =
-          std::dynamic_pointer_cast<const velox::core::NestedLoopJoinNode>(
-              node)) {
-    return velox::core::NestedLoopJoinNode::Builder(*nlJoinNode)
-        .left(newSources[0])
-        .right(newSources[1])
-        .build();
+  if (auto nlJoinNode = std::dynamic_pointer_cast<const velox::core::NestedLoopJoinNode>(node)) {
+    return velox::core::NestedLoopJoinNode::Builder(*nlJoinNode).left(newSources[0]).right(newSources[1]).build();
   }
 
   // ExpandNode
-  if (auto expandNode =
-          std::dynamic_pointer_cast<const velox::core::ExpandNode>(node)) {
-    return velox::core::ExpandNode::Builder(*expandNode)
-        .source(newSources[0])
-        .build();
+  if (auto expandNode = std::dynamic_pointer_cast<const velox::core::ExpandNode>(node)) {
+    return velox::core::ExpandNode::Builder(*expandNode).source(newSources[0]).build();
   }
 
   // RowNumberNode
-  if (auto rowNumberNode =
-          std::dynamic_pointer_cast<const velox::core::RowNumberNode>(node)) {
-    return velox::core::RowNumberNode::Builder(*rowNumberNode)
-        .source(newSources[0])
-        .build();
+  if (auto rowNumberNode = std::dynamic_pointer_cast<const velox::core::RowNumberNode>(node)) {
+    return velox::core::RowNumberNode::Builder(*rowNumberNode).source(newSources[0]).build();
   }
 
   // TopNRowNumberNode
-  if (auto topNRowNumberNode =
-          std::dynamic_pointer_cast<const velox::core::TopNRowNumberNode>(
-              node)) {
-    return velox::core::TopNRowNumberNode::Builder(*topNRowNumberNode)
-        .source(newSources[0])
-        .build();
+  if (auto topNRowNumberNode = std::dynamic_pointer_cast<const velox::core::TopNRowNumberNode>(node)) {
+    return velox::core::TopNRowNumberNode::Builder(*topNRowNumberNode).source(newSources[0]).build();
   }
 
   // WindowNode
-  if (auto windowNode =
-          std::dynamic_pointer_cast<const velox::core::WindowNode>(node)) {
-    return velox::core::WindowNode::Builder(*windowNode)
-        .source(newSources[0])
-        .build();
+  if (auto windowNode = std::dynamic_pointer_cast<const velox::core::WindowNode>(node)) {
+    return velox::core::WindowNode::Builder(*windowNode).source(newSources[0]).build();
   }
 
   // MarkDistinctNode
-  if (auto markDistinctNode =
-          std::dynamic_pointer_cast<const velox::core::MarkDistinctNode>(
-              node)) {
-    return velox::core::MarkDistinctNode::Builder(*markDistinctNode)
-        .source(newSources[0])
-        .build();
+  if (auto markDistinctNode = std::dynamic_pointer_cast<const velox::core::MarkDistinctNode>(node)) {
+    return velox::core::MarkDistinctNode::Builder(*markDistinctNode).source(newSources[0]).build();
   }
 
   // EnforceSingleRowNode
-  if (auto enforceSingleRowNode =
-          std::dynamic_pointer_cast<const velox::core::EnforceSingleRowNode>(
-              node)) {
-    return velox::core::EnforceSingleRowNode::Builder(*enforceSingleRowNode)
-        .source(newSources[0])
-        .build();
+  if (auto enforceSingleRowNode = std::dynamic_pointer_cast<const velox::core::EnforceSingleRowNode>(node)) {
+    return velox::core::EnforceSingleRowNode::Builder(*enforceSingleRowNode).source(newSources[0]).build();
   }
 
   // GroupIdNode
-  if (auto groupIdNode =
-          std::dynamic_pointer_cast<const velox::core::GroupIdNode>(node)) {
-    return velox::core::GroupIdNode::Builder(*groupIdNode)
-        .source(newSources[0])
-        .build();
+  if (auto groupIdNode = std::dynamic_pointer_cast<const velox::core::GroupIdNode>(node)) {
+    return velox::core::GroupIdNode::Builder(*groupIdNode).source(newSources[0]).build();
   }
 
   // UnnestNode
-  if (auto unnestNode =
-          std::dynamic_pointer_cast<const velox::core::UnnestNode>(node)) {
-    return velox::core::UnnestNode::Builder(*unnestNode)
-        .source(newSources[0])
-        .build();
+  if (auto unnestNode = std::dynamic_pointer_cast<const velox::core::UnnestNode>(node)) {
+    return velox::core::UnnestNode::Builder(*unnestNode).source(newSources[0]).build();
   }
 
   // TableWriteNode (write-in-FLUX): the final fragment's parquet write. Rebuild with the
   // rewritten source so the write executes inside the pinned FLUX native task -- each peer
   // writes its own slice. Unary node: one source = the data to write.
-  if (auto tableWriteNode =
-          std::dynamic_pointer_cast<const velox::core::TableWriteNode>(node)) {
-    return velox::core::TableWriteNode::Builder(*tableWriteNode)
-        .source(newSources[0])
-        .build();
+  if (auto tableWriteNode = std::dynamic_pointer_cast<const velox::core::TableWriteNode>(node)) {
+    return velox::core::TableWriteNode::Builder(*tableWriteNode).source(newSources[0]).build();
   }
 
   VELOX_FAIL(
@@ -1245,14 +1077,11 @@ velox::core::PlanNodePtr replaceValueStreamWithExchange(
 }
 
 bool containsHashJoin(const velox::core::PlanNodePtr& node) {
-  if (std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node) !=
-      nullptr) {
+  if (std::dynamic_pointer_cast<const velox::core::HashJoinNode>(node) != nullptr) {
     return true;
   }
   return std::any_of(
-      node->sources().begin(),
-      node->sources().end(),
-      [&](const auto& source) { return containsHashJoin(source); });
+      node->sources().begin(), node->sources().end(), [&](const auto& source) { return containsHashJoin(source); });
 }
 
 /// Protect a keyed FINAL aggregation whose input contains a hash join with a
@@ -1262,14 +1091,10 @@ bool containsHashJoin(const velox::core::PlanNodePtr& node) {
 velox::core::PlanNodePtr insertKeyedFinalLocalRepartitionAfterJoin(
     const velox::core::PlanNodePtr& node,
     bool& inserted) {
-  if (auto aggregation =
-          std::dynamic_pointer_cast<const velox::core::AggregationNode>(node)) {
-    if ((aggregation->step() ==
-             velox::core::AggregationNode::Step::kFinal ||
-         aggregation->step() ==
-             velox::core::AggregationNode::Step::kSingle) &&
-        !aggregation->groupingKeys().empty() &&
-        containsHashJoin(aggregation->sources().front())) {
+  if (auto aggregation = std::dynamic_pointer_cast<const velox::core::AggregationNode>(node)) {
+    if ((aggregation->step() == velox::core::AggregationNode::Step::kFinal ||
+         aggregation->step() == velox::core::AggregationNode::Step::kSingle) &&
+        !aggregation->groupingKeys().empty() && containsHashJoin(aggregation->sources().front())) {
       const auto& source = aggregation->sources().front();
       const auto& sourceType = source->outputType();
       std::vector<velox::column_index_t> keyChannels;
@@ -1290,69 +1115,45 @@ velox::core::PlanNodePtr insertKeyedFinalLocalRepartitionAfterJoin(
             sourceType->toString());
         keyChannels.push_back(channel);
       }
-      auto partitionSpec =
-          std::make_shared<velox::exec::HashPartitionFunctionSpec>(
-              sourceType, std::move(keyChannels));
+      auto partitionSpec = std::make_shared<velox::exec::HashPartitionFunctionSpec>(sourceType, std::move(keyChannels));
       auto localPartition = velox::core::LocalPartitionNode::Builder()
                                 .id(aggregation->id() + "_post_join_local_hash")
-                                .type(velox::core::LocalPartitionNode::Type::
-                                          kRepartition)
+                                .type(velox::core::LocalPartitionNode::Type::kRepartition)
                                 .scaleWriter(false)
                                 .partitionFunctionSpec(partitionSpec)
                                 .sources({source})
                                 .build();
       inserted = true;
-      LOG(WARNING)
-          << "MppJniWrapper: inserting keyed FINAL local HASH repartition "
-             "after join before aggregation "
-          << aggregation->id();
-      return velox::core::AggregationNode::Builder(*aggregation)
-          .source(std::move(localPartition))
-          .build();
+      LOG(WARNING) << "MppJniWrapper: inserting keyed FINAL local HASH repartition "
+                      "after join before aggregation "
+                   << aggregation->id();
+      return velox::core::AggregationNode::Builder(*aggregation).source(std::move(localPartition)).build();
     }
   }
 
   if (node->sources().size() != 1) {
     return node;
   }
-  auto newSource =
-      insertKeyedFinalLocalRepartitionAfterJoin(node->sources().front(), inserted);
+  auto newSource = insertKeyedFinalLocalRepartitionAfterJoin(node->sources().front(), inserted);
   if (newSource.get() == node->sources().front().get()) {
     return node;
   }
-  if (auto project =
-          std::dynamic_pointer_cast<const velox::core::ProjectNode>(node)) {
-    return velox::core::ProjectNode::Builder(*project)
-        .source(std::move(newSource))
-        .build();
+  if (auto project = std::dynamic_pointer_cast<const velox::core::ProjectNode>(node)) {
+    return velox::core::ProjectNode::Builder(*project).source(std::move(newSource)).build();
   }
-  if (auto filter =
-          std::dynamic_pointer_cast<const velox::core::FilterNode>(node)) {
-    return velox::core::FilterNode::Builder(*filter)
-        .source(std::move(newSource))
-        .build();
+  if (auto filter = std::dynamic_pointer_cast<const velox::core::FilterNode>(node)) {
+    return velox::core::FilterNode::Builder(*filter).source(std::move(newSource)).build();
   }
-  if (auto topN =
-          std::dynamic_pointer_cast<const velox::core::TopNNode>(node)) {
-    return velox::core::TopNNode::Builder(*topN)
-        .source(std::move(newSource))
-        .build();
+  if (auto topN = std::dynamic_pointer_cast<const velox::core::TopNNode>(node)) {
+    return velox::core::TopNNode::Builder(*topN).source(std::move(newSource)).build();
   }
-  if (auto orderBy =
-          std::dynamic_pointer_cast<const velox::core::OrderByNode>(node)) {
-    return velox::core::OrderByNode::Builder(*orderBy)
-        .source(std::move(newSource))
-        .build();
+  if (auto orderBy = std::dynamic_pointer_cast<const velox::core::OrderByNode>(node)) {
+    return velox::core::OrderByNode::Builder(*orderBy).source(std::move(newSource)).build();
   }
-  if (auto limit =
-          std::dynamic_pointer_cast<const velox::core::LimitNode>(node)) {
-    return velox::core::LimitNode::Builder(*limit)
-        .source(std::move(newSource))
-        .build();
+  if (auto limit = std::dynamic_pointer_cast<const velox::core::LimitNode>(node)) {
+    return velox::core::LimitNode::Builder(*limit).source(std::move(newSource)).build();
   }
-  VELOX_FAIL(
-      "Unsupported unary node '{}' above keyed FINAL local repartition",
-      node->name());
+  VELOX_FAIL("Unsupported unary node '{}' above keyed FINAL local repartition", node->name());
 }
 
 /// Keep a direct-write root single-writer without forcing the whole fragment
@@ -1365,45 +1166,66 @@ velox::core::PlanNodePtr insertKeyedFinalLocalRepartitionAfterJoin(
 /// writers and non-root write shapes continue to use their existing planning
 /// rules; widening this rewrite requires preserving their writer routing
 /// semantics explicitly.
-velox::core::PlanNodePtr insertLocalGatherBeforeDirectTableWrite(
-    const velox::core::PlanNodePtr& node,
-    bool& inserted) {
-  auto tableWrite =
-      std::dynamic_pointer_cast<const velox::core::TableWriteNode>(node);
+velox::core::PlanNodePtr insertLocalGatherBeforeDirectTableWrite(const velox::core::PlanNodePtr& node, bool& inserted) {
+  auto tableWrite = std::dynamic_pointer_cast<const velox::core::TableWriteNode>(node);
   if (tableWrite == nullptr || tableWrite->hasPartitioningScheme()) {
     return node;
   }
 
   const auto parallelWriteLanes = parallelDirectWriteLanes();
   if (parallelWriteLanes > 1) {
-    LOG(WARNING)
-        << "FluxJniWrapper: keeping direct TableWrite " << tableWrite->id()
-        << " in " << parallelWriteLanes
-        << " local driver lanes; cuDF assigns a distinct filename per lane";
+    LOG(WARNING) << "FluxJniWrapper: keeping direct TableWrite " << tableWrite->id() << " in " << parallelWriteLanes
+                 << " local driver lanes; cuDF assigns a distinct filename per lane";
     return node;
   }
 
   VELOX_CHECK_EQ(tableWrite->sources().size(), 1);
   const auto& source = tableWrite->sources().front();
-  if (auto localPartition =
-          std::dynamic_pointer_cast<const velox::core::LocalPartitionNode>(
-              source);
-      localPartition != nullptr &&
-      localPartition->type() ==
-          velox::core::LocalPartitionNode::Type::kGather) {
+  if (auto localPartition = std::dynamic_pointer_cast<const velox::core::LocalPartitionNode>(source);
+      localPartition != nullptr && localPartition->type() == velox::core::LocalPartitionNode::Type::kGather) {
     return node;
   }
 
-  auto gather = velox::core::LocalPartitionNode::gather(
-      tableWrite->id() + "_direct_write_local_gather", {source});
+  auto gather = velox::core::LocalPartitionNode::gather(tableWrite->id() + "_direct_write_local_gather", {source});
   inserted = true;
-  LOG(WARNING)
-      << "FluxJniWrapper: inserting local gather before direct TableWrite "
-      << tableWrite->id()
-      << " so upstream keyed FINAL pipelines retain local driver parallelism";
-  return velox::core::TableWriteNode::Builder(*tableWrite)
-      .source(std::move(gather))
-      .build();
+  LOG(WARNING) << "FluxJniWrapper: inserting local gather before direct TableWrite " << tableWrite->id()
+               << " so upstream keyed FINAL pipelines retain local driver parallelism";
+  return velox::core::TableWriteNode::Builder(*tableWrite).source(std::move(gather)).build();
+}
+
+/// A non-partial OrderBy requires a single Velox driver. That is correct when
+/// one downstream consumer must observe one globally ordered stream, but a
+/// direct file sink has no such consumer: Spark's sortWithinPartitions
+/// contract is materialized as ordering within each output file. When the
+/// collision-free cuDF direct-write lanes are explicitly enabled, make the
+/// immediate OrderBy lane-local so every writer driver can scan, sort and
+/// write its own file independently.
+///
+/// Keep this deliberately narrow. Partitioned/bucketed writes and OrderBy
+/// nodes anywhere other than the direct TableWrite source retain their global
+/// single-driver behavior.
+velox::core::PlanNodePtr makeDirectWriteOrderByLaneLocal(const velox::core::PlanNodePtr& node, bool& rewritten) {
+  rewritten = false;
+  if (parallelDirectWriteLanes() <= 1) {
+    return node;
+  }
+
+  auto tableWrite = std::dynamic_pointer_cast<const velox::core::TableWriteNode>(node);
+  if (tableWrite == nullptr || tableWrite->hasPartitioningScheme()) {
+    return node;
+  }
+  VELOX_CHECK_EQ(tableWrite->sources().size(), 1);
+  auto orderBy = std::dynamic_pointer_cast<const velox::core::OrderByNode>(tableWrite->sources().front());
+  if (orderBy == nullptr || orderBy->isPartial()) {
+    return node;
+  }
+
+  auto laneLocalOrderBy = velox::core::OrderByNode::Builder(*orderBy).isPartial(true).build();
+  rewritten = true;
+  LOG(WARNING) << "FluxJniWrapper: making OrderBy " << orderBy->id()
+               << " lane-local before collision-free direct TableWrite " << tableWrite->id()
+               << "; each output file remains sorted";
+  return velox::core::TableWriteNode::Builder(*tableWrite).source(std::move(laneLocalOrderBy)).build();
 }
 
 bool schemaMatches(const velox::RowTypePtr& a, const velox::RowTypePtr& b) {
@@ -1452,15 +1274,13 @@ velox::core::PlanNodePtr rewriteValueStreamsForFlux(
       inboundExchanges.size(),
       numBroadcastInputs);
 
-  std::vector<size_t> exchangeForStream(
-      valueStreamNodes.size(), std::numeric_limits<size_t>::max());
+  std::vector<size_t> exchangeForStream(valueStreamNodes.size(), std::numeric_limits<size_t>::max());
   std::vector<bool> exchangeUsed(inboundExchanges.size(), false);
   for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
     if (broadcastSlotSet.count(static_cast<int32_t>(j)) > 0) {
       continue;
     }
-    auto streamType = std::dynamic_pointer_cast<const velox::RowType>(
-        valueStreamNodes[j]->outputType());
+    auto streamType = std::dynamic_pointer_cast<const velox::RowType>(valueStreamNodes[j]->outputType());
     for (size_t k = 0; k < inboundExchanges.size(); ++k) {
       if (exchangeUsed[k]) {
         continue;
@@ -1479,8 +1299,7 @@ velox::core::PlanNodePtr rewriteValueStreamsForFlux(
           n.push_back(producerWire->nameOf(kk));
           t.push_back(producerWire->childAt(kk));
         }
-        auto stripped =
-            std::make_shared<const velox::RowType>(std::move(n), std::move(t));
+        auto stripped = std::make_shared<const velox::RowType>(std::move(n), std::move(t));
         matched = schemaMatches(streamType, stripped);
       }
       if (matched) {
@@ -1507,18 +1326,15 @@ velox::core::PlanNodePtr rewriteValueStreamsForFlux(
 
   for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
     if (broadcastSlotSet.count(static_cast<int32_t>(j)) > 0) {
-      LOG(WARNING) << "FluxJniWrapper: fragment " << fragmentId << " stream["
-                   << j << "] id=" << valueStreamNodes[j]->id()
-                   << " type=" << valueStreamNodes[j]->outputType()->toString()
+      LOG(WARNING) << "FluxJniWrapper: fragment " << fragmentId << " stream[" << j
+                   << "] id=" << valueStreamNodes[j]->id() << " type=" << valueStreamNodes[j]->outputType()->toString()
                    << " -> KEEP as ValueStream (fused broadcast slot)";
       continue;
     }
     const auto k = exchangeForStream[j];
-    LOG(WARNING) << "FluxJniWrapper: fragment " << fragmentId << " stream["
-                 << j << "] id=" << valueStreamNodes[j]->id()
-                 << " type=" << valueStreamNodes[j]->outputType()->toString()
-                 << " -> exchange[" << k << "] producerF="
-                 << inboundExchanges[k]->producerFragmentId
+    LOG(WARNING) << "FluxJniWrapper: fragment " << fragmentId << " stream[" << j << "] id=" << valueStreamNodes[j]->id()
+                 << " type=" << valueStreamNodes[j]->outputType()->toString() << " -> exchange[" << k
+                 << "] producerF=" << inboundExchanges[k]->producerFragmentId
                  << " nodeId=" << inboundExchanges[k]->exchangeNodeId;
   }
 
@@ -1532,13 +1348,9 @@ velox::core::PlanNodePtr rewriteValueStreamsForFlux(
     if (it != producerWireTypes.end()) {
       producerWire = it->second;
     }
-    const bool localRepartition =
-        keyedFinalLocalDrivers > 1 &&
-        inboundExchanges[k]->partitionType == "HASH" &&
-        hasValidHashKeys(
-            inboundExchanges[k]->partitionKeyIndices, producerWire) &&
-        feedsKeyedFinalAggregation(
-            veloxPlanNode, valueStreamNodes[j]->id());
+    const bool localRepartition = keyedFinalLocalDrivers > 1 && inboundExchanges[k]->partitionType == "HASH" &&
+        hasValidHashKeys(inboundExchanges[k]->partitionKeyIndices, producerWire) &&
+        feedsKeyedFinalAggregation(veloxPlanNode, valueStreamNodes[j]->id());
     veloxPlanNode = replaceValueStreamWithExchange(
         veloxPlanNode,
         valueStreamNodes[j]->id(),
@@ -1551,8 +1363,7 @@ velox::core::PlanNodePtr rewriteValueStreamsForFlux(
         localRepartition);
   }
 
-  LOG(INFO) << "FluxJniWrapper: fragment " << fragmentId
-            << " after ValueStream->Exchange replacement: "
+  LOG(INFO) << "FluxJniWrapper: fragment " << fragmentId << " after ValueStream->Exchange replacement: "
             << veloxPlanNode->toString(/*detailed=*/true, /*recursive=*/true);
   return veloxPlanNode;
 }
@@ -1572,17 +1383,13 @@ velox::core::PlanNodePtr wrapWithFluxPartitionedOutput(
   }
 
   auto outputNodeId = fmt::format("flux_output_{}", fragmentId);
-  const std::string partitionType =
-      outboundExchange != nullptr ? outboundExchange->partitionType : std::string("ROOT");
-  const bool isBroadcastOutput =
-      outboundExchange != nullptr && partitionType == "BROADCAST";
+  const std::string partitionType = outboundExchange != nullptr ? outboundExchange->partitionType : std::string("ROOT");
+  const bool isBroadcastOutput = outboundExchange != nullptr && partitionType == "BROADCAST";
   const char* outputKindHelper =
       isBroadcastOutput ? "broadcast" : (numOutputPartitions == 1 ? "single" : "partitioned");
 
-  LOG(INFO) << "FluxJniWrapper: fragment " << fragmentId
-            << " outbound partitionType=" << partitionType
-            << " outputKindHelper=" << outputKindHelper
-            << " numOutputPartitions=" << numOutputPartitions;
+  LOG(INFO) << "FluxJniWrapper: fragment " << fragmentId << " outbound partitionType=" << partitionType
+            << " outputKindHelper=" << outputKindHelper << " numOutputPartitions=" << numOutputPartitions;
 
   if (isBroadcastOutput) {
     return velox::core::PartitionedOutputNode::broadcast(
@@ -1595,9 +1402,8 @@ velox::core::PlanNodePtr wrapWithFluxPartitionedOutput(
   }
 
   if (numOutputPartitions == 1) {
-    const auto transportType = (outboundExchange != nullptr)
-        ? std::string{velox::core::TransportKind::kUcx}
-        : std::string{velox::core::TransportKind::kInMemory};
+    const auto transportType = (outboundExchange != nullptr) ? std::string{velox::core::TransportKind::kUcx}
+                                                             : std::string{velox::core::TransportKind::kInMemory};
     return velox::core::PartitionedOutputNode::single(
         outputNodeId,
         veloxPlanNode->outputType(),
@@ -1606,24 +1412,19 @@ velox::core::PlanNodePtr wrapWithFluxPartitionedOutput(
         veloxPlanNode);
   }
 
-  const auto& keyIndices =
-      outboundExchange != nullptr ? outboundExchange->partitionKeyIndices : std::vector<int32_t>{};
+  const auto& keyIndices = outboundExchange != nullptr ? outboundExchange->partitionKeyIndices : std::vector<int32_t>{};
   const auto& outputType = veloxPlanNode->outputType();
   auto specPair = buildPartitionFunctionSpec(
       partitionType,
       keyIndices,
       outputType,
       fragmentId,
-      outboundExchange != nullptr ? outboundExchange->rangeBoundsJson
-                                  : std::string{});
+      outboundExchange != nullptr ? outboundExchange->rangeBoundsJson : std::string{});
 
-  LOG(WARNING) << "FluxJniWrapper: fragment " << fragmentId
-               << " outbound exchange type=" << partitionType
+  LOG(WARNING) << "FluxJniWrapper: fragment " << fragmentId << " outbound exchange type=" << partitionType
                << " keyIndices.size=" << keyIndices.size()
-               << " func="
-               << (specPair.funcSpec ? specPair.funcSpec->toString() : "null")
-               << " usingRoundRobinFallback="
-               << (partitionType == "HASH" && keyIndices.empty() ? "YES" : "no");
+               << " func=" << (specPair.funcSpec ? specPair.funcSpec->toString() : "null")
+               << " usingRoundRobinFallback=" << (partitionType == "HASH" && keyIndices.empty() ? "YES" : "no");
 
   return std::make_shared<velox::core::PartitionedOutputNode>(
       outputNodeId,
@@ -1646,29 +1447,21 @@ struct FluxPeerSpec {
   std::vector<FluxPeerEndpoint> producerEndpoints;
 };
 
-std::vector<FluxPeerEndpoint> parsePeerEndpointArray(
-    const folly::dynamic& endpoints) {
+std::vector<FluxPeerEndpoint> parsePeerEndpointArray(const folly::dynamic& endpoints) {
   VELOX_CHECK(endpoints.isArray(), "FLUX peer endpoints must be a JSON array");
   std::vector<FluxPeerEndpoint> parsed;
   parsed.reserve(endpoints.size());
   int32_t fallbackPeerIndex = 0;
   for (const auto& item : endpoints) {
     VELOX_CHECK(item.isObject(), "FLUX peer endpoint must be an object");
-    VELOX_CHECK(
-        item.count("peerId") > 0,
-        "FLUX peer endpoint is missing required peerId");
-    VELOX_CHECK(
-        item.count("host") > 0,
-        "FLUX peer endpoint is missing required host");
+    VELOX_CHECK(item.count("peerId") > 0, "FLUX peer endpoint is missing required peerId");
+    VELOX_CHECK(item.count("host") > 0, "FLUX peer endpoint is missing required host");
     FluxPeerEndpoint endpoint;
     endpoint.peerId = item["peerId"].asString();
     endpoint.host = item["host"].asString();
-    endpoint.port = item.count("port") > 0
-        ? static_cast<int32_t>(item["port"].asInt())
-        : -1;
-    endpoint.peerIndex = item.count("peerIndex") > 0
-        ? static_cast<int32_t>(item["peerIndex"].asInt())
-        : fallbackPeerIndex;
+    endpoint.port = item.count("port") > 0 ? static_cast<int32_t>(item["port"].asInt()) : -1;
+    endpoint.peerIndex =
+        item.count("peerIndex") > 0 ? static_cast<int32_t>(item["peerIndex"].asInt()) : fallbackPeerIndex;
     parsed.push_back(std::move(endpoint));
     ++fallbackPeerIndex;
   }
@@ -1712,9 +1505,7 @@ FluxPeerSpec parseFluxPeerSpec(const uint8_t* data, int32_t size) {
 ///   },
 ///   ...
 /// ]
-std::vector<FluxExchangeSpec> parseExchangeSpecs(
-    const uint8_t* data,
-    int32_t size) {
+std::vector<FluxExchangeSpec> parseExchangeSpecs(const uint8_t* data, int32_t size) {
   std::string jsonStr(reinterpret_cast<const char*>(data), size);
   auto parsed = folly::parseJson(jsonStr);
   VELOX_CHECK(parsed.isArray(), "exchangeSpecsJson must be a JSON array");
@@ -1728,42 +1519,30 @@ std::vector<FluxExchangeSpec> parseExchangeSpecs(
     spec.producerFragmentId = item["producerFragmentId"].asInt();
     spec.consumerFragmentId = item["consumerFragmentId"].asInt();
     spec.exchangeNodeId = item["exchangeNodeId"].asString();
-    spec.numPartitions =
-        item.count("numPartitions") ? item["numPartitions"].asInt() : 1;
-    spec.partitionType =
-        item.count("exchangeType") ? item["exchangeType"].asString() : "ROUND_ROBIN";
-    if (item.count("partitionKeyIndices") &&
-        item["partitionKeyIndices"].isArray()) {
+    spec.numPartitions = item.count("numPartitions") ? item["numPartitions"].asInt() : 1;
+    spec.partitionType = item.count("exchangeType") ? item["exchangeType"].asString() : "ROUND_ROBIN";
+    if (item.count("partitionKeyIndices") && item["partitionKeyIndices"].isArray()) {
       for (const auto& key : item["partitionKeyIndices"]) {
-        spec.partitionKeyIndices.push_back(
-            static_cast<int32_t>(key.asInt()));
+        spec.partitionKeyIndices.push_back(static_cast<int32_t>(key.asInt()));
       }
     }
     if (item.count("rangeBoundsJson")) {
       spec.rangeBoundsJson = item["rangeBoundsJson"].asString();
     }
     if (item.count("rangeEffectivePartitions")) {
-      spec.rangeEffectivePartitions =
-          static_cast<int32_t>(item["rangeEffectivePartitions"].asInt());
+      spec.rangeEffectivePartitions = static_cast<int32_t>(item["rangeEffectivePartitions"].asInt());
     }
     if (spec.partitionType == "RANGE") {
-      VELOX_CHECK(
-          !spec.rangeBoundsJson.empty(),
-          "FLUX RANGE exchange {} is missing Spark boundaries",
-          spec.id);
+      VELOX_CHECK(!spec.rangeBoundsJson.empty(), "FLUX RANGE exchange {} is missing Spark boundaries", spec.id);
       VELOX_CHECK_GT(
-          spec.rangeEffectivePartitions,
-          0,
-          "FLUX RANGE exchange {} has invalid effective partition count",
-          spec.id);
+          spec.rangeEffectivePartitions, 0, "FLUX RANGE exchange {} has invalid effective partition count", spec.id);
       VELOX_CHECK_LE(
           spec.rangeEffectivePartitions,
           spec.numPartitions,
           "FLUX RANGE exchange {} effective partitions exceed requested",
           spec.id);
     }
-    if (item.count("producerEndpoints") &&
-        item["producerEndpoints"].isArray()) {
+    if (item.count("producerEndpoints") && item["producerEndpoints"].isArray()) {
       spec.producerEndpoints = parsePeerEndpointArray(item["producerEndpoints"]);
     }
     specs.push_back(std::move(spec));
@@ -1781,8 +1560,7 @@ extern "C" {
 // nativeCreateFluxQuery
 // ---------------------------------------------------------------------------
 
-JNIEXPORT jlong JNICALL
-Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // NOLINT
+JNIEXPORT jlong JNICALL Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // NOLINT
     JNIEnv* env,
     jobject wrapper,
     jobjectArray substraitPlansArr,
@@ -1800,9 +1578,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
   auto ctx = getRuntime(env, wrapper);
   auto runtime = dynamic_cast<VeloxRuntime*>(ctx);
   GLUTEN_CHECK(runtime != nullptr, "FluxQuery requires VeloxRuntime");
-  GLUTEN_CHECK(
-      replicatedCartesianMaxBuildBytes >= 0,
-      "replicated Cartesian max build bytes must be non-negative");
+  GLUTEN_CHECK(replicatedCartesianMaxBuildBytes >= 0, "replicated Cartesian max build bytes must be non-negative");
   const auto spillRootPath = jStringToCString(env, spillRootPathJstr);
 
   // --- Parse inputs ---
@@ -1818,15 +1594,12 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
   // Parse exchange specs JSON.
   auto safeExchangeJson = getByteArrayElementsSafe(env, exchangeSpecsJsonArr);
   auto exchangeSpecs = parseExchangeSpecs(
-      reinterpret_cast<const uint8_t*>(safeExchangeJson.elems()),
-      env->GetArrayLength(exchangeSpecsJsonArr));
+      reinterpret_cast<const uint8_t*>(safeExchangeJson.elems()), env->GetArrayLength(exchangeSpecsJsonArr));
   FluxPeerSpec peerSpec;
-  if (fluxPeerSpecJsonArr != nullptr &&
-      env->GetArrayLength(fluxPeerSpecJsonArr) > 0) {
+  if (fluxPeerSpecJsonArr != nullptr && env->GetArrayLength(fluxPeerSpecJsonArr) > 0) {
     auto safePeerSpecJson = getByteArrayElementsSafe(env, fluxPeerSpecJsonArr);
     peerSpec = parseFluxPeerSpec(
-        reinterpret_cast<const uint8_t*>(safePeerSpecJson.elems()),
-        env->GetArrayLength(fluxPeerSpecJsonArr));
+        reinterpret_cast<const uint8_t*>(safePeerSpecJson.elems()), env->GetArrayLength(fluxPeerSpecJsonArr));
   }
   if (!peerSpec.producerEndpoints.empty()) {
     for (auto& exchange : exchangeSpecs) {
@@ -1886,21 +1659,16 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
   for (const auto& [key, val] : runtime->getConfMap()) {
     preLoopMergedMap[key] = val;
   }
-  auto preLoopSessionCfg =
-      std::make_shared<velox::config::ConfigBase>(std::move(preLoopMergedMap));
-  const bool singleTaskModeRequested = preLoopSessionCfg->get<bool>(
-      kFluxSingleTaskMode, kFluxSingleTaskModeDefault);
+  auto preLoopSessionCfg = std::make_shared<velox::config::ConfigBase>(std::move(preLoopMergedMap));
+  const bool singleTaskModeRequested = preLoopSessionCfg->get<bool>(kFluxSingleTaskMode, kFluxSingleTaskModeDefault);
 #ifdef GLUTEN_ENABLE_GPU
-  const bool keepDeviceRootOutput = preLoopSessionCfg->get<bool>(
-      kCudfSkipOutputToVelox, kCudfSkipOutputToVeloxDefault);
+  const bool keepDeviceRootOutput = preLoopSessionCfg->get<bool>(kCudfSkipOutputToVelox, kCudfSkipOutputToVeloxDefault);
 #else
   const bool keepDeviceRootOutput = false;
 #endif
-  const int32_t keyedFinalLocalDrivers =
-      resolveKeyedFinalLocalDrivers(preLoopSessionCfg);
-  const bool keyedFinalDestinationLanes = preLoopSessionCfg->get<bool>(
-      kFluxKeyedFinalDestinationLanes,
-      kFluxKeyedFinalDestinationLanesDefault);
+  const int32_t keyedFinalLocalDrivers = resolveKeyedFinalLocalDrivers(preLoopSessionCfg);
+  const bool keyedFinalDestinationLanes =
+      preLoopSessionCfg->get<bool>(kFluxKeyedFinalDestinationLanes, kFluxKeyedFinalDestinationLanesDefault);
   bool singleTaskMode = singleTaskModeRequested;
   if (singleTaskMode) {
     // All known partition types are supported in single-task mode:
@@ -1911,13 +1679,11 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
     //   BROADCAST    -> producer plan inlined as-is (HashJoinBridge handles
     //                   the cross-pipeline access)
     // Any unknown partition type falls back to multi-task UCX path.
-    static const std::set<std::string> kSupportedPartitionTypes{
-        "SINGLE", "HASH", "RANGE", "ROUND_ROBIN", "BROADCAST"};
+    static const std::set<std::string> kSupportedPartitionTypes{"SINGLE", "HASH", "RANGE", "ROUND_ROBIN", "BROADCAST"};
     for (const auto& exch : exchangeSpecs) {
       if (kSupportedPartitionTypes.count(exch.partitionType) == 0) {
-        LOG(WARNING) << "FluxJniWrapper: singleTaskMode requested but exchange "
-                     << exch.id << " partitionType='" << exch.partitionType
-                     << "' not in supported set; falling back to multi-task";
+        LOG(WARNING) << "FluxJniWrapper: singleTaskMode requested but exchange " << exch.id << " partitionType='"
+                     << exch.partitionType << "' not in supported set; falling back to multi-task";
         singleTaskMode = false;
         break;
       }
@@ -1935,17 +1701,14 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
   // Per-fragment scan info accumulated for merged producers — these flow
   // into the surviving root fragment's scanInfos so FluxQueryCoordinator
   // injects their splits into the merged plan.
-  std::unordered_map<int, std::vector<std::shared_ptr<SplitInfo>>>
-      mergedProducerScanInfos;
-  std::unordered_map<int, std::vector<velox::core::PlanNodeId>>
-      mergedProducerScanNodeIds;
+  std::unordered_map<int, std::vector<std::shared_ptr<SplitInfo>>> mergedProducerScanInfos;
+  std::unordered_map<int, std::vector<velox::core::PlanNodeId>> mergedProducerScanNodeIds;
   int32_t singleTaskThreadPoolDriverBudget = 0;
   if (singleTaskMode) {
     for (const auto& exch : exchangeSpecs) {
       mergedProducerIds.insert(exch.producerFragmentId);
     }
-    LOG(WARNING) << "FluxJniWrapper: singleTaskMode active, "
-                 << mergedProducerIds.size()
+    LOG(WARNING) << "FluxJniWrapper: singleTaskMode active, " << mergedProducerIds.size()
                  << " producer fragment(s) will be merged into consumers";
   }
 
@@ -1959,35 +1722,26 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
   uint64_t globalPlanNodeIdAllocator = 100;
 
   for (jsize i = 0; i < numFragments; ++i) {
-    auto planByteArray =
-        static_cast<jbyteArray>(env->GetObjectArrayElement(substraitPlansArr, i));
+    auto planByteArray = static_cast<jbyteArray>(env->GetObjectArrayElement(substraitPlansArr, i));
     auto safePlanBytes = getByteArrayElementsSafe(env, planByteArray);
     auto planSize = env->GetArrayLength(planByteArray);
 
     // Parse protobuf Substrait plan.
     ::substrait::Plan substraitPlan;
     GLUTEN_CHECK(
-        parseProtobuf(
-            reinterpret_cast<const uint8_t*>(safePlanBytes.elems()),
-            planSize,
-            &substraitPlan),
+        parseProtobuf(reinterpret_cast<const uint8_t*>(safePlanBytes.elems()), planSize, &substraitPlan),
         fmt::format("Failed to parse Substrait plan for fragment {}", i));
 
     // Convert Substrait -> Velox PlanNode with backend defaults plus runtime
     // session overrides (e.g., cudf=true).
     LOG(WARNING) << "FluxJniWrapper: fragment " << i
-                << " cudf.enabled="
-                << sessionCfg->get<std::string>(
-                       "spark.gluten.sql.columnar.cudf", "NOT_SET")
-                << " cudf.enableTableScan="
-                << sessionCfg->get<std::string>(
-                       "spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan",
-                       "NOT_SET")
-                << " cudf.backend.enabled="
-                << sessionCfg->get<std::string>(
-                       "spark.gluten.sql.columnar.backend.velox.cudf.enabled",
-                       "NOT_SET")
-                << " confMap.size=" << runtime->getConfMap().size();
+                 << " cudf.enabled=" << sessionCfg->get<std::string>("spark.gluten.sql.columnar.cudf", "NOT_SET")
+                 << " cudf.enableTableScan="
+                 << sessionCfg->get<std::string>(
+                        "spark.gluten.sql.columnar.backend.velox.cudf.enableTableScan", "NOT_SET")
+                 << " cudf.backend.enabled="
+                 << sessionCfg->get<std::string>("spark.gluten.sql.columnar.backend.velox.cudf.enabled", "NOT_SET")
+                 << " confMap.size=" << runtime->getConfMap().size();
     // Count inbound exchanges + fused broadcasts for this fragment. Each
     // ReadRel(iterator:N) in the substrait plan needs a corresponding entry
     // in placeholderIters. Exchange slots stay nullptr (replaced with
@@ -2008,8 +1762,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
     std::vector<int32_t> broadcastSlotIndicesForFrag;
     jobjectArray broadcastIterForFragArr = nullptr;
     if (broadcastSlotIndicesPerFragArr != nullptr) {
-      auto slotsArrObj = static_cast<jintArray>(
-          env->GetObjectArrayElement(broadcastSlotIndicesPerFragArr, i));
+      auto slotsArrObj = static_cast<jintArray>(env->GetObjectArrayElement(broadcastSlotIndicesPerFragArr, i));
       if (slotsArrObj != nullptr) {
         auto safeSlots = getIntArrayElementsSafe(env, slotsArrObj);
         jsize n = env->GetArrayLength(slotsArrObj);
@@ -2021,12 +1774,10 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
       }
     }
     if (broadcastIteratorsPerFragArr != nullptr) {
-      broadcastIterForFragArr = static_cast<jobjectArray>(
-          env->GetObjectArrayElement(broadcastIteratorsPerFragArr, i));
+      broadcastIterForFragArr = static_cast<jobjectArray>(env->GetObjectArrayElement(broadcastIteratorsPerFragArr, i));
     }
 
-    const int32_t numBroadcastInputs =
-        static_cast<int32_t>(broadcastSlotIndicesForFrag.size());
+    const int32_t numBroadcastInputs = static_cast<int32_t>(broadcastSlotIndicesForFrag.size());
     if (broadcastIterForFragArr != nullptr) {
       jsize iterLen = env->GetArrayLength(broadcastIterForFragArr);
       GLUTEN_CHECK(
@@ -2058,8 +1809,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
         numStreamInputs,
         numExchangeInputs,
         numBroadcastInputs);
-    std::vector<std::shared_ptr<ResultIterator>> placeholderIters(
-        numStreamInputs, nullptr);
+    std::vector<std::shared_ptr<ResultIterator>> placeholderIters(numStreamInputs, nullptr);
 
     // Materialize broadcast slot iterators via the standard Gluten JNI bridge.
     // Each Iterator[ColumnarBatch] becomes a ResultIterator that, when Velox's
@@ -2077,19 +1827,12 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
               slotIdx,
               numStreamInputs));
       auto jIter = env->GetObjectArrayElement(broadcastIterForFragArr, b);
-      GLUTEN_CHECK(
-          jIter != nullptr,
-          fmt::format(
-              "Fragment {} broadcast iterator at index {} is null",
-              i,
-              b));
+      GLUTEN_CHECK(jIter != nullptr, fmt::format("Fragment {} broadcast iterator at index {} is null", i, b));
       auto wrapped = makeJniColumnarBatchIterator(env, jIter, ctx);
-      placeholderIters[slotIdx] =
-          std::make_shared<ResultIterator>(std::move(wrapped));
+      placeholderIters[slotIdx] = std::make_shared<ResultIterator>(std::move(wrapped));
       broadcastSlotSet.insert(slotIdx);
-      LOG(WARNING) << "FluxJniWrapper: fragment " << i
-                   << " fused broadcast wired at slot " << slotIdx
-                   << " (" << b + 1 << "/" << numBroadcastInputs << ")";
+      LOG(WARNING) << "FluxJniWrapper: fragment " << i << " fused broadcast wired at slot " << slotIdx << " (" << b + 1
+                   << "/" << numBroadcastInputs << ")";
       env->DeleteLocalRef(jIter);
     }
     if (broadcastIterForFragArr != nullptr) {
@@ -2108,33 +1851,25 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
     // each fragment's converter id allocator so it starts above the previous
     // fragment's high-water mark. See nextPlanNodeIdValue/setNextPlanNodeId.
     if (singleTaskMode) {
-      converter.setNextPlanNodeId(
-          static_cast<int>(globalPlanNodeIdAllocator));
+      converter.setNextPlanNodeId(static_cast<int>(globalPlanNodeIdAllocator));
     }
 
     // Parse split infos for this fragment from byte[][][] parameter.
     std::vector<::substrait::ReadRel_LocalFiles> localFiles;
     if (splitInfosPerFragArr != nullptr) {
-      auto fragSplitArr = static_cast<jobjectArray>(
-          env->GetObjectArrayElement(splitInfosPerFragArr, i));
+      auto fragSplitArr = static_cast<jobjectArray>(env->GetObjectArrayElement(splitInfosPerFragArr, i));
       if (fragSplitArr != nullptr) {
         jsize numSplits = env->GetArrayLength(fragSplitArr);
         for (jsize j = 0; j < numSplits; ++j) {
-          auto splitBytes = static_cast<jbyteArray>(
-              env->GetObjectArrayElement(fragSplitArr, j));
+          auto splitBytes = static_cast<jbyteArray>(env->GetObjectArrayElement(fragSplitArr, j));
           auto safeSplitBytes = getByteArrayElementsSafe(env, splitBytes);
           auto splitSize = env->GetArrayLength(splitBytes);
           ::substrait::ReadRel_LocalFiles localFile;
           GLUTEN_CHECK(
-              parseProtobuf(
-                  reinterpret_cast<const uint8_t*>(safeSplitBytes.elems()),
-                  splitSize,
-                  &localFile),
-              fmt::format(
-                  "Failed to parse split info for fragment {} split {}", i, j));
-          LOG(INFO) << "FluxJniWrapper: fragment " << i
-                    << " split " << j << " has "
-                    << localFile.items_size() << " file items";
+              parseProtobuf(reinterpret_cast<const uint8_t*>(safeSplitBytes.elems()), splitSize, &localFile),
+              fmt::format("Failed to parse split info for fragment {} split {}", i, j));
+          LOG(INFO) << "FluxJniWrapper: fragment " << i << " split " << j << " has " << localFile.items_size()
+                    << " file items";
           localFiles.push_back(std::move(localFile));
           env->DeleteLocalRef(splitBytes);
         }
@@ -2148,8 +1883,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
     if (singleTaskMode) {
       // Bump the global id allocator above this fragment's high-water mark
       // so the next fragment's converter doesn't reuse ids.
-      globalPlanNodeIdAllocator =
-          static_cast<uint64_t>(converter.nextPlanNodeIdValue());
+      globalPlanNodeIdAllocator = static_cast<uint64_t>(converter.nextPlanNodeIdValue());
     }
     // Capture this fragment's wire schema BEFORE plan rewriting. Consumer
     // fragments processed later look this up by exchange.producerFragmentId.
@@ -2163,24 +1897,17 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
     {
       std::vector<velox::core::PlanNodeId> streamIds; // unused for FLUX
       VeloxRuntime::getInfoAndIds(
-          converter.splitInfos(),
-          veloxPlanNode->leafPlanNodeIds(),
-          fragScanInfos,
-          fragScanNodeIds,
-          streamIds);
+          converter.splitInfos(), veloxPlanNode->leafPlanNodeIds(), fragScanInfos, fragScanNodeIds, streamIds);
       if (!fragScanNodeIds.empty()) {
-        LOG(INFO) << "FluxJniWrapper: fragment " << i
-                  << " has " << fragScanNodeIds.size() << " scan node(s)";
+        LOG(INFO) << "FluxJniWrapper: fragment " << i << " has " << fragScanNodeIds.size() << " scan node(s)";
         for (size_t si = 0; si < fragScanNodeIds.size(); ++si) {
-          LOG(INFO) << "  scan node " << fragScanNodeIds[si]
-                    << ": " << fragScanInfos[si]->paths.size() << " file(s)";
+          LOG(INFO) << "  scan node " << fragScanNodeIds[si] << ": " << fragScanInfos[si]->paths.size() << " file(s)";
         }
       }
     }
 
     LOG(INFO) << "FluxJniWrapper: fragment " << i
-              << " raw Velox plan: "
-              << veloxPlanNode->toString(/*detailed=*/true, /*recursive=*/true);
+              << " raw Velox plan: " << veloxPlanNode->toString(/*detailed=*/true, /*recursive=*/true);
 
     std::vector<const FluxExchangeSpec*> inboundExchanges;
     for (const auto& exchange : exchangeSpecs) {
@@ -2232,8 +1959,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
       // Single-task merge mode: instead of an ExchangeNode, pass the
       // producer fragment's already-converted unwrapped plan to splice it
       // in via LocalPartitionNode.
-      auto schemaMatches = [](const velox::RowTypePtr& a,
-                              const velox::RowTypePtr& b) {
+      auto schemaMatches = [](const velox::RowTypePtr& a, const velox::RowTypePtr& b) {
         if (a == nullptr || b == nullptr || a->size() != b->size()) {
           return false;
         }
@@ -2244,8 +1970,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
         }
         return true;
       };
-      std::vector<size_t> exchangeForStream(
-          valueStreamNodes.size(), std::numeric_limits<size_t>::max());
+      std::vector<size_t> exchangeForStream(valueStreamNodes.size(), std::numeric_limits<size_t>::max());
       std::vector<bool> exchangeUsed(inboundExchanges.size(), false);
       // Pass 1: greedy structural schema match against inbound exchanges.
       // Skip ValueStream slots that correspond to fused broadcasts -- those
@@ -2257,13 +1982,12 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
         if (broadcastSlotSet.count(static_cast<int32_t>(j)) > 0) {
           continue; // broadcast slot, leave alone
         }
-        auto streamType = std::dynamic_pointer_cast<const velox::RowType>(
-            valueStreamNodes[j]->outputType());
+        auto streamType = std::dynamic_pointer_cast<const velox::RowType>(valueStreamNodes[j]->outputType());
         for (size_t k = 0; k < inboundExchanges.size(); ++k) {
-          if (exchangeUsed[k]) continue;
+          if (exchangeUsed[k])
+            continue;
           velox::RowTypePtr producerWire;
-          auto it = producerWireTypes.find(
-              inboundExchanges[k]->producerFragmentId);
+          auto it = producerWireTypes.find(inboundExchanges[k]->producerFragmentId);
           if (it != producerWireTypes.end()) {
             producerWire = it->second;
           }
@@ -2276,8 +2000,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
               n.push_back(producerWire->nameOf(kk));
               t.push_back(producerWire->childAt(kk));
             }
-            auto stripped = std::make_shared<const velox::RowType>(
-                std::move(n), std::move(t));
+            auto stripped = std::make_shared<const velox::RowType>(std::move(n), std::move(t));
             matched = schemaMatches(streamType, stripped);
           }
           if (matched) {
@@ -2305,18 +2028,15 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
       }
       for (size_t j = 0; j < valueStreamNodes.size(); ++j) {
         if (broadcastSlotSet.count(static_cast<int32_t>(j)) > 0) {
-          LOG(WARNING) << "FluxJniWrapper: fragment " << i << " stream[" << j
-                       << "] id=" << valueStreamNodes[j]->id()
+          LOG(WARNING) << "FluxJniWrapper: fragment " << i << " stream[" << j << "] id=" << valueStreamNodes[j]->id()
                        << " type=" << valueStreamNodes[j]->outputType()->toString()
                        << " -> KEEP as ValueStream (fused broadcast slot)";
           continue;
         }
         const auto k = exchangeForStream[j];
-        LOG(WARNING) << "FluxJniWrapper: fragment " << i << " stream[" << j
-                     << "] id=" << valueStreamNodes[j]->id()
-                     << " type=" << valueStreamNodes[j]->outputType()->toString()
-                     << " -> exchange[" << k << "] producerF="
-                     << inboundExchanges[k]->producerFragmentId
+        LOG(WARNING) << "FluxJniWrapper: fragment " << i << " stream[" << j << "] id=" << valueStreamNodes[j]->id()
+                     << " type=" << valueStreamNodes[j]->outputType()->toString() << " -> exchange[" << k
+                     << "] producerF=" << inboundExchanges[k]->producerFragmentId
                      << " nodeId=" << inboundExchanges[k]->exchangeNodeId;
       }
       // Replace each non-broadcast ValueStream node with the matched
@@ -2328,28 +2048,21 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
         }
         const auto k = exchangeForStream[j];
         velox::RowTypePtr producerWire;
-        auto it = producerWireTypes.find(
-            inboundExchanges[k]->producerFragmentId);
+        auto it = producerWireTypes.find(inboundExchanges[k]->producerFragmentId);
         if (it != producerWireTypes.end()) {
           producerWire = it->second;
         }
-        const bool keyedFinalRemoteHash =
-            !singleTaskMode && keyedFinalLocalDrivers > 1 &&
+        const bool keyedFinalRemoteHash = !singleTaskMode && keyedFinalLocalDrivers > 1 &&
             inboundExchanges[k]->partitionType == "HASH" &&
-            hasValidHashKeys(
-                inboundExchanges[k]->partitionKeyIndices, producerWire) &&
-            feedsKeyedFinalAggregation(
-                veloxPlanNode, valueStreamNodes[j]->id());
-        const bool destinationLanes =
-            keyedFinalRemoteHash && keyedFinalDestinationLanes;
-        const bool localRepartition =
-            keyedFinalRemoteHash && !destinationLanes;
+            hasValidHashKeys(inboundExchanges[k]->partitionKeyIndices, producerWire) &&
+            feedsKeyedFinalAggregation(veloxPlanNode, valueStreamNodes[j]->id());
+        const bool destinationLanes = keyedFinalRemoteHash && keyedFinalDestinationLanes;
+        const bool localRepartition = keyedFinalRemoteHash && !destinationLanes;
         fragmentUsesKeyedFinalDestinationLanes |= destinationLanes;
         fragmentUsesKeyedFinalLocalRepartition |= localRepartition;
         velox::core::PlanNodePtr producerPlanForMerge;
         if (singleTaskMode) {
-          auto pit = unwrappedFragmentPlans.find(
-              inboundExchanges[k]->producerFragmentId);
+          auto pit = unwrappedFragmentPlans.find(inboundExchanges[k]->producerFragmentId);
           VELOX_CHECK(
               pit != unwrappedFragmentPlans.end(),
               "single-task mode: producer fragment {} plan missing for exchange {}",
@@ -2360,20 +2073,15 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
           // scanConnectorIds into this consumer's accumulator so when this
           // (root) fragment becomes the single Velox Task, FluxQueryCoordinator
           // injects the merged-in scan splits onto the right plan node.
-          auto& mInfos = mergedProducerScanInfos[
-              inboundExchanges[k]->producerFragmentId];
-          auto& mIds = mergedProducerScanNodeIds[
-              inboundExchanges[k]->producerFragmentId];
+          auto& mInfos = mergedProducerScanInfos[inboundExchanges[k]->producerFragmentId];
+          auto& mIds = mergedProducerScanNodeIds[inboundExchanges[k]->producerFragmentId];
           if (!mInfos.empty()) {
             for (size_t mi = 0; mi < mInfos.size(); ++mi) {
               fragScanInfos.push_back(mInfos[mi]);
               fragScanNodeIds.push_back(mIds[mi]);
             }
-            LOG(WARNING)
-                << "FluxJniWrapper: single-task merge folded "
-                << mInfos.size() << " scan(s) from fragment "
-                << inboundExchanges[k]->producerFragmentId
-                << " into fragment " << i;
+            LOG(WARNING) << "FluxJniWrapper: single-task merge folded " << mInfos.size() << " scan(s) from fragment "
+                         << inboundExchanges[k]->producerFragmentId << " into fragment " << i;
           }
         }
         veloxPlanNode = replaceValueStreamWithExchange(
@@ -2388,27 +2096,71 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
             localRepartition);
       }
 
-      LOG(INFO) << "FluxJniWrapper: fragment " << i
-                << " after ValueStream->Exchange replacement: "
+      LOG(INFO) << "FluxJniWrapper: fragment " << i << " after ValueStream->Exchange replacement: "
                 << veloxPlanNode->toString(
                        /*detailed=*/true, /*recursive=*/true);
     }
-    if (!singleTaskMode && keyedFinalLocalDrivers > 1 &&
-        !fragmentUsesKeyedFinalDestinationLanes) {
+    if (!singleTaskMode && keyedFinalLocalDrivers > 1 && !fragmentUsesKeyedFinalDestinationLanes) {
       bool insertedAfterJoin = false;
-      veloxPlanNode = insertKeyedFinalLocalRepartitionAfterJoin(
-          veloxPlanNode, insertedAfterJoin);
+      veloxPlanNode = insertKeyedFinalLocalRepartitionAfterJoin(veloxPlanNode, insertedAfterJoin);
       fragmentUsesKeyedFinalLocalRepartition |= insertedAfterJoin;
     }
     if (fragmentUsesKeyedFinalLocalRepartition) {
       bool insertedWriterGather = false;
-      veloxPlanNode = insertLocalGatherBeforeDirectTableWrite(
-          veloxPlanNode, insertedWriterGather);
+      veloxPlanNode = insertLocalGatherBeforeDirectTableWrite(veloxPlanNode, insertedWriterGather);
       if (insertedWriterGather) {
         LOG(WARNING) << "FluxJniWrapper: fragment " << i
                      << " decoupled keyed FINAL local lanes from its "
                         "single-writer pipeline";
       }
+    }
+    // A supplied Spark filename belongs to one writer, not one fragment.
+    // Insert an ordinary bounded Velox pipeline boundary rather than running
+    // multiple native sinks against that same path. The pure INNER-join gate
+    // excludes ordering, aggregation and partitioned-writer ownership rules.
+    bool fragmentUsesParallelJoinSingleWriter = false;
+    const auto requestedJoinDrivers = parallelJoinSingleWriterDrivers();
+    if (!singleTaskMode && requestedJoinDrivers > 1) {
+      const auto write = std::dynamic_pointer_cast<const velox::core::TableWriteNode>(veloxPlanNode);
+      if (write && !write->hasPartitioningScheme() && write->sources().size() == 1 &&
+          isInnerJoinMultiDriverSafePlan(write->sources().front())) {
+        VELOX_USER_CHECK(
+            parallelDirectWriteLanes() == 1 && !writeDestinationTasksEnabled(),
+            "Parallel join/single writer requires one direct writer lane and "
+            "GLUTEN_CUDF_WRITE_DESTINATION_TASKS=0");
+        veloxPlanNode = insertLocalGatherBeforeDirectTableWrite(veloxPlanNode, fragmentUsesParallelJoinSingleWriter);
+        VELOX_CHECK(fragmentUsesParallelJoinSingleWriter);
+        LOG(WARNING) << "FluxJniWrapper: fragment " << i << " enabling " << requestedJoinDrivers
+                     << " join drivers behind one gathered writer (max=4)";
+      }
+    }
+    bool madeDirectWriteOrderByLaneLocal = false;
+    veloxPlanNode = makeDirectWriteOrderByLaneLocal(veloxPlanNode, madeDirectWriteOrderByLaneLocal);
+    if (madeDirectWriteOrderByLaneLocal) {
+      LOG(WARNING) << "FluxJniWrapper: fragment " << i << " can retain parallel scan/sort/write driver lanes";
+    }
+    const auto requestedParallelWriteLanes = parallelDirectWriteLanes();
+    const auto directTableWrite = std::dynamic_pointer_cast<const velox::core::TableWriteNode>(veloxPlanNode);
+    const bool fragmentUsesParallelDirectWrite =
+        requestedParallelWriteLanes > 1 && directTableWrite != nullptr && !directTableWrite->hasPartitioningScheme();
+    // A HASH write root normally collapses all destinations owned by this peer
+    // into one Velox Task and lets its writer drivers consume the exchange
+    // streams opportunistically. That loses the destination identity before
+    // TableWrite coalescing: a row group can mix several hash buckets and make
+    // adaptive Parquet dictionary encoding fall back to PLAIN. The coordinator
+    // already supports one replica Task per owned destination. Opt into that
+    // existing path while retaining the same bounded writer-lane count.
+    const bool allInboundExchangesAreHash = !inboundExchanges.empty() &&
+        std::all_of(inboundExchanges.begin(), inboundExchanges.end(), [](const auto* exchange) {
+          return exchange != nullptr && exchange->partitionType == "HASH";
+        });
+    const bool fragmentUsesWriteDestinationTasks =
+        writeDestinationTasksEnabled() && fragmentUsesParallelDirectWrite && allInboundExchangesAreHash;
+    if (fragmentUsesWriteDestinationTasks) {
+      fragmentUsesKeyedFinalDestinationLanes = true;
+      LOG(WARNING) << "FluxJniWrapper: fragment " << i
+                   << " preserving HASH destination ownership through "
+                      "direct TableWrite tasks";
     }
 
     // Capture the post-rewrite, pre-wrap plan for use by downstream consumer
@@ -2425,11 +2177,8 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
     // Skip the PartitionedOutput wrap and fragmentSpecs push for fragments
     // that are getting merged into a downstream consumer. The consumer will
     // own the merged plan as a single Velox Task.
-    if (singleTaskMode &&
-        mergedProducerIds.find(static_cast<int32_t>(i)) !=
-            mergedProducerIds.end()) {
-      LOG(WARNING) << "FluxJniWrapper: fragment " << i
-                   << " is a merged producer in single-task mode, "
+    if (singleTaskMode && mergedProducerIds.find(static_cast<int32_t>(i)) != mergedProducerIds.end()) {
+      LOG(WARNING) << "FluxJniWrapper: fragment " << i << " is a merged producer in single-task mode, "
                    << "skipping PartitionedOutput wrap and spec push";
       env->DeleteLocalRef(planByteArray);
       continue;
@@ -2457,19 +2206,14 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
 
     auto outputNodeId = fmt::format("flux_output_{}", i);
     velox::core::PlanNodePtr wrappedPlan;
-    const std::string partitionType = outboundExchange != nullptr
-        ? outboundExchange->partitionType
-        : std::string("ROOT");
-    const bool isBroadcastOutput =
-        outboundExchange != nullptr && partitionType == "BROADCAST";
-    const char* outputKindHelper = isBroadcastOutput
-        ? "broadcast"
-        : (numOutputPartitions == 1 ? "single" : "partitioned");
+    const std::string partitionType =
+        outboundExchange != nullptr ? outboundExchange->partitionType : std::string("ROOT");
+    const bool isBroadcastOutput = outboundExchange != nullptr && partitionType == "BROADCAST";
+    const char* outputKindHelper =
+        isBroadcastOutput ? "broadcast" : (numOutputPartitions == 1 ? "single" : "partitioned");
 
-    LOG(INFO) << "FluxJniWrapper: fragment " << i
-              << " outbound partitionType=" << partitionType
-              << " outputKindHelper=" << outputKindHelper
-              << " numOutputPartitions=" << numOutputPartitions;
+    LOG(INFO) << "FluxJniWrapper: fragment " << i << " outbound partitionType=" << partitionType
+              << " outputKindHelper=" << outputKindHelper << " numOutputPartitions=" << numOutputPartitions;
 
     if (isBroadcastOutput) {
       // Broadcast output must be tagged as kBroadcast even when the exchange
@@ -2493,8 +2237,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
       //      so the coordinator receives CPU Presto pages. A GPU write sink
       //      opts into kUcx so the coordinator receives packed device columns
       //      and hands a CudfVector directly to the libcudf writer.
-      const auto transportType =
-          (outboundExchange != nullptr || keepDeviceRootOutput)
+      const auto transportType = (outboundExchange != nullptr || keepDeviceRootOutput)
           ? std::string{velox::core::TransportKind::kUcx}
           : std::string{velox::core::TransportKind::kInMemory};
       wrappedPlan = velox::core::PartitionedOutputNode::single(
@@ -2506,9 +2249,8 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
     } else {
       // Multi-partition output. RANGE uses a dedicated Spark-boundary PID
       // function; it is never substituted with hash or round-robin.
-      const auto& keyIndices = outboundExchange != nullptr
-          ? outboundExchange->partitionKeyIndices
-          : std::vector<int32_t>{};
+      const auto& keyIndices =
+          outboundExchange != nullptr ? outboundExchange->partitionKeyIndices : std::vector<int32_t>{};
 
       const auto& outputType = veloxPlanNode->outputType();
       auto specPair = buildPartitionFunctionSpec(
@@ -2516,25 +2258,21 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
           keyIndices,
           outputType,
           static_cast<int32_t>(i),
-          outboundExchange != nullptr ? outboundExchange->rangeBoundsJson
-                                      : std::string{});
+          outboundExchange != nullptr ? outboundExchange->rangeBoundsJson : std::string{});
 
-      LOG(WARNING) << "FluxJniWrapper: fragment " << i
-                   << " outbound exchange type=" << partitionType
-                   << " keyIndices.size=" << keyIndices.size()
-                   << " keyChannels=["
-                   << [&] {
-                        std::string s;
-                        for (size_t k = 0; k < keyIndices.size(); ++k) {
-                          if (k) s += ",";
-                          s += std::to_string(keyIndices[k]);
-                        }
-                        return s;
-                      }()
-                   << "] func="
-                   << (specPair.funcSpec ? specPair.funcSpec->toString() : "null")
-                   << " usingRoundRobinFallback="
-                   << (partitionType == "HASH" && keyIndices.empty() ? "YES" : "no");
+      LOG(WARNING) << "FluxJniWrapper: fragment " << i << " outbound exchange type=" << partitionType
+                   << " keyIndices.size=" << keyIndices.size() << " keyChannels=[" <<
+          [&] {
+            std::string s;
+            for (size_t k = 0; k < keyIndices.size(); ++k) {
+              if (k)
+                s += ",";
+              s += std::to_string(keyIndices[k]);
+            }
+            return s;
+          }()
+                   << "] func=" << (specPair.funcSpec ? specPair.funcSpec->toString() : "null")
+                   << " usingRoundRobinFallback=" << (partitionType == "HASH" && keyIndices.empty() ? "YES" : "no");
 
       // Emit a plain velox PartitionedOutputNode tagged with
       // TransportType::kUcx. IBM cudf's PartitionedOutputAdapter swaps
@@ -2556,8 +2294,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
           veloxPlanNode);
     }
 
-    LOG(INFO) << "FluxJniWrapper: fragment " << i
-              << " final plan (with PartitionedOutput): "
+    LOG(INFO) << "FluxJniWrapper: fragment " << i << " final plan (with PartitionedOutput): "
               << wrappedPlan->toString(/*detailed=*/true, /*recursive=*/true);
 
     // Build PlanFragment with ungrouped execution.
@@ -2568,37 +2305,28 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
         1, // numSplitGroups
         emptyGroupedIds};
 
-    const bool rightSemiProjectMultiDriverSafe =
-        outboundExchange != nullptr && partitionType == "HASH" &&
-        hasValidHashKeys(
-            outboundExchange->partitionKeyIndices,
-            veloxPlanNode->outputType()) &&
+    const bool rightSemiProjectMultiDriverSafe = outboundExchange != nullptr && partitionType == "HASH" &&
+        hasValidHashKeys(outboundExchange->partitionKeyIndices, veloxPlanNode->outputType()) &&
         isRightSemiProjectMultiDriverSafePlan(veloxPlanNode);
     if (rightSemiProjectMultiDriverSafe) {
       LOG(WARNING) << "FluxJniWrapper: fragment " << i
                    << " is a RIGHT_SEMI_PROJECT HASH-join shape that is "
                       "safe for intra-task multi-driver execution";
     }
-    const bool innerJoinMultiDriverSafe =
-        outboundExchange != nullptr && partitionType == "HASH" &&
-        hasValidHashKeys(
-            outboundExchange->partitionKeyIndices,
-            veloxPlanNode->outputType()) &&
+    const bool innerJoinMultiDriverSafe = outboundExchange != nullptr && partitionType == "HASH" &&
+        hasValidHashKeys(outboundExchange->partitionKeyIndices, veloxPlanNode->outputType()) &&
         isInnerJoinMultiDriverSafePlan(veloxPlanNode);
     if (innerJoinMultiDriverSafe) {
       LOG(WARNING) << "MppJniWrapper: fragment " << i
                    << " is a pure INNER HASH-join shape that is safe for "
                       "intra-task multi-driver execution";
     }
-
     FluxFragmentSpec fragSpec;
     // In single-task mode, merged producers are skipped (continue) above, so
     // fragment IDs in the surviving fragmentSpecs would be non-contiguous
     // (e.g. just {1}). FluxQueryCoordinator requires contiguous IDs starting
     // at 0, so renumber here based on the position in fragmentSpecs.
-    fragSpec.id = singleTaskMode
-        ? static_cast<int32_t>(fragmentSpecs.size())
-        : static_cast<int32_t>(i);
+    fragSpec.id = singleTaskMode ? static_cast<int32_t>(fragmentSpecs.size()) : static_cast<int32_t>(i);
     fragSpec.planFragment = std::move(planFragment);
     // numDrivers is the max-drivers parameter passed to Task::start. Velox
     // splits the plan into pipelines at LocalPartitionNode boundaries; each
@@ -2612,8 +2340,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
     if (singleTaskMode) {
       for (auto producerId : mergedProducerIds) {
         if (producerId >= 0 && producerId < numFragments) {
-          mergedNumDrivers = std::max(
-              mergedNumDrivers, safeNumDrivers.elems()[producerId]);
+          mergedNumDrivers = std::max(mergedNumDrivers, safeNumDrivers.elems()[producerId]);
         }
       }
       // Cap to IBM's GPU-friendly default (2). Without this, queries that
@@ -2622,11 +2349,10 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
       // pipeline — way more than a single GPU can usefully drive (cuDF
       // SM saturation + RMM mutex contention). Configurable via
       // kFluxSingleTaskMaxDrivers conf if user wants to override.
-      const int32_t driverCap = preLoopSessionCfg->get<int32_t>(
-          kFluxSingleTaskMaxDrivers, kFluxSingleTaskMaxDriversDefault);
+      const int32_t driverCap =
+          preLoopSessionCfg->get<int32_t>(kFluxSingleTaskMaxDrivers, kFluxSingleTaskMaxDriversDefault);
       if (mergedNumDrivers > driverCap) {
-        LOG(WARNING) << "FluxJniWrapper: capping mergedNumDrivers from "
-                     << mergedNumDrivers << " to " << driverCap
+        LOG(WARNING) << "FluxJniWrapper: capping mergedNumDrivers from " << mergedNumDrivers << " to " << driverCap
                      << " (singleTaskMaxDrivers)";
         mergedNumDrivers = driverCap;
       }
@@ -2635,32 +2361,39 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
       // driver count. Multiplying by folded pipeline count can start many
       // independent cuDF-heavy pipelines concurrently in one merged task,
       // increasing peak RMM pressure without increasing useful GPU parallelism.
-      singleTaskThreadPoolDriverBudget = std::max(
-          singleTaskThreadPoolDriverBudget,
-          std::max(1, mergedNumDrivers));
+      singleTaskThreadPoolDriverBudget = std::max(singleTaskThreadPoolDriverBudget, std::max(1, mergedNumDrivers));
     }
-    if (fragmentUsesKeyedFinalLocalRepartition ||
-        fragmentUsesKeyedFinalDestinationLanes) {
+    if (fragmentUsesKeyedFinalLocalRepartition || fragmentUsesKeyedFinalDestinationLanes) {
       // LocalPartition hashes rows across task drivers, so the fragment driver
       // count is the local lane count.  Use the bounded setting exactly; taking
       // max() with the pre-rewrite fragment budget could silently turn a
       // requested 4-lane local exchange back into (for example) 16 lanes.
       mergedNumDrivers = keyedFinalLocalDrivers;
       LOG(WARNING) << "FluxJniWrapper: fragment " << i << " enabling keyed FINAL "
-                   << (fragmentUsesKeyedFinalDestinationLanes
-                           ? "destination-owner tasks"
-                           : "local HASH repartition")
+                   << (fragmentUsesKeyedFinalDestinationLanes ? "destination-owner tasks" : "local HASH repartition")
                    << " with " << mergedNumDrivers << " lanes";
     }
+    if (fragmentUsesParallelDirectWrite) {
+      // A root, unpartitioned TableWrite has one writer instance per Velox
+      // driver.  Merely removing the local gather is not sufficient for a
+      // fragment whose planner-provided driver count is one (for example,
+      // SNAP's final write fragment).  Set the task driver budget to the
+      // requested lane count so cuDF encode/compress and S3 upload can overlap.
+      // CudfHiveDataSink gives every driver a distinct filename.
+      mergedNumDrivers = requestedParallelWriteLanes;
+      LOG(WARNING) << "FluxJniWrapper: fragment " << i << " enabling direct TableWrite with " << mergedNumDrivers
+                   << " local writer lanes";
+    }
+    if (fragmentUsesParallelJoinSingleWriter) {
+      mergedNumDrivers = requestedJoinDrivers;
+    }
     fragSpec.numDrivers = mergedNumDrivers;
-    fragSpec.keyedFinalLocalRepartition =
-        fragmentUsesKeyedFinalLocalRepartition;
-    fragSpec.keyedFinalDestinationLanes =
-        fragmentUsesKeyedFinalDestinationLanes;
-    fragSpec.rightSemiProjectMultiDriverSafe =
-        rightSemiProjectMultiDriverSafe;
-    fragSpec.innerJoinMultiDriverSafe =
-        innerJoinMultiDriverSafe;
+    fragSpec.keyedFinalLocalRepartition = fragmentUsesKeyedFinalLocalRepartition;
+    fragSpec.keyedFinalDestinationLanes = fragmentUsesKeyedFinalDestinationLanes;
+    fragSpec.parallelDirectWrite = fragmentUsesParallelDirectWrite;
+    fragSpec.parallelJoinSingleWriter = fragmentUsesParallelJoinSingleWriter;
+    fragSpec.rightSemiProjectMultiDriverSafe = rightSemiProjectMultiDriverSafe;
+    fragSpec.innerJoinMultiDriverSafe = innerJoinMultiDriverSafe;
     fragSpec.scanInfos = std::move(fragScanInfos);
     fragSpec.scanNodeIds = std::move(fragScanNodeIds);
     // Determine connector IDs for scan nodes from the converted Velox plan.
@@ -2668,9 +2401,8 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
     // cuDF eligibility is decided during Substrait -> Velox conversion.
     for (const auto& scanNodeId : fragSpec.scanNodeIds) {
       auto connectorId = getTableScanConnectorId(veloxPlanNode, scanNodeId);
-      LOG(WARNING) << "FluxJniWrapper: fragment " << i
-                   << " scan node " << scanNodeId
-                   << " connector: '" << connectorId << "'";
+      LOG(WARNING) << "FluxJniWrapper: fragment " << i << " scan node " << scanNodeId << " connector: '" << connectorId
+                   << "'";
       fragSpec.scanConnectorIds.push_back(std::move(connectorId));
     }
 
@@ -2689,37 +2421,74 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
   // FluxQueryCoordinator::start() so the pool is sized for the *physical*
   // driver count the coordinator will actually spawn.
   std::vector<int32_t> replicaCount(fragmentSpecs.size(), 1);
+  std::vector<std::string> inboundPartitionType(fragmentSpecs.size());
+  std::vector<int32_t> inboundPartitionCount(fragmentSpecs.size(), 1);
   for (const auto& exchange : exchangeSpecs) {
+    if (exchange.partitionType == "BROADCAST") {
+      continue;
+    }
     const auto consumer = exchange.consumerFragmentId;
     const auto n = std::max(1, exchange.numPartitions);
-    if (replicaCount[consumer] == 1) {
-      replicaCount[consumer] = n;
+    if (inboundPartitionType[consumer].empty()) {
+      inboundPartitionType[consumer] = exchange.partitionType;
+      inboundPartitionCount[consumer] = n;
     }
     // Consistency check deferred to coordinator (VELOX_CHECK_EQ there).
+  }
+  const bool hasWeightedPeerOwnership = std::getenv("GLUTEN_FLUX_PEER_WEIGHTS") != nullptr;
+  for (size_t i = 0; i < fragmentSpecs.size(); ++i) {
+    const auto& partitionType = inboundPartitionType[i];
+    const auto logicalDestinations = inboundPartitionCount[i];
+    if (partitionType == "RANGE") {
+      replicaCount[i] = logicalDestinations;
+    } else if (partitionType == "HASH") {
+      replicaCount[i] = fragmentSpecs[i].keyedFinalDestinationLanes
+          ? logicalDestinations
+          : std::min(logicalDestinations, std::max(1, fragmentSpecs[i].numDrivers));
+    }
+
+    // FluxQueryCoordinator stripes HASH/RANGE destinations across peers
+    // before creating Tasks.  The old sizing used the global destination
+    // count here (64 for FINRA), even though this executor owns only 16, and
+    // consequently created 136--144 CPU threads per GPU.  Mirror the uniform
+    // ownership rule so the execution pool is sized for local physical
+    // drivers.  Keep the conservative global bound for explicitly weighted
+    // ownership; the coordinator is the single source of truth for that less
+    // common path.
+    if (!hasWeightedPeerOwnership && peerSpec.peerCount > 1 && replicaCount[i] > 1 &&
+        (partitionType == "HASH" || partitionType == "RANGE")) {
+      int32_t ownedDestinations = 0;
+      for (int32_t destination = 0; destination < logicalDestinations; ++destination) {
+        const auto owner = std::min(
+            peerSpec.peerCount - 1,
+            static_cast<int32_t>(
+                (static_cast<int64_t>(2 * destination + 1) * peerSpec.peerCount) / (2 * logicalDestinations)));
+        ownedDestinations += owner == peerSpec.peerIndex ? 1 : 0;
+      }
+      replicaCount[i] = std::min(replicaCount[i], ownedDestinations);
+    }
+    if (!fragmentSpecs[i].scanInfos.empty()) {
+      replicaCount[i] = 1;
+    }
   }
   int32_t totalPhysicalDrivers = 0;
   for (size_t i = 0; i < fragmentSpecs.size(); ++i) {
     // Replicated fragments use 1 driver per replica (matches
     // GpuMultiFragmentTest convention); non-replicated fragments use
     // spec.numDrivers.
-    int32_t perReplicaDrivers =
-        replicaCount[i] == 1 ? std::max(1, fragmentSpecs[i].numDrivers) : 1;
+    int32_t perReplicaDrivers = replicaCount[i] == 1 ? std::max(1, fragmentSpecs[i].numDrivers) : 1;
     totalPhysicalDrivers += replicaCount[i] * perReplicaDrivers;
   }
   // At least 4 threads. Size = 2x physical drivers for exchange I/O +
   // producer-wait headroom. No hard ceiling — Velox drivers yield on
   // GPU/exchange waits, so oversubscribing a few hundred threads is fine
   // and cheaper than starving.
-  const int32_t effectivePhysicalDrivers =
-      std::max(totalPhysicalDrivers, singleTaskThreadPoolDriverBudget);
+  const int32_t effectivePhysicalDrivers = std::max(totalPhysicalDrivers, singleTaskThreadPoolDriverBudget);
   int32_t poolSize = std::max(4, effectivePhysicalDrivers * 2);
-  LOG(WARNING) << "FluxJniWrapper: threadPool size=" << poolSize
-               << " physicalDrivers=" << totalPhysicalDrivers
+  LOG(WARNING) << "FluxJniWrapper: threadPool size=" << poolSize << " physicalDrivers=" << totalPhysicalDrivers
                << " effectivePhysicalDrivers=" << effectivePhysicalDrivers
-               << " singleTaskBudget=" << singleTaskThreadPoolDriverBudget
-               << " fragments=" << fragmentSpecs.size();
-  auto executor =
-      std::make_shared<folly::CPUThreadPoolExecutor>(poolSize);
+               << " singleTaskBudget=" << singleTaskThreadPoolDriverBudget << " fragments=" << fragmentSpecs.size();
+  auto executor = std::make_shared<folly::CPUThreadPoolExecutor>(poolSize);
 
   // Generate the query id before allocating the query memory pool. Multiple
   // FLUX query RDDs can run concurrently in one executor (for example, a
@@ -2727,11 +2496,8 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
   // sibling memory-pool names to be unique, so the old fixed "FluxQuery" name
   // made the second query fail in addAggregateChild().
   static std::atomic<uint64_t> gFluxQueryCounter{0};
-  const auto localQueryOrdinal =
-      gFluxQueryCounter.fetch_add(1, std::memory_order_relaxed);
-  auto queryId = peerSpec.queryId.empty()
-      ? fmt::format("flux-{}", localQueryOrdinal)
-      : peerSpec.queryId;
+  const auto localQueryOrdinal = gFluxQueryCounter.fetch_add(1, std::memory_order_relaxed);
+  auto queryId = peerSpec.queryId.empty() ? fmt::format("flux-{}", localQueryOrdinal) : peerSpec.queryId;
   const auto fluxPoolName = fmt::format("FluxQuery.{}", localQueryOrdinal);
 
   // Create QueryCtx. We pass nullptr for the executor in QueryCtx::create
@@ -2743,8 +2509,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
   // for each Task's operators.
   auto rootPool = runtime->memoryManager()->getAggregateMemoryPool();
   auto fluxPool = rootPool->addAggregateChild(fluxPoolName);
-  std::unordered_map<std::string, std::shared_ptr<velox::config::ConfigBase>>
-      connectorConfigs;
+  std::unordered_map<std::string, std::shared_ptr<velox::config::ConfigBase>> connectorConfigs;
   auto hiveConnectorSessionConfig = createHiveConnectorSessionConfig(sessionCfg);
   connectorConfigs[kHiveConnectorId] = hiveConnectorSessionConfig;
 #ifdef GLUTEN_ENABLE_GPU
@@ -2757,17 +2522,14 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
   // backpressure on the first few pages, stalling the producer pipeline and
   // never firing noMoreData to downstream. Raise to 1 GB to give chained
   // exchanges breathing room at N up to ~200.
-  auto queryConfigMap = buildFluxQueryConfig(
-      sessionCfg, static_cast<uint64_t>(replicatedCartesianMaxBuildBytes));
+  auto queryConfigMap = buildFluxQueryConfig(sessionCfg, static_cast<uint64_t>(replicatedCartesianMaxBuildBytes));
   std::shared_ptr<folly::CPUThreadPoolExecutor> spillExecutor;
-  const auto spillThreadNum =
-      sessionCfg->get<uint32_t>(kSpillThreadNum, kSpillThreadNumDefaultValue);
+  const auto spillThreadNum = sessionCfg->get<uint32_t>(kSpillThreadNum, kSpillThreadNumDefaultValue);
   if (spillThreadNum > 0) {
     spillExecutor = std::make_shared<folly::CPUThreadPoolExecutor>(spillThreadNum);
   }
   LOG(WARNING) << "FluxJniWrapper: QueryCtx configs=" << queryConfigMap.size()
-               << " spillStrategy="
-               << sessionCfg->get<std::string>(kSpillStrategy, kSpillStrategyDefaultValue)
+               << " spillStrategy=" << sessionCfg->get<std::string>(kSpillStrategy, kSpillStrategyDefaultValue)
                << " spillThreads=" << spillThreadNum;
   auto queryCtx = velox::core::QueryCtx::create(
       executor.get(),
@@ -2779,12 +2541,9 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
       fluxPoolName);
 
   std::optional<velox::common::SpillDiskOptions> spillDiskOpts;
-  const auto spillStrategy =
-      sessionCfg->get<std::string>(kSpillStrategy, kSpillStrategyDefaultValue);
+  const auto spillStrategy = sessionCfg->get<std::string>(kSpillStrategy, kSpillStrategyDefaultValue);
   if (spillStrategy != "none") {
-    VELOX_CHECK(
-        !spillRootPath.empty(),
-        "FLUX spill is enabled but Spark did not provide a local spill root");
+    VELOX_CHECK(!spillRootPath.empty(), "FLUX spill is enabled but Spark did not provide a local spill root");
     const auto spillDir = std::filesystem::path(spillRootPath);
     std::filesystem::create_directories(spillDir);
     velox::common::SpillDiskOptions opts;
@@ -2792,15 +2551,14 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
     opts.spillDirCreated = true;
     opts.spillDirCreateCb = nullptr;
     spillDiskOpts = std::move(opts);
-    LOG(WARNING) << "FluxJniWrapper: spill disk enabled for " << queryId
-                 << " dir=" << spillDir.string();
+    LOG(WARNING) << "FluxJniWrapper: spill disk enabled for " << queryId << " dir=" << spillDir.string();
   } else {
     if (!spillRootPath.empty()) {
       std::error_code error;
       std::filesystem::remove_all(spillRootPath, error);
       if (error) {
-        LOG(WARNING) << "FluxJniWrapper: failed to remove unused spill root "
-                     << spillRootPath << ": " << error.message();
+        LOG(WARNING) << "FluxJniWrapper: failed to remove unused spill root " << spillRootPath << ": "
+                     << error.message();
       }
     }
     LOG(WARNING) << "FluxJniWrapper: spill disk disabled for " << queryId;
@@ -2811,8 +2569,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
   // Clear exchangeSpecs so FluxQueryCoordinator's wiring loop skips and the
   // assertion that consumer/producer fragment ids be valid passes.
   if (singleTaskMode) {
-    LOG(WARNING) << "FluxJniWrapper: clearing " << exchangeSpecs.size()
-                 << " exchangeSpec(s) for single-task mode";
+    LOG(WARNING) << "FluxJniWrapper: clearing " << exchangeSpecs.size() << " exchangeSpec(s) for single-task mode";
     exchangeSpecs.clear();
   }
 
@@ -2838,8 +2595,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
 
   auto handleId = ctx->saveObject(std::static_pointer_cast<void>(handle));
 
-  LOG(INFO) << "FluxJniWrapper: created FLUX query " << queryId
-            << " with " << numFragments << " fragments, "
+  LOG(INFO) << "FluxJniWrapper: created FLUX query " << queryId << " with " << numFragments << " fragments, "
             << numExchanges << " exchanges, handle=" << handleId;
 
   return handleId;
@@ -2851,8 +2607,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCreateFluxQuery( // 
 // nativeExplainFluxQuery
 // ---------------------------------------------------------------------------
 
-JNIEXPORT jobjectArray JNICALL
-Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeExplainFluxQuery( // NOLINT
+JNIEXPORT jobjectArray JNICALL Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeExplainFluxQuery( // NOLINT
     JNIEnv* env,
     jobject wrapper,
     jobjectArray substraitPlansArr,
@@ -2875,8 +2630,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeExplainFluxQuery( //
 
   auto safeExchangeJson = getByteArrayElementsSafe(env, exchangeSpecsJsonArr);
   auto exchangeSpecs = parseExchangeSpecs(
-      reinterpret_cast<const uint8_t*>(safeExchangeJson.elems()),
-      env->GetArrayLength(exchangeSpecsJsonArr));
+      reinterpret_cast<const uint8_t*>(safeExchangeJson.elems()), env->GetArrayLength(exchangeSpecsJsonArr));
 
   if (broadcastSlotIndicesPerFragArr != nullptr) {
     GLUTEN_CHECK(
@@ -2891,24 +2645,19 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeExplainFluxQuery( //
 
   auto veloxPool = defaultLeafVeloxMemoryPool();
   auto sessionCfg = createFluxSessionConfig(runtime);
-  const int32_t keyedFinalLocalDrivers =
-      resolveKeyedFinalLocalDrivers(sessionCfg);
+  const int32_t keyedFinalLocalDrivers = resolveKeyedFinalLocalDrivers(sessionCfg);
   std::unordered_map<int, velox::RowTypePtr> producerWireTypes;
   std::vector<std::string> finalPlans;
   finalPlans.reserve(numFragments);
 
   for (jsize i = 0; i < numFragments; ++i) {
-    auto planByteArray =
-        static_cast<jbyteArray>(env->GetObjectArrayElement(substraitPlansArr, i));
+    auto planByteArray = static_cast<jbyteArray>(env->GetObjectArrayElement(substraitPlansArr, i));
     auto safePlanBytes = getByteArrayElementsSafe(env, planByteArray);
     auto planSize = env->GetArrayLength(planByteArray);
 
     ::substrait::Plan substraitPlan;
     GLUTEN_CHECK(
-        parseProtobuf(
-            reinterpret_cast<const uint8_t*>(safePlanBytes.elems()),
-            planSize,
-            &substraitPlan),
+        parseProtobuf(reinterpret_cast<const uint8_t*>(safePlanBytes.elems()), planSize, &substraitPlan),
         fmt::format("Failed to parse Substrait plan for fragment {}", i));
 
     int32_t numExchangeInputs = 0;
@@ -2921,8 +2670,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeExplainFluxQuery( //
     std::vector<int32_t> broadcastSlotIndicesForFrag;
     jobjectArray broadcastIterForFragArr = nullptr;
     if (broadcastSlotIndicesPerFragArr != nullptr) {
-      auto slotsArrObj = static_cast<jintArray>(
-          env->GetObjectArrayElement(broadcastSlotIndicesPerFragArr, i));
+      auto slotsArrObj = static_cast<jintArray>(env->GetObjectArrayElement(broadcastSlotIndicesPerFragArr, i));
       if (slotsArrObj != nullptr) {
         auto safeSlots = getIntArrayElementsSafe(env, slotsArrObj);
         jsize n = env->GetArrayLength(slotsArrObj);
@@ -2934,12 +2682,10 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeExplainFluxQuery( //
       }
     }
     if (broadcastIteratorsPerFragArr != nullptr) {
-      broadcastIterForFragArr = static_cast<jobjectArray>(
-          env->GetObjectArrayElement(broadcastIteratorsPerFragArr, i));
+      broadcastIterForFragArr = static_cast<jobjectArray>(env->GetObjectArrayElement(broadcastIteratorsPerFragArr, i));
     }
 
-    const int32_t numBroadcastInputs =
-        static_cast<int32_t>(broadcastSlotIndicesForFrag.size());
+    const int32_t numBroadcastInputs = static_cast<int32_t>(broadcastSlotIndicesForFrag.size());
     if (broadcastIterForFragArr != nullptr) {
       jsize iterLen = env->GetArrayLength(broadcastIterForFragArr);
       GLUTEN_CHECK(
@@ -2970,25 +2716,17 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeExplainFluxQuery( //
         numExchangeInputs,
         numBroadcastInputs);
 
-    std::vector<std::shared_ptr<ResultIterator>> placeholderIters(
-        numStreamInputs, nullptr);
+    std::vector<std::shared_ptr<ResultIterator>> placeholderIters(numStreamInputs, nullptr);
     std::unordered_set<int32_t> broadcastSlotSet;
     for (int32_t b = 0; b < numBroadcastInputs; ++b) {
       const int32_t slotIdx = broadcastSlotIndicesForFrag[b];
       GLUTEN_CHECK(
           slotIdx >= 0 && slotIdx < numStreamInputs,
-          fmt::format(
-              "Fragment {} broadcast slot {} out of range (numStreamInputs={})",
-              i,
-              slotIdx,
-              numStreamInputs));
+          fmt::format("Fragment {} broadcast slot {} out of range (numStreamInputs={})", i, slotIdx, numStreamInputs));
       auto jIter = env->GetObjectArrayElement(broadcastIterForFragArr, b);
-      GLUTEN_CHECK(
-          jIter != nullptr,
-          fmt::format("Fragment {} broadcast iterator at index {} is null", i, b));
+      GLUTEN_CHECK(jIter != nullptr, fmt::format("Fragment {} broadcast iterator at index {} is null", i, b));
       auto wrapped = makeJniColumnarBatchIterator(env, jIter, ctx);
-      placeholderIters[slotIdx] =
-          std::make_shared<ResultIterator>(std::move(wrapped));
+      placeholderIters[slotIdx] = std::make_shared<ResultIterator>(std::move(wrapped));
       broadcastSlotSet.insert(slotIdx);
       env->DeleteLocalRef(jIter);
     }
@@ -3006,23 +2744,17 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeExplainFluxQuery( //
 
     std::vector<::substrait::ReadRel_LocalFiles> localFiles;
     if (splitInfosPerFragArr != nullptr) {
-      auto fragSplitArr = static_cast<jobjectArray>(
-          env->GetObjectArrayElement(splitInfosPerFragArr, i));
+      auto fragSplitArr = static_cast<jobjectArray>(env->GetObjectArrayElement(splitInfosPerFragArr, i));
       if (fragSplitArr != nullptr) {
         jsize numSplits = env->GetArrayLength(fragSplitArr);
         for (jsize j = 0; j < numSplits; ++j) {
-          auto splitBytes = static_cast<jbyteArray>(
-              env->GetObjectArrayElement(fragSplitArr, j));
+          auto splitBytes = static_cast<jbyteArray>(env->GetObjectArrayElement(fragSplitArr, j));
           auto safeSplitBytes = getByteArrayElementsSafe(env, splitBytes);
           auto splitSize = env->GetArrayLength(splitBytes);
           ::substrait::ReadRel_LocalFiles localFile;
           GLUTEN_CHECK(
-              parseProtobuf(
-                  reinterpret_cast<const uint8_t*>(safeSplitBytes.elems()),
-                  splitSize,
-                  &localFile),
-              fmt::format(
-                  "Failed to parse split info for fragment {} split {}", i, j));
+              parseProtobuf(reinterpret_cast<const uint8_t*>(safeSplitBytes.elems()), splitSize, &localFile),
+              fmt::format("Failed to parse split info for fragment {} split {}", i, j));
           localFiles.push_back(std::move(localFile));
           env->DeleteLocalRef(splitBytes);
         }
@@ -3041,10 +2773,8 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeExplainFluxQuery( //
         numExchangeInputs,
         numBroadcastInputs,
         keyedFinalLocalDrivers);
-    auto wrappedPlan = wrapWithFluxPartitionedOutput(
-        static_cast<int32_t>(i), veloxPlanNode, exchangeSpecs);
-    finalPlans.push_back(
-        wrappedPlan->toString(/*detailed=*/true, /*recursive=*/true));
+    auto wrappedPlan = wrapWithFluxPartitionedOutput(static_cast<int32_t>(i), veloxPlanNode, exchangeSpecs);
+    finalPlans.push_back(wrappedPlan->toString(/*detailed=*/true, /*recursive=*/true));
     env->DeleteLocalRef(planByteArray);
   }
 
@@ -3065,8 +2795,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeExplainFluxQuery( //
 // nativeStartFluxQuery
 // ---------------------------------------------------------------------------
 
-JNIEXPORT void JNICALL
-Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeStartFluxQuery( // NOLINT
+JNIEXPORT void JNICALL Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeStartFluxQuery( // NOLINT
     JNIEnv* env,
     jobject wrapper,
     jlong handle) {
@@ -3088,8 +2817,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeStartFluxQuery( // N
 // nativeGetFluxOutput
 // ---------------------------------------------------------------------------
 
-JNIEXPORT jlong JNICALL
-Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeGetFluxOutput( // NOLINT
+JNIEXPORT jlong JNICALL Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeGetFluxOutput( // NOLINT
     JNIEnv* env,
     jobject wrapper,
     jlong handle) {
@@ -3113,9 +2841,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeGetFluxOutput( // NO
   // CudfVector intentionally has no Velox child vectors. Preserve the logical
   // column count so ColumnarBatches.create() keeps the native handle instead
   // of misclassifying this as a zero-column batch.
-  auto batch = std::make_shared<VeloxColumnarBatch>(
-      rowVector,
-      static_cast<int32_t>(rowVector->type()->size()));
+  auto batch = std::make_shared<VeloxColumnarBatch>(rowVector, static_cast<int32_t>(rowVector->type()->size()));
 #else
   auto batch = std::make_shared<VeloxColumnarBatch>(rowVector);
 #endif
@@ -3144,8 +2870,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeGetFluxOutput( // NO
 /// coordinator->abort() guards against re-entry. Does NOT release the
 /// handle; the caller must still invoke nativeCloseFluxQuery to free the
 /// ObjectStore slot and the native resources.
-JNIEXPORT void JNICALL
-Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeAbortFluxQuery( // NOLINT
+JNIEXPORT void JNICALL Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeAbortFluxQuery( // NOLINT
     JNIEnv* env,
     jobject wrapper,
     jlong handle) {
@@ -3156,13 +2881,11 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeAbortFluxQuery( // N
 
   auto fluxHandle = ObjectStore::retrieve<FluxQueryHandle>(handle);
   if (fluxHandle == nullptr) {
-    LOG(WARNING) << "FluxJniWrapper: nativeAbortFluxQuery on unknown handle="
-                 << handle << " (already released?)";
+    LOG(WARNING) << "FluxJniWrapper: nativeAbortFluxQuery on unknown handle=" << handle << " (already released?)";
     return;
   }
   if (fluxHandle->coordinator == nullptr) {
-    LOG(WARNING) << "FluxJniWrapper: nativeAbortFluxQuery handle=" << handle
-                 << " has null coordinator";
+    LOG(WARNING) << "FluxJniWrapper: nativeAbortFluxQuery handle=" << handle << " has null coordinator";
     return;
   }
 
@@ -3183,8 +2906,7 @@ Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeAbortFluxQuery( // N
 // nativeCloseFluxQuery
 // ---------------------------------------------------------------------------
 
-JNIEXPORT void JNICALL
-Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCloseFluxQuery( // NOLINT
+JNIEXPORT void JNICALL Java_org_apache_gluten_vectorized_FluxQueryJniWrapper_nativeCloseFluxQuery( // NOLINT
     JNIEnv* env,
     jobject wrapper,
     jlong handle) {

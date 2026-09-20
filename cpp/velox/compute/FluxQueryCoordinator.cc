@@ -16,6 +16,7 @@
  */
 
 #include "FluxQueryCoordinator.h"
+#include "compute/GatheredJoinDrivers.h"
 
 #include "compute/FluxOperatorMetrics.h"
 
@@ -55,9 +56,9 @@
 #include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/connectors/hive/iceberg/IcebergSplit.h"
 #include "velox/core/PlanNode.h"
+#include "velox/exec/DefaultOutputBufferManager.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/OutputBuffer.h"
-#include "velox/exec/DefaultOutputBufferManager.h"
 #include "velox/exec/SerializedPage.h"
 #include "velox/exec/Task.h"
 #ifdef GLUTEN_ENABLE_GPU
@@ -117,6 +118,20 @@ int envIntOrDefault(const char* name, int defaultValue) {
   return static_cast<int>(parsed);
 }
 
+uint64_t envUint64OrDefault(const char* name, uint64_t defaultValue) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0' || value[0] == '-') {
+    return defaultValue;
+  }
+  char* end = nullptr;
+  const auto parsed = std::strtoull(value, &end, 10);
+  if (end == value || *end != '\0') {
+    LOG(WARNING) << "Ignoring invalid " << name << "='" << value << "'";
+    return defaultValue;
+  }
+  return static_cast<uint64_t>(parsed);
+}
+
 bool envFlagEnabled(const char* name) {
   const char* value = std::getenv(name);
   return value != nullptr && (std::string_view(value) == "1" || std::string_view(value) == "true");
@@ -172,6 +187,41 @@ std::string cleanedCudfPath(std::string path) {
   }
   return path;
 }
+
+// Spark populates these three file-derived info columns for every Hive split,
+// even when they are not part of the TableScan projection. They differ for
+// every physical file and the cuDF Hive reader does not materialize them.
+// Treat precisely this generated trio as compatible for multi-file reads;
+// all other split metadata must remain equal.
+bool cudfHiveInfoColumnsCanCoalesce(
+    const std::unordered_map<std::string, std::string>& left,
+    const std::unordered_map<std::string, std::string>& right) {
+  if (left == right) {
+    return true;
+  }
+  const auto isGeneratedInputFileInfo = [](const auto& info) {
+    return info.size() == 3 && info.find("input_file_name") != info.end() &&
+        info.find("input_file_block_start") != info.end() && info.find("input_file_block_length") != info.end();
+  };
+  return isGeneratedInputFileInfo(left) && isGeneratedInputFileInfo(right);
+}
+
+// Expected-count hints are advisory and absent in older Velox prefetch APIs.
+// Keep connector-format changes buildable against those runtimes without
+// changing split registration or I/O correctness.
+template <typename Prefetch>
+void setExpectedPrefetchSplits(
+    folly::Executor* executor,
+    const std::string& queryId,
+    uint64_t splits,
+    uint64_t minRegistered,
+    uint64_t scanNodes) {
+  if constexpr (requires { Prefetch::setExpectedSplitCount(executor, queryId, splits, minRegistered, scanNodes); }) {
+    Prefetch::setExpectedSplitCount(executor, queryId, splits, minRegistered, scanNodes);
+  } else {
+    VLOG(1) << "Velox prefetch API does not support expected-count hints";
+  }
+}
 #endif
 
 // NVTX domain for gluten FLUX. Same name as the one in FluxJniWrapper.cc so
@@ -219,15 +269,12 @@ FluxQueryCoordinator::FluxQueryCoordinator(
   if (spillDiskOpts_.has_value()) {
     auto& opts = spillDiskOpts_.value();
     if (!opts.spillDirCreated) {
-      VELOX_CHECK_NOT_NULL(
-          opts.spillDirCreateCb,
-          "FLUX spill root must either exist or provide a create callback");
+      VELOX_CHECK_NOT_NULL(opts.spillDirCreateCb, "FLUX spill root must either exist or provide a create callback");
       opts.spillDirPath = opts.spillDirCreateCb();
       opts.spillDirCreated = true;
       opts.spillDirCreateCb = nullptr;
     }
-    VELOX_CHECK(
-        !opts.spillDirPath.empty(), "FLUX spill root path must not be empty");
+    VELOX_CHECK(!opts.spillDirPath.empty(), "FLUX spill root path must not be empty");
     std::filesystem::create_directories(opts.spillDirPath);
   }
 
@@ -265,9 +312,8 @@ FluxQueryCoordinator::FluxQueryCoordinator(
   }
   VELOX_CHECK_NE(rootFragmentId_, -1, "No root fragment (every fragment is a producer; exchange DAG has a cycle)");
 #ifdef GLUTEN_ENABLE_GPU
-  deviceRootOutput_ = queryCtx_->queryConfig().get<bool>(
-      facebook::velox::cudf_velox::CudfConfig::kCudfSkipOutputToVelox,
-      false);
+  deviceRootOutput_ =
+      queryCtx_->queryConfig().get<bool>(facebook::velox::cudf_velox::CudfConfig::kCudfSkipOutputToVelox, false);
 #endif
 }
 
@@ -394,15 +440,13 @@ FluxQueryCoordinator::~FluxQueryCoordinator() {
   // All split readers are gone after fragmentTasks_.clear(). Release the
   // query-scoped prefetch queue and join its scheduler workers now instead
   // of accumulating one 16-thread scheduler per query until executor exit.
-  cudf_velox::connector::hive::ExecutorSplitPrefetch::eraseQuery(
-      executor_, queryCtx_->queryId());
+  cudf_velox::connector::hive::ExecutorSplitPrefetch::eraseQuery(executor_, queryCtx_->queryId());
 #endif
   if (spillDiskOpts_.has_value()) {
     std::error_code error;
     std::filesystem::remove_all(spillDiskOpts_->spillDirPath, error);
     if (error) {
-      LOG(ERROR) << "FluxQueryCoordinator[" << queryId_
-                 << "]: failed to remove spill root '"
+      LOG(ERROR) << "FluxQueryCoordinator[" << queryId_ << "]: failed to remove spill root '"
                  << spillDiskOpts_->spillDirPath << "': " << error.message();
     }
   }
@@ -418,9 +462,7 @@ FluxQueryCoordinator::~FluxQueryCoordinator() {
   // Preserve the query-scoped trim policy before releasing QueryCtx. -1
   // explicitly suppresses the executor environment fallback; -2 keeps it for
   // callers that do not provide the newer QueryConfig key.
-  const auto asyncQueryEndTrimBytes = queryCtx_
-      ? queryCtx_->queryConfig().cudfAsyncQueryEndTrimBytes()
-      : int64_t{-2};
+  const auto asyncQueryEndTrimBytes = queryCtx_ ? queryCtx_->queryConfig().cudfAsyncQueryEndTrimBytes() : int64_t{-2};
 #endif
   {
     nvtx3::scoped_range_in<GlutenFluxDomain> r{"coordinator::~destructor:queryCtx.reset"};
@@ -432,8 +474,7 @@ FluxQueryCoordinator::~FluxQueryCoordinator() {
   // boundary so a later query (or UCX's independent cudaMalloc pool) is not
   // starved by memory that has no live RMM owner.
   {
-    nvtx3::scoped_range_in<GlutenFluxDomain> r{
-        "coordinator::~destructor:trimAsyncMemoryPools"};
+    nvtx3::scoped_range_in<GlutenFluxDomain> r{"coordinator::~destructor:trimAsyncMemoryPools"};
     if (asyncQueryEndTrimBytes >= 0) {
       (void)facebook::velox::cudf_velox::trimAsyncMemoryPoolsAtQueryEnd(
           static_cast<std::size_t>(asyncQueryEndTrimBytes));
@@ -585,17 +626,25 @@ void FluxQueryCoordinator::start() {
       isRangeConsumer[consumer] = true;
     }
   }
-  // Apply consumer fan-out. HASH keeps the logical destination count on the
-  // producer buffers, but bounds local tasks by the fragment driver budget so
-  // one GPU does not build N replicated hash states. RANGE still uses one task
-  // per destination.
+  // Apply consumer fan-out. HASH normally keeps the logical destination count
+  // on the producer buffers, but bounds local tasks by the fragment driver
+  // budget so one GPU does not build N replicated hash states. A direct-write
+  // root explicitly marked for destination lanes is different: each replica
+  // contains only an Exchange and a TableWrite, and must retain one replica
+  // per destination so rows from distinct Spark output partitions never enter
+  // the same file. The shared executor still bounds simultaneously running
+  // drivers; this only preserves file/dictionary state per destination. RANGE
+  // continues to use one task per destination.
   for (size_t i = 0; i < fragmentSpecs_.size(); ++i) {
     if (isRangeConsumer[i]) {
       fragmentReplicaCount_[i] = std::max(1, consumerInboundPartitions[i]);
     } else if (isHashConsumer[i]) {
       const auto logicalDestinations = std::max(1, consumerInboundPartitions[i]);
       const auto localTaskBudget = std::max(1, fragmentSpecs_[i].numDrivers);
-      fragmentReplicaCount_[i] = std::min(logicalDestinations, localTaskBudget);
+      const bool preserveWriteDestinations =
+          rootIsWrite && static_cast<int32_t>(i) == rootFragmentId_ && fragmentSpecs_[i].keyedFinalDestinationLanes;
+      fragmentReplicaCount_[i] =
+          preserveWriteDestinations ? logicalDestinations : std::min(logicalDestinations, localTaskBudget);
       LOG(WARNING) << "FluxQueryCoordinator[" << queryId_ << "]: HASH fragment " << i
                    << " logicalDestinations=" << logicalDestinations
                    << " localConsumerTasks=" << fragmentReplicaCount_[i] << " taskBudget=" << localTaskBudget;
@@ -623,8 +672,7 @@ void FluxQueryCoordinator::start() {
   // consumer task the RANGE/HASH split wiring (dest % 1 == 0) routes every
   // destination this peer owns to that single task, so it gathers the peer's
   // whole slice into one output file.
-  if (rootIsWrite &&
-      !fragmentSpecs_[rootFragmentId_].keyedFinalDestinationLanes &&
+  if (rootIsWrite && !fragmentSpecs_[rootFragmentId_].keyedFinalDestinationLanes &&
       fragmentReplicaCount_[rootFragmentId_] != 1) {
     LOG(WARNING) << "FluxQueryCoordinator[" << queryId_ << "]: write root fragment " << rootFragmentId_
                  << " replicaCount " << fragmentReplicaCount_[rootFragmentId_] << " -> 1 (single writer per peer)";
@@ -814,8 +862,7 @@ void FluxQueryCoordinator::start() {
   // destination.  Besides wasting tasks, downstream broadcast/exchange wiring
   // waited on hundreds of empty endpoints and could deadlock behind output
   // backpressure on complex plans (Q17/Q21).
-  const auto replicaCountForPeer =
-      [&](int32_t fragmentId, int32_t peerIndex) -> int32_t {
+  const auto replicaCountForPeer = [&](int32_t fragmentId, int32_t peerIndex) -> int32_t {
     if (!peerHasFragment(fragmentId, peerIndex)) {
       return 0;
     }
@@ -824,12 +871,10 @@ void FluxQueryCoordinator::start() {
       return base;
     }
     for (const auto& exchange : exchangeSpecs_) {
-      if (exchange.consumerFragmentId != fragmentId ||
-          exchange.partitionType == "BROADCAST") {
+      if (exchange.consumerFragmentId != fragmentId || exchange.partitionType == "BROADCAST") {
         continue;
       }
-      if (exchange.partitionType != "HASH" &&
-          exchange.partitionType != "RANGE") {
+      if (exchange.partitionType != "HASH" && exchange.partitionType != "RANGE") {
         return peerIndex == 0 ? base : 0;
       }
       int32_t ownedDestinations = 0;
@@ -847,11 +892,8 @@ void FluxQueryCoordinator::start() {
       if (localReplicas != fragmentReplicaCount_[spec.id]) {
         const auto oldReplicas = fragmentReplicaCount_[spec.id];
         fragmentReplicaCount_[spec.id] = localReplicas;
-        LOG(WARNING) << "FluxQueryCoordinator[" << queryId_
-                     << "]: fragment " << spec.id
-                     << " replicaCount " << oldReplicas << " -> "
-                     << localReplicas << " for peer=" << peerIndex_ << "/"
-                     << peerCount_;
+        LOG(WARNING) << "FluxQueryCoordinator[" << queryId_ << "]: fragment " << spec.id << " replicaCount "
+                     << oldReplicas << " -> " << localReplicas << " for peer=" << peerIndex_ << "/" << peerCount_;
       }
     }
   }
@@ -964,33 +1006,28 @@ void FluxQueryCoordinator::start() {
     // back to the producer destination count.
     const auto perReplicaDrivers = (bcastN > 0) ? 1
         : (rootIsWrite && spec.id == rootFragmentId_)
-            ? (spec.keyedFinalDestinationLanes
-                   ? 1
-                   : spec.keyedFinalLocalRepartition
-                   ? std::max(1, spec.numDrivers)
-                   : 1)
+        ? (spec.keyedFinalDestinationLanes       ? 1
+               : spec.parallelJoinSingleWriter   ? gluten::gatheredJoinDrivers(spec.numDrivers, replicas)
+               : spec.parallelDirectWrite        ? std::max(1, spec.numDrivers)
+               : spec.keyedFinalLocalRepartition ? std::max(1, spec.numDrivers)
+                                                 : 1)
         : isRangeConsumer[spec.id] ? 1
         : isHashConsumer[spec.id]
-            ? (spec.keyedFinalLocalRepartition
-                   ? std::max(1, spec.numDrivers)
-                   : (replicas == 1 &&
-                              (spec.rightSemiProjectMultiDriverSafe ||
-                               spec.innerJoinMultiDriverSafe)
-                          ? std::min(2, std::max(1, spec.numDrivers))
-                          : 1))
+        ? (spec.keyedFinalLocalRepartition
+               ? std::max(1, spec.numDrivers)
+               : (replicas == 1 && (spec.rightSemiProjectMultiDriverSafe || spec.innerJoinMultiDriverSafe)
+                      ? std::min(2, std::max(1, spec.numDrivers))
+                      : 1))
         : std::max(1, spec.numDrivers);
     for (int32_t i = 0; i < replicas; ++i) {
       auto taskId = makeTaskId(spec.id, i);
       std::optional<common::SpillDiskOptions> taskSpillDiskOpts;
       if (spillDiskOpts_.has_value()) {
         const auto taskSpillDir =
-            std::filesystem::path(spillDiskOpts_->spillDirPath) /
-            fmt::format("fragment-{}-replica-{}", spec.id, i);
+            std::filesystem::path(spillDiskOpts_->spillDirPath) / fmt::format("fragment-{}-replica-{}", spec.id, i);
         std::filesystem::create_directories(taskSpillDir);
         taskSpillDiskOpts = common::SpillDiskOptions{
-            .spillDirPath = taskSpillDir.string(),
-            .spillDirCreated = true,
-            .spillDirCreateCb = nullptr};
+            .spillDirPath = taskSpillDir.string(), .spillDirCreated = true, .spillDirCreateCb = nullptr};
       }
       auto task = Task::create(
           taskId,
@@ -1009,21 +1046,16 @@ void FluxQueryCoordinator::start() {
       fragmentTaskDrivers[spec.id].push_back(perReplicaDrivers);
       fragmentTaskBroadcastFanout[spec.id].push_back(bcastN);
       fragmentTaskStarted[spec.id].push_back(false);
-      LOG(WARNING) << "FluxQueryCoordinator[" << queryId_
-                   << "]: created fragment " << spec.id << " replica " << i
-                   << "/" << replicas << " taskId=" << taskId
-                   << " drivers=" << perReplicaDrivers
-                   << " inboundN=" << inboundN
-                   << " keyedFinalLocalRepartition="
-                   << spec.keyedFinalLocalRepartition
-                   << " keyedFinalDestinationLanes="
-                   << spec.keyedFinalDestinationLanes
-                   << " rightSemiProjectMultiDriverSafe="
-                   << spec.rightSemiProjectMultiDriverSafe
-                   << " innerJoinMultiDriverSafe="
-                   << spec.innerJoinMultiDriverSafe
-                   << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN)
-                                  : std::string{});
+      LOG(WARNING) << "FluxQueryCoordinator[" << queryId_ << "]: created fragment " << spec.id << " replica " << i
+                   << "/" << replicas << " taskId=" << taskId << " drivers=" << perReplicaDrivers
+                   << " inboundN=" << inboundN << " keyedFinalLocalRepartition=" << spec.keyedFinalLocalRepartition
+                   << " keyedFinalDestinationLanes=" << spec.keyedFinalDestinationLanes
+                   << " parallelDirectWrite=" << spec.parallelDirectWrite
+                   << " parallelJoinSingleWriter=" << spec.parallelJoinSingleWriter
+                   << " localExchangeBufferBytes=" << queryCtx_->queryConfig().maxLocalExchangeBufferSize()
+                   << " rightSemiProjectMultiDriverSafe=" << spec.rightSemiProjectMultiDriverSafe
+                   << " innerJoinMultiDriverSafe=" << spec.innerJoinMultiDriverSafe
+                   << (bcastN > 0 ? fmt::format(" bcastFanout={}", bcastN) : std::string{});
     }
   }
 
@@ -1098,6 +1130,17 @@ void FluxQueryCoordinator::start() {
   // wait behind that loop merely to classify the query.
   uint64_t expectedRegularCudfS3Splits{0};
   uint64_t expectedRegularCudfS3ScanNodes{0};
+  const auto hiveMultiFileTargetBytes = envUint64OrDefault(
+      "GLUTEN_CUDF_HIVE_MULTI_FILE_TARGET_BYTES",
+      queryCtx_->queryConfig().get<uint64_t>(kCudfHiveMultiFileTargetBytes, kCudfHiveMultiFileTargetBytesDefault));
+  const auto hiveMultiFileMaxFiles = std::max(
+      0,
+      envIntOrDefault(
+          "GLUTEN_CUDF_HIVE_MULTI_FILE_MAX_FILES",
+          queryCtx_->queryConfig().get<int32_t>(kCudfHiveMultiFileMaxFiles, kCudfHiveMultiFileMaxFilesDefault)));
+  const auto hiveMultiFileMaxFileBytes = envUint64OrDefault(
+      "GLUTEN_CUDF_HIVE_MULTI_FILE_MAX_FILE_BYTES",
+      queryCtx_->queryConfig().get<uint64_t>(kCudfHiveMultiFileMaxFileBytes, kCudfHiveMultiFileMaxFileBytesDefault));
   for (const auto& spec : fragmentSpecs_) {
     if (fragmentTasks_[spec.id].empty()) {
       continue;
@@ -1111,8 +1154,9 @@ void FluxQueryCoordinator::start() {
         continue;
       }
       bool hasLocalS3Split{false};
+      std::vector<bool> countConsumed(scanInfo->paths.size(), false);
       for (size_t j = 0; j < scanInfo->paths.size(); ++j) {
-        if (scanSplitOwners.at(scanInfo.get())[j] != peerIndex_) {
+        if (countConsumed[j] || scanSplitOwners.at(scanInfo.get())[j] != peerIndex_) {
           continue;
         }
         const auto path = cleanedCudfPath(scanInfo->paths[j]);
@@ -1120,6 +1164,41 @@ void FluxQueryCoordinator::start() {
             scanInfo->properties[j]->fileSize.has_value()) {
           ++expectedRegularCudfS3Splits;
           hasLocalS3Split = true;
+          const auto isWholeCoalescibleFile = [&](size_t index) {
+            return scanInfo->format == dwio::common::FileFormat::PARQUET && hiveMultiFileTargetBytes > 0 &&
+                hiveMultiFileMaxFiles > 1 && index < scanInfo->starts.size() && index < scanInfo->lengths.size() &&
+                index < scanInfo->properties.size() && scanInfo->starts[index] == 0 &&
+                scanInfo->properties[index].has_value() && scanInfo->properties[index]->fileSize.has_value() &&
+                scanInfo->lengths[index] >= static_cast<uint64_t>(*scanInfo->properties[index]->fileSize) &&
+                static_cast<uint64_t>(*scanInfo->properties[index]->fileSize) <= hiveMultiFileMaxFileBytes &&
+                static_cast<uint64_t>(*scanInfo->properties[index]->fileSize) <= hiveMultiFileTargetBytes;
+          };
+          if (isWholeCoalescibleFile(j)) {
+            const auto primaryMetadata = j < scanInfo->metadataColumns.size()
+                ? scanInfo->metadataColumns[j]
+                : std::unordered_map<std::string, std::string>{};
+            uint64_t accumulatedBytes = static_cast<uint64_t>(*scanInfo->properties[j]->fileSize);
+            size_t coalescedCount = 1;
+            for (size_t next = j + 1;
+                 next < scanInfo->paths.size() && coalescedCount < static_cast<size_t>(hiveMultiFileMaxFiles);
+                 ++next) {
+              if (countConsumed[next] || scanSplitOwners.at(scanInfo.get())[next] != peerIndex_ ||
+                  !isWholeCoalescibleFile(next) ||
+                  !cudfHiveInfoColumnsCanCoalesce(
+                      primaryMetadata,
+                      next < scanInfo->metadataColumns.size() ? scanInfo->metadataColumns[next]
+                                                              : std::unordered_map<std::string, std::string>{})) {
+                continue;
+              }
+              const auto fileSize = static_cast<uint64_t>(*scanInfo->properties[next]->fileSize);
+              if (fileSize > hiveMultiFileTargetBytes - accumulatedBytes) {
+                continue;
+              }
+              countConsumed[next] = true;
+              accumulatedBytes += fileSize;
+              ++coalescedCount;
+            }
+          }
         }
       }
       expectedRegularCudfS3ScanNodes += hasLocalS3Split ? 1 : 0;
@@ -1131,7 +1210,7 @@ void FluxQueryCoordinator::start() {
         0,
         envIntOrDefault(
             "GLUTEN_CUDF_CACHE_HINT_FIRST_LOAD_GROUP_READY_MIN_QUERY_REGISTERED_SPLITS", defaultMinRegisteredSplits));
-    cudf_velox::connector::hive::ExecutorSplitPrefetch::setExpectedSplitCount(
+    setExpectedPrefetchSplits<cudf_velox::connector::hive::ExecutorSplitPrefetch>(
         queryCtx_->executor(),
         queryCtx_->queryId(),
         expectedRegularCudfS3Splits,
@@ -1218,89 +1297,58 @@ void FluxQueryCoordinator::start() {
             }
           }
           std::unordered_map<std::string, std::string> customSplitInfo{{"table_format", "hive-iceberg"}};
-          std::vector<connector::hive::iceberg::IcebergCoalescedFile>
-              coalescedFiles;
+          std::vector<connector::hive::iceberg::IcebergCoalescedFile> coalescedFiles;
 #ifdef GLUTEN_ENABLE_GPU
-          const auto configuredMultiFileTarget =
-              queryCtx_->queryConfig().get<uint64_t>(
-                  kCudfIcebergMultiFileTargetBytes,
-                  kCudfIcebergMultiFileTargetBytesDefault);
+          const auto configuredMultiFileTarget = queryCtx_->queryConfig().get<uint64_t>(
+              kCudfIcebergMultiFileTargetBytes, kCudfIcebergMultiFileTargetBytesDefault);
           const auto targetBytes = configuredMultiFileTarget > 0
               ? configuredMultiFileTarget
               : queryCtx_->queryConfig().get<uint64_t>(
-                    kCudfGpuTargetBatchBytes,
-                    std::stoull(kCudfGpuTargetBatchBytesDefault));
+                    kCudfGpuTargetBatchBytes, std::stoull(kCudfGpuTargetBatchBytesDefault));
           const auto maxFiles = queryCtx_->queryConfig().get<int32_t>(
-              kCudfIcebergMultiFileMaxFiles,
-              kCudfIcebergMultiFileMaxFilesDefault);
+              kCudfIcebergMultiFileMaxFiles, kCudfIcebergMultiFileMaxFilesDefault);
           const auto maxFileBytes = queryCtx_->queryConfig().get<uint64_t>(
-              kCudfIcebergMultiFileMaxFileBytes,
-              kCudfIcebergMultiFileMaxFileBytesDefault);
-          const bool useExperimentalReader =
-              queryCtx_->queryConfig().get<bool>(
-                  kCudfHiveUseExperimentalReader, false);
+              kCudfIcebergMultiFileMaxFileBytes, kCudfIcebergMultiFileMaxFileBytesDefault);
+          const bool useExperimentalReader = queryCtx_->queryConfig().get<bool>(kCudfHiveUseExperimentalReader, false);
           // A whole-file Iceberg Parquet task covers [4, fileSize), excluding
           // its PAR1 header. Require the range to reach EOF so genuine
           // row-group splits are never coalesced.
           const auto isWholeFile = [&](size_t index) {
-            return index < scanInfo->starts.size() &&
-                index < scanInfo->lengths.size() &&
-                index < scanInfo->properties.size() &&
-                scanInfo->starts[index] <= 4 &&
-                scanInfo->properties[index].has_value() &&
-                scanInfo->properties[index]->fileSize.has_value() &&
-                scanInfo->starts[index] <= static_cast<uint64_t>(
-                    *scanInfo->properties[index]->fileSize) &&
-                scanInfo->lengths[index] >= static_cast<uint64_t>(
-                    *scanInfo->properties[index]->fileSize) -
-                    scanInfo->starts[index];
+            return index < scanInfo->starts.size() && index < scanInfo->lengths.size() &&
+                index < scanInfo->properties.size() && scanInfo->starts[index] <= 4 &&
+                scanInfo->properties[index].has_value() && scanInfo->properties[index]->fileSize.has_value() &&
+                scanInfo->starts[index] <= static_cast<uint64_t>(*scanInfo->properties[index]->fileSize) &&
+                scanInfo->lengths[index] >=
+                static_cast<uint64_t>(*scanInfo->properties[index]->fileSize) - scanInfo->starts[index];
           };
           const bool useCudfIceberg = connectorId == kCudfIcebergConnectorId;
-          const bool primaryCanCoalesce = useCudfIceberg &&
-              !useExperimentalReader &&
-              targetBytes > 0 && maxFiles > 1 && deleteFiles.empty() &&
-              isWholeFile(j) &&
-              static_cast<uint64_t>(*scanInfo->properties[j]->fileSize) <=
-                  targetBytes &&
-              static_cast<uint64_t>(*scanInfo->properties[j]->fileSize) <=
-                  maxFileBytes;
-          uint64_t accumulatedBytes = primaryCanCoalesce
-              ? static_cast<uint64_t>(*scanInfo->properties[j]->fileSize)
-              : 0;
+          const bool primaryCanCoalesce = useCudfIceberg && !useExperimentalReader && targetBytes > 0 && maxFiles > 1 &&
+              deleteFiles.empty() && isWholeFile(j) &&
+              static_cast<uint64_t>(*scanInfo->properties[j]->fileSize) <= targetBytes &&
+              static_cast<uint64_t>(*scanInfo->properties[j]->fileSize) <= maxFileBytes;
+          uint64_t accumulatedBytes =
+              primaryCanCoalesce ? static_cast<uint64_t>(*scanInfo->properties[j]->fileSize) : 0;
           if (primaryCanCoalesce) {
-            for (size_t next = j + 1;
-                 next < scanInfo->paths.size() &&
-                 coalescedFiles.size() + 1 < static_cast<size_t>(maxFiles) &&
-                 accumulatedBytes < targetBytes;
+            for (size_t next = j + 1; next < scanInfo->paths.size() &&
+                 coalescedFiles.size() + 1 < static_cast<size_t>(maxFiles) && accumulatedBytes < targetBytes;
                  ++next) {
-              if (scanSplitConsumed[next] ||
-                  scanSplitOwners.at(scanInfo.get())[next] != peerIndex_) {
+              if (scanSplitConsumed[next] || scanSplitOwners.at(scanInfo.get())[next] != peerIndex_) {
                 continue;
               }
               const bool hasDeletes =
-                  next < icebergSplitInfo->deleteFilesVec.size() &&
-                  !icebergSplitInfo->deleteFilesVec[next].empty();
-              const bool samePartition =
-                  scanInfo->partitionColumns.empty() ||
-                  scanInfo->partitionColumns[next] ==
-                      scanInfo->partitionColumns[j];
-              const bool sameMetadata =
-                  scanInfo->metadataColumns[next] ==
-                  scanInfo->metadataColumns[j];
-              if (hasDeletes || !isWholeFile(next) || !samePartition ||
-                  !sameMetadata ||
-                  static_cast<uint64_t>(
-                      *scanInfo->properties[next]->fileSize) > maxFileBytes) {
+                  next < icebergSplitInfo->deleteFilesVec.size() && !icebergSplitInfo->deleteFilesVec[next].empty();
+              const bool samePartition = scanInfo->partitionColumns.empty() ||
+                  scanInfo->partitionColumns[next] == scanInfo->partitionColumns[j];
+              const bool sameMetadata = scanInfo->metadataColumns[next] == scanInfo->metadataColumns[j];
+              if (hasDeletes || !isWholeFile(next) || !samePartition || !sameMetadata ||
+                  static_cast<uint64_t>(*scanInfo->properties[next]->fileSize) > maxFileBytes) {
                 continue;
               }
-              const auto fileSize = static_cast<uint64_t>(
-                  *scanInfo->properties[next]->fileSize);
-              if (accumulatedBytes >= targetBytes ||
-                  fileSize > targetBytes - accumulatedBytes) {
+              const auto fileSize = static_cast<uint64_t>(*scanInfo->properties[next]->fileSize);
+              if (accumulatedBytes >= targetBytes || fileSize > targetBytes - accumulatedBytes) {
                 continue;
               }
-              coalescedFiles.push_back(
-                  {scanInfo->paths[next], fileSize});
+              coalescedFiles.push_back({scanInfo->paths[next], fileSize});
               accumulatedBytes += fileSize;
               scanSplitConsumed[next] = true;
             }
@@ -1323,42 +1371,26 @@ void FluxQueryCoordinator::start() {
               /*dataSequenceNumber=*/0,
               std::move(coalescedFiles));
 #ifdef GLUTEN_ENABLE_GPU
-          const auto prefetchPrimaryPath =
-              cleanedCudfPath(scanInfo->paths[j]);
-          if (connectorId == kCudfIcebergConnectorId &&
-              queryCtx_->executor() != nullptr &&
+          const auto prefetchPrimaryPath = cleanedCudfPath(scanInfo->paths[j]);
+          if (connectorId == kCudfIcebergConnectorId && queryCtx_->executor() != nullptr &&
               prefetchPrimaryPath.starts_with("s3://")) {
             const auto icebergConnectorSplit =
-                std::dynamic_pointer_cast<
-                    connector::hive::iceberg::HiveIcebergSplit>(
-                    connectorSplit);
+                std::dynamic_pointer_cast<connector::hive::iceberg::HiveIcebergSplit>(connectorSplit);
             VELOX_CHECK_NOT_NULL(icebergConnectorSplit);
-            std::vector<
-                cudf_velox::connector::hive::SplitPrefetchFile>
-                prefetchFiles;
+            std::vector<cudf_velox::connector::hive::SplitPrefetchFile> prefetchFiles;
             std::optional<uint64_t> primaryFileSize;
             if (icebergConnectorSplit->properties.has_value() &&
                 icebergConnectorSplit->properties->fileSize.has_value()) {
-              primaryFileSize = static_cast<uint64_t>(
-                  *icebergConnectorSplit->properties->fileSize);
+              primaryFileSize = static_cast<uint64_t>(*icebergConnectorSplit->properties->fileSize);
             }
             if (primaryFileSize.has_value()) {
-              prefetchFiles.reserve(
-                  1 + icebergConnectorSplit->coalescedFiles.size());
-              prefetchFiles.push_back(
-                  {prefetchPrimaryPath,
-                   *primaryFileSize});
-              for (const auto& file :
-                   icebergConnectorSplit->coalescedFiles) {
-                prefetchFiles.push_back(
-                    {cleanedCudfPath(file.filePath), file.length});
+              prefetchFiles.reserve(1 + icebergConnectorSplit->coalescedFiles.size());
+              prefetchFiles.push_back({prefetchPrimaryPath, *primaryFileSize});
+              for (const auto& file : icebergConnectorSplit->coalescedFiles) {
+                prefetchFiles.push_back({cleanedCudfPath(file.filePath), file.length});
               }
-              cudf_velox::connector::hive::ExecutorSplitPrefetch::
-                  registerSplit(
-                      queryCtx_->executor(),
-                      queryCtx_->queryId(),
-                      prefetchPrimaryPath,
-                      std::move(prefetchFiles));
+              cudf_velox::connector::hive::ExecutorSplitPrefetch::registerSplit(
+                  queryCtx_->executor(), queryCtx_->queryId(), prefetchPrimaryPath, std::move(prefetchFiles));
             }
           }
 #endif
@@ -1369,26 +1401,64 @@ void FluxQueryCoordinator::start() {
           if (j < scanInfo->metadataColumns.size()) {
             metadataColumn = scanInfo->metadataColumns[j];
           }
+          const auto targetBytes = hiveMultiFileTargetBytes;
+          const auto maxFiles = hiveMultiFileMaxFiles;
+          const auto maxFileBytes = hiveMultiFileMaxFileBytes;
+          const auto isWholeCoalescibleFile = [&](size_t index) {
+            return scanInfo->format == dwio::common::FileFormat::PARQUET && targetBytes > 0 && maxFiles > 1 &&
+                index < scanInfo->starts.size() && index < scanInfo->lengths.size() &&
+                index < scanInfo->properties.size() && scanInfo->starts[index] == 0 &&
+                scanInfo->properties[index].has_value() && scanInfo->properties[index]->fileSize.has_value() &&
+                scanInfo->lengths[index] >= static_cast<uint64_t>(*scanInfo->properties[index]->fileSize) &&
+                static_cast<uint64_t>(*scanInfo->properties[index]->fileSize) <= maxFileBytes &&
+                static_cast<uint64_t>(*scanInfo->properties[index]->fileSize) <= targetBytes;
+          };
+          std::vector<cudf_velox::connector::hive::CudfCoalescedFile> coalescedFiles;
+          uint64_t accumulatedBytes =
+              isWholeCoalescibleFile(j) ? static_cast<uint64_t>(*scanInfo->properties[j]->fileSize) : 0;
+          if (isWholeCoalescibleFile(j)) {
+            for (size_t next = j + 1;
+                 next < scanInfo->paths.size() && coalescedFiles.size() + 1 < static_cast<size_t>(maxFiles);
+                 ++next) {
+              if (scanSplitConsumed[next] || scanSplitOwners.at(scanInfo.get())[next] != peerIndex_ ||
+                  !isWholeCoalescibleFile(next) ||
+                  !cudfHiveInfoColumnsCanCoalesce(
+                      metadataColumn,
+                      next < scanInfo->metadataColumns.size() ? scanInfo->metadataColumns[next]
+                                                              : std::unordered_map<std::string, std::string>{}) ||
+                  static_cast<uint64_t>(*scanInfo->properties[next]->fileSize) > targetBytes - accumulatedBytes) {
+                continue;
+              }
+              const auto fileSize = static_cast<uint64_t>(*scanInfo->properties[next]->fileSize);
+              coalescedFiles.push_back({cleanedCudfPath(scanInfo->paths[next]), fileSize});
+              accumulatedBytes += fileSize;
+              scanSplitConsumed[next] = true;
+            }
+          }
           connectorSplit = std::make_shared<cudf_velox::connector::hive::CudfHiveConnectorSplit>(
               kCudfHiveConnectorId,
               cleanedCudfPath(scanInfo->paths[j]),
               scanInfo->starts[j],
               scanInfo->lengths[j],
               /*splitWeight=*/0,
-              metadataColumn);
+              metadataColumn,
+              std::move(coalescedFiles),
+              scanInfo->format);
           const auto prefetchPath = cleanedCudfPath(scanInfo->paths[j]);
-          if (queryCtx_->executor() != nullptr &&
-              prefetchPath.starts_with("s3://") &&
-              j < scanInfo->properties.size() &&
-              scanInfo->properties[j].has_value() &&
+          if (queryCtx_->executor() != nullptr && prefetchPath.starts_with("s3://") &&
+              j < scanInfo->properties.size() && scanInfo->properties[j].has_value() &&
               scanInfo->properties[j]->fileSize.has_value()) {
+            const auto cudfHiveSplit =
+                std::dynamic_pointer_cast<cudf_velox::connector::hive::CudfHiveConnectorSplit>(connectorSplit);
+            VELOX_CHECK_NOT_NULL(cudfHiveSplit);
+            std::vector<cudf_velox::connector::hive::SplitPrefetchFile> prefetchFiles;
+            prefetchFiles.reserve(1 + cudfHiveSplit->coalescedFiles.size());
+            prefetchFiles.push_back({prefetchPath, static_cast<uint64_t>(*scanInfo->properties[j]->fileSize)});
+            for (const auto& file : cudfHiveSplit->coalescedFiles) {
+              prefetchFiles.push_back({file.filePath, file.length});
+            }
             cudf_velox::connector::hive::ExecutorSplitPrefetch::registerSplit(
-                queryCtx_->executor(),
-                queryCtx_->queryId(),
-                prefetchPath,
-                {{prefetchPath,
-                  static_cast<uint64_t>(
-                      *scanInfo->properties[j]->fileSize)}});
+                queryCtx_->executor(), queryCtx_->queryId(), prefetchPath, std::move(prefetchFiles));
           }
         } else
 #endif
@@ -1456,12 +1526,11 @@ void FluxQueryCoordinator::start() {
     const auto appendProducerEndpoints =
         [&](const std::string& peerId, const std::string& host, int32_t port, int32_t replicaCount) {
           for (int32_t j = 0; j < replicaCount; ++j) {
-            producerEndpoints.push_back(
-                ProducerEndpointForSplit{
-                    peerId == localPeerId_ ? makeTaskId(exchange.producerFragmentId, j)
-                                           : makeTaskIdForPeer(peerId, exchange.producerFragmentId, j),
-                    host,
-                    port});
+            producerEndpoints.push_back(ProducerEndpointForSplit{
+                peerId == localPeerId_ ? makeTaskId(exchange.producerFragmentId, j)
+                                       : makeTaskIdForPeer(peerId, exchange.producerFragmentId, j),
+                host,
+                port});
           }
         };
 
@@ -1472,15 +1541,12 @@ void FluxQueryCoordinator::start() {
       // and newer UCX versions correctly reject 127.0.0.1 in that setup.
       // Prefer the endpoint this executor registered with the driver so the
       // handshake uses an address supported by the configured UCX device.
-      const auto localEndpoint = std::find_if(
-          exchange.producerEndpoints.begin(),
-          exchange.producerEndpoints.end(),
-          [&](const auto& peer) { return peer.peerId == localPeerId_; });
+      const auto localEndpoint =
+          std::find_if(exchange.producerEndpoints.begin(), exchange.producerEndpoints.end(), [&](const auto& peer) {
+            return peer.peerId == localPeerId_;
+          });
       if (localEndpoint != exchange.producerEndpoints.end()) {
-        VELOX_CHECK(
-            !localEndpoint->host.empty(),
-            "Local FLUX peer endpoint {} has empty host",
-            localPeerId_);
+        VELOX_CHECK(!localEndpoint->host.empty(), "Local FLUX peer endpoint {} has empty host", localPeerId_);
         VELOX_CHECK_GT(
             localEndpoint->port,
             0,
@@ -1495,18 +1561,11 @@ void FluxQueryCoordinator::start() {
             localEndpoint->port,
             urlPort);
         appendProducerEndpoints(
-            localPeerId_,
-            localEndpoint->host,
-            localEndpoint->port,
-            static_cast<int32_t>(producerReplicas.size()));
+            localPeerId_, localEndpoint->host, localEndpoint->port, static_cast<int32_t>(producerReplicas.size()));
       } else {
         // Preserve standalone/single-peer compatibility when no registry
         // endpoint was supplied.
-        appendProducerEndpoints(
-            localPeerId_,
-            "127.0.0.1",
-            urlPort,
-            static_cast<int32_t>(producerReplicas.size()));
+        appendProducerEndpoints(localPeerId_, "127.0.0.1", urlPort, static_cast<int32_t>(producerReplicas.size()));
       }
     }
     for (const auto& peer : exchange.producerEndpoints) {
@@ -1521,20 +1580,10 @@ void FluxQueryCoordinator::start() {
           "FLUX peer id must be non-empty and must not contain '/' or '://', got '{}'",
           peer.peerId);
       VELOX_CHECK_GT(
-          peer.port,
-          0,
-          "FLUX peer endpoint {} has invalid RemoteConnectorSplit URL port {}",
-          peer.peerId,
-          peer.port);
-      VELOX_CHECK(
-          !peer.host.empty(),
-          "FLUX peer endpoint {} has empty host",
-          peer.peerId);
+          peer.port, 0, "FLUX peer endpoint {} has invalid RemoteConnectorSplit URL port {}", peer.peerId, peer.port);
+      VELOX_CHECK(!peer.host.empty(), "FLUX peer endpoint {} has empty host", peer.peerId);
       appendProducerEndpoints(
-          peer.peerId,
-          peer.host,
-          peer.port,
-          replicaCountForPeer(exchange.producerFragmentId, peer.peerIndex));
+          peer.peerId, peer.host, peer.port, replicaCountForPeer(exchange.producerFragmentId, peer.peerIndex));
     }
     VELOX_CHECK(
         !producerEndpoints.empty(),
@@ -1575,8 +1624,7 @@ void FluxQueryCoordinator::start() {
       if (isBroadcast) {
         int32_t destination = static_cast<int32_t>(cIdx);
         for (int32_t peer = 0; peer < peerIndex_; ++peer) {
-          destination +=
-              replicaCountForPeer(exchange.consumerFragmentId, peer);
+          destination += replicaCountForPeer(exchange.consumerFragmentId, peer);
         }
         for (const auto& producerEndpoint : producerEndpoints) {
           const auto url = fmt::format(
@@ -1601,13 +1649,10 @@ void FluxQueryCoordinator::start() {
           continue;
         }
         const bool assigned = isRange
-            ? ownedOrdinal % static_cast<int>(consumerReplicas.size()) ==
-                  static_cast<int>(cIdx)
-            : isHash
-                ? (consumerReplicas.size() == 1 ||
-                   ownedOrdinal % static_cast<int>(consumerReplicas.size()) ==
-                       static_cast<int>(cIdx))
-                : true;
+            ? ownedOrdinal % static_cast<int>(consumerReplicas.size()) == static_cast<int>(cIdx)
+            : isHash ? (consumerReplicas.size() == 1 ||
+                        ownedOrdinal % static_cast<int>(consumerReplicas.size()) == static_cast<int>(cIdx))
+                     : true;
         ++ownedOrdinal;
         if (!assigned) {
           continue;
@@ -1625,8 +1670,7 @@ void FluxQueryCoordinator::start() {
         }
       }
       consumerTask->noMoreSplits(exchange.exchangeNodeId);
-      pendingUcxExchangePrimes.push_back(
-          {consumerTask->taskId(), exchange.exchangeNodeId, std::move(remoteTaskUrls)});
+      pendingUcxExchangePrimes.push_back({consumerTask->taskId(), exchange.exchangeNodeId, std::move(remoteTaskUrls)});
     }
     LOG(WARNING) << "FluxQueryCoordinator[" << queryId_ << "]: exchange " << exchange.id << " wired (" << splitCount
                  << " splits across " << consumerReplicas.size() << " consumer task(s), " << producerEndpoints.size()
@@ -1678,9 +1722,7 @@ void FluxQueryCoordinator::start() {
   // every consumer already has all RemoteConnectorSplits and every scan has
   // its Hive splits, so no task starts in an incomplete split state.
   for (const auto& spec : fragmentSpecs_) {
-    for (int32_t i = 0;
-         i < static_cast<int32_t>(fragmentTasks_[spec.id].size());
-         ++i) {
+    for (int32_t i = 0; i < static_cast<int32_t>(fragmentTasks_[spec.id].size()); ++i) {
       startFragmentTask(spec.id, i);
     }
   }
@@ -1692,14 +1734,10 @@ void FluxQueryCoordinator::start() {
   // scheduler wake-up and losing the intended inter-stage overlap.
   if (envFlagEnabled("GLUTEN_MPP_PRIME_UCX_EXCHANGE_CLIENTS")) {
     for (const auto& pending : pendingUcxExchangePrimes) {
-      const bool primed = cudf_velox::primeUcxExchangeClient(
-          pending.consumerTaskId,
-          pending.exchangeNodeId,
-          pending.remoteTaskUrls);
-      LOG(WARNING) << "FluxQueryCoordinator[" << queryId_
-                   << "]: UCX client prime task=" << pending.consumerTaskId
-                   << " node=" << pending.exchangeNodeId
-                   << " urls=" << pending.remoteTaskUrls.size()
+      const bool primed =
+          cudf_velox::primeUcxExchangeClient(pending.consumerTaskId, pending.exchangeNodeId, pending.remoteTaskUrls);
+      LOG(WARNING) << "FluxQueryCoordinator[" << queryId_ << "]: UCX client prime task=" << pending.consumerTaskId
+                   << " node=" << pending.exchangeNodeId << " urls=" << pending.remoteTaskUrls.size()
                    << " primed=" << primed;
     }
   }
@@ -1822,15 +1860,14 @@ void FluxQueryCoordinator::start() {
               blockedReasons.append(fmt::format("{}={}", reason, count));
             }
             LOG(WARNING) << "FluxWatchdog[" << queryId_ << "] tick=" << tick
-                         << " non-terminal taskId=" << task->taskId()
-                         << " state=" << static_cast<int>(task->state())
+                         << " non-terminal taskId=" << task->taskId() << " state=" << static_cast<int>(task->state())
                          << " numDrivers=" << task->numTotalDrivers()
-                         << " numFinishedDrivers="
-                         << task->numFinishedDrivers()
+                         << " numFinishedDrivers=" << task->numFinishedDrivers()
                          << " queuedDrivers=" << liveStats.numQueuedDrivers
-                         << " runningDrivers=" << liveStats.numRunningDrivers
-                         << " blockedDrivers={" << blockedReasons << "}";
-            if (++sampled >= 6) break;
+                         << " runningDrivers=" << liveStats.numRunningDrivers << " blockedDrivers={" << blockedReasons
+                         << "}";
+            if (++sampled >= 6)
+              break;
           }
         }
       }
@@ -2061,8 +2098,7 @@ bool FluxQueryCoordinator::fetchNextOutputPage(std::vector<std::unique_ptr<Seria
 
 #ifdef GLUTEN_ENABLE_GPU
 RowVectorPtr FluxQueryCoordinator::fetchNextDeviceOutput() {
-  nvtx3::scoped_range_in<GlutenFluxDomain> nvtxRange{
-      "coordinator::fetchNextDeviceOutput"};
+  nvtx3::scoped_range_in<GlutenFluxDomain> nvtxRange{"coordinator::fetchNextDeviceOutput"};
   const auto rootReplicas = fragmentReplicaCount_[rootFragmentId_];
   constexpr int32_t kDestination = 0;
   constexpr uint64_t kMaxBytes = std::numeric_limits<uint64_t>::max();
@@ -2091,8 +2127,7 @@ RowVectorPtr FluxQueryCoordinator::fetchNextDeviceOutput() {
     return -1;
   };
 
-  auto queueManager =
-      facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
+  auto queueManager = facebook::velox::ucx_exchange::UcxOutputQueueManager::getInstanceRef();
   while (!noMoreData_) {
     const int32_t idx = pickNext();
     if (idx < 0) {
@@ -2103,8 +2138,7 @@ RowVectorPtr FluxQueryCoordinator::fetchNextDeviceOutput() {
     }
 
     struct DeviceFetchState {
-      ContinuePromise promise{
-          "FluxQueryCoordinator::fetchNextDeviceOutput"};
+      ContinuePromise promise{"FluxQueryCoordinator::fetchNextDeviceOutput"};
       std::atomic<bool> fulfilled{false};
       std::shared_ptr<cudf::packed_columns> data;
       int64_t sequence{0};
@@ -2115,12 +2149,9 @@ RowVectorPtr FluxQueryCoordinator::fetchNextDeviceOutput() {
     auto state = std::make_shared<DeviceFetchState>();
     state->sequence = requestedSequence;
 
-    VLOG(2) << "FluxQueryCoordinator[" << queryId_
-            << "]: fetchNextDeviceOutput rootTask=" << rootTaskId
+    VLOG(2) << "FluxQueryCoordinator[" << queryId_ << "]: fetchNextDeviceOutput rootTask=" << rootTaskId
             << " seq=" << requestedSequence
-            << " rootState="
-            << static_cast<int>(
-                   fragmentTasks_[rootFragmentId_][idx]->state());
+            << " rootState=" << static_cast<int>(fragmentTasks_[rootFragmentId_][idx]->state());
 
     queueManager->getData(
         rootTaskId,
@@ -2128,13 +2159,9 @@ RowVectorPtr FluxQueryCoordinator::fetchNextDeviceOutput() {
         kMaxBytes,
         requestedSequence,
         [state, idx, qid = queryId_](
-            std::shared_ptr<cudf::packed_columns> data,
-            int64_t sequence,
-            std::vector<int64_t> /*remainingBytes*/) {
-          VLOG(2) << "FluxQueryCoordinator[" << qid
-                  << "]: device getData callback fired replica=" << idx
-                  << " sequence=" << sequence
-                  << " hasData=" << (data != nullptr);
+            std::shared_ptr<cudf::packed_columns> data, int64_t sequence, std::vector<int64_t> /*remainingBytes*/) {
+          VLOG(2) << "FluxQueryCoordinator[" << qid << "]: device getData callback fired replica=" << idx
+                  << " sequence=" << sequence << " hasData=" << (data != nullptr);
           state->data = std::move(data);
           state->sequence = sequence;
           bool expected = false;
@@ -2152,42 +2179,28 @@ RowVectorPtr FluxQueryCoordinator::fetchNextDeviceOutput() {
     }
 
     rethrowFirstTaskError();
-    VELOX_CHECK_EQ(
-        state->sequence,
-        requestedSequence,
-        "Unexpected UCX root output sequence for task {}",
-        rootTaskId);
+    VELOX_CHECK_EQ(state->sequence, requestedSequence, "Unexpected UCX root output sequence for task {}", rootTaskId);
 
     if (state->data == nullptr) {
       rootReplicaAtEnd_[idx] = true;
       queueManager->deleteResults(rootTaskId, kDestination);
-      noMoreData_ = std::all_of(
-          rootReplicaAtEnd_.begin(),
-          rootReplicaAtEnd_.end(),
-          [](bool atEnd) { return atEnd; });
+      noMoreData_ = std::all_of(rootReplicaAtEnd_.begin(), rootReplicaAtEnd_.end(), [](bool atEnd) { return atEnd; });
       continue;
     }
 
     rootOutputSequence_[idx] = state->sequence + 1;
     auto packed = std::move(state->data);
-    VELOX_CHECK_EQ(
-        packed.use_count(),
-        1,
-        "GPU sink root output must have unique ownership");
-    cudf::packed_columns packedColumns(
-        std::move(packed->metadata), std::move(packed->gpu_data));
+    VELOX_CHECK_EQ(packed.use_count(), 1, "GPU sink root output must have unique ownership");
+    cudf::packed_columns packedColumns(std::move(packed->metadata), std::move(packed->gpu_data));
     packed.reset();
 
     auto tableView = cudf::unpack(packedColumns);
-    auto packedTable = std::make_unique<cudf::packed_table>(
-        cudf::packed_table{tableView, std::move(packedColumns)});
-    auto outputType = std::dynamic_pointer_cast<const RowType>(
-        fragmentSpecs_[rootFragmentId_]
-            .planFragment.planNode->outputType());
+    auto packedTable = std::make_unique<cudf::packed_table>(cudf::packed_table{tableView, std::move(packedColumns)});
+    auto outputType =
+        std::dynamic_pointer_cast<const RowType>(fragmentSpecs_[rootFragmentId_].planFragment.planNode->outputType());
     VELOX_CHECK_NOT_NULL(outputType, "Root fragment must have RowType output");
     if (deserializePool_ == nullptr) {
-      deserializePool_ =
-          queryCtx_->pool()->addLeafChild("flux_device_output");
+      deserializePool_ = queryCtx_->pool()->addLeafChild("flux_device_output");
     }
     return std::make_shared<facebook::velox::cudf_velox::CudfVector>(
         deserializePool_.get(),
@@ -2291,6 +2304,7 @@ RowVectorPtr FluxQueryCoordinator::next() {
   if (deviceRootOutput_) {
     if (noMoreData_) {
       rethrowFirstTaskError();
+      logOperatorMetrics();
       return nullptr;
     }
     return fetchNextDeviceOutput();
@@ -2544,7 +2558,8 @@ void FluxQueryCoordinator::abort(std::chrono::milliseconds perTaskTimeout) {
           ++terminalAfterWait;
         } else {
           ++timedOut;
-          LOG(ERROR) << "FluxQueryCoordinator[" << queryId_ << "]: abort() TIMEOUT waiting for taskId=" << task->taskId()
+          LOG(ERROR) << "FluxQueryCoordinator[" << queryId_
+                     << "]: abort() TIMEOUT waiting for taskId=" << task->taskId()
                      << " state=" << static_cast<int>(task->state()) << " numDrivers=" << task->numTotalDrivers()
                      << " numFinishedDrivers=" << task->numFinishedDrivers()
                      << " — task may still hold MemoryPool reservations";
@@ -2588,15 +2603,14 @@ void FluxQueryCoordinator::waitForCompletion() {
       if (task == nullptr) {
         continue;
       }
-      completionWatchers.emplace_back(
-          std::move(task->taskCompletionFuture())
-              .via(&folly::InlineExecutor::instance())
-              .thenTry([waitState](folly::Try<folly::Unit>&&) -> folly::Unit {
-                std::lock_guard<std::mutex> lock(waitState->mutex);
-                ++waitState->completed;
-                waitState->cv.notify_all();
-                return folly::Unit{};
-              }));
+      completionWatchers.emplace_back(std::move(task->taskCompletionFuture())
+                                          .via(&folly::InlineExecutor::instance())
+                                          .thenTry([waitState](folly::Try<folly::Unit>&&) -> folly::Unit {
+                                            std::lock_guard<std::mutex> lock(waitState->mutex);
+                                            ++waitState->completed;
+                                            waitState->cv.notify_all();
+                                            return folly::Unit{};
+                                          }));
     }
   }
 

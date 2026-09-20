@@ -68,6 +68,29 @@ class GlutenExpressionMappingSuite
     }
   }
 
+  test("empty blacklist fast path observes subsequent SQLConf changes") {
+    withSQLConf(
+      GlutenConfig.EXPRESSION_BLACK_LIST.key -> "",
+      GlutenConfig.FALLBACK_REGEXP_EXPRESSIONS.key -> "false") {
+      val original = ExpressionMappings.expressionsMap
+      assert(ExpressionMappings.blacklistExpressionMap.isEmpty)
+      withSQLConf(GlutenConfig.EXPRESSION_BLACK_LIST.key -> " ADD , regexp_replace ") {
+        val blocked = ExpressionMappings.blacklistExpressionMap
+        val allowed = ExpressionMappings.expressionsMap
+        assert(blocked.nonEmpty)
+        assert(blocked.values.forall(Set("add", "regexp_replace")))
+        assert((allowed ++ blocked) == original)
+        assert(!allowed.values.exists(Set("add", "regexp_replace")))
+      }
+      assert(ExpressionMappings.expressionsMap == original)
+      assert(ExpressionMappings.blacklistExpressionMap.isEmpty)
+      withSQLConf(GlutenConfig.FALLBACK_REGEXP_EXPRESSIONS.key -> "true") {
+        assert(ExpressionMappings.blacklistExpressionMap.values.toSet.contains("regexp_replace"))
+      }
+      assert(ExpressionMappings.expressionsMap == original)
+    }
+  }
+
   testWithMinSparkVersion("test blacklisting regexp expressions", "3.2") {
     val names = ExpressionMappings.expressionsMap.values.toSet
     assert(names.contains("rlike"))

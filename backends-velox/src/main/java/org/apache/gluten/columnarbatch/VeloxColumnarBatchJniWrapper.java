@@ -41,6 +41,13 @@ public class VeloxColumnarBatchJniWrapper implements RuntimeAware {
   public native long repeatedThenCompose(
       long repeatedBatch, long nonRepeatedBatch, int[] rowId2RowNums);
 
+  /**
+   * Extract the compact result emitted by a native Velox TableWrite operator without exporting the
+   * batch through Arrow. Element zero is the ASCII-encoded written-row count; the remaining
+   * elements are the UTF-8 JSON file fragments from rows 1..N-1.
+   */
+  public static native byte[][] getWriteFilesMetrics(long veloxBatchHandle);
+
   @Override
   public long rtHandle() {
     return runtime.getHandle();
