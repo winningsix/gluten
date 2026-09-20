@@ -300,6 +300,16 @@ const std::string kCudfExchangeConcatOptimizationEnabled =
     "spark.gluten.sql.columnar.backend.velox.cudf.exchange_concat_optimization_enabled";
 const std::string kCudfExchangeConcatOptimizationEnabledDefault = "true";
 
+// Coalesce the final device-resident stream independently from post-exchange
+// batches before passing it to the native Parquet writer.
+const std::string kCudfTableWriteConcatEnabled =
+    "spark.gluten.sql.columnar.backend.velox.cudf.table_write_concat_enabled";
+const std::string kCudfTableWriteConcatEnabledDefault = "false";
+const std::string kCudfTableWriteConcatRows = "spark.gluten.sql.columnar.backend.velox.cudf.table_write_concat_rows";
+const std::string kCudfTableWriteConcatRowsDefault = "20000000";
+const std::string kCudfTableWriteConcatBytes = "spark.gluten.sql.columnar.backend.velox.cudf.table_write_concat_bytes";
+const std::string kCudfTableWriteConcatBytesDefault = "1073741824";
+
 // Enables cuDF's persistent FINAL streaming groupby with a fixed distinct-key
 // capacity. Zero keeps the all-GPU levelled aggregation path.
 const std::string kCudfGroupbyStreamingMaxDistinctKeys =

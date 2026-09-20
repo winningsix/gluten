@@ -720,6 +720,27 @@ object VeloxConfig extends ConfigRegistry {
       .intConf
       .createWithDefault(50)
 
+  val CUDF_TABLE_WRITE_CONCAT_ENABLED =
+    buildStaticConf(
+      "spark.gluten.sql.columnar.backend.velox.cudf.table_write_concat_enabled")
+      .doc("Coalesce device batches immediately before the native table writer.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val CUDF_TABLE_WRITE_CONCAT_ROWS =
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.table_write_concat_rows")
+      .doc("Row target for device batch coalescing immediately before table write.")
+      .intConf
+      .checkValue(_ > 0, "must be positive")
+      .createWithDefault(20000000)
+
+  val CUDF_TABLE_WRITE_CONCAT_BYTES =
+    buildStaticConf("spark.gluten.sql.columnar.backend.velox.cudf.table_write_concat_bytes")
+      .doc("Byte target for device batch coalescing immediately before table write; 0 disables it.")
+      .longConf
+      .checkValue(_ >= 0, "must be non-negative")
+      .createWithDefault(1024L * 1024 * 1024)
+
   val CUDF_GROUPBY_STREAMING_MAX_DISTINCT_KEYS =
     buildConf("spark.gluten.sql.columnar.backend.velox.cudf.groupbyStreamingMaxDistinctKeys")
       .doc(
